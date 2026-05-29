@@ -4,17 +4,17 @@ set -euo pipefail
 usage() {
   printf '%s\n' \
     'Usage:' \
-    '  bash scripts/install.sh --global' \
-    '  bash scripts/install.sh --project /path/to/project'
+    '  bash adapters/opencode/install.sh --global' \
+    '  bash adapters/opencode/install.sh --project /path/to/project'
 }
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 install_commands() {
   local dest_dir="$1"
   mkdir -p "$dest_dir"
   local file
-  for file in "$ROOT_DIR"/commands/*.md; do
+  for file in "$ROOT_DIR"/adapters/opencode/commands/*.md; do
     install -m 0644 "$file" "$dest_dir/$(basename "$file")"
   done
 }
@@ -23,7 +23,7 @@ install_agents() {
   local dest_dir="$1"
   mkdir -p "$dest_dir"
   local file
-  for file in "$ROOT_DIR"/agents/*.md; do
+  for file in "$ROOT_DIR"/adapters/opencode/agents/*.md; do
     install -m 0644 "$file" "$dest_dir/$(basename "$file")"
   done
 }
@@ -32,7 +32,7 @@ install_support_readme() {
   local dest_dir="$1"
   mkdir -p "$dest_dir"
   install -m 0644 \
-    "$ROOT_DIR/support/opsx-controller-state-README.md" \
+    "$ROOT_DIR/adapters/opencode/support/opsx-controller-state-README.md" \
     "$dest_dir/README.md"
 }
 
@@ -55,13 +55,13 @@ ensure_project_config() {
   if [[ -f "$project_dir/opencode.json" || -f "$project_dir/opencode.jsonc" || -f "$project_dir/.opencode/opencode.json" ]]; then
     printf '%s\n' \
       'Existing OpenCode config detected.' \
-      'Merge templates/project/opencode.json.snippet.json manually if needed.'
+      'Merge adapters/opencode/templates/project/opencode.json.snippet.json manually if needed.'
     return
   fi
 
   mkdir -p "$project_dir/.opencode"
   install -m 0644 \
-    "$ROOT_DIR/templates/project/opencode.json.snippet.json" \
+    "$ROOT_DIR/adapters/opencode/templates/project/opencode.json.snippet.json" \
     "$project_dir/.opencode/opencode.json"
 }
 

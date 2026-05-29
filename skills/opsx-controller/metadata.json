@@ -1,0 +1,11 @@
+{
+  "version": "1.1.0",
+  "organization": "OpenSpec",
+  "date": "May 2026",
+  "abstract": "Self-contained OpenSpec controller workflow reference for Vercel skill installation, with shared core contract and adapter guidance for OpenCode and Claude Code.",
+  "references": [
+    "https://github.com/brianmoney/opsx-controller",
+    "https://github.com/vercel-labs/agent-skills",
+    "https://docs.anthropic.com/en/docs/claude-code"
+  ]
+}

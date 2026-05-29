@@ -1,0 +1,11 @@
+{
+  "name": "opsx-controller",
+  "description": "OpenSpec controller workflow for Claude Code with a namespaced /opsx-controller:opsx-drive skill and supporting phase agents.",
+  "version": "1.0.0",
+  "author": {
+    "name": "brianmoney"
+  },
+  "homepage": "https://github.com/brianmoney/opsx-controller",
+  "repository": "https://github.com/brianmoney/opsx-controller",
+  "license": "MIT"
+}
