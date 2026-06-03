@@ -1,0 +1,13 @@
+{
+  "name": "opsx-controller",
+  "version": "0.1.0",
+  "description": "OpenSpec controller for Codex CLI — strict implement-review-archive loop for accepted OpenSpec changes",
+  "author": "opsx-controller",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "OpenSpec Controller",
+    "shortDescription": "Drive OpenSpec changes through a strict implement-review-archive loop",
+    "category": "workflow",
+    "capabilities": ["subagent-orchestration", "openspec-workflow"]
+  }
+}
