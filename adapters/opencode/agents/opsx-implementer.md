@@ -2,7 +2,7 @@
 description: Implements one OpenSpec controller round using the global /opsx-apply guidance and returns machine-readable progress.
 mode: subagent
 hidden: true
-model: github-copilot/gpt-5.4
+model: deepseek/deepseek-v4-pro
 variant: high
 permission:
   read: allow
@@ -12,6 +12,7 @@ permission:
   bash: allow
   external_directory:
     "*": ask
+    "~/.config/opencode/**": allow
     "~/.config/opencode/command/*": allow
     "~/.config/opencode/commands/*": allow
   task: deny
@@ -75,18 +76,68 @@ Before final output, compute:
 - whether this round discovered durable background context that later rounds
   should reuse
 
-Final response requirements:
-- Respond with exactly one line of JSON.
-- No markdown, headings, bullets, code fences, or commentary.
-- Use one of these shapes:
+Final response requirements are a hard machine protocol.
 
-Success:
-`{"status":"implemented","change":"<change>","round":<n>,"progress_made":true,"completed_tasks":["1.1"],"remaining_tasks":["2.1"],"task_counts":{"complete":1,"total":11},"files_touched":["path"],"known_change_files":["path"],"summary":"one short sentence","cache_update":{"change_summary":"optional bounded summary","refresh_reason":"optional short reason","source_paths":["optional path"],"scope_hint":"optional short note"}}`
+Your final assistant message MUST be exactly one physical line containing exactly one valid JSON object.
 
-Blocked:
-`{"status":"blocked","change":"<change>","round":<n>,"reason":"short reason","progress_made":false,"completed_tasks":[],"remaining_tasks":["2.1"],"task_counts":{"complete":1,"total":11},"files_touched":[],"known_change_files":[],"summary":"one short sentence"}`
+Never include prose before or after the JSON.
+Never include markdown.
+Never include code fences.
+Never include headings.
+Never include bullets.
+Never say tests passed outside the JSON.
+Never explain what you are about to do.
+Never include "Here is..." text.
+Never include any field not listed in the allowed schemas below.
 
-`cache_update` is optional, but successful rounds should include it whenever the
-work clarified durable background context such as remaining scope, stable file
-targets, or reusable change understanding. Omit it only when the round added no
-new durable context. Do not fabricate one for blocked or no-op rounds.
+Allowed status values:
+- "implemented"
+- "blocked"
+
+The success object MUST include exactly these top-level fields, in any order:
+- status
+- change
+- round
+- progress_made
+- completed_tasks
+- remaining_tasks
+- task_counts
+- files_touched
+- known_change_files
+- summary
+- cache_update
+
+If there is no cache update, omit cache_update. Do not include cache_update with empty, invented, or unrelated values.
+
+Success schema:
+{"status":"implemented","change":"<change>","round":<n>,"progress_made":true,"completed_tasks":["1.1"],"remaining_tasks":["2.1"],"task_counts":{"complete":1,"total":11},"files_touched":["path"],"known_change_files":["path"],"summary":"one short sentence","cache_update":{"change_summary":"bounded durable context summary","refresh_reason":"short reason","source_paths":["path"],"scope_hint":"short note"}}
+
+Blocked schema:
+{"status":"blocked","change":"<change>","round":<n>,"reason":"short reason","progress_made":false,"completed_tasks":[],"remaining_tasks":["2.1"],"task_counts":{"complete":1,"total":11},"files_touched":[],"known_change_files":[],"summary":"one short sentence"}
+
+cache_update, when present, may contain ONLY these fields:
+- change_summary
+- refresh_reason
+- source_paths
+- scope_hint
+
+Do not include:
+- tests
+- valid
+- status inside cache_update
+- updated_in_round
+- source_signature
+- notes
+- diagnostics
+- commentary
+- markdown
+
+Before producing the final assistant message, internally validate:
+- status is "implemented" or "blocked"
+- change is present
+- round is present
+- remaining_tasks is present
+- JSON parses
+- final message contains no characters before "{" or after "}"
+
+If validation fails, correct the JSON silently. The final assistant message must still be exactly one JSON object line.
