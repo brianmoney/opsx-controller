@@ -155,8 +155,8 @@ If you want the host repo instructions to advertise the controller path, merge
 
 What it contains:
 
-- `adapters/codex-cli/skills/opsx-drive/SKILL.md`: controller skill
-- `adapters/codex-cli/skills/opsx-drive/agents/openai.yaml`: skill metadata
+- `adapters/codex-cli/skills/opsx-drive/SKILL.md`: controller skill with required YAML frontmatter
+- `adapters/codex-cli/skills/opsx-drive/agents/openai.yaml`: optional Codex UI metadata
 - `adapters/codex-cli/agents/opsx-implementer.toml`: implementation phase agent
 - `adapters/codex-cli/agents/opsx-reviewer.toml`: strict review phase agent
 - `adapters/codex-cli/agents/opsx-archiver.toml`: archive phase agent

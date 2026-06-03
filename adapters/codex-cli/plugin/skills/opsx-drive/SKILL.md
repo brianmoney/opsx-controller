@@ -1,3 +1,8 @@
+---
+name: opsx-drive
+description: Start or resume the OpenSpec controller for one accepted change. Use when you want a strict implement-review-archive loop in Codex or VS Code with durable state, blocking review findings, and explicit archive scope.
+---
+
 Start or resume the OpenSpec controller for exactly one change.
 
 Resolved controller inputs:
