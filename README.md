@@ -14,6 +14,8 @@ to package for different coding clients.
   and templates
 - `adapters/claude-code/`: Claude Code skill, phase agents, installer, support
   files, and templates
+- `adapters/codex-cli/`: Codex CLI skill, phase agents, installer, support
+  files, templates, and plugin manifest
 - `plugins/opsx-controller/`: Claude Code plugin package for `--plugin-dir` and
   marketplace packaging
 - `skills/opsx-controller/`: Vercel `npx skill` package for discovery and
@@ -148,6 +150,78 @@ Usage from the host project root:
 If you want the host repo instructions to advertise the controller path, merge
 `adapters/claude-code/templates/project/CLAUDE.snippet.md` into that project's
 `CLAUDE.md`.
+
+## Codex CLI Adapter
+
+What it contains:
+
+- `adapters/codex-cli/skills/opsx-drive/SKILL.md`: controller skill
+- `adapters/codex-cli/skills/opsx-drive/agents/openai.yaml`: skill metadata
+- `adapters/codex-cli/agents/opsx-implementer.toml`: implementation phase agent
+- `adapters/codex-cli/agents/opsx-reviewer.toml`: strict review phase agent
+- `adapters/codex-cli/agents/opsx-archiver.toml`: archive phase agent
+- `adapters/codex-cli/support/opsx-controller-state-README.md`: state contract
+- `adapters/codex-cli/templates/project/`: host-project setup snippets
+- `adapters/codex-cli/install.sh`: Codex CLI installer
+- `adapters/codex-cli/plugin/.codex-plugin/plugin.json`: marketplace manifest
+- `adapters/codex-cli/plugin/skills/opsx-drive/`: plugin-scoped controller skill
+- `adapters/codex-cli/plugin/agents/`: plugin-scoped phase agents
+
+Requirements:
+
+- OpenAI Codex CLI
+- OpenSpec CLI available in the shell
+- a host project that already uses OpenSpec
+- repo guidance in `AGENTS.md`
+- Codex CLI configured with `agents.max_depth >= 1` for subagent dispatch
+
+Install globally:
+
+```bash
+bash adapters/codex-cli/install.sh --global
+```
+
+Install into one project:
+
+```bash
+bash adapters/codex-cli/install.sh --project /path/to/project
+```
+
+Project install behavior:
+
+- copies skill into `<project>/.agents/skills/opsx-drive/`
+- copies agents into `<project>/.codex/agents/`
+- installs the controller state contract at
+  `<project>/.codex/opsx-controller/README.md`
+- ensures `<project>/.codex/.gitignore` ignores `opsx-controller/*.json`
+
+Usage from the host project root:
+
+```text
+$opsx-drive <change-id>
+```
+
+State path differs from other adapters: durable state files live at
+`.opsx-controller/<change-id>.json` (project root) because Codex sandbox
+protects the `.codex/` directory from agent writes.
+
+If you want the host repo instructions to advertise the controller path, merge
+`adapters/codex-cli/templates/project/AGENTS.snippet.md` into that project's
+`AGENTS.md`.
+
+### Codex Plugin
+
+A self-contained plugin bundle at `adapters/codex-cli/plugin/` is ready for
+Codex marketplace distribution.
+
+Create the plugin bundle locally:
+
+```bash
+bash adapters/codex-cli/install.sh --plugin
+```
+
+The plugin includes the controller skill, phase agents, and a marketplace
+manifest (`.codex-plugin/plugin.json`).
 
 ## Claude Code Plugin
 
