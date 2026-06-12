@@ -26,6 +26,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -337,6 +338,33 @@ def change_dir(repo: Path, cid: str) -> Path:
     return repo / "openspec" / "changes" / cid
 
 
+AUTHORED_ARTIFACTS = ("proposal.md", "tasks.md")
+
+
+def change_authored(repo: Path, cid: str) -> bool:
+    """True only when the change dir holds the required artifacts, not just a
+    bare `openspec new change` scaffold (`.openspec.yaml`). The scheduler uses
+    this — instead of mere directory existence — to decide whether a change
+    still needs authoring, so a half-written scaffold no longer silently skips
+    the create stage and gets driven as if complete."""
+    cdir = change_dir(repo, cid)
+    return cdir.is_dir() and all((cdir / a).is_file() for a in AUTHORED_ARTIFACTS)
+
+
+def scaffold_is_clearable(repo: Path, cid: str) -> bool:
+    """True when a change dir is a pure, untracked scaffold the orchestrator may
+    remove before re-creating: it exists, holds no authored markdown, and has no
+    tracked files. Any `.md` content or any tracked file makes it unsafe to
+    delete (it may carry hand-written work), so we refuse and ask the operator."""
+    cdir = change_dir(repo, cid)
+    if not cdir.is_dir():
+        return False
+    if any(p.is_file() for p in cdir.rglob("*.md")):
+        return False
+    tracked = git(repo, "ls-files", "--", str(cdir.relative_to(repo)))
+    return not tracked.stdout.strip()
+
+
 def verify_change_created(repo: Path, cfg: dict, cid: str) -> tuple[bool, str]:
     """A change counts as created only when independent evidence agrees:
     1. openspec/changes/<id> exists with proposal.md and tasks.md
@@ -526,6 +554,20 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
         r = rec(state, cid)
         if r["status"] == RUNNING:  # stale from a killed run
             set_status(state, cid, PENDING, "recovered from interrupted run")
+        # A change that failed only because no create_invoke was configured
+        # (so create never ran: create_attempts == 0) should re-queue once the
+        # operator supplies one — otherwise the stale reason keeps reporting
+        # "no create_invoke configured" even after the plan is fixed, and the
+        # operator has to guess that a manual `reset` is required.
+        if (
+            r["status"] == FAILED
+            and r.get("create_attempts", 0) == 0
+            and not change_authored(repo, cid)
+            and cfg["changes"][cid]["create_invoke"]
+        ):
+            set_status(state, cid, PENDING, "create_invoke now configured; will retry")
+            log(f"reconcile: {cid} create config now present; re-queued")
+            continue
         if r["status"] != DONE:
             ok, _ = verify_change_done(repo, cfg, cid)
             if ok:
@@ -583,7 +625,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         cid = ready[0]
         change_cfg = cfg["changes"][cid]
         r = rec(state, cid)
-        needs_create = not change_dir(repo, cid).exists()
+        needs_create = not change_authored(repo, cid)
 
         if cfg["require_clean_tracked"] and not tracked_tree_clean(repo):
             log("tracked worktree is dirty; refusing to start a new stage")
@@ -599,6 +641,25 @@ def cmd_run(args: argparse.Namespace) -> int:
                 )
                 save_state(repo, cfg["name"], state)
                 continue
+            # A previous attempt may have left a bare scaffold (just
+            # .openspec.yaml). `openspec new change` refuses a populated dir, so
+            # clear a pure untracked scaffold to let the author command start
+            # clean; refuse if the dir holds authored or tracked content.
+            if change_dir(repo, cid).is_dir():
+                if scaffold_is_clearable(repo, cid):
+                    shutil.rmtree(change_dir(repo, cid))
+                    log(f"  removed incomplete scaffold openspec/changes/{cid}/ "
+                        f"before re-create")
+                else:
+                    set_status(
+                        state, cid, FAILED,
+                        f"openspec/changes/{cid} exists but is incomplete "
+                        f"(missing {', '.join(AUTHORED_ARTIFACTS)}) and holds "
+                        f"authored or tracked content; finish or remove it, "
+                        f"then reset",
+                    )
+                    save_state(repo, cfg["name"], state)
+                    continue
             c_attempt = r["create_attempts"] + 1
             if c_attempt > change_cfg["create_max_attempts"]:
                 set_status(state, cid, FAILED, "create retry budget exhausted")
@@ -708,11 +769,24 @@ def cmd_status(args: argparse.Namespace) -> int:
     return cmd_status_inner(cfg, state, header=f"plan: {cfg['name']}")
 
 
+def display_order(cfg: dict) -> list[str]:
+    """Phase-ascending for human reading (P0, P1, ...), with the scheduler's
+    topological order as a stable tiebreaker within a phase. Changes without a
+    phase sort last. cfg['order'] itself stays topological for dispatch."""
+    topo_index = {cid: i for i, cid in enumerate(cfg["order"])}
+
+    def key(cid: str) -> tuple:
+        phase = cfg["changes"][cid].get("phase")
+        return (phase is None, phase if phase is not None else 0, topo_index[cid])
+
+    return sorted(cfg["order"], key=key)
+
+
 def cmd_status_inner(cfg: dict, state: dict, header: str) -> int:
     print(header)
     width = max(len(c) for c in cfg["order"])
     failed = 0
-    for cid in cfg["order"]:
+    for cid in display_order(cfg):
         status = classify(cfg, state, cid)
         r = rec(state, cid)
         extra = f"  ({r['reason']})" if r.get("reason") and status != DONE else ""
