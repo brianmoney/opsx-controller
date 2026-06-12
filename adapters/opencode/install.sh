@@ -36,6 +36,14 @@ install_support_readme() {
     "$dest_dir/README.md"
 }
 
+install_orchestrator() {
+  local dest_dir="$HOME/.local/bin"
+  mkdir -p "$dest_dir"
+  install -m 0755 \
+    "$ROOT_DIR/orchestrator/opsx-plan.py" \
+    "$dest_dir/opsx-plan"
+}
+
 ensure_project_gitignore() {
   local gitignore_path="$1/.opencode/.gitignore"
   local ignore_line='opsx-controller/*.json'
@@ -70,10 +78,12 @@ install_global() {
   install_commands "$config_root/commands"
   install_agents "$config_root/agents"
   install_support_readme "$config_root/opsx-controller"
+  install_orchestrator
   printf '%s\n' \
     "Installed commands to $config_root/commands" \
     "Installed agents to $config_root/agents" \
-    "Installed support files to $config_root/opsx-controller"
+    "Installed support files to $config_root/opsx-controller" \
+    "Installed opsx-plan to $HOME/.local/bin/opsx-plan"
 }
 
 install_project() {
