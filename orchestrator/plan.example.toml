@@ -1,0 +1,165 @@
+# Example opsx-plan manifest, derived from the Knowledge Forge
+# Post-Refactor Hardening Plan. Copy into the host project (e.g. as
+# openspec/plan.toml) and edit. Each change must already exist as an
+# accepted OpenSpec change before the orchestrator can drive it.
+#
+# Review the depends_on graph by hand before running unattended:
+# a mis-stated dependency is the most likely catastrophic failure mode.
+
+[plan]
+name = "kf-hardening"
+adapter = "opencode"            # opencode | claude-code | codex-cli
+timeout_minutes = 90            # per drive invocation
+max_attempts = 2                # per change, across orchestrator retries
+require_clean_tracked = true    # refuse to start a change on a dirty tree
+
+# --- create stage: automates the repetitive /opsx-ff invocation -------------
+# When openspec/changes/<id> does not exist, the orchestrator runs
+# create_invoke ({change} and {plan_doc} are substituted), then verifies the
+# result independently: proposal.md + tasks.md exist, created_check exits 0,
+# and no tracked files were modified (creation must be additive).
+plan_doc = "docs/phased-implementation-plan.md"
+create_invoke = "opencode run \"/opsx-ff Please review @{plan_doc} and create a change for {change}\""
+create_timeout_minutes = 30
+create_max_attempts = 2
+created_check = "openspec validate {change} --strict"
+# Orchestrator-created changes wait for `opsx-plan accept <plan> <id>` before
+# driving, so you can review the proposal/spec deltas your frontier model
+# produced. Set false for fully unattended create->drive.
+review_created = true
+
+# Independent post-archive gates, run after every completed change.
+# Add your fast test suite command here once it exists (Phase 6).
+fast_checks = [
+  "openspec validate --all",
+  # "pytest -m fast -q",
+]
+
+# Override the adapter defaults if your client invocation differs:
+# invoke = "opencode run \"/opsx-drive {change}\""
+# state_file = ".opencode/opsx-controller/{change}.json"
+
+# --- Phase 0: planning baseline and spec hygiene ---------------------------
+
+[[changes]]
+id = "remove-duplicate-workspace-architecture-requirements"
+phase = 0
+
+[[changes]]
+id = "add-openspec-semantic-duplicate-validation"
+phase = 0
+depends_on = ["remove-duplicate-workspace-architecture-requirements"]
+pause_before = true   # first change in proposed `verification-gates` capability
+
+# --- Phase 1: executor security and process bounds -------------------------
+
+[[changes]]
+id = "enforce-opencode-handoff-scope-at-execution"
+phase = 1
+
+[[changes]]
+id = "bound-opencode-executor-process-lifecycle"
+phase = 1
+
+# --- Phase 2: runtime crash consistency ------------------------------------
+
+[[changes]]
+id = "add-atomic-runtime-state-writes"
+phase = 2
+pause_before = true   # first change in proposed `runtime-state` capability
+
+[[changes]]
+id = "validate-runtime-locking-filesystem-contract"
+phase = 2
+depends_on = ["add-atomic-runtime-state-writes"]
+
+# --- Phase 3: Gmail boundary decomposition ----------------------------------
+# pause_before on the first Phase 3 change models the Phase 1 exit gate:
+# approve only after live scope enforcement and timeout tests have passed.
+
+[[changes]]
+id = "extract-gmail-agent-dispatch-coordinator"
+phase = 3
+depends_on = [
+  "enforce-opencode-handoff-scope-at-execution",
+  "bound-opencode-executor-process-lifecycle",
+]
+pause_before = true   # Phase 1 exit gate (human judgment)
+
+[[changes]]
+id = "extract-gmail-calendar-and-reminder-handlers"
+phase = 3
+depends_on = ["extract-gmail-agent-dispatch-coordinator"]
+
+[[changes]]
+id = "extract-gmail-outbound-action-handler"
+phase = 3
+depends_on = ["extract-gmail-calendar-and-reminder-handlers"]
+
+[[changes]]
+id = "route-gmail-durable-writes-through-vault-lifecycle"
+phase = 3
+depends_on = ["extract-gmail-outbound-action-handler"]
+
+[[changes]]
+id = "enforce-knowledge-forge-package-boundaries"
+phase = 3
+depends_on = ["route-gmail-durable-writes-through-vault-lifecycle"]
+
+# --- Phase 4: retention and schema evolution --------------------------------
+
+[[changes]]
+id = "implement-reference-aware-runtime-retention"
+phase = 4
+depends_on = ["validate-runtime-locking-filesystem-contract"]
+
+[[changes]]
+id = "introduce-versioned-runtime-schema-migrations"
+phase = 4
+depends_on = ["validate-runtime-locking-filesystem-contract"]
+enabled = false   # deferred until the first runtime schema version bump
+
+# --- Phase 5: optional dependency provisioning -------------------------------
+
+[[changes]]
+id = "define-pack-dependency-resolution-contract"
+phase = 5
+pause_before = true   # first change in proposed `pack-dependencies` capability
+
+[[changes]]
+id = "add-pack-dependency-plan-command"
+phase = 5
+depends_on = ["define-pack-dependency-resolution-contract"]
+
+[[changes]]
+id = "add-safe-python-pack-dependency-install"
+phase = 5
+depends_on = ["add-pack-dependency-plan-command"]
+
+# --- Phase 6: verification speed and continuous gates ------------------------
+
+[[changes]]
+id = "classify-fast-and-integration-test-suites"
+phase = 6
+
+[[changes]]
+id = "replace-copy-heavy-test-workspaces"
+phase = 6
+depends_on = ["classify-fast-and-integration-test-suites"]
+
+[[changes]]
+id = "establish-repository-quality-gates"
+phase = 6
+depends_on = [
+  "add-openspec-semantic-duplicate-validation",
+  "enforce-knowledge-forge-package-boundaries",
+  "classify-fast-and-integration-test-suites",
+]
+
+[[changes]]
+id = "add-scheduled-integration-and-installer-validation"
+phase = 6
+depends_on = [
+  "establish-repository-quality-gates",
+  "replace-copy-heavy-test-workspaces",
+]
