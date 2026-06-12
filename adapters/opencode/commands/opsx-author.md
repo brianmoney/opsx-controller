@@ -18,7 +18,7 @@ Resolved inputs:
 Entry rules:
 
 - If the planning request is empty, stop and report that
-  `/opsx-author <what to plan, with source material references>` is required.
+  `/opsx-plan <what to plan, with source material references>` is required.
 - Resolve the output path: use a path named in the request; otherwise write to
   `docs/plans/<kebab-case-topic>-plan.md`.
 - If the output file already exists, stop and report it, unless the request
@@ -142,7 +142,7 @@ Self-verification before the final response:
    unintended backticked slug or `Phase N` reference appears in any of them.
 2. If the orchestrator is available (an `opsx-plan` executable on PATH, or a
    script path documented in `AGENTS.md`), run
-   `opsx-plan compile <doc> -o /tmp/opsx-author-selfcheck.toml --force` and fix
+   `opsx-plan compile <doc> -o /tmp/opsx-plan-selfcheck.toml --force` and fix
    any REVIEW items that were not intentional, then rerun until the remaining
    REVIEW items are exactly the intentional ones.
 3. If the compiler is not available, state that in the final response so the
