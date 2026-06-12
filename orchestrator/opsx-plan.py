@@ -271,44 +271,47 @@ def find_archive_commit(repo: Path, cid: str) -> str:
 
 
 def verify_change_done(repo: Path, cfg: dict, cid: str) -> tuple[bool, str]:
-    """A change is done only when independent evidence agrees:
-    1. openspec/changes/<id> is absent
-    2. a dated archive directory for <id> exists
-    3. an `archive(<id>):` commit is reachable from HEAD
-    4. the controller state file, if present, agrees (completed/done/passed)
-    """
-    reasons: list[str] = []
+    """A change is done when OpenSpec has archived it.
 
+    Authoritative evidence (required): the change has left openspec/changes/
+    and now lives under a dated openspec/changes/archive/ directory. That move
+    is exactly what `openspec archive` produces atomically, and is the ground
+    truth of completion.
+
+    Corroborating signals (warn, never veto): an `archive(<id>):` commit
+    reachable from HEAD, and the controller state file agreeing
+    (completed/done/passed). These go stale when a change was archived by hand,
+    squashed into another commit, or recovered after a drive error, so they are
+    surfaced as notes but no longer fail a change that OpenSpec itself archived.
+    """
     if (repo / "openspec" / "changes" / cid).exists():
-        reasons.append(f"openspec/changes/{cid} still exists")
+        return False, f"openspec/changes/{cid} still exists"
 
     if find_archive_dir(repo, cid) is None:
-        reasons.append("no dated archive directory found")
+        return False, "no dated archive directory found"
 
-    commit = find_archive_commit(repo, cid)
-    if not commit:
-        reasons.append("no archive commit reachable from HEAD")
+    warnings: list[str] = []
+    if not find_archive_commit(repo, cid):
+        warnings.append("no archive(<id>): commit (archived manually or squashed?)")
 
     cs = read_controller_state(repo, cfg, cid)
     if cs is not None:
         if cs.get("_malformed"):
-            reasons.append("controller state file is malformed JSON")
+            warnings.append("controller state file is malformed JSON")
         else:
             if cs.get("status") != "completed" or cs.get("phase") != "done":
-                reasons.append(
-                    f"controller state says status={cs.get('status')} "
+                warnings.append(
+                    f"controller state stale: status={cs.get('status')} "
                     f"phase={cs.get('phase')}"
                 )
             arch = cs.get("archive", {})
             if arch.get("status") != "passed" or not arch.get("commit"):
-                reasons.append("controller archive state not passed")
-            elif commit and arch.get("commit") not in (commit,):
-                # commits may diverge if the operator amended; verify existence
-                exists = git(repo, "cat-file", "-e", f"{arch['commit']}^{{commit}}")
-                if exists.returncode != 0:
-                    reasons.append("controller archive commit not found in repo")
+                warnings.append("controller archive state not passed")
 
-    return (not reasons, "; ".join(reasons))
+    if warnings:
+        log(f"  note: {cid} archived but {'; '.join(warnings)}")
+
+    return True, ""
 
 
 def run_fast_checks(repo: Path, cfg: dict) -> tuple[bool, str]:
