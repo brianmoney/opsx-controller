@@ -3,18 +3,28 @@
 
 Iterates a TOML plan manifest of OpenSpec changes (a DAG), invoking the
 client adapter's opsx-drive controller headlessly for each ready change,
-verifying completion from ground truth (controller state file, archive
-directory, archive commit), and gating progress on configurable fast checks.
+verifying completion from OpenSpec ground truth, and gating progress on
+configurable fast checks.
 
 Design rules:
   - The orchestrator is deterministic. All LLM judgment lives inside
     /opsx-drive. This layer only does ordering, dispatch, and verification.
-  - Never trust the drive process exit code or stdout as success. A change
-    is done only when independent evidence agrees.
+  - Never trust the drive process exit code or stdout as success. The single
+    source of truth is OpenSpec's own archive move (the change leaves
+    openspec/changes/<id> for a dated openspec/changes/archive/ directory).
+    The orchestrator deliberately depends on nothing the drive privately
+    maintains — not its controller state JSON, not a commit-message
+    convention, not an adapter path — because those drift and produced false
+    negatives. OpenSpec's filesystem state is the contract.
+  - The drive is re-invoked patiently: each invocation is one round, and the
+    orchestrator keeps running rounds while the change makes progress (tasks.md
+    checkboxes or worktree advancing), stopping only when OpenSpec archives it,
+    the round budget is spent, or several rounds make no progress.
   - A failed change blocks its dependents; independent branches continue.
   - Changes with pause_before=true wait for explicit `approve`.
   - State is reconciled against the repository on startup, so the run can
-    be killed and resumed at any time.
+    be killed and resumed at any time; a change already mid-drive keeps its
+    in-progress worktree rather than tripping the clean-tree gate.
 
 Requires Python 3.11+ (tomllib). Stdlib only.
 """
@@ -22,6 +32,7 @@ Requires Python 3.11+ (tomllib). Stdlib only.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -110,6 +121,15 @@ def load_plan(path: Path) -> dict:
         "invoke": plan.get("invoke", defaults.get("invoke")),
         "state_file": plan.get("state_file", defaults.get("state_file")),
         "timeout_minutes": float(plan.get("timeout_minutes", 90)),
+        # --- drive stage: patient re-invoke loop (OpenSpec ground truth) ---
+        # drive_max_rounds: max drive invocations per change before giving up.
+        # no_progress_limit: consecutive zero-progress rounds that mean "stuck".
+        # (max_attempts is still accepted for back-compat but no longer gates
+        # the drive; it seeds drive_max_rounds when that is unset.)
+        "drive_max_rounds": int(
+            plan.get("drive_max_rounds", plan.get("max_attempts", 6) or 6)
+        ),
+        "no_progress_limit": int(plan.get("no_progress_limit", 2)),
         "max_attempts": int(plan.get("max_attempts", 2)),
         "fast_checks": list(plan.get("fast_checks", [])),
         "check_timeout_minutes": float(plan.get("check_timeout_minutes", 15)),
@@ -142,6 +162,12 @@ def load_plan(path: Path) -> dict:
                 c.get("timeout_minutes", cfg["timeout_minutes"])
             ),
             "max_attempts": int(c.get("max_attempts", cfg["max_attempts"])),
+            "drive_max_rounds": int(
+                c.get("drive_max_rounds", cfg["drive_max_rounds"])
+            ),
+            "no_progress_limit": int(
+                c.get("no_progress_limit", cfg["no_progress_limit"])
+            ),
             "create_invoke": c.get("create_invoke", cfg["create_invoke"]),
             "create_max_attempts": int(
                 c.get("create_max_attempts", cfg["create_max_attempts"])
@@ -213,14 +239,22 @@ def save_state(repo: Path, plan_name: str, state: dict) -> None:
 
 
 def rec(state: dict, cid: str) -> dict:
-    return state["changes"].setdefault(
+    r = state["changes"].setdefault(
         cid,
         {
             "status": PENDING, "attempts": 0, "reason": "", "updated_at": "",
             "create_attempts": 0, "created_by_orchestrator": False,
-            "accepted": False,
+            "accepted": False, "drive_rounds": 0, "no_progress": 0,
         },
     )
+    # Backfill keys added in later versions so state written by an older
+    # orchestrator loads without KeyErrors.
+    for k, v in (
+        ("create_attempts", 0), ("created_by_orchestrator", False),
+        ("accepted", False), ("drive_rounds", 0), ("no_progress", 0),
+    ):
+        r.setdefault(k, v)
+    return r
 
 
 def set_status(state: dict, cid: str, status: str, reason: str = "") -> None:
@@ -240,17 +274,6 @@ def git(repo: Path, *args: str) -> subprocess.CompletedProcess:
     )
 
 
-def read_controller_state(repo: Path, cfg: dict, cid: str) -> dict | None:
-    p = repo / cfg["state_file"].format(change=cid)
-    if not p.exists():
-        return None
-    try:
-        with open(p, encoding="utf-8") as fh:
-            return json.load(fh)
-    except (json.JSONDecodeError, OSError):
-        return {"_malformed": True}
-
-
 def find_archive_dir(repo: Path, cid: str) -> Path | None:
     root = repo / "openspec" / "changes" / "archive"
     if not root.is_dir():
@@ -263,56 +286,65 @@ def find_archive_dir(repo: Path, cid: str) -> Path | None:
     return None
 
 
-def find_archive_commit(repo: Path, cid: str) -> str:
-    res = git(
-        repo, "log", "--fixed-strings", f"--grep=archive({cid}):",
-        "--format=%H", "-n", "1",
-    )
-    return res.stdout.strip() if res.returncode == 0 else ""
-
-
 def verify_change_done(repo: Path, cfg: dict, cid: str) -> tuple[bool, str]:
-    """A change is done when OpenSpec has archived it.
+    """Done == OpenSpec has archived the change.
 
-    Authoritative evidence (required): the change has left openspec/changes/
-    and now lives under a dated openspec/changes/archive/ directory. That move
-    is exactly what `openspec archive` produces atomically, and is the ground
-    truth of completion.
-
-    Corroborating signals (warn, never veto): an `archive(<id>):` commit
-    reachable from HEAD, and the controller state file agreeing
-    (completed/done/passed). These go stale when a change was archived by hand,
-    squashed into another commit, or recovered after a drive error, so they are
-    surfaced as notes but no longer fail a change that OpenSpec itself archived.
+    The single source of truth is OpenSpec's own archive move: the change has
+    left openspec/changes/<id> and now lives under a dated
+    openspec/changes/archive/<date>-<id> directory — exactly what `openspec
+    archive` produces atomically. The orchestrator deliberately depends on
+    nothing else: not the `archive(<id>):` commit convention, not the
+    controller's private state JSON, not the adapter path. Those proved to go
+    stale or diverge (manual archives, squashed commits, adapter mismatches,
+    weak drive models) and produced false negatives. Ground truth is the
+    filesystem state OpenSpec maintains.
     """
     if (repo / "openspec" / "changes" / cid).exists():
-        return False, f"openspec/changes/{cid} still exists"
-
+        return False, f"openspec/changes/{cid} still in active changes (not archived)"
     if find_archive_dir(repo, cid) is None:
         return False, "no dated archive directory found"
-
-    warnings: list[str] = []
-    if not find_archive_commit(repo, cid):
-        warnings.append("no archive(<id>): commit (archived manually or squashed?)")
-
-    cs = read_controller_state(repo, cfg, cid)
-    if cs is not None:
-        if cs.get("_malformed"):
-            warnings.append("controller state file is malformed JSON")
-        else:
-            if cs.get("status") != "completed" or cs.get("phase") != "done":
-                warnings.append(
-                    f"controller state stale: status={cs.get('status')} "
-                    f"phase={cs.get('phase')}"
-                )
-            arch = cs.get("archive", {})
-            if arch.get("status") != "passed" or not arch.get("commit"):
-                warnings.append("controller archive state not passed")
-
-    if warnings:
-        log(f"  note: {cid} archived but {'; '.join(warnings)}")
-
     return True, ""
+
+
+def count_tasks(repo: Path, cid: str) -> tuple[int, int]:
+    """(completed, total) markdown task checkboxes in the change's tasks.md.
+    OpenSpec tracks implementation progress as `- [ ]` / `- [x]` lines, so this
+    is a spec-native progress signal independent of the drive's internals."""
+    tasks = change_dir(repo, cid) / "tasks.md"
+    if not tasks.is_file():
+        return (0, 0)
+    done = total = 0
+    for line in tasks.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = re.match(r"\s*[-*] \[([ xX])\]", line)
+        if m:
+            total += 1
+            if m.group(1) in ("x", "X"):
+                done += 1
+    return (done, total)
+
+
+def progress_fingerprint(repo: Path, cid: str) -> tuple[int, int, str]:
+    """A round-over-round progress signal: (completed_tasks, total_tasks,
+    worktree_hash). Task counts catch the drive ticking checkboxes; the worktree
+    hash catches code edits that advance the change without (yet) ticking a box.
+    Either changing between rounds counts as forward progress."""
+    done, total = count_tasks(repo, cid)
+    res = git(repo, "status", "--porcelain")
+    tree = "\n".join(
+        ln for ln in res.stdout.splitlines() if not ln[3:].startswith(".opsx-plan/")
+    )
+    digest = hashlib.sha1(tree.encode("utf-8", "replace")).hexdigest()[:12]
+    return (done, total, digest)
+
+
+def describe_progress(
+    before: tuple[int, int, str], after: tuple[int, int, str]
+) -> str:
+    if (after[0], after[1]) != (before[0], before[1]):
+        return f"tasks {after[0]}/{after[1]} (was {before[0]}/{before[1]})"
+    if after[2] != before[2]:
+        return "worktree advanced"
+    return "no change"
 
 
 def run_fast_checks(repo: Path, cfg: dict) -> tuple[bool, str]:
@@ -415,35 +447,14 @@ def tracked_tree_clean(repo: Path) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Retry policy: read the controller's own schema-v3 state to decide whether
-# re-invoking /opsx-drive can plausibly succeed.
-# ---------------------------------------------------------------------------
-
-NO_RETRY_RESULTS = {"max_rounds_reached", "no_progress"}
-
-
-def retry_makes_sense(controller_state: dict | None) -> tuple[bool, str]:
-    if controller_state is None:
-        return True, "no controller state written; treating as transient"
-    if controller_state.get("_malformed"):
-        return False, "controller state file is malformed; needs operator"
-    last = controller_state.get("last_result", "")
-    if last in NO_RETRY_RESULTS:
-        return False, f"controller stopped with {last}; needs operator"
-    if last == "archive_failed":
-        outlook = (
-            controller_state.get("archive", {})
-            .get("triage", {})
-            .get("retry_outlook", "unknown")
-        )
-        if outlook == "same_failure":
-            return False, "archive triage says retry would fail the same way"
-        return True, f"archive failed with retry_outlook={outlook}"
-    return True, f"last_result={last or 'unset'}"
-
-
-# ---------------------------------------------------------------------------
 # Drive invocation
+#
+# Retry is no longer decided by parsing the drive's private controller state.
+# The orchestrator re-invokes the drive (each invocation = one round) and, after
+# each round, consults OpenSpec ground truth: archived -> done; otherwise it
+# keeps going as long as the change is making progress (progress_fingerprint),
+# and stops only when archived, when the round budget is spent, or when several
+# consecutive rounds make no progress (an operator is then needed).
 # ---------------------------------------------------------------------------
 
 def run_stage(
@@ -627,7 +638,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         r = rec(state, cid)
         needs_create = not change_authored(repo, cid)
 
-        if cfg["require_clean_tracked"] and not tracked_tree_clean(repo):
+        # The clean-tree gate guards against *starting* work on top of unrelated
+        # uncommitted changes. A change already mid-drive (drive_rounds > 0) owns
+        # the dirty worktree — its own in-progress edits — so it must be allowed
+        # to continue; the drive (and its archive step) will commit and clean up.
+        in_progress = r.get("drive_rounds", 0) > 0
+        if (
+            cfg["require_clean_tracked"]
+            and not in_progress
+            and not tracked_tree_clean(repo)
+        ):
             log("tracked worktree is dirty; refusing to start a new stage")
             log("commit/stash tracked modifications, then re-run")
             return 2
@@ -709,19 +729,32 @@ def cmd_run(args: argparse.Namespace) -> int:
             visited.add(cid)  # exists already; nothing to create, don't drive
             continue
 
-        # ----- drive stage -----
-        attempt = r["attempts"] + 1
-        if attempt > change_cfg["max_attempts"]:
-            set_status(state, cid, FAILED, "retry budget exhausted")
+        # ----- drive stage: one round of the patient loop -----
+        # Each pass runs a single drive invocation, then judges from OpenSpec
+        # ground truth. A non-archived round that still moved the change forward
+        # leaves it PENDING so the scheduler re-picks it for the next round; a
+        # spent round budget or a no-progress streak ends it for an operator.
+        max_rounds = change_cfg["drive_max_rounds"]
+        if r["drive_rounds"] >= max_rounds:
+            set_status(
+                state, cid, FAILED,
+                f"drove {r['drive_rounds']} rounds without OpenSpec archiving "
+                f"the change; needs operator",
+            )
             save_state(repo, cfg["name"], state)
             continue
 
-        log(f"=== {cid} (attempt {attempt}/{change_cfg['max_attempts']}) ===")
-        r["attempts"] = attempt
+        round_n = r["drive_rounds"] + 1
+        fp_before = progress_fingerprint(repo, cid)
+        log(f"=== {cid} drive round {round_n}/{max_rounds} "
+            f"(tasks {fp_before[0]}/{fp_before[1]}, "
+            f"no-progress {r['no_progress']}/{change_cfg['no_progress_limit']}) ===")
+        r["drive_rounds"] = round_n
+        r["attempts"] = round_n  # back-compat mirror
         set_status(state, cid, RUNNING)
         save_state(repo, cfg["name"], state)
 
-        outcome, log_path = drive_change(repo, cfg, cid, attempt)
+        outcome, log_path = drive_change(repo, cfg, cid, round_n)
         rec(state, cid)["last_log"] = str(log_path)
 
         if outcome == "spawn_error":
@@ -729,30 +762,41 @@ def cmd_run(args: argparse.Namespace) -> int:
             save_state(repo, cfg["name"], state)
             return 2
 
-        ok, why = verify_change_done(repo, cfg, cid)
+        ok, _ = verify_change_done(repo, cfg, cid)
         if ok:
             checks_ok, check_why = run_fast_checks(repo, cfg)
             if checks_ok:
-                set_status(state, cid, DONE, "verified + checks passed")
+                set_status(state, cid, DONE, "archived in OpenSpec + checks passed")
                 log(f"  done: {cid}")
                 ran += 1
             else:
-                # The change is archived but the repo fails checks. Re-driving
-                # cannot fix this; an operator must intervene.
+                # Archived but the repo fails fast checks. Re-driving cannot fix
+                # this; an operator must intervene.
                 set_status(state, cid, FAILED, f"post-archive {check_why}")
                 log(f"  FAILED post-archive checks: {check_why}")
+            save_state(repo, cfg["name"], state)
+            continue
+
+        # Not archived yet — did this round make forward progress?
+        fp_after = progress_fingerprint(repo, cid)
+        prog = describe_progress(fp_before, fp_after)
+        if fp_after != fp_before:
+            r["no_progress"] = 0
         else:
-            cs = read_controller_state(repo, cfg, cid)
-            can_retry, retry_why = retry_makes_sense(cs)
-            if outcome == "timeout":
-                why = f"drive timed out; {why}"
-            detail = f"{why} :: {retry_why}"
-            if can_retry and attempt < change_cfg["max_attempts"]:
-                set_status(state, cid, PENDING, f"will retry: {detail}")
-                log(f"  not done yet ({detail}); retrying")
-            else:
-                set_status(state, cid, FAILED, detail)
-                log(f"  FAILED: {detail}")
+            r["no_progress"] += 1
+
+        timed_out = " (round timed out)" if outcome == "timeout" else ""
+        if r["no_progress"] >= change_cfg["no_progress_limit"]:
+            set_status(
+                state, cid, FAILED,
+                f"no progress for {r['no_progress']} rounds{timed_out}; "
+                f"last round: {prog}; needs operator",
+            )
+            log(f"  FAILED: stalled — {prog}{timed_out}")
+        else:
+            set_status(state, cid, PENDING,
+                       f"not archived yet{timed_out}; {prog}; continuing")
+            log(f"  not archived yet ({prog}{timed_out}); will run another round")
 
         save_state(repo, cfg["name"], state)
 
@@ -843,6 +887,7 @@ def cmd_reset(args: argparse.Namespace) -> int:
         state["changes"][cid] = {
             "status": PENDING, "attempts": 0, "create_attempts": 0,
             "created_by_orchestrator": False, "accepted": False,
+            "drive_rounds": 0, "no_progress": 0,
             "reason": "reset by operator", "updated_at": utcnow(),
         }
         log(f"reset: {cid}")
