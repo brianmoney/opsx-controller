@@ -57,7 +57,12 @@ except ModuleNotFoundError:  # pragma: no cover
 # ---------------------------------------------------------------------------
 ADAPTER_DEFAULTS = {
     "opencode": {
-        "invoke": 'opencode run "/opsx-drive {change}"',
+        # --agent is required: without it `opencode run` uses the default
+        # (build) agent on the default model, ignoring the command file's
+        # `agent:`/`model:`. That made the drive run on deepseek-v4-pro as a
+        # generic agent that guessed wrong adapter paths (.codex/...). Pinning
+        # the agent runs the controller on its own model (gpt-5.4).
+        "invoke": 'opencode run --agent opsx-controller "/opsx-drive {change}"',
         "state_file": ".opencode/opsx-controller/{change}.json",
     },
     "claude-code": {
