@@ -2,7 +2,7 @@
 description: Implements one OpenSpec controller round using the global /opsx-apply guidance and returns machine-readable progress.
 mode: subagent
 hidden: true
-model: deepseek/deepseek-v4-pro
+# model is bound by role in opencode.json (agent.opsx-implementer -> {env:OPSX_CHEAP_MODEL})
 variant: high
 permission:
   read: allow

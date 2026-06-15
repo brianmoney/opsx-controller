@@ -4,7 +4,7 @@ description: Drives one OpenSpec change through implement, review, and archive r
 # it headlessly as the top-level driver; hidden keeps it out of interactive menus.
 mode: all
 hidden: true
-model: github-copilot/gpt-5.4
+# model is bound by role in opencode.json (agent.opsx-controller -> {env:OPSX_SMART_MODEL})
 variant: xhigh
 permission:
   read: allow

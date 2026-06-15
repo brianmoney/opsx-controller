@@ -2,7 +2,7 @@
 description: Archives one OpenSpec change non-interactively after a clean review and returns a machine-readable outcome.
 mode: subagent
 hidden: true
-model: deepseek/deepseek-v4-pro
+# model is bound by role in opencode.json (agent.opsx-archiver -> {env:OPSX_CHEAP_MODEL})
 variant: high
 permission:
   read: allow

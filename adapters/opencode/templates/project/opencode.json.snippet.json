@@ -4,5 +4,11 @@
     "ignore": [
       ".opencode/opsx-controller/**/*.json"
     ]
+  },
+  "agent": {
+    "opsx-controller":  { "model": "{env:OPSX_SMART_MODEL}" },
+    "opsx-reviewer":    { "model": "{env:OPSX_SMART_MODEL}" },
+    "opsx-implementer": { "model": "{env:OPSX_CHEAP_MODEL}" },
+    "opsx-archiver":    { "model": "{env:OPSX_CHEAP_MODEL}" }
   }
 }

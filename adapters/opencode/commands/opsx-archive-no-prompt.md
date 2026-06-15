@@ -1,7 +1,7 @@
 ---
 description: Legacy non-interactive archive helper retained for automation compatibility
 agent: build
-model: deepseek/deepseek-v4-pro
+# model inherited from opencode.json default (this legacy helper runs as the build agent)
 ---
 
 Legacy helper note:

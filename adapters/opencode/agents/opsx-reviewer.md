@@ -2,7 +2,7 @@
 description: Reviews one OpenSpec controller round with a strict zero-finding gate and returns a machine-readable verdict.
 mode: subagent
 hidden: true
-model: github-copilot/gpt-5.4
+# model is bound by role in opencode.json (agent.opsx-reviewer -> {env:OPSX_SMART_MODEL})
 variant: xhigh
 permission:
   read: allow
