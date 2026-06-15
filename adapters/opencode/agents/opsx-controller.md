@@ -56,9 +56,11 @@ Global prompt source rules:
   - `$HOME/.config/opencode/command/<name>.md`
 - The required prompt basenames are:
   - `opsx-apply.md`
-  - `opsx-review.md`
   - `opsx-verify.md`
   - `opsx-archive.md`
+- The atomic verify step delegates to the core OpenSpec `opsx-verify` command;
+  `opsx-review.md` is intentionally not required (its archive-vs-fix decision is
+  the controller's own responsibility, not a separate review prose).
 - Read the resolved files before the first phase dispatch. If any are missing,
   fail closed.
 

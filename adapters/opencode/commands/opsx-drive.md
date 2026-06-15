@@ -1,6 +1,7 @@
 ---
 description: Start or resume the OpenSpec controller for one change
 agent: opsx-controller
+model: github-copilot/gpt-5.4
 subtask: false
 ---
 

@@ -34,12 +34,13 @@ Input arrives from `opsx-controller` as plain text fields such as:
 Required workflow:
 1. Parse the input block.
 2. Read `AGENTS.md`.
-3. Read the installed global review and verify prompts from the first files that
-   exist:
-   - `$HOME/.config/opencode/commands/opsx-review.md`
-   - `$HOME/.config/opencode/command/opsx-review.md`
+3. Read and apply the core OpenSpec verify command. This is the single atomic
+   verifier the workflow delegates to — use it, do not reimplement it. Read the
+   first file that exists:
    - `$HOME/.config/opencode/commands/opsx-verify.md`
    - `$HOME/.config/opencode/command/opsx-verify.md`
+   Do not also read `opsx-review.md`: `/opsx-verify` is the atomic verification,
+   and the archive-vs-fix decision belongs to `opsx-controller`, not here.
 4. Run `openspec status --change "<change>" --json` and
    `openspec instructions apply --change "<change>" --json`.
 5. Read `STATE_FILE` when it exists.

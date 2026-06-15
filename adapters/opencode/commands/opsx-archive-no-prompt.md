@@ -1,6 +1,7 @@
 ---
 description: Legacy non-interactive archive helper retained for automation compatibility
 agent: build
+model: deepseek/deepseek-v4-pro
 ---
 
 Legacy helper note:
