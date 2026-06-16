@@ -3,7 +3,9 @@ description: Reviews one OpenSpec controller round with a strict zero-finding ga
 mode: subagent
 hidden: true
 # model is bound by role in opencode.json (agent.opsx-reviewer -> {env:OPSX_SMART_MODEL})
-variant: xhigh
+# variant high (not xhigh): xhigh review calls wedged for 50-70min on large
+# changes; a strict pass/fail gate does not need maximum reasoning effort.
+variant: high
 permission:
   read: allow
   glob: allow
