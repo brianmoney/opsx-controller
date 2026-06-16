@@ -375,6 +375,15 @@ def change_dir(repo: Path, cid: str) -> Path:
     return repo / "openspec" / "changes" / cid
 
 
+def has_controller_state(repo: Path, cfg: dict, cid: str) -> bool:
+    """True when the drive has a persisted controller state file for this change
+    — i.e. it is mid-flight. Used (alongside drive_rounds) to recognise that the
+    change owns the current dirty worktree, so resuming it after a plan-state
+    reset or an interrupted run does not trip the clean-tree gate."""
+    sf = cfg.get("state_file")
+    return bool(sf) and (repo / sf.format(change=cid)).exists()
+
+
 def controller_diagnostic(repo: Path, cfg: dict, cid: str) -> str:
     """Best-effort read of the drive's own controller state, used ONLY to enrich
     operator-facing failure messages — never for done/progress decisions, which
@@ -672,10 +681,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         needs_create = not change_authored(repo, cid)
 
         # The clean-tree gate guards against *starting* work on top of unrelated
-        # uncommitted changes. A change already mid-drive (drive_rounds > 0) owns
-        # the dirty worktree — its own in-progress edits — so it must be allowed
-        # to continue; the drive (and its archive step) will commit and clean up.
-        in_progress = r.get("drive_rounds", 0) > 0
+        # uncommitted changes. A change already mid-drive owns the dirty worktree
+        # — its own in-progress edits — so it must be allowed to continue; the
+        # drive (and its archive step) will commit and clean up. "Mid-drive" is
+        # either drive_rounds > 0 this run, or a persisted controller state from
+        # a prior run, so resuming after a plan-state reset or an interrupted run
+        # does not trip the gate.
+        in_progress = (
+            r.get("drive_rounds", 0) > 0
+            or has_controller_state(repo, cfg, cid)
+        )
         if (
             cfg["require_clean_tracked"]
             and not in_progress
