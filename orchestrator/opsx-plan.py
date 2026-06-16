@@ -375,6 +375,34 @@ def change_dir(repo: Path, cid: str) -> Path:
     return repo / "openspec" / "changes" / cid
 
 
+def controller_diagnostic(repo: Path, cfg: dict, cid: str) -> str:
+    """Best-effort read of the drive's own controller state, used ONLY to enrich
+    operator-facing failure messages — never for done/progress decisions, which
+    stay on OpenSpec ground truth. The orchestrator gave up; this surfaces the
+    drive's self-reported reason (e.g. a blocked phase, a malformed-output
+    result, or the outstanding review fix prompt) so 'no progress' is never the
+    whole story. Returns '' when no usable state exists."""
+    sf = cfg.get("state_file")
+    if not sf:
+        return ""
+    try:
+        with open(repo / sf.format(change=cid), encoding="utf-8") as fh:
+            d = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return ""
+    bits: list[str] = []
+    if d.get("status"):
+        bits.append(f"controller {d.get('status')}/{d.get('phase', '?')}")
+    if d.get("last_result"):
+        bits.append(f"last_result={d['last_result']}")
+    fix = (d.get("latest_fix_prompt") or "").strip()
+    if not fix:
+        fix = ((d.get("last_review") or {}).get("fix_prompt") or "").strip()
+    if fix:
+        bits.append("fix: " + " ".join(fix.split())[:160])
+    return "; ".join(bits)
+
+
 AUTHORED_ARTIFACTS = ("proposal.md", "tasks.md")
 
 
@@ -741,11 +769,15 @@ def cmd_run(args: argparse.Namespace) -> int:
         # spent round budget or a no-progress streak ends it for an operator.
         max_rounds = change_cfg["drive_max_rounds"]
         if r["drive_rounds"] >= max_rounds:
+            diag = controller_diagnostic(repo, cfg, cid)
             set_status(
                 state, cid, FAILED,
                 f"drove {r['drive_rounds']} rounds without OpenSpec archiving "
-                f"the change; needs operator",
+                f"the change; needs operator"
+                + (f" :: {diag}" if diag else ""),
             )
+            if diag:
+                log(f"  note: {diag}")
             save_state(repo, cfg["name"], state)
             continue
 
@@ -792,12 +824,15 @@ def cmd_run(args: argparse.Namespace) -> int:
 
         timed_out = " (round timed out)" if outcome == "timeout" else ""
         if r["no_progress"] >= change_cfg["no_progress_limit"]:
+            diag = controller_diagnostic(repo, cfg, cid)
             set_status(
                 state, cid, FAILED,
                 f"no progress for {r['no_progress']} rounds{timed_out}; "
-                f"last round: {prog}; needs operator",
+                f"last round: {prog}; needs operator"
+                + (f" :: {diag}" if diag else ""),
             )
-            log(f"  FAILED: stalled — {prog}{timed_out}")
+            log(f"  FAILED: stalled — {prog}{timed_out}"
+                + (f" :: {diag}" if diag else ""))
         else:
             set_status(state, cid, PENDING,
                        f"not archived yet{timed_out}; {prog}; continuing")
