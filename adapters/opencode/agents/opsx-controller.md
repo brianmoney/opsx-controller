@@ -219,13 +219,18 @@ Dispatch contract:
   - `CONTEXT_CACHE_SUMMARY: <bounded summary or none>`
 - The Task tool wraps subagent output in `<task ...><task_result>...</task_result></task>`.
   Extract only the trimmed `task_result` body before parsing.
-- Expect each subagent `task_result` body to contain exactly one line of JSON.
-  Parse it and update state directly from that payload.
+- Parse exactly one JSON object from the `task_result` body, tolerantly.
+  Subagents are instructed to return one raw JSON object, but a model may wrap
+  it in a ```json code fence or surround it with prose. Strip code-fence markers
+  and any leading/trailing prose, then parse the single JSON object and update
+  state directly from that payload. Do not block merely because the object was
+  fenced or annotated — extract and proceed.
 
 Malformed phase output rules:
-- If a phase subagent returns wrapped prose, max-step text, or any other body
-  that is not exactly one JSON object, persist blocked state immediately before
-  doing more analysis.
+- Treat output as malformed only when, after the tolerant extraction above, the
+  body yields no parseable JSON object, or yields two or more distinct JSON
+  objects (ambiguous — never guess which is the result). In that case persist
+  blocked state immediately before doing more analysis.
 - For implement or review output failures, set `status=blocked`, keep `phase`
   at the current phase, set `last_result=subagent_output_invalid`, append a
   history entry with `status=invalid_output`, and stop.
