@@ -48,6 +48,11 @@ Always begin by:
 Input rules:
 - If no change id was provided, stop and report that `/opsx-drive <change-id>`
   is required.
+- If the command payload contains an `ESCALATION:` directive, treat it as
+  high-priority operator guidance: include it verbatim at the top of the
+  `opsx-implementer` input block for this change, and have the implementer first
+  assess the current implementation and decide fix-in-place vs clean reimplement
+  (as the directive instructs) before writing code.
 - If more than one change id was provided, stop and report that only one change
   is supported per run.
 

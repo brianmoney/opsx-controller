@@ -75,6 +75,17 @@ ADAPTER_DEFAULTS = {
     },
 }
 
+# Injected into the drive message when a change escalates to the stronger model.
+# {n} = review fails so far, {model} = the escalated implementer model.
+DEFAULT_ESCALATE_DIRECTIVE = (
+    "ESCALATION: a cheaper implementer failed strict review {n} times without "
+    "converging, so this drive now runs the implementer on a stronger model "
+    "({model}). Before writing code, first ASSESS the current implementation "
+    "against the latest review findings, then DECIDE whether to (a) fix it in "
+    "place or (b) revert this change's source edits and reimplement from a "
+    "clean slate. State the decision in one line, then proceed."
+)
+
 DONE = "done"
 PENDING = "pending"
 RUNNING = "running"
@@ -135,6 +146,16 @@ def load_plan(path: Path) -> dict:
             plan.get("drive_max_rounds", plan.get("max_attempts", 6) or 6)
         ),
         "no_progress_limit": int(plan.get("no_progress_limit", 2)),
+        # escalation: after N failed review rounds, run the implementer on a
+        # stronger model. 0 disables. escalate_model defaults to the value of
+        # $OPSX_SMART_MODEL (the "smart" role) at run time.
+        "escalate_after_review_fails": int(
+            plan.get("escalate_after_review_fails", 0)
+        ),
+        "escalate_model": plan.get("escalate_model", ""),
+        "escalate_directive": plan.get(
+            "escalate_directive", DEFAULT_ESCALATE_DIRECTIVE
+        ),
         "max_attempts": int(plan.get("max_attempts", 2)),
         "fast_checks": list(plan.get("fast_checks", [])),
         "check_timeout_minutes": float(plan.get("check_timeout_minutes", 15)),
@@ -172,6 +193,12 @@ def load_plan(path: Path) -> dict:
             ),
             "no_progress_limit": int(
                 c.get("no_progress_limit", cfg["no_progress_limit"])
+            ),
+            "escalate_after_review_fails": int(
+                c.get(
+                    "escalate_after_review_fails",
+                    cfg["escalate_after_review_fails"],
+                )
             ),
             "create_invoke": c.get("create_invoke", cfg["create_invoke"]),
             "create_max_attempts": int(
@@ -250,6 +277,7 @@ def rec(state: dict, cid: str) -> dict:
             "status": PENDING, "attempts": 0, "reason": "", "updated_at": "",
             "create_attempts": 0, "created_by_orchestrator": False,
             "accepted": False, "drive_rounds": 0, "no_progress": 0,
+            "review_fails": 0, "escalated": False,
         },
     )
     # Backfill keys added in later versions so state written by an older
@@ -257,6 +285,7 @@ def rec(state: dict, cid: str) -> dict:
     for k, v in (
         ("create_attempts", 0), ("created_by_orchestrator", False),
         ("accepted", False), ("drive_rounds", 0), ("no_progress", 0),
+        ("review_fails", 0), ("escalated", False),
     ):
         r.setdefault(k, v)
     return r
@@ -373,6 +402,21 @@ def run_fast_checks(repo: Path, cfg: dict) -> tuple[bool, str]:
 
 def change_dir(repo: Path, cid: str) -> Path:
     return repo / "openspec" / "changes" / cid
+
+
+def last_review_verdict(repo: Path, cfg: dict, cid: str) -> str:
+    """The drive's most recent review verdict ('pass'/'fail'/'') from controller
+    state — used only to drive the escalation policy (count review failures),
+    not done/progress decisions. Returns '' when unavailable."""
+    sf = cfg.get("state_file")
+    if not sf:
+        return ""
+    try:
+        with open(repo / sf.format(change=cid), encoding="utf-8") as fh:
+            d = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return ""
+    return str((d.get("last_review") or {}).get("verdict") or "").lower()
 
 
 def has_controller_state(repo: Path, cfg: dict, cid: str) -> bool:
@@ -502,11 +546,17 @@ def tracked_tree_clean(repo: Path) -> bool:
 def run_stage(
     repo: Path, cfg: dict, cid: str, stage: str, invoke_tpl: str,
     timeout_minutes: float, attempt: int,
+    env: dict | None = None, directive: str = "",
 ) -> tuple[str, Path]:
     """Run a templated stage command ('create' or 'drive'). Returns
     (outcome, log_path) where outcome is 'exited', 'timeout', or
     'spawn_error'. Output goes to a log file so it can be tailed live;
-    the exit code is informational only."""
+    the exit code is informational only.
+
+    env, when given, replaces the child process environment (used to override
+    the model role for an escalated drive). directive, when given, is appended
+    to the invocation's message (its last argument) so it rides in on the drive
+    payload only when escalation is active."""
     global _current_proc
     log_dir = repo / ".opsx-plan" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -515,8 +565,10 @@ def run_stage(
     cmd = shlex.split(
         invoke_tpl.format(change=cid, plan_doc=cfg["plan_doc"])
     )
+    if directive and cmd:
+        cmd[-1] = cmd[-1] + "\n\n" + directive
     timeout_s = timeout_minutes * 60
-    log(f"  exec[{stage}]: {' '.join(cmd)}  "
+    log(f"  exec[{stage}]: {' '.join(shlex.split(invoke_tpl.format(change=cid, plan_doc=cfg['plan_doc'])))}  "
         f"(timeout {timeout_s/60:g}m, log {log_path})")
 
     try:
@@ -525,7 +577,7 @@ def run_stage(
             lf.flush()
             proc = subprocess.Popen(
                 cmd, cwd=repo, stdout=lf, stderr=subprocess.STDOUT,
-                start_new_session=True,
+                start_new_session=True, env=env,
             )
             _current_proc = proc
             try:
@@ -540,10 +592,14 @@ def run_stage(
         return "spawn_error", log_path
 
 
-def drive_change(repo: Path, cfg: dict, cid: str, attempt: int) -> tuple[str, Path]:
+def drive_change(
+    repo: Path, cfg: dict, cid: str, attempt: int,
+    env: dict | None = None, directive: str = "",
+) -> tuple[str, Path]:
     return run_stage(
         repo, cfg, cid, "drive", cfg["invoke"],
         cfg["changes"][cid]["timeout_minutes"], attempt,
+        env=env, directive=directive,
     )
 
 
@@ -803,10 +859,32 @@ def cmd_run(args: argparse.Namespace) -> int:
             f"no-progress {r['no_progress']}/{change_cfg['no_progress_limit']}) ===")
         r["drive_rounds"] = round_n
         r["attempts"] = round_n  # back-compat mirror
+
+        # Escalation: once the cheap implementer has failed review enough times,
+        # run this change's implementer on the stronger model and inject an
+        # assess-then-decide directive. The override is scoped to this drive
+        # subprocess via its environment; nothing global changes.
+        threshold = change_cfg["escalate_after_review_fails"]
+        escalate_model = cfg["escalate_model"] or os.environ.get(
+            "OPSX_SMART_MODEL", ""
+        )
+        drive_env, directive = None, ""
+        if threshold and r["review_fails"] >= threshold and escalate_model:
+            if not r["escalated"]:
+                r["escalated"] = True
+                log(f"  ESCALATING implementer -> {escalate_model} "
+                    f"(after {r['review_fails']} review fails)")
+            drive_env = {**os.environ, "OPSX_CHEAP_MODEL": escalate_model}
+            directive = cfg["escalate_directive"].format(
+                n=r["review_fails"], model=escalate_model
+            )
+
         set_status(state, cid, RUNNING)
         save_state(repo, cfg["name"], state)
 
-        outcome, log_path = drive_change(repo, cfg, cid, round_n)
+        outcome, log_path = drive_change(
+            repo, cfg, cid, round_n, env=drive_env, directive=directive
+        )
         rec(state, cid)["last_log"] = str(log_path)
 
         if outcome == "spawn_error":
@@ -836,6 +914,16 @@ def cmd_run(args: argparse.Namespace) -> int:
             r["no_progress"] = 0
         else:
             r["no_progress"] += 1
+
+        # Track review outcomes for the escalation policy — only when a review
+        # actually ran this round (a timeout/wedge is not a review failure a
+        # stronger implementer can fix). A passing review resets the counter.
+        if outcome != "timeout":
+            verdict = last_review_verdict(repo, cfg, cid)
+            if verdict == "fail":
+                r["review_fails"] += 1
+            elif verdict == "pass":
+                r["review_fails"] = 0
 
         timed_out = " (round timed out)" if outcome == "timeout" else ""
         if r["no_progress"] >= change_cfg["no_progress_limit"]:
@@ -943,6 +1031,7 @@ def cmd_reset(args: argparse.Namespace) -> int:
             "status": PENDING, "attempts": 0, "create_attempts": 0,
             "created_by_orchestrator": False, "accepted": False,
             "drive_rounds": 0, "no_progress": 0,
+            "review_fails": 0, "escalated": False,
             "reason": "reset by operator", "updated_at": utcnow(),
         }
         log(f"reset: {cid}")
