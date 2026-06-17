@@ -404,19 +404,32 @@ def change_dir(repo: Path, cid: str) -> Path:
     return repo / "openspec" / "changes" / cid
 
 
-def last_review_verdict(repo: Path, cfg: dict, cid: str) -> str:
-    """The drive's most recent review verdict ('pass'/'fail'/'') from controller
-    state — used only to drive the escalation policy (count review failures),
-    not done/progress decisions. Returns '' when unavailable."""
+def count_review_fails(repo: Path, cfg: dict, cid: str) -> int:
+    """Consecutive failed review rounds in the drive's controller history (reset
+    by a passing review). This is the true 'N review fails' signal at the
+    controller's own review granularity — a single opsx-plan drive invocation can
+    contain several controller review rounds, so counting per invocation
+    undercounts badly. Read-only and used solely for the escalation policy (not
+    done/progress, which stay on OpenSpec ground truth). Because it reads the
+    controller state, it also persists across a plan-state `reset` until the
+    controller state is cleared. Returns 0 when unavailable."""
     sf = cfg.get("state_file")
     if not sf:
-        return ""
+        return 0
     try:
         with open(repo / sf.format(change=cid), encoding="utf-8") as fh:
             d = json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return ""
-    return str((d.get("last_review") or {}).get("verdict") or "").lower()
+        return 0
+    n = 0
+    for h in d.get("history", []):
+        if h.get("phase") != "review":
+            continue
+        if "fail" in str(h.get("status", "")).lower():
+            n += 1
+        else:
+            n = 0  # a passing (or non-failing) review breaks the streak
+    return n
 
 
 def has_controller_state(repo: Path, cfg: dict, cid: str) -> bool:
@@ -863,7 +876,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         # Escalation: once the cheap implementer has failed review enough times,
         # run this change's implementer on the stronger model and inject an
         # assess-then-decide directive. The override is scoped to this drive
-        # subprocess via its environment; nothing global changes.
+        # subprocess via its environment; nothing global changes. The fail count
+        # comes from the controller's own review history (true per-review-round
+        # granularity), not opsx-plan's per-invocation view.
+        r["review_fails"] = count_review_fails(repo, cfg, cid)
         threshold = change_cfg["escalate_after_review_fails"]
         escalate_model = cfg["escalate_model"] or os.environ.get(
             "OPSX_SMART_MODEL", ""
@@ -914,16 +930,6 @@ def cmd_run(args: argparse.Namespace) -> int:
             r["no_progress"] = 0
         else:
             r["no_progress"] += 1
-
-        # Track review outcomes for the escalation policy — only when a review
-        # actually ran this round (a timeout/wedge is not a review failure a
-        # stronger implementer can fix). A passing review resets the counter.
-        if outcome != "timeout":
-            verdict = last_review_verdict(repo, cfg, cid)
-            if verdict == "fail":
-                r["review_fails"] += 1
-            elif verdict == "pass":
-                r["review_fails"] = 0
 
         timed_out = " (round timed out)" if outcome == "timeout" else ""
         if r["no_progress"] >= change_cfg["no_progress_limit"]:
