@@ -1,8 +1,10 @@
 ---
 description: Drives one OpenSpec change through implement, review, and archive rounds with durable state.
-mode: subagent
+# mode: all (not subagent) so `opencode run --agent opsx-controller` can launch
+# it headlessly as the top-level driver; hidden keeps it out of interactive menus.
+mode: all
 hidden: true
-model: github-copilot/gpt-5.4
+# model is bound by role in opencode.json (agent.opsx-controller -> {env:OPSX_SMART_MODEL})
 variant: xhigh
 permission:
   read: allow
@@ -46,6 +48,11 @@ Always begin by:
 Input rules:
 - If no change id was provided, stop and report that `/opsx-drive <change-id>`
   is required.
+- If the command payload contains an `ESCALATION:` directive, treat it as
+  high-priority operator guidance: include it verbatim at the top of the
+  `opsx-implementer` input block for this change, and have the implementer first
+  assess the current implementation and decide fix-in-place vs clean reimplement
+  (as the directive instructs) before writing code.
 - If more than one change id was provided, stop and report that only one change
   is supported per run.
 
@@ -56,9 +63,11 @@ Global prompt source rules:
   - `$HOME/.config/opencode/command/<name>.md`
 - The required prompt basenames are:
   - `opsx-apply.md`
-  - `opsx-review.md`
   - `opsx-verify.md`
   - `opsx-archive.md`
+- The atomic verify step delegates to the core OpenSpec `opsx-verify` command;
+  `opsx-review.md` is intentionally not required (its archive-vs-fix decision is
+  the controller's own responsibility, not a separate review prose).
 - Read the resolved files before the first phase dispatch. If any are missing,
   fail closed.
 
@@ -215,13 +224,18 @@ Dispatch contract:
   - `CONTEXT_CACHE_SUMMARY: <bounded summary or none>`
 - The Task tool wraps subagent output in `<task ...><task_result>...</task_result></task>`.
   Extract only the trimmed `task_result` body before parsing.
-- Expect each subagent `task_result` body to contain exactly one line of JSON.
-  Parse it and update state directly from that payload.
+- Parse exactly one JSON object from the `task_result` body, tolerantly.
+  Subagents are instructed to return one raw JSON object, but a model may wrap
+  it in a ```json code fence or surround it with prose. Strip code-fence markers
+  and any leading/trailing prose, then parse the single JSON object and update
+  state directly from that payload. Do not block merely because the object was
+  fenced or annotated — extract and proceed.
 
 Malformed phase output rules:
-- If a phase subagent returns wrapped prose, max-step text, or any other body
-  that is not exactly one JSON object, persist blocked state immediately before
-  doing more analysis.
+- Treat output as malformed only when, after the tolerant extraction above, the
+  body yields no parseable JSON object, or yields two or more distinct JSON
+  objects (ambiguous — never guess which is the result). In that case persist
+  blocked state immediately before doing more analysis.
 - For implement or review output failures, set `status=blocked`, keep `phase`
   at the current phase, set `last_result=subagent_output_invalid`, append a
   history entry with `status=invalid_output`, and stop.

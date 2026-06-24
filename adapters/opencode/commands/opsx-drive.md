@@ -1,6 +1,7 @@
 ---
 description: Start or resume the OpenSpec controller for one change
 agent: opsx-controller
+# runs as the opsx-controller agent, whose model is bound by role in opencode.json
 subtask: false
 ---
 
