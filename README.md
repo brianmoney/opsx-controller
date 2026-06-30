@@ -68,14 +68,34 @@ Requirements:
 Install globally:
 
 ```bash
+set -a
+source .env
+set +a
 bash adapters/opencode/install.sh --global
 ```
 
 Install into one project:
 
 ```bash
+set -a
+source .env
+set +a
 bash adapters/opencode/install.sh --project /path/to/project
 ```
+
+Required model environment variables for the OpenCode agents:
+
+```bash
+cp .env.example .env
+set -a
+source .env
+set +a
+```
+
+- `OPSX_CONTROLLER_MODEL`
+- `OPSX_IMPLEMENTER_MODEL`
+- `OPSX_REVIEWER_MODEL`
+- `OPSX_ARCHIVER_MODEL`
 
 Project install behavior:
 
@@ -90,6 +110,9 @@ Project install behavior:
 If the project already has `opencode.json`, `opencode.jsonc`, or
 `.opencode/opencode.json`, merge
 `adapters/opencode/templates/project/opencode.json.snippet.json` manually.
+
+The OpenCode adapter agent files resolve their `model` values from those env
+vars, so OpenCode must be started from a shell where they are exported.
 
 Usage from the host project root:
 

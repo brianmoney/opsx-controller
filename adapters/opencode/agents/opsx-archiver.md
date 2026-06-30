@@ -2,7 +2,7 @@
 description: Archives one OpenSpec change non-interactively after a clean review and returns a machine-readable outcome.
 mode: subagent
 hidden: true
-model: github-copilot/gpt-5.4
+model: "{env:OPSX_ARCHIVER_MODEL}"
 variant: high
 permission:
   read: allow

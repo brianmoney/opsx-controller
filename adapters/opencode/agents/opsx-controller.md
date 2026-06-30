@@ -2,7 +2,7 @@
 description: Drives one OpenSpec change through implement, review, and archive rounds with durable state.
 mode: subagent
 hidden: true
-model: github-copilot/gpt-5.4
+model: "{env:OPSX_CONTROLLER_MODEL}"
 variant: xhigh
 permission:
   read: allow
