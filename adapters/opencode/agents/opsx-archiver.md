@@ -35,10 +35,8 @@ Required workflow:
 3. Read the installed global archive prompt from the first file that exists:
    - `$HOME/.config/opencode/commands/opsx-archive.md`
    - `$HOME/.config/opencode/command/opsx-archive.md`
-4. Read the non-interactive archive helper rules from the first file that
-   exists:
-   - `.opencode/commands/opsx-archive-no-prompt.md`
-   - `$HOME/.config/opencode/commands/opsx-archive-no-prompt.md`
+4. Do not run or rely on the deprecated `/opsx-archive-no-prompt` helper. This
+   agent is the supported non-interactive archive path.
 5. Read `STATE_FILE` when it exists. Use the controller-owned
    `tracked_change_files` list as the default implementation file set for
    explicit archive staging, and fall back to the union of all successful

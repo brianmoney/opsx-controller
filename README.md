@@ -47,7 +47,10 @@ What it contains:
 - `adapters/opencode/agents/opsx-implementer.md`: implementation round agent
 - `adapters/opencode/agents/opsx-reviewer.md`: strict reviewer agent
 - `adapters/opencode/agents/opsx-archiver.md`: non-interactive archiver agent
-- `adapters/opencode/commands/opsx-archive-no-prompt.md`: legacy archive helper
+- `adapters/opencode/commands/opsx-review.md`: review prompt used by the
+  controller's strict review phase
+- `adapters/opencode/commands/opsx-archive-no-prompt.md`: deprecated archive
+  helper stub that fails closed and points users to `/opsx-drive`
 - `adapters/opencode/commands/opsx-verify-auto.md`: legacy verifier helper
 - `adapters/opencode/support/opsx-controller-state-README.md`: state contract
 - `adapters/opencode/templates/project/`: host-project setup snippets
@@ -59,9 +62,8 @@ Requirements:
 - OpenSpec CLI available in the shell
 - a host project that already uses OpenSpec
 - repo-specific guidance in the host project's `AGENTS.md`
-- global phase prompts already installed as OpenCode slash commands:
+- global OpenSpec phase prompts already installed as OpenCode slash commands:
   - `/opsx-apply`
-  - `/opsx-review`
   - `/opsx-verify`
   - `/opsx-archive`
 
@@ -111,8 +113,9 @@ If the project already has `opencode.json`, `opencode.jsonc`, or
 `.opencode/opencode.json`, merge
 `adapters/opencode/templates/project/opencode.json.snippet.json` manually.
 
-The OpenCode adapter agent files resolve their `model` values from those env
-vars, so OpenCode must be started from a shell where they are exported.
+The OpenCode adapter installer resolves the agent `model` values from those env
+vars and writes concrete `provider/model` values into the installed Markdown
+agent files. Re-run the installer after changing any `OPSX_*_MODEL` value.
 
 Usage from the host project root:
 

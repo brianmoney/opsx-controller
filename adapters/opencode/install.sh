@@ -22,10 +22,45 @@ install_commands() {
 install_agents() {
   local dest_dir="$1"
   mkdir -p "$dest_dir"
+
   local file
   for file in "$ROOT_DIR"/adapters/opencode/agents/*.md; do
-    install -m 0644 "$file" "$dest_dir/$(basename "$file")"
+    install_agent "$file" "$dest_dir/$(basename "$file")"
   done
+}
+
+require_model_envs() {
+  require_model_env OPSX_CONTROLLER_MODEL
+  require_model_env OPSX_IMPLEMENTER_MODEL
+  require_model_env OPSX_REVIEWER_MODEL
+  require_model_env OPSX_ARCHIVER_MODEL
+}
+
+require_model_env() {
+  local name="$1"
+  if [[ -z "${!name:-}" ]]; then
+    printf 'Required model environment variable is not set: %s\n' "$name" >&2
+    printf 'Source your opsx-controller .env before installing the OpenCode adapter.\n' >&2
+    exit 1
+  fi
+}
+
+install_agent() {
+  local src="$1"
+  local dest="$2"
+  local tmp
+  tmp="$(mktemp)"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line//\{env:OPSX_CONTROLLER_MODEL\}/${OPSX_CONTROLLER_MODEL}}"
+    line="${line//\{env:OPSX_IMPLEMENTER_MODEL\}/${OPSX_IMPLEMENTER_MODEL}}"
+    line="${line//\{env:OPSX_REVIEWER_MODEL\}/${OPSX_REVIEWER_MODEL}}"
+    line="${line//\{env:OPSX_ARCHIVER_MODEL\}/${OPSX_ARCHIVER_MODEL}}"
+    printf '%s\n' "$line"
+  done <"$src" >"$tmp"
+
+  install -m 0644 "$tmp" "$dest"
+  rm -f "$tmp"
 }
 
 install_support_readme() {
@@ -74,6 +109,8 @@ ensure_project_config() {
 }
 
 install_global() {
+  require_model_envs
+
   local config_root="$HOME/.config/opencode"
   install_commands "$config_root/commands"
   install_agents "$config_root/agents"
@@ -92,6 +129,8 @@ install_project() {
     printf 'Project directory does not exist: %s\n' "$project_dir" >&2
     exit 1
   fi
+
+  require_model_envs
 
   install_commands "$project_dir/.opencode/commands"
   install_agents "$project_dir/.opencode/agents"

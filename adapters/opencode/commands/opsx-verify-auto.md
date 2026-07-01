@@ -15,7 +15,7 @@ The deprecated `openspec-loop.sh` wrapper greps for a discrete verifier status.
 Your final response is parser-facing output, not a human-facing report.
 
 Verify output to classify:
-!`if [ -n "$1" ]; then opencode run --agent build "/opsx-verify $1"; else opencode run --agent build "/opsx-verify"; fi`
+!`if [ -n "$1" ]; then opencode run --agent build "/opsx-verify $1"; else printf 'VERIFY_FAIL: missing change id; rerun /opsx-verify-auto <change-id>.\n'; fi`
 
 Classify the verify output using these rules:
 - Return `VERIFY_PASS` only if the verify output contains no CRITICAL issues and
@@ -23,6 +23,8 @@ Classify the verify output using these rules:
 - Return `VERIFY_FAIL` if the verify output contains any CRITICAL issues, any
   WARNING issues, or if the verify output is missing, unusable, incomplete, or
   ambiguous.
+- Return `VERIFY_FAIL` if no change id was provided; do not invoke interactive
+  `/opsx-verify` without an explicit change id.
 - Ignore SUGGESTION items unless they are needed to explain how to resolve a
   CRITICAL or WARNING issue.
 - For `VERIFY_FAIL`, convert the CRITICAL and WARNING issues into a compact fix
