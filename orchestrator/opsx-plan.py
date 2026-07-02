@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""opsx-plan: deterministic plan-level orchestrator for /opsx-drive.
+"""opsx-plan: deterministic plan-level orchestrator for OpenSpec changes.
 
-Iterates a TOML plan manifest of OpenSpec changes (a DAG), invoking the
-client adapter's opsx-drive controller headlessly for each ready change,
-verifying completion from ground truth (controller state file, archive
-directory, archive commit), and gating progress on configurable fast checks.
+Iterates a TOML plan manifest of OpenSpec changes (a DAG). Depending on the
+adapter, it either invokes a legacy single-command controller or owns the
+implement/review/archive phase loop directly, verifies completion from ground
+truth, and gates progress on configurable fast checks.
 
 Design rules:
-  - The orchestrator is deterministic. All LLM judgment lives inside
-    /opsx-drive. This layer only does ordering, dispatch, and verification.
-  - Never trust the drive process exit code or stdout as success. A change
-    is done only when independent evidence agrees.
+  - The orchestrator is deterministic. All LLM judgment lives inside the
+    configured workers. This layer only does ordering, dispatch, and
+    verification.
+  - Never trust a worker or controller exit code or stdout as success. A
+    change is done only when independent evidence agrees.
   - A failed change blocks its dependents; independent branches continue.
   - Changes with pause_before=true wait for explicit `approve`.
   - State is reconciled against the repository on startup, so the run can
@@ -22,6 +23,7 @@ Requires Python 3.11+ (tomllib). Stdlib only.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -48,6 +50,9 @@ ADAPTER_DEFAULTS = {
     "opencode": {
         "invoke": 'opencode run "/opsx-drive {change}"',
         "state_file": ".opencode/opsx-controller/{change}.json",
+        "implement_invoke": "opencode run --agent opsx-implementer",
+        "review_invoke": "opencode run --agent opsx-reviewer",
+        "archive_invoke": "opencode run --agent opsx-archiver",
     },
     "claude-code": {
         "invoke": 'claude -p "/opsx-drive {change}"',
@@ -66,6 +71,7 @@ FAILED = "failed"
 SKIPPED = "skipped"
 
 ARCHIVE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-")
+TASK_RE = re.compile(r"^- \[(?P<done>[ xX])\]\s+")
 
 _current_proc: subprocess.Popen | None = None
 
@@ -109,8 +115,19 @@ def load_plan(path: Path) -> dict:
         "adapter": adapter,
         "invoke": plan.get("invoke", defaults.get("invoke")),
         "state_file": plan.get("state_file", defaults.get("state_file")),
+        "implement_invoke": plan.get(
+            "implement_invoke", defaults.get("implement_invoke", "")
+        ),
+        "review_invoke": plan.get(
+            "review_invoke", defaults.get("review_invoke", "")
+        ),
+        "archive_invoke": plan.get(
+            "archive_invoke", defaults.get("archive_invoke", "")
+        ),
         "timeout_minutes": float(plan.get("timeout_minutes", 90)),
         "max_attempts": int(plan.get("max_attempts", 2)),
+        "max_rounds": int(plan.get("max_rounds", 5)),
+        "no_progress_limit": int(plan.get("no_progress_limit", 2)),
         "fast_checks": list(plan.get("fast_checks", [])),
         "check_timeout_minutes": float(plan.get("check_timeout_minutes", 15)),
         "require_clean_tracked": bool(plan.get("require_clean_tracked", True)),
@@ -190,12 +207,106 @@ def state_path(repo: Path, plan_name: str) -> Path:
     return repo / ".opsx-plan" / f"{plan_name}.state.json"
 
 
+def default_context_cache() -> dict:
+    return {
+        "valid": False,
+        "status": "missing",
+        "compiled_by": "",
+        "updated_in_round": 0,
+        "source_signature": "",
+        "source_paths": [],
+        "refresh_reason": "",
+        "change_summary": "",
+        "scope_hint": "",
+    }
+
+
+def default_last_review() -> dict:
+    return {
+        "verdict": "pending",
+        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+        "summary": "",
+        "fix_prompt": "",
+    }
+
+
+def default_archive_state() -> dict:
+    return {
+        "status": "not_started",
+        "path": "",
+        "commit": "",
+        "reason": "",
+        "spec_sync_status": "",
+        "triage": {
+            "scope_basis": "",
+            "in_scope_files": [],
+            "ambiguous_files": [],
+            "retry_guidance": "",
+            "retry_outlook": "unknown",
+        },
+    }
+
+
+def default_last_stage() -> dict:
+    return {
+        "name": "",
+        "round": 0,
+        "outcome": "",
+        "log_path": "",
+        "updated_at": "",
+    }
+
+
+def new_change_record() -> dict:
+    return {
+        "status": PENDING,
+        "attempts": 0,
+        "reason": "",
+        "updated_at": "",
+        "create_attempts": 0,
+        "created_by_orchestrator": False,
+        "accepted": False,
+        "phase": "implement",
+        "round": 1,
+        "max_rounds": 5,
+        "no_progress_streak": 0,
+        "latest_fix_prompt": "",
+        "last_result": "",
+        "task_counts": {"complete": 0, "total": 0},
+        "tracked_change_files": [],
+        "context_cache": default_context_cache(),
+        "last_review": default_last_review(),
+        "archive": default_archive_state(),
+        "history": [],
+        "last_stage": default_last_stage(),
+        "last_log": "",
+    }
+
+
+def merge_defaults(target: dict, defaults: dict) -> dict:
+    for key, value in defaults.items():
+        if key not in target:
+            target[key] = copy.deepcopy(value)
+        elif isinstance(target[key], dict) and isinstance(value, dict):
+            merge_defaults(target[key], value)
+    return target
+
+
 def load_state(repo: Path, plan_name: str) -> dict:
     p = state_path(repo, plan_name)
     if p.exists():
         with open(p, encoding="utf-8") as fh:
-            return json.load(fh)
-    return {"plan": plan_name, "approvals": [], "changes": {}}
+            state = json.load(fh)
+    else:
+        state = {"plan": plan_name, "approvals": [], "changes": {}}
+    state.setdefault("plan", plan_name)
+    state.setdefault("approvals", [])
+    state.setdefault("changes", {})
+    for cid, record in state["changes"].items():
+        if isinstance(record, dict):
+            merge_defaults(record, new_change_record())
+            record.setdefault("change", cid)
+    return state
 
 
 def save_state(repo: Path, plan_name: str, state: dict) -> None:
@@ -213,14 +324,9 @@ def save_state(repo: Path, plan_name: str, state: dict) -> None:
 
 
 def rec(state: dict, cid: str) -> dict:
-    return state["changes"].setdefault(
-        cid,
-        {
-            "status": PENDING, "attempts": 0, "reason": "", "updated_at": "",
-            "create_attempts": 0, "created_by_orchestrator": False,
-            "accepted": False,
-        },
-    )
+    record = state["changes"].setdefault(cid, new_change_record())
+    merge_defaults(record, new_change_record())
+    return record
 
 
 def set_status(state: dict, cid: str, status: str, reason: str = "") -> None:
@@ -228,6 +334,561 @@ def set_status(state: dict, cid: str, status: str, reason: str = "") -> None:
     r["status"] = status
     r["reason"] = reason
     r["updated_at"] = utcnow()
+
+
+def is_direct_opencode(cfg: dict) -> bool:
+    return cfg["adapter"] == "opencode" and all(
+        cfg.get(name) for name in ("implement_invoke", "review_invoke", "archive_invoke")
+    )
+
+
+def change_task_counts(repo: Path, cid: str) -> dict:
+    counts = {"complete": 0, "total": 0}
+    tasks = change_dir(repo, cid) / "tasks.md"
+    if not tasks.is_file():
+        return counts
+    for line in tasks.read_text(encoding="utf-8").splitlines():
+        match = TASK_RE.match(line)
+        if not match:
+            continue
+        counts["total"] += 1
+        if match.group("done").lower() == "x":
+            counts["complete"] += 1
+    return counts
+
+
+def update_task_counts(repo: Path, state: dict, cid: str) -> None:
+    rec(state, cid)["task_counts"] = change_task_counts(repo, cid)
+
+
+def merge_paths(*groups: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for path in group:
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            merged.append(path)
+    return merged
+
+
+def change_context_paths(repo: Path, cid: str) -> list[str]:
+    cdir = change_dir(repo, cid)
+    if not cdir.is_dir():
+        return []
+    return sorted(str(path.relative_to(repo)) for path in cdir.rglob("*") if path.is_file())
+
+
+def worker_state_path(repo: Path, plan_name: str, cid: str) -> Path:
+    return repo / ".opsx-plan" / "workers" / plan_name / f"{cid}.json"
+
+
+def save_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def save_worker_state(repo: Path, cfg: dict, state: dict, cid: str) -> None:
+    if not is_direct_opencode(cfg):
+        return
+    r = rec(state, cid)
+    payload = {
+        "version": 3,
+        "change": cid,
+        "schema": "spec-driven",
+        "status": (
+            "completed" if r["status"] == DONE else "blocked"
+            if r["status"] == FAILED else "running"
+        ),
+        "phase": r["phase"],
+        "round": r["round"],
+        "max_rounds": r["max_rounds"],
+        "no_progress_streak": r["no_progress_streak"],
+        "latest_fix_prompt": r["latest_fix_prompt"],
+        "last_result": r["last_result"],
+        "task_counts": r["task_counts"],
+        "tracked_change_files": r["tracked_change_files"],
+        "context_cache": r["context_cache"],
+        "last_review": r["last_review"],
+        "archive": r["archive"],
+        "history": r["history"],
+    }
+    save_json(worker_state_path(repo, cfg["name"], cid), payload)
+
+
+def persist_direct_state(repo: Path, cfg: dict, state: dict, cid: str) -> None:
+    save_state(repo, cfg["name"], state)
+    save_worker_state(repo, cfg, state, cid)
+
+
+def single_line(value: str) -> str:
+    compact = " ".join((value or "").split())
+    return compact if compact else "none"
+
+
+def build_worker_input(repo: Path, cfg: dict, state: dict, cid: str) -> str:
+    r = rec(state, cid)
+    update_task_counts(repo, state, cid)
+    cache = r["context_cache"]
+    return "\n".join(
+        [
+            f"CHANGE: {cid}",
+            f"ROUND: {r['round']}",
+            f"STATE_FILE: {worker_state_path(repo, cfg['name'], cid)}",
+            f"LATEST_FIX_PROMPT: {single_line(r['latest_fix_prompt'])}",
+            f"TASK_COUNTS: {r['task_counts']['complete']}/{r['task_counts']['total']}",
+            f"CONTEXT_CACHE_STATUS: {cache['status']}",
+            f"CONTEXT_CACHE_VALID: {'true' if cache['valid'] else 'false'}",
+            f"CONTEXT_CACHE_SUMMARY: {single_line(cache['change_summary'])}",
+        ]
+    )
+
+
+def next_stage_log_path(repo: Path, cid: str, stage: str, round_num: int) -> Path:
+    log_dir = repo / ".opsx-plan" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    existing = sorted(log_dir.glob(f"{cid}.{stage}.r{round_num}.*.log"))
+    return log_dir / f"{cid}.{stage}.r{round_num}.{len(existing) + 1}.log"
+
+
+def record_stage_log(
+    state: dict,
+    cid: str,
+    stage: str,
+    round_num: int,
+    outcome: str,
+    log_path: Path,
+) -> None:
+    r = rec(state, cid)
+    r["last_log"] = str(log_path)
+    r["last_stage"] = {
+        "name": stage,
+        "round": round_num,
+        "outcome": outcome,
+        "log_path": str(log_path),
+        "updated_at": utcnow(),
+    }
+
+
+def parse_stage_json(log_path: Path) -> tuple[dict | None, str]:
+    lines: list[str] = []
+    for raw in log_path.read_text(encoding="utf-8").splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("# "):
+            continue
+        lines.append(stripped)
+    if len(lines) != 1:
+        return None, f"expected exactly one JSON line, got {len(lines)}"
+    try:
+        payload = json.loads(lines[0])
+    except json.JSONDecodeError as exc:
+        return None, f"invalid JSON output: {exc.msg}"
+    if not isinstance(payload, dict):
+        return None, "stage output was not a JSON object"
+    return payload, ""
+
+
+def append_history(state: dict, cid: str, entry: dict) -> None:
+    rec(state, cid)["history"].append(entry)
+
+
+def reachable_commit(repo: Path, commit: str) -> bool:
+    if not commit:
+        return False
+    res = git(repo, "merge-base", "--is-ancestor", commit, "HEAD")
+    return res.returncode == 0
+
+
+def verify_direct_archive_done(repo: Path, cid: str, record: dict) -> tuple[bool, str]:
+    archive = record["archive"]
+    if archive.get("status") != "passed":
+        return False, "no fresh archive worker result recorded"
+    if change_dir(repo, cid).exists():
+        return False, f"openspec/changes/{cid} still exists"
+    archive_path = archive.get("path", "")
+    if not archive_path:
+        return False, "archive worker did not record archive path"
+    archive_dir = repo / archive_path
+    if not archive_dir.is_dir():
+        return False, f"archive path missing: {archive_path}"
+    actual_archive = find_archive_dir(repo, cid)
+    if actual_archive is None:
+        return False, "no dated archive directory found"
+    if actual_archive.resolve() != archive_dir.resolve():
+        return False, (
+            f"archive directory mismatch: expected {archive_path}, found "
+            f"{actual_archive.relative_to(repo)}"
+        )
+    commit = archive.get("commit", "")
+    if not commit:
+        return False, "archive worker did not record archive commit"
+    if not reachable_commit(repo, commit):
+        return False, f"archive commit not reachable from HEAD: {commit}"
+    if find_archive_commit(repo, cid) != commit:
+        return False, "archive commit does not match latest archive(<change>) commit"
+    return True, ""
+
+
+def normalize_task_counts(payload: dict) -> dict:
+    counts = payload.get("task_counts", {})
+    if not isinstance(counts, dict):
+        return {"complete": 0, "total": 0}
+    return {
+        "complete": int(counts.get("complete", 0)),
+        "total": int(counts.get("total", 0)),
+    }
+
+
+def normalize_finding_counts(payload: dict) -> dict:
+    counts = payload.get("finding_counts", {})
+    if not isinstance(counts, dict):
+        return {"critical": 0, "warning": 0, "note": 0}
+    return {
+        "critical": int(counts.get("critical", 0)),
+        "warning": int(counts.get("warning", 0)),
+        "note": int(counts.get("note", 0)),
+    }
+
+
+def invoke_direct_stage(
+    repo: Path,
+    cfg: dict,
+    cid: str,
+    stage: str,
+    round_num: int,
+    input_block: str,
+) -> tuple[str, Path]:
+    cmd = shlex.split(cfg[f"{stage}_invoke"]) + [input_block]
+    log_path = next_stage_log_path(repo, cid, stage, round_num)
+    timeout_s = cfg["changes"][cid]["timeout_minutes"] * 60
+    log(
+        f"  exec[{stage}]: {' '.join(cmd[:-1])} <input> "
+        f"(timeout {timeout_s / 60:g}m, log {log_path})"
+    )
+    return run_logged_command(repo, cmd, log_path, timeout_s, stage, round_num)
+
+
+def run_logged_command(
+    repo: Path,
+    cmd: list[str],
+    log_path: Path,
+    timeout_s: float,
+    stage: str,
+    attempt: int,
+) -> tuple[str, Path]:
+    global _current_proc
+    try:
+        with open(log_path, "w", encoding="utf-8") as lf:
+            lf.write(f"# {utcnow()} {stage} attempt {attempt}: {' '.join(cmd)}\n")
+            lf.flush()
+            proc = subprocess.Popen(
+                cmd,
+                cwd=repo,
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            _current_proc = proc
+            try:
+                proc.wait(timeout=timeout_s)
+                return "exited", log_path
+            except subprocess.TimeoutExpired:
+                terminate_group(proc)
+                return "timeout", log_path
+            finally:
+                _current_proc = None
+    except FileNotFoundError:
+        return "spawn_error", log_path
+
+
+def apply_implement_result(
+    repo: Path,
+    cfg: dict,
+    state: dict,
+    cid: str,
+    payload: dict,
+) -> str:
+    r = rec(state, cid)
+    status = payload.get("status")
+    if status == "blocked":
+        r["last_result"] = "implement_blocked"
+        update_task_counts(repo, state, cid)
+        append_history(
+            state,
+            cid,
+            {
+                "round": r["round"],
+                "phase": "implement",
+                "status": "blocked",
+                "summary": payload.get("summary", "implement blocked"),
+                "reason": payload.get("reason", "implement blocked"),
+            },
+        )
+        set_status(state, cid, FAILED, payload.get("reason", "implement blocked"))
+        return "stop"
+    if status != "implemented":
+        set_status(state, cid, FAILED, f"implement returned unexpected status={status}")
+        r["last_result"] = "implement_invalid"
+        return "stop"
+    r["task_counts"] = normalize_task_counts(payload)
+    progress = bool(payload.get("progress_made"))
+    r["no_progress_streak"] = 0 if progress else r["no_progress_streak"] + 1
+    files_touched = [str(path) for path in payload.get("files_touched", [])]
+    known_change_files = [str(path) for path in payload.get("known_change_files", [])]
+    r["tracked_change_files"] = merge_paths(
+        change_context_paths(repo, cid),
+        r["tracked_change_files"],
+        files_touched,
+        known_change_files,
+    )
+    cache_update = payload.get("cache_update")
+    if isinstance(cache_update, dict):
+        cache = r["context_cache"]
+        cache.update(
+            {
+                "valid": True,
+                "status": "ready",
+                "compiled_by": "opsx-implementer",
+                "updated_in_round": r["round"],
+                "change_summary": cache_update.get(
+                    "change_summary", cache["change_summary"]
+                ),
+                "refresh_reason": cache_update.get(
+                    "refresh_reason", cache["refresh_reason"]
+                ),
+                "source_paths": cache_update.get("source_paths", cache["source_paths"]),
+                "scope_hint": cache_update.get("scope_hint", cache.get("scope_hint", "")),
+            }
+        )
+    r["last_result"] = "implement_completed"
+    append_history(
+        state,
+        cid,
+        {
+            "round": r["round"],
+            "phase": "implement",
+            "status": "implemented",
+            "summary": payload.get("summary", "implementation round completed"),
+            "progress_made": progress,
+            "completed_tasks": payload.get("completed_tasks", []),
+            "files_touched": files_touched,
+        },
+    )
+    if r["no_progress_streak"] >= cfg["no_progress_limit"]:
+        r["last_result"] = "no_progress"
+        set_status(state, cid, FAILED, "no progress ceiling reached")
+        return "stop"
+    r["phase"] = "review"
+    set_status(state, cid, PENDING, payload.get("summary", "implementation complete"))
+    return "continue"
+
+
+def apply_review_result(repo: Path, state: dict, cid: str, payload: dict) -> str:
+    r = rec(state, cid)
+    if payload.get("status") != "reviewed":
+        set_status(
+            state,
+            cid,
+            FAILED,
+            f"review returned unexpected status={payload.get('status')}",
+        )
+        r["last_result"] = "review_invalid"
+        return "stop"
+    counts = normalize_finding_counts(payload)
+    verdict = payload.get("verdict")
+    summary = payload.get("summary", "review completed")
+    fix_prompt = payload.get("fix_prompt", "")
+    update_task_counts(repo, state, cid)
+    r["last_review"] = {
+        "verdict": verdict,
+        "finding_counts": counts,
+        "summary": summary,
+        "fix_prompt": fix_prompt,
+    }
+    append_history(
+        state,
+        cid,
+        {
+            "round": r["round"],
+            "phase": "review",
+            "status": verdict,
+            "summary": summary,
+            "finding_counts": counts,
+        },
+    )
+    passed = verdict == "pass" and counts == {"critical": 0, "warning": 0, "note": 0}
+    if passed:
+        r["latest_fix_prompt"] = ""
+        r["last_result"] = "review_passed"
+        r["phase"] = "archive"
+        set_status(state, cid, PENDING, summary)
+        return "continue"
+    if verdict not in {"pass", "fail"}:
+        set_status(state, cid, FAILED, f"review returned unexpected verdict={verdict}")
+        r["last_result"] = "review_invalid"
+        return "stop"
+    r["latest_fix_prompt"] = fix_prompt
+    if r["round"] >= r["max_rounds"]:
+        r["last_result"] = "max_rounds_reached"
+        set_status(state, cid, FAILED, "review retry budget exhausted")
+        return "stop"
+    r["last_result"] = "review_failed"
+    r["round"] += 1
+    r["phase"] = "implement"
+    set_status(state, cid, PENDING, summary)
+    return "continue"
+
+
+def apply_archive_result(repo: Path, cfg: dict, state: dict, cid: str, payload: dict) -> str:
+    r = rec(state, cid)
+    archive = r["archive"]
+    if payload.get("status") == "blocked":
+        archive.update(
+            {
+                "status": "failed",
+                "path": payload.get("archive_path", ""),
+                "commit": payload.get("commit", ""),
+                "reason": payload.get("reason", "archive blocked"),
+                "spec_sync_status": payload.get("spec_sync_status", "not_started"),
+                "triage": payload.get("triage", default_archive_state()["triage"]),
+            }
+        )
+        r["last_result"] = "archive_failed"
+        append_history(
+            state,
+            cid,
+            {
+                "round": r["round"],
+                "phase": "archive",
+                "status": "blocked",
+                "summary": payload.get("summary", "archive blocked"),
+                "reason": payload.get("reason", "archive blocked"),
+            },
+        )
+        set_status(state, cid, FAILED, payload.get("reason", "archive blocked"))
+        return "stop"
+    if payload.get("status") != "archived":
+        set_status(
+            state,
+            cid,
+            FAILED,
+            f"archive returned unexpected status={payload.get('status')}",
+        )
+        archive["status"] = "failed"
+        archive["reason"] = "invalid archive output"
+        r["last_result"] = "archive_invalid"
+        return "stop"
+    archive.update(
+        {
+            "status": "passed",
+            "path": payload.get("archive_path", ""),
+            "commit": payload.get("commit", ""),
+            "reason": "",
+            "spec_sync_status": payload.get("spec_sync_status", ""),
+            "triage": default_archive_state()["triage"],
+        }
+    )
+    append_history(
+        state,
+        cid,
+        {
+            "round": r["round"],
+            "phase": "archive",
+            "status": "archived",
+            "summary": payload.get("summary", "archive completed"),
+            "archive_path": archive["path"],
+            "commit": archive["commit"],
+        },
+    )
+    r["last_result"] = "archive_passed"
+    ok, why = verify_direct_archive_done(repo, cid, r)
+    if not ok:
+        archive["status"] = "failed"
+        archive["reason"] = why
+        set_status(state, cid, FAILED, f"archive unverified: {why}")
+        return "stop"
+    checks_ok, check_why = run_fast_checks(repo, cfg)
+    if not checks_ok:
+        archive["status"] = "failed"
+        archive["reason"] = f"post-archive {check_why}"
+        r["last_result"] = "post_archive_check_failed"
+        set_status(state, cid, FAILED, f"post-archive {check_why}")
+        return "stop"
+    r["phase"] = "done"
+    set_status(state, cid, DONE, "verified + checks passed")
+    return "done"
+
+
+def run_direct_change(
+    repo: Path,
+    cfg: dict,
+    state: dict,
+    cid: str,
+    budget_deadline: float | None = None,
+) -> str:
+    r = rec(state, cid)
+    while True:
+        if budget_deadline and time.monotonic() > budget_deadline:
+            set_status(state, cid, PENDING, f"budget exhausted while waiting to run {r['phase']}")
+            persist_direct_state(repo, cfg, state, cid)
+            return "budget"
+        stage = r["phase"]
+        round_num = r["round"]
+        if stage == "done":
+            ok, why = verify_direct_archive_done(repo, cid, r)
+            if ok:
+                set_status(state, cid, DONE, "verified + checks passed")
+            else:
+                set_status(state, cid, FAILED, f"completed state no longer verifiable: {why}")
+            persist_direct_state(repo, cfg, state, cid)
+            return r["status"]
+        if stage not in {"implement", "review", "archive"}:
+            r["phase"] = "implement"
+            stage = "implement"
+
+        input_block = build_worker_input(repo, cfg, state, cid)
+        set_status(state, cid, RUNNING, f"{stage} round {round_num}")
+        persist_direct_state(repo, cfg, state, cid)
+        outcome, log_path = invoke_direct_stage(repo, cfg, cid, stage, round_num, input_block)
+        record_stage_log(state, cid, stage, round_num, outcome, log_path)
+
+        if outcome == "spawn_error":
+            rec(state, cid)["last_result"] = f"{stage}_spawn_error"
+            set_status(state, cid, FAILED, f"could not spawn {stage}: {cfg[f'{stage}_invoke']}")
+            persist_direct_state(repo, cfg, state, cid)
+            return "spawn_error"
+        if outcome == "timeout":
+            rec(state, cid)["last_result"] = f"{stage}_timeout"
+            set_status(state, cid, FAILED, f"{stage} timed out")
+            persist_direct_state(repo, cfg, state, cid)
+            return "failed"
+
+        payload, parse_why = parse_stage_json(log_path)
+        if payload is None:
+            rec(state, cid)["last_result"] = "subagent_output_invalid"
+            if stage == "archive":
+                rec(state, cid)["archive"]["status"] = "failed"
+                rec(state, cid)["archive"]["reason"] = parse_why
+            set_status(state, cid, FAILED, f"{stage} output invalid: {parse_why}")
+            persist_direct_state(repo, cfg, state, cid)
+            return "failed"
+
+        if stage == "implement":
+            action = apply_implement_result(repo, cfg, state, cid, payload)
+        elif stage == "review":
+            action = apply_review_result(repo, state, cid, payload)
+        else:
+            action = apply_archive_result(repo, cfg, state, cid, payload)
+        persist_direct_state(repo, cfg, state, cid)
+        if action == "continue":
+            continue
+        return action
 
 
 # ---------------------------------------------------------------------------
@@ -365,12 +1026,18 @@ def scaffold_is_clearable(repo: Path, cid: str) -> bool:
     return not tracked.stdout.strip()
 
 
-def verify_change_created(repo: Path, cfg: dict, cid: str) -> tuple[bool, str]:
+def verify_change_created(
+    repo: Path,
+    cfg: dict,
+    cid: str,
+    before_tracked: tuple[str, str, str] | None = None,
+) -> tuple[bool, str]:
     """A change counts as created only when independent evidence agrees:
     1. openspec/changes/<id> exists with proposal.md and tasks.md
     2. the configured created_check command (default
        `openspec validate <id> --strict`) exits 0
-    3. creation touched no tracked files (change authoring is additive)
+    3. when a pre-create snapshot is provided, creation touched no tracked files
+       (change authoring is additive)
     """
     reasons: list[str] = []
     cdir = change_dir(repo, cid)
@@ -395,12 +1062,33 @@ def verify_change_created(repo: Path, cfg: dict, cid: str) -> tuple[bool, str]:
         except FileNotFoundError as exc:
             reasons.append(f"created_check command not found: {exc}")
 
-    if not tracked_tree_clean(repo):
+    if before_tracked is not None and tracked_worktree_snapshot(repo) != before_tracked:
         reasons.append(
             "creation modified tracked files; change authoring must be "
             "additive (review with `git status` before continuing)"
         )
     return (not reasons, "; ".join(reasons))
+
+
+def tracked_worktree_snapshot(repo: Path) -> tuple[str, str, str]:
+    """Return tracked-file state, excluding untracked files.
+
+    Creation runs are allowed to add untracked OpenSpec files, but must not alter
+    tracked files. Capturing the full tracked diff before and after the create
+    stage avoids falsely failing when unrelated tracked edits already existed.
+    """
+    pieces: list[str] = []
+    for args in (
+        ("status", "--porcelain", "--untracked-files=no"),
+        ("diff", "--no-ext-diff", "--binary"),
+        ("diff", "--cached", "--no-ext-diff", "--binary"),
+    ):
+        res = git(repo, *args)
+        if res.returncode != 0:
+            pieces.append(f"git {' '.join(args)} failed: {res.stderr}")
+        else:
+            pieces.append(res.stdout)
+    return pieces[0], pieces[1], pieces[2]
 
 
 def tracked_tree_clean(repo: Path) -> bool:
@@ -454,7 +1142,6 @@ def run_stage(
     (outcome, log_path) where outcome is 'exited', 'timeout', or
     'spawn_error'. Output goes to a log file so it can be tailed live;
     the exit code is informational only."""
-    global _current_proc
     log_dir = repo / ".opsx-plan" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{cid}.{stage}{attempt}.log"
@@ -465,26 +1152,7 @@ def run_stage(
     timeout_s = timeout_minutes * 60
     log(f"  exec[{stage}]: {' '.join(cmd)}  "
         f"(timeout {timeout_s/60:g}m, log {log_path})")
-
-    try:
-        with open(log_path, "w", encoding="utf-8") as lf:
-            lf.write(f"# {utcnow()} {stage} attempt {attempt}: {' '.join(cmd)}\n")
-            lf.flush()
-            proc = subprocess.Popen(
-                cmd, cwd=repo, stdout=lf, stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-            _current_proc = proc
-            try:
-                proc.wait(timeout=timeout_s)
-                return "exited", log_path
-            except subprocess.TimeoutExpired:
-                terminate_group(proc)
-                return "timeout", log_path
-            finally:
-                _current_proc = None
-    except FileNotFoundError:
-        return "spawn_error", log_path
+    return run_logged_command(repo, cmd, log_path, timeout_s, stage, attempt)
 
 
 def drive_change(repo: Path, cfg: dict, cid: str, attempt: int) -> tuple[str, Path]:
@@ -513,7 +1181,7 @@ def terminate_group(proc: subprocess.Popen, grace: float = 15.0) -> None:
 
 
 def handle_sigint(signum, frame):  # noqa: ARG001
-    log("interrupted; terminating active drive process group")
+    log("interrupted; terminating active stage process group")
     if _current_proc is not None:
         terminate_group(_current_proc)
     sys.exit(130)
@@ -552,6 +1220,8 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
     """Make recorded state agree with repository reality."""
     for cid in cfg["order"]:
         r = rec(state, cid)
+        if is_direct_opencode(cfg):
+            r["max_rounds"] = cfg["max_rounds"]
         if r["status"] == RUNNING:  # stale from a killed run
             set_status(state, cid, PENDING, "recovered from interrupted run")
         # A change that failed only because no create_invoke was configured
@@ -569,12 +1239,69 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
             log(f"reconcile: {cid} create config now present; re-queued")
             continue
         if r["status"] != DONE:
-            ok, _ = verify_change_done(repo, cfg, cid)
-            if ok:
-                set_status(state, cid, DONE, "verified from repository evidence")
-                log(f"reconcile: {cid} already archived; marked done")
+            if is_direct_opencode(cfg):
+                archived_on_disk = (
+                    not change_dir(repo, cid).exists() and find_archive_dir(repo, cid) is not None
+                )
+                if r["archive"].get("status") == "passed":
+                    ok, why = verify_direct_archive_done(repo, cid, r)
+                    if ok:
+                        r["phase"] = "done"
+                        set_status(
+                            state,
+                            cid,
+                            DONE,
+                            "verified from plan state + repository evidence",
+                        )
+                        log(f"reconcile: {cid} already archived; marked done")
+                        continue
+                    if archived_on_disk:
+                        set_status(
+                            state,
+                            cid,
+                            FAILED,
+                            f"recorded archive success but evidence is inconsistent: {why}",
+                        )
+                        log(f"reconcile: {cid} archive evidence inconsistent: {why}")
+                        continue
+                elif archived_on_disk:
+                    set_status(
+                        state,
+                        cid,
+                        FAILED,
+                        "repository archived change but plan state lacks archive worker evidence",
+                    )
+                    log(
+                        f"reconcile: {cid} archived on disk without plan-owned archive evidence"
+                    )
+                    continue
+            else:
+                ok, _ = verify_change_done(repo, cfg, cid)
+                if ok:
+                    set_status(state, cid, DONE, "verified from repository evidence")
+                    log(f"reconcile: {cid} already archived; marked done")
+                    continue
+            if (
+                r["status"] == PENDING
+                and r.get("create_attempts", 0) > 0
+                and change_authored(repo, cid)
+                and not r.get("created_by_orchestrator")
+            ):
+                created_ok, created_why = verify_change_created(repo, cfg, cid)
+                if created_ok:
+                    r["created_by_orchestrator"] = True
+                    set_status(state, cid, PENDING, "created and verified")
+                    log(f"reconcile: {cid} already created; marked for acceptance")
+                else:
+                    set_status(
+                        state, cid, PENDING,
+                        f"create verification pending: {created_why}",
+                    )
         else:
-            ok, why = verify_change_done(repo, cfg, cid)
+            if is_direct_opencode(cfg):
+                ok, why = verify_direct_archive_done(repo, cid, r)
+            else:
+                ok, why = verify_change_done(repo, cfg, cid)
             if not ok:
                 set_status(
                     state, cid, FAILED,
@@ -671,6 +1398,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             r["create_attempts"] = c_attempt
             set_status(state, cid, RUNNING, "creating change")
             save_state(repo, cfg["name"], state)
+            before_tracked = tracked_worktree_snapshot(repo)
 
             outcome, log_path = run_stage(
                 repo, cfg, cid, "create", change_cfg["create_invoke"],
@@ -684,7 +1412,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 save_state(repo, cfg["name"], state)
                 return 2
 
-            ok, why = verify_change_created(repo, cfg, cid)
+            ok, why = verify_change_created(repo, cfg, cid, before_tracked)
             if ok:
                 r["created_by_orchestrator"] = True
                 set_status(state, cid, PENDING, "created and verified")
@@ -707,6 +1435,17 @@ def cmd_run(args: argparse.Namespace) -> int:
 
         if args.create_only:
             visited.add(cid)  # exists already; nothing to create, don't drive
+            continue
+
+        if is_direct_opencode(cfg):
+            log(f"=== {cid} direct OpenCode execution (round {r['round']}) ===")
+            result = run_direct_change(repo, cfg, state, cid, budget_deadline)
+            if result == DONE:
+                log(f"  done: {cid}")
+                ran += 1
+            elif result == "spawn_error":
+                return 2
+            visited.add(cid)
             continue
 
         # ----- drive stage -----
@@ -840,11 +1579,10 @@ def cmd_reset(args: argparse.Namespace) -> int:
         if cid not in cfg["changes"]:
             print(f"unknown change: {cid}", file=sys.stderr)
             return 2
-        state["changes"][cid] = {
-            "status": PENDING, "attempts": 0, "create_attempts": 0,
-            "created_by_orchestrator": False, "accepted": False,
-            "reason": "reset by operator", "updated_at": utcnow(),
-        }
+        state["changes"][cid] = new_change_record()
+        state["changes"][cid]["max_rounds"] = cfg["max_rounds"]
+        state["changes"][cid]["reason"] = "reset by operator"
+        state["changes"][cid]["updated_at"] = utcnow()
         log(f"reset: {cid}")
     save_state(repo, cfg["name"], state)
     return 0

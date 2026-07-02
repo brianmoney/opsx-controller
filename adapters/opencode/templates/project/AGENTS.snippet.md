@@ -5,6 +5,8 @@ want the iterative implement-review-archive loop for one accepted OpenSpec
 change.
 
 - `/opsx-drive` supports exactly one change per run.
+- `opsx-plan` uses direct implement/review/archive worker dispatch for
+  OpenCode-backed plan runs; it does not nest `/opsx-drive` internally.
 - Durable controller state lives under
   `.opencode/opsx-controller/<change-id>.json`.
 - The controller uses the fixed agents `opsx-controller`, `opsx-implementer`,

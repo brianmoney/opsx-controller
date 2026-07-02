@@ -19,6 +19,8 @@ Controller entry rules:
 - Start or resume `.opencode/opsx-controller/$1.json`.
 - Use the `opsx-controller` agent workflow and do not fall back to
   `openspec-loop.sh` for the normal apply-review-archive loop.
+- `opsx-plan` no longer invokes this command internally for OpenCode-backed
+  plan runs; this command remains the manual single-change controller surface.
 - The controller result is final for this command run.
 - Do not run follow-up recovery, reconciliation, retries, repo edits, or extra
   tool calls in the command layer after the controller responds.

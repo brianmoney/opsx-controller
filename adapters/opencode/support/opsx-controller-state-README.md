@@ -3,6 +3,12 @@
 `/opsx-drive <change-id>` persists durable per-change controller state in this
 directory.
 
+`opsx-plan` no longer depends on these files for OpenCode-backed plan runs.
+Direct plan execution keeps the authoritative phase, round, review, archive,
+and retry state in `.opsx-plan/<plan-name>.state.json`, and may synthesize
+compatibility worker-state snapshots under `.opsx-plan/workers/` before
+dispatching `opsx-implementer`, `opsx-reviewer`, or `opsx-archiver`.
+
 This file can live in either location:
 
 - project scope: `.opencode/opsx-controller/README.md`
@@ -97,3 +103,5 @@ Safety rules:
 Operational note:
 - After changing `opencode.json`, `.opencode/commands/`, or `.opencode/agents/`,
   restart OpenCode so the updated controller workflow is loaded.
+- `opsx-plan` no longer nests `/opsx-drive` for OpenCode execution; manual
+  `/opsx-drive <change-id>` remains the supported single-change controller path.

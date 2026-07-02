@@ -6,8 +6,10 @@ agent: build
 Author exactly one phased implementation plan markdown document for this
 repository. The document is both a human planning artifact and machine input:
 `opsx-plan compile` parses it deterministically into a `plan.toml` manifest
-that drives automated change creation (`/opsx-ff`) and implementation
-(`/opsx-drive`). Follow the machine-read convention below exactly — a
+that drives automated change creation (`/opsx-ff`) and implementation. On
+OpenCode-backed plan runs, `opsx-plan` now dispatches implement/review/archive
+workers directly; `/opsx-drive <change-id>` remains the manual single-change
+controller path. Follow the machine-read convention below exactly — a
 mis-stated dependency line becomes a wrong edge in an unattended automation
 DAG.
 

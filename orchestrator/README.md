@@ -1,20 +1,23 @@
 # opsx-plan: plan-level orchestrator
 
-`orchestrator/opsx-plan.py` sits one layer above `/opsx-drive`. It iterates a
-TOML plan manifest of OpenSpec changes (a dependency DAG) and, for each ready
-change, runs a two-stage lifecycle:
+`orchestrator/opsx-plan.py` iterates a TOML plan manifest of OpenSpec changes
+(a dependency DAG) and, for each ready change, runs a staged lifecycle:
 
 1. **create** — if `openspec/changes/<id>` does not exist, invoke your change
    authoring command (e.g. `/opsx-ff ... create a change for {change}`) and
    verify the result independently
-2. **drive** — invoke the client adapter's `/opsx-drive` controller and verify
-   completion from ground truth instead of trusting the drive run's output
+2. **implement / review / archive** — for OpenCode-backed runs, dispatch the
+   fixed `opsx-implementer`, `opsx-reviewer`, and `opsx-archiver` workers as
+   separate one-shot subprocesses, with `opsx-plan` owning phase state,
+   retries, recovery, and verification
+3. **legacy drive** — non-OpenCode adapters may still invoke a single
+   controller command and verify completion from ground truth instead of
+   trusting that run's output
 
 The orchestrator is deliberately a deterministic script, not an agent. All
-LLM judgment stays inside `/opsx-ff` and `/opsx-drive`. This layer only does
-ordering, dispatch, verification, retry policy, and durable bookkeeping —
-work that a script does more reliably and more cheaply than a controller
-model.
+LLM judgment stays inside `/opsx-ff` and the configured implement/review/archive
+workers. This layer only does ordering, dispatch, verification, retry policy,
+and durable bookkeeping.
 
 ## Requirements
 
@@ -83,8 +86,8 @@ python3 .../opsx-plan.py accept plan.toml <change-id>
 
 Changes you created by hand are presumed reviewed and skip this gate. Use
 `run --create-only` to batch create+verify the currently actionable frontier
-without driving anything. Set `review_created = false` for fully unattended
-create→drive (recommended only after `/opsx-ff` output has earned that trust
+without dispatching implementation stages. Set `review_created = false` for
+fully unattended create→implement (recommended only after `/opsx-ff` output has earned that trust
 on a few supervised runs).
 
 ## Usage
@@ -115,9 +118,12 @@ Useful run flags: `--max-changes N`, `--budget-minutes N`,
 `--only <id> [<id>...]`, `--repo <path>`.
 
 Orchestrator state lives at `.opsx-plan/<plan-name>.state.json` in the host
-project; per-attempt drive logs at `.opsx-plan/logs/<change>.attemptN.log`
-(tail them to watch a run live). Add `.opsx-plan/` to the host project's
-`.gitignore`.
+project. For OpenCode-backed direct runs, that file is the authoritative
+durable source for each change's phase, round, latest fix prompt, review
+result, archive result, tracked change files, and last-stage log metadata.
+Per-stage logs live at `.opsx-plan/logs/<change>.<stage>.r<round>.*.log`, and
+compatibility worker-state snapshots used as phase inputs live under
+`.opsx-plan/workers/`. Add `.opsx-plan/` to the host project's `.gitignore`.
 
 ## Plan manifest
 
@@ -135,33 +141,39 @@ orchestrator validates ids and rejects cycles, but it cannot detect a
 
 A change is marked `done` only when all of the following agree:
 
-1. `openspec/changes/<id>` is absent from the worktree
-2. a dated `openspec/changes/archive/YYYY-MM-DD-<id>` directory exists
-3. an `archive(<id>):` commit is reachable from `HEAD`
-4. the adapter's controller state file, if present, says
-   `status=completed`, `phase=done`, `archive.status=passed`
+1. a fresh archive worker run returned machine-readable success for the current
+   change
+2. `openspec/changes/<id>` is absent from the worktree
+3. a dated `openspec/changes/archive/YYYY-MM-DD-<id>` directory exists
+4. an `archive(<id>):` commit is reachable from `HEAD` and matches the stored
+   archive result
 5. all `fast_checks` commands exit 0 (e.g. `openspec validate --all`,
    your fast test suite)
 
-The drive process exit code is never treated as success. This mirrors the
-controller contract's own rule that only fresh archiver evidence may mark a
-change completed.
+The worker process exit code is never treated as success. For OpenCode-backed
+plan runs, repository archive evidence without matching plan-owned archive
+worker evidence is reconciled as failed, not as completed.
 
 On startup the orchestrator reconciles recorded state against the repo:
-changes archived outside the orchestrator are detected and marked done;
-recorded-done changes whose evidence has disappeared are downgraded to
-failed; a stale `running` status from a killed run is recovered to pending.
+recorded-done changes whose evidence has disappeared are downgraded to failed;
+a stale `running` status from a killed run is recovered to pending; and a
+direct OpenCode change resumes from the persisted plan-owned phase instead of a
+nested controller state file.
 
 ## Retry and failure policy
 
-- Re-invoking `/opsx-drive` resumes from the controller's own durable state,
-  so an orchestrator retry continues a blocked run rather than restarting it.
-- The orchestrator reads the schema-v3 state file to decide whether a retry
-  is plausible: it retries after `archive_failed` (unless triage says
-  `retry_outlook=same_failure`) and after invalid subagent output, but never
-  after `max_rounds_reached` or `no_progress` — those need an operator.
+- For OpenCode-backed runs, `opsx-plan` owns the implement-review-archive loop
+  directly. It persists the active phase, round, latest fix prompt,
+  no-progress streak, review verdict, archive result, and tracked log path in
+  the plan state file and resumes from that state on the next run.
+- Review failures loop back to implement inside `opsx-plan`; the script
+  advances rounds itself and stops when `max_rounds` or `no_progress_limit` is
+  reached.
+- Manual `/opsx-drive <change-id>` remains available for single-change control,
+  but `opsx-plan` no longer nests `/opsx-drive` for OpenCode execution.
 - A change that archives successfully but then fails `fast_checks` is marked
-  failed without retry (re-driving an archived change cannot fix the repo).
+  failed without retry (re-archiving an already archived change cannot fix the
+  repo).
 - A failed change blocks its dependents; independent branches keep running.
 - `require_clean_tracked` (default true) refuses to start a new change while
   tracked files are dirty, so failures cannot bleed across changes.
@@ -169,11 +181,12 @@ failed; a stale `running` status from a killed run is recovered to pending.
 
 ## Adapter invocation
 
-Defaults (override with `invoke` / `state_file` in `[plan]`):
+Defaults (override with `invoke` / `state_file` / `implement_invoke` /
+`review_invoke` / `archive_invoke` in `[plan]`):
 
-| adapter | invoke | state file |
+| adapter | invocation | state file |
 |---|---|---|
-| `opencode` | `opencode run "/opsx-drive {change}"` | `.opencode/opsx-controller/{change}.json` |
+| `opencode` | `opencode run --agent opsx-implementer`, `opencode run --agent opsx-reviewer`, `opencode run --agent opsx-archiver` for plan runs; `opencode run "/opsx-drive {change}"` remains the manual single-change controller entrypoint | `.opencode/opsx-controller/{change}.json` for manual `/opsx-drive`; `.opsx-plan/<plan>.state.json` is authoritative for direct plan execution |
 | `claude-code` | `claude -p "/opsx-drive {change}"` | `.claude/opsx-controller/{change}.json` |
 | `codex-cli` | `codex exec "$opsx-drive {change}"` | `.opsx-controller/{change}.json` |
 
@@ -184,7 +197,7 @@ pre-granted (settings or `--permission-mode`), and Codex needs
 
 ## Execution model
 
-Serial by design: two drive runs mutating one worktree is a known failure
+Serial by design: two mutating plan-stage runs in one worktree is a known failure
 mode, and the archive commit per change keeps each step independently
 revertable. If you later want parallel independent branches, run them in
 separate `git worktree` checkouts with a merge step gated on `fast_checks` —
