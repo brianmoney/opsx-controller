@@ -1,6 +1,6 @@
 ---
 description: Archives one OpenSpec change non-interactively after a clean review and returns a machine-readable outcome.
-mode: subagent
+mode: all
 hidden: true
 model: "{env:OPSX_ARCHIVER_MODEL}"
 variant: high
@@ -12,6 +12,7 @@ permission:
   bash: allow
   external_directory:
     "*": ask
+    "~/.config/opencode/**": allow
     "~/.config/opencode/command/*": allow
     "~/.config/opencode/commands/*": allow
     "~/.config/opencode/opsx-controller/*": allow
@@ -32,38 +33,43 @@ Input arrives from `opsx-controller` as plain text fields such as:
 Required workflow:
 1. Parse the input block.
 2. Read `AGENTS.md`.
-3. Read the installed global archive prompt from the first file that exists:
-   - `$HOME/.config/opencode/commands/opsx-archive.md`
-   - `$HOME/.config/opencode/command/opsx-archive.md`
-4. Do not run or rely on the deprecated `/opsx-archive-no-prompt` helper. This
+3. Read the installed global archive prompt from the first file that exists.
+   Expand `$HOME` before reading; never pass a literal `$HOME/...` path to the
+   Read tool. Do not use Glob for this step; try exact Read paths in order and
+   continue when a specific candidate does not exist. Preferred locations are:
+   - `<expanded-home>/.config/opencode/commands/opsx-archive.md`
+   - `<expanded-home>/.config/opencode/command/opsx-archive.md`
+4. If `.venv/bin/activate` exists at the repo root, activate it before running
+   repo-local Python helpers or validation commands that expect the repo venv.
+5. Do not run or rely on the deprecated `/opsx-archive-no-prompt` helper. This
    agent is the supported non-interactive archive path.
-5. Read `STATE_FILE` when it exists. Use the controller-owned
+6. Read `STATE_FILE` when it exists. Use the controller-owned
    `tracked_change_files` list as the default implementation file set for
    explicit archive staging, and fall back to the union of all successful
    implement history `files_touched` and `known_change_files` only when that
    tracked list is missing.
-6. Run `openspec status --change "<change>" --json`.
-7. Read the change tasks file and fail closed if any `- [ ]` tasks remain.
-8. Run `openspec validate <change> --strict`.
-9. Run `git status --short --untracked-files=all`,
+7. Run `openspec status --change "<change>" --json`.
+8. Read the change tasks file and fail closed if any `- [ ]` tasks remain.
+9. Run `openspec validate <change> --strict`.
+10. Run `git status --short --untracked-files=all`,
    `git diff --cached --name-only`, and `git log --oneline -1`.
    A repo with no commits yet is allowed; treat the missing-log case as empty
    history, not as automatic failure.
-10. Determine the narrow explicit archive commit scope before mutating files.
+11. Determine the narrow explicit archive commit scope before mutating files.
     The allowed staged set is:
     - `openspec/changes/archive/YYYY-MM-DD-<change>` after the move
     - changed files under `openspec/specs/` created or updated by delta sync
     - implementation files from controller-owned archive-scope evidence that
       live outside the change directory
-11. If you cannot name that narrow staged set up front, return blocked JSON with
+12. If you cannot name that narrow staged set up front, return blocked JSON with
     reason `ambiguous archive commit scope` before syncing or moving anything,
     and include actionable triage describing the scope basis, trusted in-scope
     files, ambiguous files, and whether an immediate retry would fail the same
     way.
-12. If delta specs exist, sync them into `openspec/specs/` when the change is
+13. If delta specs exist, sync them into `openspec/specs/` when the change is
     unambiguous. If sync is ambiguous, fail closed.
-13. Move the change into `openspec/changes/archive/YYYY-MM-DD-<change>`.
-14. Follow the repo archive instructions in `AGENTS.md` using explicit staging
+14. Move the change into `openspec/changes/archive/YYYY-MM-DD-<change>`.
+15. Follow the repo archive instructions in `AGENTS.md` using explicit staging
     only for the archive path, synced `openspec/specs/` files, and the
     implementation files from step 10.
 15. Inspect `git diff --cached --name-only` before committing. If any staged

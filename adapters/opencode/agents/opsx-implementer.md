@@ -1,6 +1,6 @@
 ---
 description: Implements one OpenSpec controller round using the global /opsx-apply guidance and returns machine-readable progress.
-mode: subagent
+mode: all
 hidden: true
 model: "{env:OPSX_IMPLEMENTER_MODEL}"
 variant: high
@@ -35,26 +35,31 @@ Input arrives from `opsx-controller` as plain text fields such as:
 Required workflow:
 1. Parse the input block.
 2. Read `AGENTS.md`.
-3. Read the installed global apply prompt from the first file that exists:
-   - `$HOME/.config/opencode/commands/opsx-apply.md`
-   - `$HOME/.config/opencode/command/opsx-apply.md`
-4. Run `openspec status --change "<change>" --json` and
+3. Read the installed global apply prompt from the first file that exists.
+   Expand `$HOME` before reading; never pass a literal `$HOME/...` path to the
+   Read tool. Do not use Glob for this step; try exact Read paths in order and
+   continue when a specific candidate does not exist. Preferred locations are:
+   - `<expanded-home>/.config/opencode/commands/opsx-apply.md`
+   - `<expanded-home>/.config/opencode/command/opsx-apply.md`
+4. If `.venv/bin/activate` exists at the repo root, activate it before running
+   repo-local Python helpers, `pytest`, `ruff`, or `bash scripts/quality-gate.sh`.
+5. Run `openspec status --change "<change>" --json` and
    `openspec instructions apply --change "<change>" --json`.
-5. Read `STATE_FILE` when it exists so you can trust the controller-owned cache
+6. Read `STATE_FILE` when it exists so you can trust the controller-owned cache
    contract and current round history.
-6. If `CONTEXT_CACHE_VALID=true` and `CONTEXT_CACHE_STATUS=ready`, use
+7. If `CONTEXT_CACHE_VALID=true` and `CONTEXT_CACHE_STATUS=ready`, use
    `CONTEXT_CACHE_SUMMARY` plus the persisted `context_cache` from `STATE_FILE`
    as stable background context. Do not reread every `contextFiles` artifact by
    default in that case.
-7. Always reread the tasks file for the active change, plus the current fix or
+8. Always reread the tasks file for the active change, plus the current fix or
    implementation scope files needed for this round. If `LATEST_FIX_PROMPT` is
    non-empty, treat it as the highest-priority fix scope for this round.
-8. Only fall back to rereading all `contextFiles` when the cache is missing,
+9. Only fall back to rereading all `contextFiles` when the cache is missing,
    stale, inconsistent with the state file, or the current round reveals a
    design question that cannot be resolved from the cached background summary.
-9. Implement the next required work for this change.
-10. Keep edits minimal and scoped to the change.
-11. Mark completed tasks in the change task file immediately after finishing
+10. Implement the next required work for this change.
+11. Keep edits minimal and scoped to the change.
+12. Mark completed tasks in the change task file immediately after finishing
     them.
 
 Guardrails:

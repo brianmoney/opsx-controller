@@ -72,6 +72,7 @@ SKIPPED = "skipped"
 
 ARCHIVE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-")
 TASK_RE = re.compile(r"^- \[(?P<done>[ xX])\]\s+")
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 _current_proc: subprocess.Popen | None = None
 
@@ -479,19 +480,21 @@ def record_stage_log(
 def parse_stage_json(log_path: Path) -> tuple[dict | None, str]:
     lines: list[str] = []
     for raw in log_path.read_text(encoding="utf-8").splitlines():
-        stripped = raw.strip()
+        stripped = ANSI_ESCAPE_RE.sub("", raw).strip()
         if not stripped or stripped.startswith("# "):
             continue
         lines.append(stripped)
-    if len(lines) != 1:
-        return None, f"expected exactly one JSON line, got {len(lines)}"
-    try:
-        payload = json.loads(lines[0])
-    except json.JSONDecodeError as exc:
-        return None, f"invalid JSON output: {exc.msg}"
-    if not isinstance(payload, dict):
-        return None, "stage output was not a JSON object"
-    return payload, ""
+    for candidate in reversed(lines):
+        if not (candidate.startswith("{") and candidate.endswith("}")):
+            continue
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        return payload, ""
+    return None, f"expected a final JSON object line, got {len(lines)} non-comment lines"
 
 
 def append_history(state: dict, cid: str, entry: dict) -> None:

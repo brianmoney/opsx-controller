@@ -320,6 +320,46 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
         self.assertEqual(record["status"], self.opsx_plan.FAILED)
         self.assertIn("output invalid", record["reason"])
 
+    def test_transcript_log_with_final_json_line_is_accepted(self) -> None:
+        calls, _ = self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "lines": "\x1b[0mnoise\n$ command\n{\"status\":\"implemented\",\"change\":\"add-example\",\"round\":1,\"progress_made\":false,\"completed_tasks\":[],\"remaining_tasks\":[],\"task_counts\":{\"complete\":2,\"total\":2},\"files_touched\":[],\"known_change_files\":[],\"summary\":\"implementation complete\"}\n",
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 1,
+                        "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "review passed",
+                        "fix_prompt": "",
+                        "next_phase": "archive",
+                    },
+                },
+                {
+                    "stage": "archive",
+                    "archive_repo": True,
+                    "result": {
+                        "status": "archived",
+                        "change": self.cid,
+                        "archive_path": "",
+                        "spec_sync_status": "no-delta",
+                        "commit": "",
+                        "summary": "archive succeeded",
+                    },
+                },
+            ]
+        )
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, self.opsx_plan.DONE)
+        self.assertEqual([stage for stage, _, _ in calls], ["implement", "review", "archive"])
+
     def test_reconcile_recovers_interrupted_review_from_plan_state(self) -> None:
         record = self.opsx_plan.rec(self.state, self.cid)
         record["status"] = self.opsx_plan.RUNNING
@@ -669,6 +709,55 @@ class OpsxDriveCompatibilityTests(unittest.TestCase):
             self.opsx_plan.is_direct_opencode(cfg),
             "default OpenCode config must route through direct workers, not /opsx-drive",
         )
+
+
+class OpenCodeAgentModeTests(unittest.TestCase):
+    AGENT_DIR = Path(__file__).resolve().parents[2] / "adapters" / "opencode" / "agents"
+
+    def test_opencode_worker_agents_are_runnable_via_run_agent(self) -> None:
+        for name in (
+            "opsx-controller.md",
+            "opsx-implementer.md",
+            "opsx-reviewer.md",
+            "opsx-archiver.md",
+        ):
+            text = (self.AGENT_DIR / name).read_text(encoding="utf-8")
+            self.assertIn(
+                "mode: all",
+                text,
+                f"{name} must remain runnable both as a direct --agent target and as a subagent",
+            )
+
+    def test_opencode_worker_agents_expand_home_and_activate_repo_venv(self) -> None:
+        for name in (
+            "opsx-implementer.md",
+            "opsx-reviewer.md",
+            "opsx-archiver.md",
+        ):
+            text = (self.AGENT_DIR / name).read_text(encoding="utf-8")
+            self.assertIn(
+                "Expand `$HOME` before reading; never pass a literal `$HOME/...` path",
+                text,
+                f"{name} must forbid literal $HOME Read paths",
+            )
+            self.assertIn(
+                "If `.venv/bin/activate` exists at the repo root, activate it",
+                text,
+                f"{name} must remind the worker to activate the repo venv when present",
+            )
+            self.assertIn(
+                "Do not use Glob for this step; try exact Read paths",
+                text,
+                f"{name} must avoid broad globbing for global prompt discovery",
+            )
+
+        for name in ("opsx-reviewer.md", "opsx-archiver.md"):
+            text = (self.AGENT_DIR / name).read_text(encoding="utf-8")
+            self.assertIn(
+                '"~/.config/opencode/**": allow',
+                text,
+                f"{name} must allow direct reads under ~/.config/opencode",
+            )
 
 
 if __name__ == "__main__":

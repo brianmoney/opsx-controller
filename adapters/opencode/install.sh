@@ -1,14 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../../lib/install-common.sh
+source "$SCRIPT_DIR/../../lib/install-common.sh"
+
 usage() {
   printf '%s\n' \
     'Usage:' \
     '  bash adapters/opencode/install.sh --global' \
-    '  bash adapters/opencode/install.sh --project /path/to/project'
+    '  bash adapters/opencode/install.sh --project /path/to/project' \
+    '  bash adapters/opencode/install.sh --global --verify' \
+    '  bash adapters/opencode/install.sh --project /path/to/project --verify'
 }
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Parse optional flags
+VERIFY=false
+args=()
+for arg in "$@"; do
+  case "$arg" in
+    --verify)
+      VERIFY=true
+      ;;
+    *)
+      args+=("$arg")
+      ;;
+  esac
+done
+set -- "${args[@]}"
 
 install_commands() {
   local dest_dir="$1"
@@ -27,40 +48,6 @@ install_agents() {
   for file in "$ROOT_DIR"/adapters/opencode/agents/*.md; do
     install_agent "$file" "$dest_dir/$(basename "$file")"
   done
-}
-
-require_model_envs() {
-  require_model_env OPSX_CONTROLLER_MODEL
-  require_model_env OPSX_IMPLEMENTER_MODEL
-  require_model_env OPSX_REVIEWER_MODEL
-  require_model_env OPSX_ARCHIVER_MODEL
-}
-
-require_model_env() {
-  local name="$1"
-  if [[ -z "${!name:-}" ]]; then
-    printf 'Required model environment variable is not set: %s\n' "$name" >&2
-    printf 'Source your opsx-controller .env before installing the OpenCode adapter.\n' >&2
-    exit 1
-  fi
-}
-
-install_agent() {
-  local src="$1"
-  local dest="$2"
-  local tmp
-  tmp="$(mktemp)"
-
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    line="${line//\{env:OPSX_CONTROLLER_MODEL\}/${OPSX_CONTROLLER_MODEL}}"
-    line="${line//\{env:OPSX_IMPLEMENTER_MODEL\}/${OPSX_IMPLEMENTER_MODEL}}"
-    line="${line//\{env:OPSX_REVIEWER_MODEL\}/${OPSX_REVIEWER_MODEL}}"
-    line="${line//\{env:OPSX_ARCHIVER_MODEL\}/${OPSX_ARCHIVER_MODEL}}"
-    printf '%s\n' "$line"
-  done <"$src" >"$tmp"
-
-  install -m 0644 "$tmp" "$dest"
-  rm -f "$tmp"
 }
 
 install_support_readme() {
@@ -108,6 +95,17 @@ ensure_project_config() {
     "$project_dir/.opencode/opencode.json"
 }
 
+do_verify() {
+  if ! $VERIFY; then
+    return 0
+  fi
+  if verify_command_available opencode; then
+    printf '%s\n' "opencode CLI detected. Restart OpenCode to reload commands and agents."
+  else
+    print_verify_notice opencode
+  fi
+}
+
 install_global() {
   require_model_envs
 
@@ -121,6 +119,7 @@ install_global() {
     "Installed agents to $config_root/agents" \
     "Installed support files to $config_root/opsx-controller" \
     "Installed opsx-plan to $HOME/.local/bin/opsx-plan"
+  do_verify
 }
 
 install_project() {
@@ -143,6 +142,7 @@ install_project() {
     "Installed agents to $project_dir/.opencode/agents" \
     "Installed support files to $project_dir/.opencode/opsx-controller" \
     "Updated $project_dir/.opencode/.gitignore"
+  do_verify
 }
 
 if [[ $# -eq 0 ]]; then
@@ -152,14 +152,14 @@ fi
 
 case "$1" in
   --global)
-    if [[ $# -ne 1 ]]; then
+    if [[ $# -lt 1 || $# -gt 2 ]]; then
       usage
       exit 1
     fi
     install_global
     ;;
   --project)
-    if [[ $# -ne 2 ]]; then
+    if [[ $# -lt 2 || $# -gt 3 ]]; then
       usage
       exit 1
     fi
@@ -175,3 +175,5 @@ case "$1" in
 esac
 
 printf '%s\n' 'Restart OpenCode after install so it reloads commands and agents.'
+
+

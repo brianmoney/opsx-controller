@@ -1,14 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../../lib/install-common.sh
+source "$SCRIPT_DIR/../../lib/install-common.sh"
+
 usage() {
   printf '%s\n' \
     'Usage:' \
     '  bash adapters/claude-code/install.sh --global' \
-    '  bash adapters/claude-code/install.sh --project /path/to/project'
+    '  bash adapters/claude-code/install.sh --project /path/to/project' \
+    '  bash adapters/claude-code/install.sh --global --verify' \
+    '  bash adapters/claude-code/install.sh --project /path/to/project --verify'
 }
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+VERIFY=false
+
+# Parse optional flags
+for arg in "$@"; do
+  case "$arg" in
+    --verify)
+      VERIFY=true
+      shift
+      ;;
+  esac
+done
 
 install_skills() {
   local dest_root="$1"
@@ -53,6 +70,17 @@ ensure_project_gitignore() {
   fi
 }
 
+do_verify() {
+  if ! $VERIFY; then
+    return 0
+  fi
+  if verify_command_available claude; then
+    printf '%s\n' "claude CLI detected. Restart Claude Code to reload skills and agents."
+  else
+    print_verify_notice claude
+  fi
+}
+
 install_global() {
   local config_root="$HOME/.claude"
   install_skills "$config_root/skills"
@@ -62,6 +90,7 @@ install_global() {
     "Installed skills to $config_root/skills" \
     "Installed agents to $config_root/agents" \
     "Installed support files to $config_root/opsx-controller"
+  do_verify
 }
 
 install_project() {
@@ -81,6 +110,7 @@ install_project() {
     "Installed agents to $project_dir/.claude/agents" \
     "Installed support files to $project_dir/.claude/opsx-controller" \
     "Updated $project_dir/.claude/.gitignore"
+  do_verify
 }
 
 if [[ $# -eq 0 ]]; then
@@ -90,14 +120,14 @@ fi
 
 case "$1" in
   --global)
-    if [[ $# -ne 1 ]]; then
+    if [[ $# -lt 1 || $# -gt 2 ]]; then
       usage
       exit 1
     fi
     install_global
     ;;
   --project)
-    if [[ $# -ne 2 ]]; then
+    if [[ $# -lt 2 || $# -gt 3 ]]; then
       usage
       exit 1
     fi

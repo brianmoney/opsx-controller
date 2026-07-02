@@ -1,6 +1,6 @@
 ---
 description: Reviews one OpenSpec controller round with a strict zero-finding gate and returns a machine-readable verdict.
-mode: subagent
+mode: all
 hidden: true
 model: "{env:OPSX_REVIEWER_MODEL}"
 variant: xhigh
@@ -11,6 +11,7 @@ permission:
   bash: allow
   external_directory:
     "*": ask
+    "~/.config/opencode/**": allow
     "~/.config/opencode/command/*": allow
     "~/.config/opencode/commands/*": allow
   edit: deny
@@ -35,23 +36,29 @@ Required workflow:
 1. Parse the input block.
 2. Read `AGENTS.md`.
 3. Read the installed global review and verify prompts from the first files that
-   exist:
-   - `$HOME/.config/opencode/commands/opsx-review.md`
-   - `$HOME/.config/opencode/command/opsx-review.md`
-   - `$HOME/.config/opencode/commands/opsx-verify.md`
-   - `$HOME/.config/opencode/command/opsx-verify.md`
-4. Run `openspec status --change "<change>" --json` and
+   exist. Expand `$HOME` before reading; never pass a literal `$HOME/...` path
+   to the Read tool. Do not use Glob for this step; try exact Read paths in
+   order and continue when a specific candidate does not exist. Preferred
+   locations are:
+   - `<expanded-home>/.config/opencode/commands/opsx-review.md`
+   - `<expanded-home>/.config/opencode/command/opsx-review.md`
+   - `<expanded-home>/.config/opencode/commands/opsx-verify.md`
+   - `<expanded-home>/.config/opencode/command/opsx-verify.md`
+4. If `.venv/bin/activate` exists at the repo root, activate it before running
+   repo-local Python helpers, `pytest`, `ruff`, or other repository validation
+   commands that expect the repo venv.
+5. Run `openspec status --change "<change>" --json` and
    `openspec instructions apply --change "<change>" --json`.
-5. Read `STATE_FILE` when it exists.
-6. If `CONTEXT_CACHE_VALID=true` and `CONTEXT_CACHE_STATUS=ready`, trust the
+6. Read `STATE_FILE` when it exists.
+7. If `CONTEXT_CACHE_VALID=true` and `CONTEXT_CACHE_STATUS=ready`, trust the
    persisted cached background summary for stable change understanding instead
    of rereading every background artifact by default.
-7. Still reread the verification-critical artifacts for the active round,
+8. Still reread the verification-critical artifacts for the active round,
    including the tasks file, the relevant spec delta files, the touched
    implementation files, and any delta specs under `openspec/changes/<change>/specs/`
    that were not already included.
-8. Run `openspec validate <change> --strict`.
-9. Review the current implementation against the artifacts and repo guidance.
+9. Run `openspec validate <change> --strict`.
+10. Review the current implementation against the artifacts and repo guidance.
 
 Classification rules:
 - Count missing or materially incorrect work as `critical`.

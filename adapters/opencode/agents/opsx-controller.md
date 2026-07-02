@@ -1,6 +1,6 @@
 ---
 description: Drives one OpenSpec change through implement, review, and archive rounds with durable state.
-mode: subagent
+mode: all
 hidden: true
 model: "{env:OPSX_CONTROLLER_MODEL}"
 variant: xhigh

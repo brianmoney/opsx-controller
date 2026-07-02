@@ -1,39 +1,60 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../../lib/install-common.sh
+source "$SCRIPT_DIR/../../lib/install-common.sh"
+
 usage() {
   printf '%s\n' \
     'Usage:' \
     '  bash install.sh --global' \
     '  bash install.sh --project <path>' \
-    '  bash install.sh --plugin'
+    '  bash install.sh --plugin' \
+    '  bash install.sh --global --verify' \
+    '  bash install.sh --project <path> --verify'
 }
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+VERIFY=false
+
+# Parse optional flags
+for arg in "$@"; do
+  case "$arg" in
+    --verify)
+      VERIFY=true
+      shift
+      ;;
+  esac
+done
 
 install_skill() {
-  local dest_base="$1"
+  local src_dir="$1"
+  local dest_base="$2"
   local skill_dir="$dest_base/skills/opsx-drive"
   mkdir -p "$skill_dir"
-  install -m 0644 "$SCRIPT_DIR/skills/opsx-drive/SKILL.md" "$skill_dir/SKILL.md"
+  install -m 0644 "$src_dir/skills/opsx-drive/SKILL.md" "$skill_dir/SKILL.md"
   mkdir -p "$skill_dir/agents"
-  install -m 0644 "$SCRIPT_DIR/skills/opsx-drive/agents/openai.yaml" "$skill_dir/agents/openai.yaml"
+  install -m 0644 "$src_dir/skills/opsx-drive/agents/openai.yaml" "$skill_dir/agents/openai.yaml"
 }
 
 install_agents() {
-  local dest_dir="$1"
+  local src_dir="$1"
+  local dest_dir="$2"
   mkdir -p "$dest_dir"
   local file
-  for file in "$SCRIPT_DIR/agents/"*.toml; do
+  for file in "$src_dir/agents/"*.toml; do
+    [[ -e "$file" ]] || continue
     install -m 0644 "$file" "$dest_dir/$(basename "$file")"
   done
 }
 
 install_support_readme() {
-  local dest_dir="$1"
+  local src_dir="$1"
+  local dest_dir="$2"
   mkdir -p "$dest_dir"
   install -m 0644 \
-    "$SCRIPT_DIR/support/opsx-controller-state-README.md" \
+    "$src_dir/support/opsx-controller-state-README.md" \
     "$dest_dir/README.md"
 }
 
@@ -51,16 +72,28 @@ ensure_project_gitignore() {
   fi
 }
 
+do_verify() {
+  if ! $VERIFY; then
+    return 0
+  fi
+  if verify_command_available codex; then
+    printf '%s\n' "codex CLI detected. Restart Codex CLI to reload skills and agents."
+  else
+    print_verify_notice codex
+  fi
+}
+
 install_global() {
   local skills_root="$HOME/.agents"
   local agents_root="$HOME/.codex"
-  install_skill "$skills_root"
-  install_agents "$agents_root/agents"
-  install_support_readme "$agents_root/opsx-controller"
+  install_skill "$SCRIPT_DIR" "$skills_root"
+  install_agents "$SCRIPT_DIR" "$agents_root/agents"
+  install_support_readme "$SCRIPT_DIR" "$agents_root/opsx-controller"
   printf '%s\n' \
     "Installed skill to $skills_root/skills/opsx-drive/" \
     "Installed agents to $agents_root/agents/" \
     "Installed support files to $agents_root/opsx-controller/"
+  do_verify
 }
 
 install_project() {
@@ -72,9 +105,9 @@ install_project() {
 
   local skills_root="$project_dir/.agents"
   local agents_root="$project_dir/.codex"
-  install_skill "$skills_root"
-  install_agents "$agents_root/agents"
-  install_support_readme "$agents_root/opsx-controller"
+  install_skill "$SCRIPT_DIR" "$skills_root"
+  install_agents "$SCRIPT_DIR" "$agents_root/agents"
+  install_support_readme "$SCRIPT_DIR" "$agents_root/opsx-controller"
   ensure_project_gitignore "$project_dir"
 
   printf '%s\n' \
@@ -82,6 +115,7 @@ install_project() {
     "Installed agents to $agents_root/agents/" \
     "Installed support files to $agents_root/opsx-controller/" \
     "Updated $agents_root/.gitignore"
+  do_verify
 }
 
 install_plugin() {
@@ -94,6 +128,7 @@ install_plugin() {
   install -m 0644 "$SCRIPT_DIR/skills/opsx-drive/agents/openai.yaml" "$plugin_dir/skills/opsx-drive/agents/openai.yaml"
   local file
   for file in "$SCRIPT_DIR/agents/"*.toml; do
+    [[ -e "$file" ]] || continue
     install -m 0644 "$file" "$plugin_dir/agents/$(basename "$file")"
   done
 
@@ -111,14 +146,14 @@ fi
 
 case "$1" in
   --global)
-    if [[ $# -ne 1 ]]; then
+    if [[ $# -lt 1 || $# -gt 2 ]]; then
       usage
       exit 1
     fi
     install_global
     ;;
   --project)
-    if [[ $# -ne 2 ]]; then
+    if [[ $# -lt 2 || $# -gt 3 ]]; then
       usage
       exit 1
     fi
