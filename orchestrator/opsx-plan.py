@@ -428,6 +428,13 @@ def persist_direct_state(repo: Path, cfg: dict, state: dict, cid: str) -> None:
     save_worker_state(repo, cfg, state, cid)
 
 
+def sync_direct_worker_state(repo: Path, cfg: dict, state: dict) -> None:
+    if not is_direct_opencode(cfg):
+        return
+    for cid in cfg["order"]:
+        save_worker_state(repo, cfg, state, cid)
+
+
 def single_line(value: str) -> str:
     compact = " ".join((value or "").split())
     return compact if compact else "none"
@@ -508,6 +515,13 @@ def reachable_commit(repo: Path, commit: str) -> bool:
     return res.returncode == 0
 
 
+def resolve_commit(repo: Path, commit: str) -> str:
+    if not commit:
+        return ""
+    res = git(repo, "rev-parse", "--verify", commit)
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
 def verify_direct_archive_done(repo: Path, cid: str, record: dict) -> tuple[bool, str]:
     archive = record["archive"]
     if archive.get("status") != "passed":
@@ -533,7 +547,10 @@ def verify_direct_archive_done(repo: Path, cid: str, record: dict) -> tuple[bool
         return False, "archive worker did not record archive commit"
     if not reachable_commit(repo, commit):
         return False, f"archive commit not reachable from HEAD: {commit}"
-    if find_archive_commit(repo, cid) != commit:
+    resolved_commit = resolve_commit(repo, commit)
+    if not resolved_commit:
+        return False, f"archive commit could not be resolved: {commit}"
+    if find_archive_commit(repo, cid) != resolved_commit:
         return False, "archive commit does not match latest archive(<change>) commit"
     return True, ""
 
@@ -1223,6 +1240,9 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
     """Make recorded state agree with repository reality."""
     for cid in cfg["order"]:
         r = rec(state, cid)
+        archived_on_disk = (
+            not change_dir(repo, cid).exists() and find_archive_dir(repo, cid) is not None
+        )
         if is_direct_opencode(cfg):
             r["max_rounds"] = cfg["max_rounds"]
         if r["status"] == RUNNING:  # stale from a killed run
@@ -1236,6 +1256,7 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
             r["status"] == FAILED
             and r.get("create_attempts", 0) == 0
             and not change_authored(repo, cid)
+            and not archived_on_disk
             and cfg["changes"][cid]["create_invoke"]
         ):
             set_status(state, cid, PENDING, "create_invoke now configured; will retry")
@@ -1243,9 +1264,26 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
             continue
         if r["status"] != DONE:
             if is_direct_opencode(cfg):
-                archived_on_disk = (
-                    not change_dir(repo, cid).exists() and find_archive_dir(repo, cid) is not None
-                )
+                if archived_on_disk and r["archive"].get("path") and r["archive"].get("commit"):
+                    archive_status = r["archive"].get("status")
+                    archive_reason = r["archive"].get("reason", "")
+                    if archive_status != "passed":
+                        r["archive"]["status"] = "passed"
+                    ok, why = verify_direct_archive_done(repo, cid, r)
+                    if ok:
+                        r["archive"]["status"] = "passed"
+                        r["archive"]["reason"] = ""
+                        r["phase"] = "done"
+                        set_status(
+                            state,
+                            cid,
+                            DONE,
+                            "verified from plan state + repository evidence",
+                        )
+                        log(f"reconcile: {cid} already archived; marked done")
+                        continue
+                    r["archive"]["status"] = archive_status
+                    r["archive"]["reason"] = archive_reason
                 if r["archive"].get("status") == "passed":
                     ok, why = verify_direct_archive_done(repo, cid, r)
                     if ok:
@@ -1325,6 +1363,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     reconcile(repo, cfg, state)
     save_state(repo, cfg["name"], state)
+    sync_direct_worker_state(repo, cfg, state)
 
     if args.dry_run:
         return cmd_status_inner(cfg, state, header="dry run: planned order")
@@ -1508,6 +1547,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     state = load_state(repo, cfg["name"])
     reconcile(repo, cfg, state)
     save_state(repo, cfg["name"], state)
+    sync_direct_worker_state(repo, cfg, state)
     return cmd_status_inner(cfg, state, header=f"plan: {cfg['name']}")
 
 
