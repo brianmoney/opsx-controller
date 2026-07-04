@@ -92,6 +92,30 @@ on a few supervised runs).
 
 ## Usage
 
+### Single-change execution
+
+For a single already-authored OpenSpec change, use `opsx-run` to skip the plan
+manifest:
+
+```bash
+# Direct entrypoint (requires the orchestrator installed at ~/.local/bin)
+opsx-run add-gardening-suggestions
+
+# Equivalent subcommand under opsx-plan
+python3 /path/to/opsx-controller/orchestrator/opsx-plan.py run-one add-gardening-suggestions
+```
+
+`opsx-run <change-id>` synthesizes a one-change OpenCode configuration with the
+same defaults as plan-level execution (`max_rounds=5`, `no_progress_limit=2`,
+`require_clean_tracked=true`) and runs the direct implement-review-archive loop.
+The change must already exist at `openspec/changes/<change-id>/` with
+`proposal.md` and `tasks.md` authored — `opsx-run` does not create changes.
+
+Durable state is persisted to `.opsx-plan/run-<change-id>.state.json`, and stage
+logs go to `.opsx-plan/logs/`. Interrupted runs can be resumed by re-invoking
+the same `opsx-run <change-id>` command.
+
+### Plan-level execution
 
 From the host project root:
 

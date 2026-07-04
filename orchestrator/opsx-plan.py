@@ -176,6 +176,67 @@ def load_plan(path: Path) -> dict:
     return cfg
 
 
+def build_single_change_config(repo: Path, change_id: str) -> dict:
+    """Build a minimal one-change OpenCode direct-execution config.
+
+    Synthesizes a config dict that mirrors the output of ``load_plan`` for
+    exactly one already-authored OpenSpec change, without requiring a TOML
+    manifest.  Fails early when the change dir is missing or unauthored.
+    """
+    cdir = change_dir(repo, change_id)
+    if not cdir.is_dir():
+        raise PlanError(f"openspec/changes/{change_id} does not exist")
+    if not change_authored(repo, change_id):
+        raise PlanError(
+            f"openspec/changes/{change_id} is missing required artifacts "
+            f"({', '.join(AUTHORED_ARTIFACTS)})"
+        )
+
+    defaults = ADAPTER_DEFAULTS["opencode"]
+    plan_name = f"run-{change_id}"
+
+    cfg = {
+        "name": plan_name,
+        "adapter": "opencode",
+        "invoke": defaults["invoke"],
+        "state_file": defaults["state_file"],
+        "implement_invoke": defaults["implement_invoke"],
+        "review_invoke": defaults["review_invoke"],
+        "archive_invoke": defaults["archive_invoke"],
+        "timeout_minutes": 90,
+        "max_attempts": 2,
+        "max_rounds": 5,
+        "no_progress_limit": 2,
+        "fast_checks": [],
+        "check_timeout_minutes": 15,
+        "require_clean_tracked": True,
+        "plan_doc": "",
+        "create_invoke": "",
+        "create_timeout_minutes": 30,
+        "create_max_attempts": 2,
+        "review_created": False,
+        "created_check": "openspec validate {change} --strict",
+    }
+
+    by_id = {
+        change_id: {
+            "id": change_id,
+            "phase": None,
+            "depends_on": [],
+            "pause_before": False,
+            "enabled": True,
+            "timeout_minutes": 90,
+            "max_attempts": 2,
+            "create_invoke": "",
+            "create_max_attempts": 2,
+        }
+    }
+
+    cfg["order"] = [change_id]
+    cfg["changes"] = by_id
+    return cfg
+
+
 def topo_sort(by_id: dict[str, dict]) -> list[str]:
     """Kahn's algorithm; deterministic (manifest order breaks ties)."""
     ids = list(by_id)
@@ -1631,7 +1692,104 @@ def cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_run_one(args: argparse.Namespace) -> int:
+    """Run exactly one authored OpenSpec change through the direct OpenCode loop."""
+    repo = Path(args.repo).resolve()
+    change_id = args.change
+
+    cdir = change_dir(repo, change_id)
+    if not cdir.is_dir():
+        print(f"error: openspec/changes/{change_id} does not exist", file=sys.stderr)
+        return 2
+    if not change_authored(repo, change_id):
+        print(
+            f"error: openspec/changes/{change_id} is missing required artifacts "
+            f"({', '.join(AUTHORED_ARTIFACTS)})",
+            file=sys.stderr,
+        )
+        return 2
+
+    cfg = build_single_change_config(repo, change_id)
+    state = load_state(repo, cfg["name"])
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    if cfg["require_clean_tracked"] and not tracked_tree_clean(repo):
+        print(
+            "error: tracked worktree is dirty; commit/stash then re-run",
+            file=sys.stderr,
+        )
+        return 2
+
+    reconcile(repo, cfg, state)
+    save_state(repo, cfg["name"], state)
+    sync_direct_worker_state(repo, cfg, state)
+
+    r = rec(state, change_id)
+    if r["status"] == DONE:
+        log(f"{change_id} is already done")
+        return 0
+
+    log(f"=== {change_id} direct OpenCode execution (round {r['round']}) ===")
+    result = run_direct_change(repo, cfg, state, change_id)
+
+    if result == DONE:
+        log(f"  done: {change_id}")
+    elif result == "spawn_error":
+        failed_stage = r.get("phase")
+        failed_invoke = (
+            cfg.get(f"{failed_stage}_invoke", "")
+            if failed_stage in {"implement", "review", "archive"}
+            else ""
+        )
+        print(
+            f"error: could not start direct worker dispatch for openspec/changes/{change_id}: "
+            f"{failed_invoke or r.get('reason', 'unknown direct worker')}",
+            file=sys.stderr,
+        )
+        return 2
+
+    display = r["status"]
+    if r.get("reason"):
+        display += f" ({r['reason']})"
+    print(f"  {change_id}  {display}")
+    return 0 if result == DONE else 1
+
+
 def main() -> int:
+    # Executable-name dispatch: opsx-run <change-id> [--repo <path>]
+    exe_name = os.path.basename(sys.argv[0])
+    if exe_name in ("opsx-run", "opsx-run.py"):
+        if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+            print(
+                "usage: opsx-run <change-id> [--repo <path>]",
+                file=sys.stderr,
+            )
+            return 2 if len(sys.argv) < 2 else 0
+
+        repo_arg = "."
+        change_id = None
+        i = 1
+        while i < len(sys.argv):
+            if sys.argv[i] == "--repo" and i + 1 < len(sys.argv):
+                repo_arg = sys.argv[i + 1]
+                i += 2
+            elif not sys.argv[i].startswith("-") and change_id is None:
+                change_id = sys.argv[i]
+                i += 1
+            else:
+                print(
+                    f"error: unexpected argument: {sys.argv[i]}",
+                    file=sys.stderr,
+                )
+                return 2
+
+        if change_id is None:
+            print("usage: opsx-run <change-id> [--repo <path>]", file=sys.stderr)
+            return 2
+
+        args = argparse.Namespace(repo=repo_arg, change=change_id)
+        return cmd_run_one(args)
+
     ap = argparse.ArgumentParser(prog="opsx-plan", description=__doc__)
     ap.add_argument("--repo", default=".", help="host project root (default: cwd)")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1667,6 +1825,12 @@ def main() -> int:
     p_reset.add_argument("plan")
     p_reset.add_argument("change", nargs="+")
     p_reset.set_defaults(fn=cmd_reset)
+
+    p_run_one = sub.add_parser(
+        "run-one", help="run a single authored OpenSpec change directly"
+    )
+    p_run_one.add_argument("change", help="change id")
+    p_run_one.set_defaults(fn=cmd_run_one)
 
     args = ap.parse_args()
     try:

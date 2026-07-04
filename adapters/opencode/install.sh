@@ -64,6 +64,9 @@ install_orchestrator() {
   install -m 0755 \
     "$ROOT_DIR/orchestrator/opsx-plan.py" \
     "$dest_dir/opsx-plan"
+  install -m 0755 \
+    "$ROOT_DIR/orchestrator/opsx-plan.py" \
+    "$dest_dir/opsx-run"
 }
 
 ensure_project_gitignore() {
@@ -118,7 +121,8 @@ install_global() {
     "Installed commands to $config_root/commands" \
     "Installed agents to $config_root/agents" \
     "Installed support files to $config_root/opsx-controller" \
-    "Installed opsx-plan to $HOME/.local/bin/opsx-plan"
+    "Installed opsx-plan to $HOME/.local/bin/opsx-plan" \
+    "Installed opsx-run to $HOME/.local/bin/opsx-run"
   do_verify
 }
 
