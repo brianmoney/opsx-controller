@@ -553,6 +553,8 @@ def parse_stage_json(log_path: Path) -> tuple[dict | None, str]:
             continue
         lines.append(stripped)
     for candidate in reversed(lines):
+        if candidate.startswith("`") and candidate.endswith("`"):
+            candidate = candidate.strip("`").strip()
         if not (candidate.startswith("{") and candidate.endswith("}")):
             continue
         try:
@@ -563,6 +565,22 @@ def parse_stage_json(log_path: Path) -> tuple[dict | None, str]:
             continue
         return payload, ""
     return None, f"expected a final JSON object line, got {len(lines)} non-comment lines"
+
+
+def record_archive_evidence(repo: Path, record: dict, cid: str) -> bool:
+    archive_dir = find_archive_dir(repo, cid)
+    commit = find_archive_commit(repo, cid)
+    if archive_dir is None or not commit:
+        return False
+    record["archive"].update(
+        {
+            "status": "passed",
+            "path": str(archive_dir.relative_to(repo)),
+            "commit": commit,
+            "reason": "",
+        }
+    )
+    return True
 
 
 def append_history(state: dict, cid: str, entry: dict) -> None:
@@ -1027,8 +1045,9 @@ def verify_change_done(repo: Path, cfg: dict, cid: str) -> tuple[bool, str]:
     squashed into another commit, or recovered after a drive error, so they are
     surfaced as notes but no longer fail a change that OpenSpec itself archived.
     """
-    if (repo / "openspec" / "changes" / cid).exists():
-        return False, f"openspec/changes/{cid} still exists"
+    cdir = change_dir(repo, cid)
+    if cdir.exists():
+        return False, f"{cdir.relative_to(repo)} still exists"
 
     if find_archive_dir(repo, cid) is None:
         return False, "no dated archive directory found"
@@ -1333,26 +1352,20 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
             continue
         if r["status"] != DONE:
             if is_direct_opencode(cfg):
-                if archived_on_disk and r["archive"].get("path") and r["archive"].get("commit"):
-                    archive_status = r["archive"].get("status")
-                    archive_reason = r["archive"].get("reason", "")
-                    if archive_status != "passed":
-                        r["archive"]["status"] = "passed"
+                if archived_on_disk and record_archive_evidence(repo, r, cid):
                     ok, why = verify_direct_archive_done(repo, cid, r)
                     if ok:
-                        r["archive"]["status"] = "passed"
-                        r["archive"]["reason"] = ""
                         r["phase"] = "done"
                         set_status(
                             state,
                             cid,
                             DONE,
-                            "verified from plan state + repository evidence",
+                            "verified from repository archive evidence",
                         )
                         log(f"reconcile: {cid} already archived; marked done")
                         continue
-                    r["archive"]["status"] = archive_status
-                    r["archive"]["reason"] = archive_reason
+                    r["archive"]["status"] = "failed"
+                    r["archive"]["reason"] = why
                 if r["archive"].get("status") == "passed":
                     ok, why = verify_direct_archive_done(repo, cid, r)
                     if ok:
