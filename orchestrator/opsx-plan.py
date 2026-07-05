@@ -1658,6 +1658,53 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Compile helpers
+# ---------------------------------------------------------------------------
+
+def resolve_compile_source(repo: Path, source: str) -> Path:
+    """Resolve a compile source path relative to *repo*.
+
+    Returns the absolute ``Path`` or raises ``PlanError`` when the source
+    does not exist or is not a ``.md`` file.
+    """
+    p = (repo / source).resolve()
+    if not p.is_file():
+        raise PlanError(f"source not found: {p}")
+    if p.suffix.lower() != ".md":
+        raise PlanError(f"source must be a markdown file (.md): {p}")
+    return p
+
+
+def resolve_compile_output(repo: Path, output: str, force: bool) -> Path:
+    """Resolve compile output path, refusing overwrite unless *force*.
+
+    Returns the absolute ``Path`` for the output file.  The parent
+    directory is created if it does not already exist.
+    """
+    p = (repo / output).resolve()
+    if p.exists() and not force:
+        raise PlanError(
+            f"output exists: {p}  (use --force to overwrite)"
+        )
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def check_controller_model() -> str:
+    """Return the configured controller model for compile.
+
+    Raises ``PlanError`` when ``OPSX_CONTROLLER_MODEL`` is unset or empty.
+    """
+    model = os.environ.get("OPSX_CONTROLLER_MODEL", "").strip()
+    if not model:
+        raise PlanError(
+            "OPSX_CONTROLLER_MODEL is not set; "
+            "compile requires a controller model to invoke OpenCode"
+        )
+    return model
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -2021,6 +2068,22 @@ def cmd_run_one(args: argparse.Namespace) -> int:
     return 0 if result == DONE else 1
 
 
+def cmd_compile(args: argparse.Namespace) -> int:
+    """opsx-plan compile <source.md> -o <output.toml> [--force]"""
+    repo = Path(args.repo).resolve()
+
+    # Validate inputs
+    source_path = resolve_compile_source(repo, args.source)
+    output_path = resolve_compile_output(repo, args.output, args.force)
+    model = check_controller_model()
+
+    log(f"compile: {source_path} -> {output_path}  (model: {model})")
+    print(f"Compiling {source_path} ...")
+    print(f"Output will be written to: {output_path}")
+    print("(full implementation coming in later tasks)")
+    return 0
+
+
 def main() -> int:
     # Executable-name dispatch: opsx-run <change-id> [--repo <path>]
     exe_name = os.path.basename(sys.argv[0])
@@ -2091,6 +2154,20 @@ def main() -> int:
     p_reset.add_argument("plan")
     p_reset.add_argument("change", nargs="+")
     p_reset.set_defaults(fn=cmd_reset)
+
+    p_compile = sub.add_parser(
+        "compile", help="compile a markdown plan to TOML"
+    )
+    p_compile.add_argument(
+        "source", help="path to source markdown plan (.md)"
+    )
+    p_compile.add_argument(
+        "-o", "--output", required=True, help="output TOML path"
+    )
+    p_compile.add_argument(
+        "--force", action="store_true", help="overwrite existing output"
+    )
+    p_compile.set_defaults(fn=cmd_compile)
 
     p_run_one = sub.add_parser(
         "run-one", help="run a single authored OpenSpec change directly"

@@ -1,8 +1,8 @@
 ## 1. Compile Command Plumbing
 
-- [ ] 1.1 Add an `opsx-plan compile` argparse subcommand with `source`, `-o/--output`, and `--force` options.
-- [ ] 1.2 Add compile command validation for missing source files, non-markdown source paths, existing output without `--force`, and missing or empty `OPSX_CONTROLLER_MODEL`.
-- [ ] 1.3 Add helper functions for resolving compile paths relative to the current repo and preserving clear error messages through `PlanError`.
+- [x] 1.1 Add an `opsx-plan compile` argparse subcommand with `source`, `-o/--output`, and `--force` options.
+- [x] 1.2 Add compile command validation for missing source files, non-markdown source paths, existing output without `--force`, and missing or empty `OPSX_CONTROLLER_MODEL`.
+- [x] 1.3 Add helper functions for resolving compile paths relative to the current repo and preserving clear error messages through `PlanError`.
 
 ## 2. Prompt And Reference Bundle
 
