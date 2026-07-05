@@ -164,6 +164,10 @@ The initial `schema_version` SHALL be `1`.
 - **WHEN** a telemetry file contains records with `schema_version` values of `1` and `2`
 - **THEN** a reader SHALL parse both record shapes correctly by branching on `schema_version`
 
+#### Scenario: Complete record with all fields populated
+- **WHEN** a telemetry record is written for a successfully completed review stage with full invocation context, model identity, parsed findings, detailed token usage, and a resolved per-token cost estimate
+- **THEN** the record includes all identifier fields (`schema_version`, `plan_name`, `run_id`, `change_id`, `stage`, `round`, `status`, `started_at`, `ended_at`, `duration_ms`), a complete `invocation` object, a complete `model` object with `provider` and `model_id`, a complete `result` object with `verdict` and finding counts, a complete `usage` object with all token counts populated and `usage_available` set to `true`, and a `cost` object with `status` set to `"estimated"`, `pricing_catalog_version` identifying the catalog version, `price_snapshot` containing `billing_mode` and rates, and `estimated_cost` holding the calculated value
+
 #### Scenario: Future field additions do not break readers
 - **WHEN** a future schema version adds optional fields
 - **THEN** readers targeting the current schema version SHALL ignore unknown fields and still extract all fields defined in the current version
