@@ -11,7 +11,7 @@ permission:
   grep: allow
   bash: allow
   external_directory:
-    "*": ask
+    "*": deny
     "~/.config/opencode/command/*": allow
     "~/.config/opencode/commands/*": allow
     "~/.config/opencode/opsx-controller/*": allow
@@ -34,7 +34,7 @@ inventory of files that clearly belong to the active change, and fail closed
 when the workflow cannot continue safely.
 
 Always begin by:
-1. Reading `AGENTS.md`.
+1. Reading repo-root `AGENTS.md` if it exists; continue without it if missing. Never search parent or external directories for it.
 2. Reading the workflow state contract from the first file that exists:
    - `.opencode/opsx-controller/README.md`
    - `$HOME/.config/opencode/opsx-controller/README.md`

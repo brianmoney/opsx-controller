@@ -11,7 +11,7 @@ permission:
   grep: allow
   bash: allow
   external_directory:
-    "*": ask
+    "*": deny
     "~/.config/opencode/**": allow
     "~/.config/opencode/command/*": allow
     "~/.config/opencode/commands/*": allow
@@ -32,7 +32,7 @@ Input arrives from `opsx-controller` as plain text fields such as:
 
 Required workflow:
 1. Parse the input block.
-2. Read `AGENTS.md`.
+2. Read repo-root `AGENTS.md` if it exists; continue without it if missing. Never search parent or external directories for it.
 3. Read the installed global archive prompt from the first file that exists.
    Expand `$HOME` before reading; never pass a literal `$HOME/...` path to the
    Read tool. Do not use Glob for this step; try exact Read paths in order and

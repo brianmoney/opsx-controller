@@ -1303,6 +1303,124 @@ class OpenCodeAgentModeTests(unittest.TestCase):
                 f"{name} must allow direct reads under ~/.config/opencode",
             )
 
+    @staticmethod
+    def _extract_external_directory_block(text: str) -> str:
+        lines = text.splitlines()
+        start_idx: int | None = None
+        base_indent: int | None = None
+        for i, line in enumerate(lines):
+            stripped = line.lstrip()
+            if stripped.startswith("external_directory:"):
+                start_idx = i
+                base_indent = len(line) - len(stripped)
+                break
+        if start_idx is None:
+            return ""
+        block_lines: list[str] = []
+        for j in range(start_idx + 1, len(lines)):
+            line = lines[j]
+            stripped = line.lstrip()
+            if stripped == "":
+                block_lines.append(line)
+                continue
+            indent = len(line) - len(stripped)
+            if indent <= base_indent and not stripped.startswith('"') and not stripped.startswith("#"):
+                break
+            block_lines.append(line)
+        return "\n".join(block_lines)
+
+    def test_opencode_worker_agents_deny_broad_external_directory(self) -> None:
+        for name in (
+            "opsx-controller.md",
+            "opsx-implementer.md",
+            "opsx-reviewer.md",
+            "opsx-archiver.md",
+        ):
+            text = (self.AGENT_DIR / name).read_text(encoding="utf-8")
+            block = self._extract_external_directory_block(text)
+            self.assertTrue(
+                block,
+                f"{name} must contain an external_directory permission block",
+            )
+            self.assertIn(
+                '"*": deny',
+                block,
+                f"{name} must deny broad external_directory access (wildcard deny inside external_directory block)",
+            )
+            self.assertIn(
+                "~/.config/opencode",
+                block,
+                f"{name} must preserve explicit ~/.config/opencode allow rules inside the external_directory block",
+            )
+
+
+class ParseStageJsonPermissionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.log_dir = Path(self.tmp.name)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _write_log(self, content: str) -> Path:
+        p = self.log_dir / f"test-{id(content)}.log"
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    def test_auto_rejected_external_directory_transcript_is_parsed_as_permission_denial(self) -> None:
+        content = (
+            "# some header\n"
+            "model output line\n"
+            "The user rejected permission for external_directory\n"
+            "auto-rejecting request\n"
+        )
+        log_path = self._write_log(content)
+        payload, reason = self.opsx_plan.parse_stage_json(log_path)
+        self.assertIsNone(payload)
+        self.assertIn("permission denied before JSON output", reason)
+
+    def test_valid_final_json_remains_authoritative_despite_noisy_transcript(self) -> None:
+        content = (
+            "# some header\n"
+            "permission requested for external_directory\n"
+            "auto-rejecting\n"
+            '{"status":"implemented","change":"ex","round":1,"progress_made":true,'
+            '"completed_tasks":[],"remaining_tasks":[],'
+            '"task_counts":{"complete":0,"total":0},'
+            '"files_touched":[],"known_change_files":[],"summary":"done"}\n'
+        )
+        log_path = self._write_log(content)
+        payload, reason = self.opsx_plan.parse_stage_json(log_path)
+        self.assertIsNotNone(payload, f"should have parsed JSON, got reason={reason}")
+        self.assertEqual(payload["status"], "implemented")
+        self.assertEqual(reason, "")
+
+    def test_external_directory_permission_denied_marker_detected(self) -> None:
+        content = (
+            "# start\n"
+            "external_directory permission denied for path /home/user\n"
+            "aborting\n"
+        )
+        log_path = self._write_log(content)
+        payload, reason = self.opsx_plan.parse_stage_json(log_path)
+        self.assertIsNone(payload)
+        self.assertIn("permission denied before JSON output", reason)
+        self.assertIn("external_directory permission denied", reason)
+
+    def test_no_permission_marker_returns_generic_reason(self) -> None:
+        content = (
+            "some output\n"
+            "more output\n"
+            "nothing parseable\n"
+        )
+        log_path = self._write_log(content)
+        payload, reason = self.opsx_plan.parse_stage_json(log_path)
+        self.assertIsNone(payload)
+        self.assertIn("expected a final JSON object line", reason)
+        self.assertNotIn("permission denied", reason)
+
 
 class DirectStageTelemetryTests(unittest.TestCase):
     def setUp(self) -> None:

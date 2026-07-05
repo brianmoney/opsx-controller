@@ -720,6 +720,14 @@ def _record_stage_telemetry(
     rec(state, cid)["telemetry"] = {"latest_telemetry": record["uid"]}
 
 
+PERMISSION_REJECTION_MARKERS = [
+    "permission requested",
+    "auto-rejecting",
+    "The user rejected permission",
+    "external_directory permission denied",
+]
+
+
 def parse_stage_json(log_path: Path) -> tuple[dict | None, str]:
     lines: list[str] = []
     for raw in log_path.read_text(encoding="utf-8").splitlines():
@@ -739,6 +747,14 @@ def parse_stage_json(log_path: Path) -> tuple[dict | None, str]:
         if not isinstance(payload, dict):
             continue
         return payload, ""
+    # No valid JSON object found: inspect for permission-rejection markers
+    joined = " ".join(line.lower() for line in lines)
+    for marker in PERMISSION_REJECTION_MARKERS:
+        if marker.lower() in joined:
+            return None, (
+                f"permission denied before JSON output "
+                f"(marker: {marker!r} found in {len(lines)} lines)"
+            )
     return None, f"expected a final JSON object line, got {len(lines)} non-comment lines"
 
 
