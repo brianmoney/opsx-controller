@@ -1304,5 +1304,1562 @@ class OpenCodeAgentModeTests(unittest.TestCase):
             )
 
 
+class DirectStageTelemetryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        git(self.repo, "init")
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        git(self.repo, "add", "tracked.txt")
+        git(
+            self.repo,
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "user.name=Test User",
+            "commit",
+            "-m",
+            "init",
+        )
+        self.cid = "add-telemetry-test"
+        self.plan_name = f"run-{self.cid}"
+        self.cfg = {
+            "name": self.plan_name,
+            "adapter": "opencode",
+            "implement_invoke": "opencode run --agent opsx-implementer",
+            "review_invoke": "opencode run --agent opsx-reviewer",
+            "archive_invoke": "opencode run --agent opsx-archiver",
+            "invoke": 'opencode run "/opsx-drive {change}"',
+            "state_file": ".opencode/opsx-controller/{change}.json",
+            "timeout_minutes": 1,
+            "max_attempts": 2,
+            "max_rounds": 2,
+            "no_progress_limit": 2,
+            "fast_checks": [],
+            "check_timeout_minutes": 1,
+            "require_clean_tracked": False,
+            "review_created": False,
+            "changes": {
+                self.cid: {
+                    "id": self.cid,
+                    "depends_on": [],
+                    "enabled": True,
+                    "pause_before": False,
+                    "timeout_minutes": 1,
+                    "max_attempts": 2,
+                    "create_invoke": "",
+                    "create_max_attempts": 1,
+                }
+            },
+            "order": [self.cid],
+            "created_check": "",
+            "plan_doc": "",
+            "create_timeout_minutes": 1,
+        }
+        self.state = {"plan": self.plan_name, "approvals": [], "changes": {}}
+        self._saved_invoke = self.opsx_plan.invoke_direct_stage
+        self._saved_checks = self.opsx_plan.run_fast_checks
+
+    def tearDown(self) -> None:
+        self.opsx_plan.invoke_direct_stage = self._saved_invoke
+        self.opsx_plan.run_fast_checks = self._saved_checks
+        self.tmp.cleanup()
+
+    def write_authored_change(self, cid: str) -> None:
+        cdir = self.repo / "openspec" / "changes" / cid
+        cdir.mkdir(parents=True)
+        (cdir / "proposal.md").write_text("## Why\n", encoding="utf-8")
+        (cdir / "tasks.md").write_text(
+            "## 1. Tasks\n\n- [ ] 1.1 Example task\n- [ ] 1.2 Example task\n",
+            encoding="utf-8",
+        )
+
+    def archive_change_in_repo(self, cid: str) -> tuple[str, str]:
+        src = self.repo / "openspec" / "changes" / cid
+        archive_rel = f"openspec/changes/archive/2026-07-05-{cid}"
+        dst = self.repo / archive_rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dst)
+        git(self.repo, "add", "-A", "openspec")
+        git(
+            self.repo,
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "user.name=Test User",
+            "commit",
+            "-m",
+            f"archive({cid}): archive completed OpenSpec change",
+        )
+        commit = (
+            subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=self.repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            .stdout.strip()
+        )
+        return archive_rel, commit
+
+    def stage_runner(self, payloads: list[dict]) -> list[str]:
+        input_blocks: list[str] = []
+
+        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+            self.assertTrue(payloads, f"unexpected stage call: {stage}")
+            payload = payloads.pop(0)
+            self.assertEqual(stage, payload["stage"])
+            input_blocks.append(input_block)
+            if stage == "archive" and payload.get("archive_repo"):
+                archive_path, commit = self.archive_change_in_repo(cid)
+                payload = {
+                    **payload,
+                    "result": {
+                        **payload["result"],
+                        "archive_path": archive_path,
+                        "commit": commit,
+                    },
+                    "archive_path": archive_path,
+                    "commit": commit,
+                }
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            lines = payload.get("lines")
+            if lines is None:
+                if "result" in payload:
+                    body = json.dumps(payload["result"]) + "\n"
+                else:
+                    body = "\n"
+            else:
+                body = lines
+            log_path.write_text(body, encoding="utf-8")
+            return payload.get("outcome", "exited"), log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+        return input_blocks
+
+    def _read_telemetry(self) -> list[dict]:
+        jsonl = self.repo / ".opsx-plan" / "telemetry" / f"{self.plan_name}.jsonl"
+        if not jsonl.is_file():
+            return []
+        records: list[dict] = []
+        for line in jsonl.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                records.append(json.loads(line))
+        return records
+
+    # 6.1
+    def test_successful_implement_stage_produces_completed_record(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": ["orchestrator/opsx-plan.py"],
+                        "known_change_files": [],
+                        "summary": "implemented first round",
+                    },
+                },
+                {"stage": "review", "outcome": "timeout"},
+            ]
+        )
+
+        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        records = self._read_telemetry()
+        self.assertGreaterEqual(len(records), 1)
+        r = records[0]
+        self.assertEqual(r["status"], "completed")
+        self.assertEqual(r["stage"], "implement")
+        self.assertIsNotNone(r["ended_at"])
+        self.assertIsNotNone(r["duration_ms"])
+        self.assertGreaterEqual(r["duration_ms"], 0)
+        self.assertEqual(r["change_id"], self.cid)
+        self.assertEqual(r["plan_name"], self.plan_name)
+        self.assertEqual(r["schema_version"], self.opsx_plan.TELEMETRY_SCHEMA_VERSION)
+        self.assertTrue(r["uid"])
+        self.assertIsNotNone(r["started_at"])
+        self.assertIn("log_path", r["result"])
+        self.assertIsNotNone(r["result"]["log_path"])
+
+    # 6.2
+    def test_successful_review_stage_populates_verdict_and_findings(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 1,
+                        "verdict": "fail",
+                        "finding_counts": {"critical": 2, "warning": 3, "note": 1},
+                        "summary": "review failed with findings",
+                        "fix_prompt": "fix stuff",
+                        "next_phase": "implement",
+                    },
+                },
+                {"stage": "implement", "outcome": "timeout"},
+            ]
+        )
+
+        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        records = self._read_telemetry()
+        review_records = [r for r in records if r["stage"] == "review"]
+        self.assertGreaterEqual(len(review_records), 1)
+        rev = review_records[0]
+        self.assertEqual(rev["status"], "completed")
+        self.assertEqual(rev["result"]["verdict"], "fail")
+        self.assertEqual(rev["result"]["critical_count"], 2)
+        self.assertEqual(rev["result"]["warning_count"], 3)
+        self.assertEqual(rev["result"]["note_count"], 1)
+        self.assertEqual(rev["result"]["stage_status"], "reviewed")
+
+    # 6.3
+    def test_successful_archive_stage_produces_completed_record(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 1,
+                        "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "review passed",
+                        "fix_prompt": "",
+                        "next_phase": "archive",
+                    },
+                },
+                {
+                    "stage": "archive",
+                    "archive_repo": True,
+                    "result": {
+                        "status": "archived",
+                        "change": self.cid,
+                        "archive_path": "",
+                        "spec_sync_status": "no-delta",
+                        "commit": "",
+                        "summary": "archive succeeded",
+                    },
+                },
+            ]
+        )
+
+        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        records = self._read_telemetry()
+        archive_records = [r for r in records if r["stage"] == "archive"]
+        self.assertGreaterEqual(len(archive_records), 1)
+        arch = archive_records[0]
+        self.assertEqual(arch["status"], "completed")
+        self.assertEqual(arch["result"]["stage_status"], "archived")
+
+    # 6.4
+    def test_timeout_produces_timeout_record(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "outcome": "timeout",
+                },
+            ]
+        )
+
+        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        records = self._read_telemetry()
+        self.assertGreaterEqual(len(records), 1)
+        r = records[0]
+        self.assertEqual(r["status"], "timeout")
+        self.assertIsNotNone(r["result"]["error_message"])
+        self.assertIn("timed out", r["result"]["error_message"])
+        self.assertIsNotNone(r["duration_ms"])
+
+    # 6.5
+    def test_spawn_error_produces_spawn_error_record(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "outcome": "spawn_error",
+                },
+            ]
+        )
+
+        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        records = self._read_telemetry()
+        self.assertGreaterEqual(len(records), 1)
+        r = records[0]
+        self.assertEqual(r["status"], "spawn_error")
+        self.assertIsNotNone(r["result"]["error_message"])
+        self.assertIn("could not spawn", r["result"]["error_message"])
+        self.assertIsNone(r["result"]["stage_status"])
+
+    # 6.6
+    def test_invalid_worker_json_produces_invalid_output_record(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "lines": "not json\nsecond line\n",
+                },
+            ]
+        )
+
+        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        records = self._read_telemetry()
+        self.assertGreaterEqual(len(records), 1)
+        r = records[0]
+        self.assertEqual(r["status"], "invalid_output")
+        self.assertIsNotNone(r["result"]["error_message"])
+        self.assertIsNone(r["result"]["stage_status"])
+
+    # 6.7
+    def test_telemetry_record_appended_to_correct_plan_jsonl(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented",
+                    },
+                },
+                {"stage": "review", "outcome": "timeout"},
+            ]
+        )
+
+        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        jsonl = self.repo / ".opsx-plan" / "telemetry" / f"{self.plan_name}.jsonl"
+        self.assertTrue(jsonl.is_file(), f"expected {jsonl}")
+        content = jsonl.read_text(encoding="utf-8")
+        self.assertTrue(content.endswith("\n"))
+
+    # 6.8
+    def test_worker_state_includes_telemetry_latest_uid(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented",
+                    },
+                },
+                {"stage": "review", "outcome": "timeout"},
+            ]
+        )
+
+        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        worker_state = self.opsx_plan.worker_state_path(self.repo, self.plan_name, self.cid)
+        self.assertTrue(worker_state.is_file())
+        payload = json.loads(worker_state.read_text(encoding="utf-8"))
+        self.assertIn("telemetry", payload)
+        self.assertIn("latest_telemetry", payload["telemetry"])
+        self.assertTrue(payload["telemetry"]["latest_telemetry"])
+
+        # Verify the UID matches what's in the JSONL (latest record)
+        records = self._read_telemetry()
+        self.assertGreaterEqual(len(records), 1)
+        self.assertEqual(
+            payload["telemetry"]["latest_telemetry"],
+            records[-1]["uid"],
+        )
+
+    # 6.9
+    def test_usage_and_cost_are_default_unavailable(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented",
+                    },
+                },
+                {"stage": "review", "outcome": "timeout"},
+            ]
+        )
+
+        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        records = self._read_telemetry()
+        r = records[0]
+        usage = r["usage"]
+        self.assertFalse(usage["usage_available"])
+        self.assertIsNone(usage["input_tokens"])
+        self.assertIsNone(usage["output_tokens"])
+        self.assertIsNone(usage["cached_input_tokens"])
+        self.assertIsNone(usage["reasoning_tokens"])
+        self.assertIsNone(usage["total_tokens"])
+        self.assertIsNone(usage["usage_source"])
+        cost = r["cost"]
+        self.assertEqual(cost["status"], "unavailable")
+        self.assertIsNone(cost["pricing_catalog_version"])
+        self.assertIsNone(cost["price_snapshot"])
+        self.assertIsNone(cost["unresolved_reason"])
+        self.assertIsNone(cost["estimated_cost"])
+
+    # 6.10
+    def test_telemetry_directory_created_on_first_write(self) -> None:
+        telemetry_dir = self.repo / ".opsx-plan" / "telemetry"
+        self.assertFalse(telemetry_dir.is_dir())
+
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented",
+                    },
+                },
+                {"stage": "review", "outcome": "timeout"},
+            ]
+        )
+
+        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertTrue(telemetry_dir.is_dir())
+
+    # 6.11
+    def test_run_id_stable_across_pause_and_resume(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+
+        # First run: implement succeeds, review fails
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 1,
+                        "verdict": "fail",
+                        "finding_counts": {"critical": 1, "warning": 0, "note": 0},
+                        "summary": "review failed",
+                        "fix_prompt": "fix it",
+                        "next_phase": "implement",
+                    },
+                },
+                {
+                    "stage": "implement",
+                    "outcome": "timeout",
+                },
+            ]
+        )
+
+        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        records = self._read_telemetry()
+        self.assertGreaterEqual(len(records), 2)
+        run_ids = {r["run_id"] for r in records}
+        self.assertEqual(len(run_ids), 1, f"all records should share the same run_id, got: {run_ids}")
+
+        first_run_id = records[0]["run_id"]
+        self.assertTrue(first_run_id)
+
+    # 6.12
+    def test_existing_resume_behavior_preserved(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+
+        # First run: implement succeeds, review fails
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 1,
+                        "verdict": "fail",
+                        "finding_counts": {"critical": 1, "warning": 0, "note": 0},
+                        "summary": "review failed",
+                        "fix_prompt": "Add tests",
+                        "next_phase": "implement",
+                    },
+                },
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 2,
+                        "progress_made": True,
+                        "completed_tasks": ["1.2"],
+                        "remaining_tasks": [],
+                        "task_counts": {"complete": 2, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented round 2",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 2,
+                        "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "review passed",
+                        "fix_prompt": "",
+                        "next_phase": "archive",
+                    },
+                },
+                {
+                    "stage": "archive",
+                    "archive_repo": True,
+                    "result": {
+                        "status": "archived",
+                        "change": self.cid,
+                        "archive_path": "",
+                        "spec_sync_status": "no-delta",
+                        "commit": "",
+                        "summary": "archive succeeded",
+                    },
+                },
+            ]
+        )
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, self.opsx_plan.DONE)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        self.assertEqual(record["phase"], "done")
+        self.assertEqual(record["round"], 2)
+        self.assertEqual(record["status"], self.opsx_plan.DONE)
+        self.assertEqual(record["archive"]["status"], "passed")
+
+        # Verify telemetry was written for all stages
+        records = self._read_telemetry()
+        stages = [r["stage"] for r in records]
+        self.assertEqual(stages, ["implement", "review", "implement", "review", "archive"])
+
+    def test_blocked_implement_produces_failed_telemetry(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "blocked",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": False,
+                        "completed_tasks": [],
+                        "remaining_tasks": ["1.1"],
+                        "task_counts": {"complete": 0, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implement blocked",
+                        "reason": "missing design artifact",
+                    },
+                },
+            ]
+        )
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, "stop")
+        records = self._read_telemetry()
+        self.assertGreaterEqual(len(records), 1)
+        r = records[0]
+        self.assertEqual(r["status"], "failed")
+        self.assertEqual(r["stage"], "implement")
+        self.assertIsNotNone(r["result"]["error_message"])
+        self.assertIn("implement_blocked", r["result"]["error_message"])
+
+    def test_unexpected_implement_status_produces_failed_telemetry(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "unknown-weird-status",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": False,
+                        "completed_tasks": [],
+                        "remaining_tasks": [],
+                        "task_counts": {"complete": 0, "total": 0},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "weird",
+                    },
+                },
+            ]
+        )
+
+        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        records = self._read_telemetry()
+        self.assertGreaterEqual(len(records), 1)
+        r = records[0]
+        self.assertEqual(r["status"], "failed")
+        self.assertIsNotNone(r["result"]["error_message"])
+        self.assertIn("implement_invalid", r["result"]["error_message"])
+
+    def test_unexpected_review_status_produces_failed_telemetry(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "not-reviewed",
+                        "change": self.cid,
+                        "round": 1,
+                        "verdict": "unknown",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "bad review",
+                        "fix_prompt": "",
+                    },
+                },
+            ]
+        )
+
+        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        records = self._read_telemetry()
+        review_records = [r for r in records if r["stage"] == "review"]
+        self.assertGreaterEqual(len(review_records), 1)
+        rev = review_records[0]
+        self.assertEqual(rev["status"], "failed")
+        self.assertIsNotNone(rev["result"]["error_message"])
+        self.assertIn("review_invalid", rev["result"]["error_message"])
+
+    def test_unexpected_review_verdict_produces_failed_telemetry(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 1,
+                        "verdict": "undecided",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "unexpected verdict",
+                        "fix_prompt": "",
+                    },
+                },
+            ]
+        )
+
+        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        records = self._read_telemetry()
+        review_records = [r for r in records if r["stage"] == "review"]
+        self.assertGreaterEqual(len(review_records), 1)
+        rev = review_records[0]
+        self.assertEqual(rev["status"], "failed")
+        self.assertIsNotNone(rev["result"]["error_message"])
+        self.assertIn("review_invalid", rev["result"]["error_message"])
+
+    def test_blocked_archive_produces_failed_telemetry(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 1,
+                        "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "review passed",
+                        "fix_prompt": "",
+                        "next_phase": "archive",
+                    },
+                },
+                {
+                    "stage": "archive",
+                    "result": {
+                        "status": "blocked",
+                        "change": self.cid,
+                        "archive_path": "",
+                        "commit": "",
+                        "reason": "cannot archive: dirty tree",
+                        "spec_sync_status": "not_started",
+                        "summary": "archive blocked",
+                    },
+                },
+            ]
+        )
+
+        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        records = self._read_telemetry()
+        archive_records = [r for r in records if r["stage"] == "archive"]
+        self.assertGreaterEqual(len(archive_records), 1)
+        arch = archive_records[0]
+        self.assertEqual(arch["status"], "failed")
+        self.assertIsNotNone(arch["result"]["error_message"])
+        self.assertIn("archive_failed", arch["result"]["error_message"])
+
+    def test_unexpected_archive_status_produces_failed_telemetry(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 1,
+                        "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "review passed",
+                        "fix_prompt": "",
+                        "next_phase": "archive",
+                    },
+                },
+                {
+                    "stage": "archive",
+                    "result": {
+                        "status": "weird-archive-status",
+                        "change": self.cid,
+                        "archive_path": "",
+                        "commit": "",
+                        "reason": "",
+                        "spec_sync_status": "not_started",
+                        "summary": "unexpected",
+                    },
+                },
+            ]
+        )
+
+        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        records = self._read_telemetry()
+        archive_records = [r for r in records if r["stage"] == "archive"]
+        self.assertGreaterEqual(len(archive_records), 1)
+        arch = archive_records[0]
+        self.assertEqual(arch["status"], "failed")
+        self.assertIsNotNone(arch["result"]["error_message"])
+        self.assertIn("archive_invalid", arch["result"]["error_message"])
+
+    def test_telemetry_write_failure_logs_warning_but_does_not_block(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented",
+                    },
+                },
+                {"stage": "review", "outcome": "timeout"},
+            ]
+        )
+
+        log_calls: list[str] = []
+
+        def capture_log(msg: str) -> None:
+            log_calls.append(msg)
+
+        with mock.patch.object(
+            self.opsx_plan, "write_telemetry_record", side_effect=OSError("disk full")
+        ), mock.patch.object(self.opsx_plan, "log", side_effect=capture_log):
+            self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        # Stage must still advance despite telemetry write failure
+        record = self.opsx_plan.rec(self.state, self.cid)
+        self.assertEqual(record["status"], self.opsx_plan.FAILED)
+
+        # A warning must have been logged
+        warning_msgs = [msg for msg in log_calls if "warning" in msg.lower()]
+        self.assertTrue(warning_msgs, f"expected warning log, got: {log_calls}")
+
+    def test_no_progress_produces_failed_telemetry(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": False,
+                        "completed_tasks": [],
+                        "remaining_tasks": ["1.1", "1.2"],
+                        "task_counts": {"complete": 0, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "no progress round 1",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 1,
+                        "verdict": "fail",
+                        "finding_counts": {"critical": 1, "warning": 0, "note": 0},
+                        "summary": "still missing",
+                        "fix_prompt": "do it",
+                        "next_phase": "implement",
+                    },
+                },
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 2,
+                        "progress_made": False,
+                        "completed_tasks": [],
+                        "remaining_tasks": ["1.1", "1.2"],
+                        "task_counts": {"complete": 0, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "no progress round 2",
+                    },
+                },
+            ]
+        )
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, "stop")
+        records = self._read_telemetry()
+        implement_records = [r for r in records if r["stage"] == "implement"]
+        # The last implement should have status=failed due to no_progress
+        last_impl = implement_records[-1]
+        self.assertEqual(last_impl["status"], "failed")
+        self.assertIsNotNone(last_impl["result"]["error_message"])
+        self.assertIn("no_progress", last_impl["result"]["error_message"])
+
+    def test_max_rounds_produces_failed_telemetry(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        self.cfg["max_rounds"] = 1
+        record["max_rounds"] = 1
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": [],
+                        "remaining_tasks": ["1.1"],
+                        "task_counts": {"complete": 0, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented round 1",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 1,
+                        "verdict": "fail",
+                        "finding_counts": {"critical": 1, "warning": 0, "note": 0},
+                        "summary": "review failed",
+                        "fix_prompt": "fix",
+                        "next_phase": "implement",
+                    },
+                },
+            ]
+        )
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, "stop")
+        records = self._read_telemetry()
+        review_records = [r for r in records if r["stage"] == "review"]
+        self.assertGreaterEqual(len(review_records), 1)
+        rev = review_records[0]
+        self.assertEqual(rev["status"], "failed")
+        self.assertIsNotNone(rev["result"]["error_message"])
+        self.assertIn("max_rounds_reached", rev["result"]["error_message"])
+
+    def test_review_fail_verdict_continues_and_produces_completed_telemetry(self) -> None:
+        """Review with verdict=fail loops back to implement (action=continue),
+        so its telemetry must stay 'completed', not 'failed'."""
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 1,
+                        "verdict": "fail",
+                        "finding_counts": {"critical": 1, "warning": 0, "note": 0},
+                        "summary": "review failed",
+                        "fix_prompt": "fix it",
+                        "next_phase": "implement",
+                    },
+                },
+                {"stage": "implement", "outcome": "timeout"},
+            ]
+        )
+
+        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        records = self._read_telemetry()
+        review_records = [r for r in records if r["stage"] == "review"]
+        self.assertGreaterEqual(len(review_records), 1)
+        rev = review_records[0]
+        self.assertEqual(rev["status"], "completed")
+        self.assertEqual(rev["result"]["verdict"], "fail")
+
+    def _assert_worker_state_has_latest_telemetry_uid(self) -> None:
+        """Helper: verify worker state JSON has the telemetry UID matching the
+        last record in the JSONL file."""
+        worker_state = self.opsx_plan.worker_state_path(self.repo, self.plan_name, self.cid)
+        self.assertTrue(worker_state.is_file(), f"worker state missing: {worker_state}")
+        payload = json.loads(worker_state.read_text(encoding="utf-8"))
+        self.assertIn("telemetry", payload)
+        self.assertIn("latest_telemetry", payload["telemetry"])
+        uid = payload["telemetry"]["latest_telemetry"]
+        self.assertTrue(uid, "latest_telemetry must be a non-empty UID string")
+
+        records = self._read_telemetry()
+        self.assertGreaterEqual(len(records), 1, "at least one telemetry record expected")
+        self.assertEqual(
+            uid,
+            records[-1]["uid"],
+            "worker state telemetry.latest_telemetry must match last JSONL record UID",
+        )
+
+    def test_terminal_blocked_implement_persists_telemetry_uid_to_worker_state(self) -> None:
+        """Blocked implement (action=stop) must persist its telemetry UID to
+        worker state so the link is available for later analysis."""
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "blocked",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": False,
+                        "completed_tasks": [],
+                        "remaining_tasks": ["1.1"],
+                        "task_counts": {"complete": 0, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implement blocked",
+                        "reason": "missing design artifact",
+                    },
+                },
+            ]
+        )
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+        self.assertEqual(result, "stop")
+        self._assert_worker_state_has_latest_telemetry_uid()
+
+    def test_terminal_blocked_archive_persists_telemetry_uid_to_worker_state(self) -> None:
+        """Blocked archive (action=stop) must persist its telemetry UID to
+        worker state."""
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 1,
+                        "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "review passed",
+                        "fix_prompt": "",
+                        "next_phase": "archive",
+                    },
+                },
+                {
+                    "stage": "archive",
+                    "result": {
+                        "status": "blocked",
+                        "change": self.cid,
+                        "archive_path": "",
+                        "commit": "",
+                        "reason": "cannot archive: dirty tree",
+                        "spec_sync_status": "not_started",
+                        "summary": "archive blocked",
+                    },
+                },
+            ]
+        )
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+        self.assertEqual(result, "stop")
+        self._assert_worker_state_has_latest_telemetry_uid()
+
+    def test_terminal_successful_archive_persists_telemetry_uid_to_worker_state(self) -> None:
+        """Successful archive (action=done) must persist its telemetry UID to
+        worker state even though the change is complete."""
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 1,
+                        "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "review passed",
+                        "fix_prompt": "",
+                        "next_phase": "archive",
+                    },
+                },
+                {
+                    "stage": "archive",
+                    "archive_repo": True,
+                    "result": {
+                        "status": "archived",
+                        "change": self.cid,
+                        "archive_path": "",
+                        "spec_sync_status": "no-delta",
+                        "commit": "",
+                        "summary": "archive succeeded",
+                    },
+                },
+            ]
+        )
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+        self.assertEqual(result, self.opsx_plan.DONE)
+        self._assert_worker_state_has_latest_telemetry_uid()
+
+    def test_terminal_no_progress_persists_telemetry_uid_to_worker_state(self) -> None:
+        """No-progress stop must also persist its telemetry UID."""
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": False,
+                        "completed_tasks": [],
+                        "remaining_tasks": ["1.1", "1.2"],
+                        "task_counts": {"complete": 0, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "no progress round 1",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 1,
+                        "verdict": "fail",
+                        "finding_counts": {"critical": 1, "warning": 0, "note": 0},
+                        "summary": "still missing",
+                        "fix_prompt": "do it",
+                        "next_phase": "implement",
+                    },
+                },
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 2,
+                        "progress_made": False,
+                        "completed_tasks": [],
+                        "remaining_tasks": ["1.1", "1.2"],
+                        "task_counts": {"complete": 0, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "no progress round 2",
+                    },
+                },
+            ]
+        )
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+        self.assertEqual(result, "stop")
+        self._assert_worker_state_has_latest_telemetry_uid()
+
+    def test_terminal_max_rounds_persists_telemetry_uid_to_worker_state(self) -> None:
+        """Max-rounds stop must persist its telemetry UID."""
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        self.cfg["max_rounds"] = 1
+        record["max_rounds"] = 1
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": [],
+                        "remaining_tasks": ["1.1"],
+                        "task_counts": {"complete": 0, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented round 1",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 1,
+                        "verdict": "fail",
+                        "finding_counts": {"critical": 1, "warning": 0, "note": 0},
+                        "summary": "review failed",
+                        "fix_prompt": "fix",
+                        "next_phase": "implement",
+                    },
+                },
+            ]
+        )
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+        self.assertEqual(result, "stop")
+        self._assert_worker_state_has_latest_telemetry_uid()
+
+    def test_terminal_unexpected_archive_verdict_persists_telemetry_uid_to_worker_state(self) -> None:
+        """Unexpected archive verdict (action=stop) must also persist its
+        telemetry UID."""
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 1,
+                        "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "review passed",
+                        "fix_prompt": "",
+                        "next_phase": "archive",
+                    },
+                },
+                {
+                    "stage": "archive",
+                    "result": {
+                        "status": "weird-archive-status",
+                        "change": self.cid,
+                        "archive_path": "",
+                        "commit": "",
+                        "reason": "",
+                        "spec_sync_status": "not_started",
+                        "summary": "unexpected",
+                    },
+                },
+            ]
+        )
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+        self.assertEqual(result, "stop")
+        self._assert_worker_state_has_latest_telemetry_uid()
+
+
 if __name__ == "__main__":
     unittest.main()

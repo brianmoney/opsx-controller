@@ -33,6 +33,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -342,6 +343,7 @@ def new_change_record() -> dict:
         "history": [],
         "last_stage": default_last_stage(),
         "last_log": "",
+        "telemetry": {"latest_telemetry": ""},
     }
 
 
@@ -480,6 +482,7 @@ def save_worker_state(repo: Path, cfg: dict, state: dict, cid: str) -> None:
         "last_review": r["last_review"],
         "archive": r["archive"],
         "history": r["history"],
+        "telemetry": r["telemetry"],
     }
     save_json(worker_state_path(repo, cfg["name"], cid), payload)
 
@@ -543,6 +546,178 @@ def record_stage_log(
         "log_path": str(log_path),
         "updated_at": utcnow(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Telemetry recording (plan-run-observability schema v1)
+# ---------------------------------------------------------------------------
+
+TELEMETRY_SCHEMA_VERSION = 1
+
+
+def compute_duration_ms(started_at: str, ended_at: str) -> int:
+    start = datetime.fromisoformat(started_at)
+    end = datetime.fromisoformat(ended_at)
+    return int((end - start).total_seconds() * 1000)
+
+
+def build_telemetry_record(
+    *,
+    plan_name: str,
+    run_id: str,
+    change_id: str,
+    stage: str,
+    round_num: int,
+    status: str,
+    started_at: str,
+    ended_at: str,
+    duration_ms: int,
+    adapter: str,
+    worker_command: str,
+    timeout_seconds: int,
+    retry_attempt: int = 0,
+    log_path: str = "",
+    stage_status: str | None = None,
+    error_message: str | None = None,
+    verdict: str | None = None,
+    critical_count: int | None = None,
+    warning_count: int | None = None,
+    note_count: int | None = None,
+) -> dict:
+    return {
+        "schema_version": TELEMETRY_SCHEMA_VERSION,
+        "uid": str(uuid.uuid4()),
+        "plan_name": plan_name,
+        "run_id": run_id,
+        "change_id": change_id,
+        "stage": stage,
+        "round": round_num,
+        "status": status,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "duration_ms": duration_ms,
+        "invocation": {
+            "adapter": adapter,
+            "worker_command": worker_command,
+            "args_sample": None,
+            "timeout_seconds": timeout_seconds,
+            "retry_attempt": retry_attempt,
+        },
+        "model": {
+            "provider": None,
+            "model_id": None,
+            "model_alias": None,
+        },
+        "result": {
+            "log_path": log_path,
+            "stage_status": stage_status,
+            "error_message": error_message,
+            "verdict": verdict,
+            "critical_count": critical_count,
+            "warning_count": warning_count,
+            "note_count": note_count,
+        },
+        "usage": {
+            "usage_available": False,
+            "input_tokens": None,
+            "output_tokens": None,
+            "cached_input_tokens": None,
+            "reasoning_tokens": None,
+            "total_tokens": None,
+            "usage_source": None,
+        },
+        "cost": {
+            "status": "unavailable",
+            "pricing_catalog_version": None,
+            "price_snapshot": None,
+            "unresolved_reason": None,
+            "estimated_cost": None,
+        },
+    }
+
+
+def write_telemetry_record(repo: Path, plan_name: str, record: dict) -> None:
+    telemetry_dir = repo / ".opsx-plan" / "telemetry"
+    telemetry_dir.mkdir(parents=True, exist_ok=True)
+    jsonl_path = telemetry_dir / f"{plan_name}.jsonl"
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    with open(jsonl_path, "a", encoding="utf-8") as fh:
+        fh.write(line)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def get_or_create_run_id(repo: Path, cfg: dict, state: dict) -> str:
+    run_id = state.get("run_id", "")
+    if run_id:
+        return run_id
+    started_at = state.get("started_at", "")
+    if started_at:
+        # Derive stable run_id from plan started_at timestamp
+        run_id = started_at.replace(":", "").replace("-", "").replace("T", "-")
+    else:
+        # First run: generate UUID, persist started_at and run_id
+        now = utcnow()
+        state["started_at"] = now
+        run_id = now.replace(":", "").replace("-", "").replace("T", "-")
+    state["run_id"] = run_id
+    save_state(repo, cfg["name"], state)
+    return run_id
+
+
+def _record_stage_telemetry(
+    repo: Path,
+    cfg: dict,
+    state: dict,
+    cid: str,
+    stage: str,
+    round_num: int,
+    started_at: str,
+    ended_at: str,
+    duration_ms: int,
+    telemetry_status: str,
+    error_message: str | None,
+    payload: dict | None,
+    log_path: Path,
+) -> None:
+    run_id = get_or_create_run_id(repo, cfg, state)
+    stage_status = payload.get("status") if isinstance(payload, dict) else None
+    verdict = None
+    critical_count = None
+    warning_count = None
+    note_count = None
+    if isinstance(payload, dict) and stage == "review":
+        verdict = payload.get("verdict")
+        counts = payload.get("finding_counts")
+        if isinstance(counts, dict):
+            critical_count = counts.get("critical")
+            warning_count = counts.get("warning")
+            note_count = counts.get("note")
+    rel_log_path = str(log_path.relative_to(repo)) if log_path else ""
+
+    record = build_telemetry_record(
+        plan_name=cfg["name"],
+        run_id=run_id,
+        change_id=cid,
+        stage=stage,
+        round_num=round_num,
+        status=telemetry_status,
+        started_at=started_at,
+        ended_at=ended_at,
+        duration_ms=duration_ms,
+        adapter=cfg["adapter"],
+        worker_command=cfg[f"{stage}_invoke"],
+        timeout_seconds=int(cfg["changes"][cid]["timeout_minutes"] * 60),
+        log_path=rel_log_path,
+        stage_status=stage_status,
+        error_message=error_message,
+        verdict=verdict,
+        critical_count=critical_count,
+        warning_count=warning_count,
+        note_count=note_count,
+    )
+    write_telemetry_record(repo, cfg["name"], record)
+    rec(state, cid)["telemetry"] = {"latest_telemetry": record["uid"]}
 
 
 def parse_stage_json(log_path: Path) -> tuple[dict | None, str]:
@@ -954,15 +1129,43 @@ def run_direct_change(
         input_block = build_worker_input(repo, cfg, state, cid)
         set_status(state, cid, RUNNING, f"{stage} round {round_num}")
         persist_direct_state(repo, cfg, state, cid)
+
+        # 3.1 Capture started_at before invocation
+        started_at = utcnow()
+
+        def _write_telemetry(telemetry_status: str, error_message: str | None) -> None:
+            """Write a telemetry record. Logs a warning on failure; never raises."""
+            try:
+                _record_stage_telemetry(
+                    repo, cfg, state, cid, stage, round_num,
+                    started_at, ended_at, duration_ms,
+                    telemetry_status, error_message,
+                    payload, log_path,
+                )
+            except Exception as exc:
+                log(f"warning: failed to write telemetry for {cid}/{stage} r{round_num}: {exc}")
+
         outcome, log_path = invoke_direct_stage(repo, cfg, cid, stage, round_num, input_block)
         record_stage_log(state, cid, stage, round_num, outcome, log_path)
 
+        # 3.2 Capture ended_at, compute duration, determine telemetry status
+        ended_at = utcnow()
+        duration_ms = compute_duration_ms(started_at, ended_at)
+        payload: dict | None = None
+        parse_why = ""
+
         if outcome == "spawn_error":
+            _write_telemetry(
+                "spawn_error",
+                f"could not spawn {stage}: {cfg[f'{stage}_invoke']}",
+            )
             rec(state, cid)["last_result"] = f"{stage}_spawn_error"
             set_status(state, cid, FAILED, f"could not spawn {stage}: {cfg[f'{stage}_invoke']}")
             persist_direct_state(repo, cfg, state, cid)
             return "spawn_error"
+
         if outcome == "timeout":
+            _write_telemetry("timeout", f"{stage} timed out")
             rec(state, cid)["last_result"] = f"{stage}_timeout"
             set_status(state, cid, FAILED, f"{stage} timed out")
             persist_direct_state(repo, cfg, state, cid)
@@ -970,6 +1173,7 @@ def run_direct_change(
 
         payload, parse_why = parse_stage_json(log_path)
         if payload is None:
+            _write_telemetry("invalid_output", parse_why)
             rec(state, cid)["last_result"] = "subagent_output_invalid"
             if stage == "archive":
                 rec(state, cid)["archive"]["status"] = "failed"
@@ -978,6 +1182,8 @@ def run_direct_change(
             persist_direct_state(repo, cfg, state, cid)
             return "failed"
 
+        # Parseable payload: apply control-flow dispatch first, then record
+        # telemetry with the definitive outcome.
         if stage == "implement":
             action = apply_implement_result(repo, cfg, state, cid, payload)
         elif stage == "review":
@@ -985,8 +1191,26 @@ def run_direct_change(
         else:
             action = apply_archive_result(repo, cfg, state, cid, payload)
         persist_direct_state(repo, cfg, state, cid)
+
+        # Determine telemetry status from the control-flow decision.
+        if action == "stop":
+            telemetry_status = "failed"
+            last_result = rec(state, cid).get("last_result", "")
+            reason = rec(state, cid).get("reason", "")
+            error_message = f"control flow stopped: {last_result}"
+            if reason:
+                error_message += f" - {reason}"
+        else:
+            telemetry_status = "completed"
+            error_message = None
+
+        _write_telemetry(telemetry_status, error_message)
+
         if action == "continue":
             continue
+        # Persist after telemetry write so telemetry.latest_telemetry is saved
+        # for stop/done outcomes (e.g. blocked implement, archived archive).
+        persist_direct_state(repo, cfg, state, cid)
         return action
 
 
