@@ -1077,7 +1077,15 @@ def run_fast_checks(repo: Path, cfg: dict) -> tuple[bool, str]:
 
 
 def change_dir(repo: Path, cid: str) -> Path:
-    return repo / "openspec" / "changes" / cid
+    direct = repo / "openspec" / "changes" / cid
+    if direct.is_dir():
+        return direct
+    changes_dir = repo / "openspec" / "changes"
+    if changes_dir.is_dir():
+        for entry in sorted(changes_dir.iterdir(), reverse=True):
+            if entry.is_dir() and entry.name.endswith(f"-{cid}"):
+                return entry
+    return direct
 
 
 AUTHORED_ARTIFACTS = ("proposal.md", "tasks.md")
@@ -1128,7 +1136,7 @@ def verify_change_created(
         if not (cdir / artifact).is_file():
             reasons.append(f"missing {artifact}")
 
-    check = cfg["created_check"].format(change=cid)
+    check = cfg["created_check"].format(change=cdir.name)
     if check.strip():
         try:
             res = subprocess.run(
