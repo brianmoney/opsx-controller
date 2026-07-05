@@ -1443,9 +1443,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             log("max-changes reached; stopping")
             break
 
+        create_only_ok = {"ready", "awaiting_approval"} if args.create_only else {"ready"}
         ready = [
             c for c in cfg["order"]
-            if c not in visited and classify(cfg, state, c) == "ready"
+            if c not in visited and classify(cfg, state, c) in create_only_ok
         ]
         if args.only:
             ready = [c for c in ready if c in args.only]
