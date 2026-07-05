@@ -1,0 +1,224 @@
+# ===========================================================================
+# Pricing Catalog
+# ===========================================================================
+#
+# This file stores model pricing entries used by the cost estimation pipeline.
+# It is operator-maintained and version-controlled alongside the loader code.
+#
+# ---------------------------------------------------------------------------
+# How to add a new model entry
+# ---------------------------------------------------------------------------
+#
+# Add a new ``[[entries]]`` block below. Required fields for every entry:
+#   provider        - API provider name (e.g. "openai", "anthropic", "google")
+#   model_id        - canonical model identifier (e.g. "gpt-4o")
+#   display_name    - human-readable name for reports (e.g. "GPT-4o")
+#   billing_mode    - "per_token" or "subscription"
+#   currency        - ISO 4217 three-letter code (e.g. "USD")
+#   effective_date  - ISO-8601 date when this pricing became/become effective
+#
+# For per-token models (billing_mode = "per_token"):
+#   input_price_per_mtok          (required)  USD per million input tokens
+#   output_price_per_mtok         (optional)  USD per million output tokens
+#   cached_input_price_per_mtok   (optional)  USD per million cached input tokens
+#   reasoning_price_per_mtok      (optional)  USD per million reasoning tokens
+#
+#   At minimum ``input_price_per_mtok`` must be a positive value.  Other
+#   per-mtok fields can be omitted when the provider does not break down
+#   that token category separately.
+#
+# For subscription models (billing_mode = "subscription"):
+#   subscription_period  (required)  "monthly" or "yearly"
+#   subscription_price   (required)  price in the specified currency
+#
+# Optional fields (all modes):
+#   notes  - freeform operator notes about this entry
+#
+# ---------------------------------------------------------------------------
+# How to update a pricing rate
+# ---------------------------------------------------------------------------
+#
+# **Do not edit existing entries in place.**  Instead, add a new
+# ``[[entries]]`` block with the same ``(provider, model_id)`` pair and a
+# later ``effective_date``.  The loader always picks the entry with the
+# latest ``effective_date`` for a given pair.  This preserves historical
+# pricing so that past telemetry records remain reproducible.
+#
+# Example: GPT-4o price reduction effective 2025-07-01
+#
+#   # Old entry (kept for history):
+#   [[entries]]
+#   provider = "openai"
+#   model_id = "gpt-4o"
+#   display_name = "GPT-4o"
+#   billing_mode = "per_token"
+#   currency = "USD"
+#   input_price_per_mtok = 2.50
+#   effective_date = "2025-01-01"
+#
+#   # New entry (becomes active on 2025-07-01):
+#   [[entries]]
+#   provider = "openai"
+#   model_id = "gpt-4o"
+#   display_name = "GPT-4o (reduced)"
+#   billing_mode = "per_token"
+#   currency = "USD"
+#   input_price_per_mtok = 2.00
+#   effective_date = "2025-07-01"
+#
+# ---------------------------------------------------------------------------
+# How to handle model deprecation
+# ---------------------------------------------------------------------------
+#
+# When a model is discontinued:
+#   1. Keep the existing entries in the catalog — historical runs
+#      that used the model still need reproducible pricing.
+#   2. Add a ``notes`` field to the last entry indicating deprecation,
+#      e.g. ``notes = "Deprecated 2025-09-01; superseded by gpt-5"``.
+#   3. There is no ``deprecated`` or ``superseded_by`` field yet; use
+#      ``notes`` for tracking.
+#
+# ---------------------------------------------------------------------------
+
+[catalog]
+version = "1.0.0"
+updated = "2026-07-05"
+
+# ---------------------------------------------------------------------------
+# OpenAI entries
+# ---------------------------------------------------------------------------
+
+[[entries]]
+provider = "openai"
+model_id = "gpt-4o"
+display_name = "GPT-4o"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 2.50
+output_price_per_mtok = 10.00
+cached_input_price_per_mtok = 1.25
+effective_date = "2025-01-01"
+notes = "Standard GPT-4o pricing as of early 2025"
+
+[[entries]]
+provider = "openai"
+model_id = "gpt-4o-mini"
+display_name = "GPT-4o Mini"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 0.15
+output_price_per_mtok = 0.60
+cached_input_price_per_mtok = 0.075
+effective_date = "2025-01-01"
+notes = "Lightweight GPT-4o variant"
+
+[[entries]]
+provider = "openai"
+model_id = "o3"
+display_name = "o3"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 10.00
+output_price_per_mtok = 40.00
+cached_input_price_per_mtok = 2.50
+reasoning_price_per_mtok = 20.00
+effective_date = "2025-04-01"
+notes = "OpenAI o3 reasoning model"
+
+# ---------------------------------------------------------------------------
+# Anthropic entries
+# ---------------------------------------------------------------------------
+
+[[entries]]
+provider = "anthropic"
+model_id = "claude-sonnet-4-20250514"
+display_name = "Claude Sonnet 4"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 3.00
+output_price_per_mtok = 15.00
+cached_input_price_per_mtok = 0.30
+effective_date = "2025-06-01"
+notes = "Claude Sonnet 4 standard pricing"
+
+[[entries]]
+provider = "anthropic"
+model_id = "claude-haiku-3-5-sonnet-20241022"
+display_name = "Claude 3.5 Haiku"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 0.80
+output_price_per_mtok = 4.00
+cached_input_price_per_mtok = 0.08
+effective_date = "2025-01-01"
+notes = "Claude 3.5 Haiku — fast, cost-effective"
+
+# ---------------------------------------------------------------------------
+# Google entries
+# ---------------------------------------------------------------------------
+
+[[entries]]
+provider = "google"
+model_id = "gemini-2.0-flash"
+display_name = "Gemini 2.0 Flash"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 0.10
+output_price_per_mtok = 0.40
+effective_date = "2025-02-01"
+notes = "Gemini 2.0 Flash — fast and inexpensive"
+
+[[entries]]
+provider = "google"
+model_id = "gemini-2.5-pro"
+display_name = "Gemini 2.5 Pro"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 1.25
+output_price_per_mtok = 10.00
+cached_input_price_per_mtok = 0.3125
+reasoning_price_per_mtok = 3.50
+effective_date = "2025-06-01"
+notes = "Gemini 2.5 Pro with reasoning"
+
+# ---------------------------------------------------------------------------
+# DeepSeek entries
+# ---------------------------------------------------------------------------
+
+[[entries]]
+provider = "deepseek"
+model_id = "deepseek-v3"
+display_name = "DeepSeek V3"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 0.27
+output_price_per_mtok = 1.10
+effective_date = "2025-01-01"
+notes = "DeepSeek V3 — cost-efficient frontier model"
+
+[[entries]]
+provider = "deepseek"
+model_id = "deepseek-r1"
+display_name = "DeepSeek R1"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 0.55
+output_price_per_mtok = 2.19
+reasoning_price_per_mtok = 2.19
+effective_date = "2025-01-20"
+notes = "DeepSeek R1 reasoning model"
+
+# ---------------------------------------------------------------------------
+# Subscription model example (GitHub Copilot)
+# ---------------------------------------------------------------------------
+
+[[entries]]
+provider = "github"
+model_id = "copilot"
+display_name = "GitHub Copilot"
+billing_mode = "subscription"
+currency = "USD"
+subscription_period = "monthly"
+subscription_price = 10.00
+effective_date = "2025-01-01"
+notes = "GitHub Copilot individual monthly subscription"
