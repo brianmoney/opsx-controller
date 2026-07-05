@@ -1641,14 +1641,34 @@ def cmd_status_inner(cfg: dict, state: dict, header: str) -> int:
     return 1 if failed else 0
 
 
+def resolve_changes(cfg: dict, args: list[str]) -> list[str] | None:
+    """Resolve each arg: P<N> maps to all changes in that phase; else exact slug."""
+    resolved: list[str] = []
+    for arg in args:
+        m = re.fullmatch(r"P(\d+)", arg)
+        if m:
+            phase = int(m.group(1))
+            matched = [c for c in cfg["order"] if cfg["changes"][c].get("phase") == phase]
+            if not matched:
+                print(f"no changes found for phase P{phase}", file=sys.stderr)
+                return None
+            resolved.extend(matched)
+        elif arg in cfg["changes"]:
+            resolved.append(arg)
+        else:
+            print(f"unknown change: {arg}", file=sys.stderr)
+            return None
+    return resolved
+
+
 def cmd_approve(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
     cfg = load_plan(Path(args.plan).resolve())
     state = load_state(repo, cfg["name"])
-    for cid in args.change:
-        if cid not in cfg["changes"]:
-            print(f"unknown change: {cid}", file=sys.stderr)
-            return 2
+    changes = resolve_changes(cfg, args.change)
+    if changes is None:
+        return 2
+    for cid in changes:
         if cid not in state["approvals"]:
             state["approvals"].append(cid)
             log(f"approved: {cid}")
@@ -1661,10 +1681,10 @@ def cmd_accept(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
     cfg = load_plan(Path(args.plan).resolve())
     state = load_state(repo, cfg["name"])
-    for cid in args.change:
-        if cid not in cfg["changes"]:
-            print(f"unknown change: {cid}", file=sys.stderr)
-            return 2
+    changes = resolve_changes(cfg, args.change)
+    if changes is None:
+        return 2
+    for cid in changes:
         ok, why = verify_change_created(repo, cfg, cid)
         if not ok:
             print(f"refusing to accept {cid}: {why}", file=sys.stderr)
@@ -1679,10 +1699,10 @@ def cmd_reset(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
     cfg = load_plan(Path(args.plan).resolve())
     state = load_state(repo, cfg["name"])
-    for cid in args.change:
-        if cid not in cfg["changes"]:
-            print(f"unknown change: {cid}", file=sys.stderr)
-            return 2
+    changes = resolve_changes(cfg, args.change)
+    if changes is None:
+        return 2
+    for cid in changes:
         state["changes"][cid] = new_change_record()
         state["changes"][cid]["max_rounds"] = cfg["max_rounds"]
         state["changes"][cid]["reason"] = "reset by operator"

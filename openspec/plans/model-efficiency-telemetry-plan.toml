@@ -1,0 +1,76 @@
+[plan]
+name = "model-efficiency-telemetry"
+adapter = "opencode"
+timeout_minutes = 90
+max_attempts = 2
+max_rounds = 5
+no_progress_limit = 2
+require_clean_tracked = true
+plan_doc = "openspec/plans/model-efficiency-telemetry-plan.md"
+create_invoke = "opencode run \"/opsx-ff Please review @{plan_doc} and create a change for {change}\""
+create_timeout_minutes = 30
+create_max_attempts = 2
+created_check = "openspec validate {change} --strict"
+review_created = true
+fast_checks = [
+  "openspec validate --all",
+]
+
+# Phase 1: Telemetry Foundation
+
+[[changes]]
+id = "define-plan-run-telemetry-schema"
+phase = 1
+pause_before = true # first change in proposed `plan-run-observability` capability
+
+[[changes]]
+id = "record-direct-stage-telemetry"
+phase = 1
+depends_on = ["define-plan-run-telemetry-schema"]
+
+[[changes]]
+id = "capture-worker-usage-metadata"
+phase = 1
+depends_on = ["record-direct-stage-telemetry"]
+
+# Phase 2: Pricing And Cost Normalization
+
+[[changes]]
+id = "add-model-pricing-catalog"
+phase = 2
+depends_on = ["define-plan-run-telemetry-schema"]
+
+[[changes]]
+id = "estimate-stage-token-costs"
+phase = 2
+depends_on = [
+  "capture-worker-usage-metadata",
+  "add-model-pricing-catalog",
+]
+# Optional manual pricing-policy gate from the source plan.
+# Uncomment after compile/review if cost-reporting policy needs approval first.
+# pause_before = true
+
+# Phase 3: Metrics And Reporting
+
+[[changes]]
+id = "aggregate-plan-efficiency-metrics"
+phase = 3
+depends_on = ["estimate-stage-token-costs"]
+
+[[changes]]
+id = "add-opsx-plan-report-command"
+phase = 3
+depends_on = ["aggregate-plan-efficiency-metrics"]
+
+[[changes]]
+id = "export-plan-efficiency-dashboard"
+phase = 3
+depends_on = ["add-opsx-plan-report-command"]
+
+# Phase 4: Operator Workflow
+
+[[changes]]
+id = "document-model-efficiency-workflow"
+phase = 4
+depends_on = ["export-plan-efficiency-dashboard"]
