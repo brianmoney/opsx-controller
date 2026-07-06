@@ -2979,5 +2979,526 @@ class DirectStageTelemetryTests(unittest.TestCase):
         self._assert_worker_state_has_latest_telemetry_uid()
 
 
+class CompileTests(unittest.TestCase):
+    """Tests for ``opsx-plan compile``: prompt construction, template
+    injection, validation, error handling, and CLI routing."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        git(self.repo, "init")
+        git(
+            self.repo,
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "user.name=Test User",
+            "commit",
+            "-m",
+            "init",
+            "--allow-empty",
+        )
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _write_plan_md(self, rel_path: str, content: str) -> Path:
+        p = self.repo / rel_path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    def _set_model(self) -> None:
+        import os as _os
+        _os.environ["OPSX_CONTROLLER_MODEL"] = "test-model"
+
+    def _clear_model(self) -> None:
+        import os as _os
+        _os.environ.pop("OPSX_CONTROLLER_MODEL", None)
+
+    # -- resolve / validation helpers (already covered by earlier tasks) --
+
+    def test_resolve_compile_source_rejects_missing_file(self) -> None:
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan.resolve_compile_source(self.repo, "nonexistent.md")
+        self.assertIn("not found", str(ctx.exception))
+
+    def test_resolve_compile_source_rejects_non_md_extension(self) -> None:
+        p = self.repo / "plan.txt"
+        p.write_text("text", encoding="utf-8")
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan.resolve_compile_source(self.repo, "plan.txt")
+        self.assertIn("must be a markdown file", str(ctx.exception))
+
+    def test_resolve_compile_output_refuses_existing_without_force(self) -> None:
+        p = self.repo / "out.toml"
+        p.write_text("existing", encoding="utf-8")
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan.resolve_compile_output(self.repo, "out.toml", force=False)
+        self.assertIn("exists", str(ctx.exception))
+        self.assertIn("--force", str(ctx.exception))
+
+    def test_resolve_compile_output_allows_overwrite_with_force(self) -> None:
+        p = self.repo / "out.toml"
+        p.write_text("existing", encoding="utf-8")
+        result = self.opsx_plan.resolve_compile_output(self.repo, "out.toml", force=True)
+        self.assertEqual(result, p.resolve())
+
+    def test_check_controller_model_fails_when_unset(self) -> None:
+        self._clear_model()
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan.check_controller_model()
+        self.assertIn("OPSX_CONTROLLER_MODEL", str(ctx.exception))
+
+    def test_check_controller_model_succeeds_when_set(self) -> None:
+        self._set_model()
+        model = self.opsx_plan.check_controller_model()
+        self.assertEqual(model, "test-model")
+
+    # -- prompt construction --
+
+    def test_build_compile_prompt_includes_source_content(self) -> None:
+        content = "# My Plan\n\n## Phase 1\n\n### Change: `my-change`\n\n**Depends on:** None.\n"
+        prompt = self.opsx_plan.build_compile_prompt(content, Path("/tmp/fake.md"), self.repo)
+        self.assertIn("My Plan", prompt)
+        self.assertIn("my-change", prompt)
+        self.assertIn("Source plan markdown", prompt)
+
+    def test_build_compile_prompt_includes_schema_guidance(self) -> None:
+        prompt = self.opsx_plan.build_compile_prompt("content", Path("/tmp/fake.md"), self.repo)
+        self.assertIn("[plan]", prompt)
+        self.assertIn("[[changes]]", prompt)
+        self.assertIn("depends_on", prompt)
+        self.assertIn("pause_before", prompt)
+
+    def test_build_compile_prompt_instructs_toml_only_output(self) -> None:
+        prompt = self.opsx_plan.build_compile_prompt("content", Path("/tmp/fake.md"), self.repo)
+        self.assertIn("Output only TOML", prompt)
+        self.assertIn("fenced ```toml block", prompt)
+
+    def test_build_compile_prompt_includes_dependency_semantics(self) -> None:
+        prompt = self.opsx_plan.build_compile_prompt("content", Path("/tmp/fake.md"), self.repo)
+        self.assertIn("become `depends_on`", prompt)
+        self.assertIn("independence wording", prompt)
+        self.assertIn("deferred", prompt.lower())
+
+    def test_build_compile_prompt_instructs_plan_doc_reference(self) -> None:
+        prompt = self.opsx_plan.build_compile_prompt("content", Path("/tmp/fake.md"), self.repo)
+        self.assertIn("plan_doc", prompt)
+        self.assertIn("/tmp/fake.md", prompt)
+
+    def test_build_compile_prompt_includes_repo_relative_source_path(self) -> None:
+        source = self._write_plan_md("openspec/plans/my-plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
+        prompt = self.opsx_plan.build_compile_prompt("# Plan\n", source, self.repo)
+        self.assertIn('"openspec/plans/my-plan.md"', prompt)
+        self.assertIn("plan_doc", prompt)
+
+    def test_build_compile_prompt_notes_no_templates_when_none_found(self) -> None:
+        prompt = self.opsx_plan.build_compile_prompt("content", Path("/tmp/fake.md"), self.repo)
+        self.assertIn("No `openspec/plans/*.md` template plan pairs were found", prompt)
+
+    def test_build_compile_prompt_injects_template_pairs(self) -> None:
+        plans_dir = self.repo / "openspec" / "plans"
+        plans_dir.mkdir(parents=True)
+        (plans_dir / "example-plan.md").write_text("# Example plan\n", encoding="utf-8")
+        (plans_dir / "example-plan.toml").write_text('[plan]\nname = "example"\n', encoding="utf-8")
+
+        prompt = self.opsx_plan.build_compile_prompt("content", Path("/tmp/fake.md"), self.repo)
+        self.assertIn("Example plan", prompt)
+        self.assertIn("example-plan.toml", prompt)
+        self.assertIn('name = "example"', prompt)
+
+    def test_discover_template_pairs_returns_empty_when_no_plans_dir(self) -> None:
+        pairs = self.opsx_plan.discover_template_pairs(self.repo)
+        self.assertEqual(pairs, [])
+
+    def test_discover_template_pairs_finds_md_and_toml(self) -> None:
+        plans_dir = self.repo / "openspec" / "plans"
+        plans_dir.mkdir(parents=True)
+        (plans_dir / "a.md").write_text("md", encoding="utf-8")
+        (plans_dir / "a.toml").write_text("toml", encoding="utf-8")
+        (plans_dir / "b.md").write_text("md2", encoding="utf-8")
+
+        pairs = self.opsx_plan.discover_template_pairs(self.repo)
+        self.assertEqual(len(pairs), 2)
+        self.assertEqual(pairs[0][0].name, "a.md")
+        self.assertIsNotNone(pairs[0][1])
+        self.assertEqual(pairs[1][0].name, "b.md")
+        self.assertIsNone(pairs[1][1])
+
+    # -- cmd_compile error handling --
+
+    def test_cmd_compile_fails_without_model(self) -> None:
+        self._clear_model()
+        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
+        out = self.repo / "out.toml"
+        args = argparse.Namespace(repo=str(self.repo), source="plan.md",
+                                  output=str(out), force=False)
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan.cmd_compile(args)
+        self.assertIn("OPSX_CONTROLLER_MODEL", str(ctx.exception))
+
+    def test_cmd_compile_fails_when_output_exists_without_force(self) -> None:
+        self._set_model()
+        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
+        out = self.repo / "out.toml"
+        out.write_text("existing", encoding="utf-8")
+        args = argparse.Namespace(repo=str(self.repo), source="plan.md",
+                                  output=str(out), force=False)
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan.cmd_compile(args)
+        self.assertIn("exists", str(ctx.exception))
+
+    def test_cmd_compile_fails_when_source_not_found(self) -> None:
+        self._set_model()
+        out = self.repo / "out.toml"
+        args = argparse.Namespace(repo=str(self.repo), source="missing.md",
+                                  output=str(out), force=False)
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan.cmd_compile(args)
+        self.assertIn("not found", str(ctx.exception))
+
+    # -- successful compile (mocked opencode) --
+
+    def test_cmd_compile_success_with_valid_toml(self) -> None:
+        self._set_model()
+        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
+
+        valid_toml = (
+            '[plan]\nname = "test"\nadapter = "opencode"\n\n'
+            "[[changes]]\nid = \"c1\"\nphase = 1\n"
+        )
+
+        def fake_run(repo, model, prompt):
+            return valid_toml, ""
+
+        original = self.opsx_plan.run_opencode_for_compile
+        try:
+            self.opsx_plan.run_opencode_for_compile = fake_run
+            out = self.repo / "out.toml"
+            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
+                                      output=str(out), force=False)
+            rc = self.opsx_plan.cmd_compile(args)
+            self.assertEqual(rc, 0)
+            self.assertTrue(out.is_file())
+            content = out.read_text(encoding="utf-8")
+            self.assertIn("c1", content)
+        finally:
+            self.opsx_plan.run_opencode_for_compile = original
+
+    def test_cmd_compile_success_with_fenced_toml(self) -> None:
+        self._set_model()
+        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
+
+        fenced_toml = (
+            '```toml\n'
+            '[plan]\nname = "test"\nadapter = "opencode"\n\n'
+            "[[changes]]\nid = \"c1\"\nphase = 1\n"
+            '```\n'
+        )
+
+        def fake_run(repo, model, prompt):
+            return fenced_toml, ""
+
+        original = self.opsx_plan.run_opencode_for_compile
+        try:
+            self.opsx_plan.run_opencode_for_compile = fake_run
+            out = self.repo / "out.toml"
+            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
+                                      output=str(out), force=False)
+            rc = self.opsx_plan.cmd_compile(args)
+            self.assertEqual(rc, 0)
+            self.assertTrue(out.is_file())
+            content = out.read_text(encoding="utf-8")
+            self.assertIn("c1", content)
+        finally:
+            self.opsx_plan.run_opencode_for_compile = original
+
+    # -- invalid TOML rejection --
+
+    def test_cmd_compile_rejects_invalid_toml(self) -> None:
+        self._set_model()
+        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
+
+        def fake_run(repo, model, prompt):
+            return "not valid toml {{{", ""
+
+        original = self.opsx_plan.run_opencode_for_compile
+        try:
+            self.opsx_plan.run_opencode_for_compile = fake_run
+            out = self.repo / "out.toml"
+            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
+                                      output=str(out), force=False)
+            with self.assertRaises(self.opsx_plan.PlanError):
+                self.opsx_plan.cmd_compile(args)
+            self.assertFalse(out.is_file())
+        finally:
+            self.opsx_plan.run_opencode_for_compile = original
+
+    def test_cmd_compile_rejects_empty_output(self) -> None:
+        self._set_model()
+        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
+
+        def fake_run(repo, model, prompt):
+            return "   ", ""
+
+        original = self.opsx_plan.run_opencode_for_compile
+        try:
+            self.opsx_plan.run_opencode_for_compile = fake_run
+            out = self.repo / "out.toml"
+            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
+                                      output=str(out), force=False)
+            with self.assertRaises(self.opsx_plan.PlanError):
+                self.opsx_plan.cmd_compile(args)
+            self.assertFalse(out.is_file())
+        finally:
+            self.opsx_plan.run_opencode_for_compile = original
+
+    def test_cmd_compile_rejects_toml_with_no_changes(self) -> None:
+        self._set_model()
+        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
+
+        no_changes_toml = '[plan]\nname = "test"\n'
+
+        def fake_run(repo, model, prompt):
+            return no_changes_toml, ""
+
+        original = self.opsx_plan.run_opencode_for_compile
+        try:
+            self.opsx_plan.run_opencode_for_compile = fake_run
+            out = self.repo / "out.toml"
+            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
+                                      output=str(out), force=False)
+            with self.assertRaises(self.opsx_plan.PlanError):
+                self.opsx_plan.cmd_compile(args)
+            self.assertFalse(out.is_file())
+        finally:
+            self.opsx_plan.run_opencode_for_compile = original
+
+    def test_cmd_compile_rejects_unknown_dependency(self) -> None:
+        self._set_model()
+        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
+
+        unknown_dep_toml = (
+            '[plan]\nname = "test"\nadapter = "opencode"\n\n'
+            "[[changes]]\nid = \"c1\"\nphase = 1\n"
+            "depends_on = [\"nonexistent\"]\n"
+        )
+
+        def fake_run(repo, model, prompt):
+            return unknown_dep_toml, ""
+
+        original = self.opsx_plan.run_opencode_for_compile
+        try:
+            self.opsx_plan.run_opencode_for_compile = fake_run
+            out = self.repo / "out.toml"
+            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
+                                      output=str(out), force=False)
+            with self.assertRaises(self.opsx_plan.PlanError):
+                self.opsx_plan.cmd_compile(args)
+            self.assertFalse(out.is_file())
+        finally:
+            self.opsx_plan.run_opencode_for_compile = original
+
+    def test_cmd_compile_rejects_duplicate_change_id(self) -> None:
+        self._set_model()
+        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
+
+        dup_id_toml = (
+            '[plan]\nname = "test"\nadapter = "opencode"\n\n'
+            "[[changes]]\nid = \"c1\"\nphase = 1\n"
+            "[[changes]]\nid = \"c1\"\nphase = 2\n"
+        )
+
+        def fake_run(repo, model, prompt):
+            return dup_id_toml, ""
+
+        original = self.opsx_plan.run_opencode_for_compile
+        try:
+            self.opsx_plan.run_opencode_for_compile = fake_run
+            out = self.repo / "out.toml"
+            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
+                                      output=str(out), force=False)
+            with self.assertRaises(self.opsx_plan.PlanError):
+                self.opsx_plan.cmd_compile(args)
+            self.assertFalse(out.is_file())
+        finally:
+            self.opsx_plan.run_opencode_for_compile = original
+
+    def test_cmd_compile_does_not_overwrite_on_failure(self) -> None:
+        """Even when --force is passed, an invalid model output must not
+        overwrite an existing file."""
+        self._set_model()
+        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
+        out = self.repo / "out.toml"
+        out.write_text("original content", encoding="utf-8")
+
+        def fake_run(repo, model, prompt):
+            return "bad toml {{{", ""
+
+        original = self.opsx_plan.run_opencode_for_compile
+        try:
+            self.opsx_plan.run_opencode_for_compile = fake_run
+            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
+                                      output=str(out), force=True)
+            with self.assertRaises(self.opsx_plan.PlanError):
+                self.opsx_plan.cmd_compile(args)
+            self.assertEqual(out.read_text(encoding="utf-8"), "original content")
+        finally:
+            self.opsx_plan.run_opencode_for_compile = original
+
+    # -- extract_toml --
+
+    def test_extract_toml_from_fenced_block(self) -> None:
+        output = '```toml\n[plan]\nname = "x"\n```\n'
+        result = self.opsx_plan.extract_toml(output)
+        self.assertIn('[plan]', result)
+        self.assertNotIn('```', result)
+
+    def test_extract_toml_from_bare_output(self) -> None:
+        output = '[plan]\nname = "x"\n'
+        result = self.opsx_plan.extract_toml(output)
+        self.assertEqual(result, output.strip())
+
+    def test_extract_toml_rejects_empty(self) -> None:
+        with self.assertRaises(self.opsx_plan.PlanError):
+            self.opsx_plan.extract_toml("   ")
+
+    def test_extract_toml_rejects_no_toml(self) -> None:
+        with self.assertRaises(self.opsx_plan.PlanError):
+            self.opsx_plan.extract_toml("just some prose, no brackets")
+
+    def test_extract_toml_rejects_multiple_fenced_blocks(self) -> None:
+        output = (
+            '```toml\n[plan]\nname = "x"\n```\n'
+            '```toml\n[plan]\nname = "y"\n```\n'
+        )
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan.extract_toml(output)
+        self.assertIn("multiple fenced", str(ctx.exception))
+
+    def test_extract_toml_rejects_prose_before_fenced_block(self) -> None:
+        output = "Here is the compiled plan:\n\n```toml\n[plan]\nname = \"x\"\n```\n"
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan.extract_toml(output)
+        self.assertIn("extra content found around", str(ctx.exception))
+
+    def test_extract_toml_rejects_prose_after_fenced_block(self) -> None:
+        output = "```toml\n[plan]\nname = \"x\"\n```\n\nLet me know if you need changes."
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan.extract_toml(output)
+        self.assertIn("extra content found around", str(ctx.exception))
+
+    def test_extract_toml_accepts_clean_fenced_block_with_surrounding_whitespace(self) -> None:
+        output = "\n\n```toml\n[plan]\nname = \"x\"\n```\n\n"
+        result = self.opsx_plan.extract_toml(output)
+        self.assertIn('[plan]', result)
+        self.assertNotIn('```', result)
+
+    # -- CLI parser coverage --
+
+    def test_compile_subcommand_appears_in_help(self) -> None:
+        """Prove ``compile`` appears in the subcommand list."""
+        self.opsx_plan.sys = mock.Mock()
+        stderr = io.StringIO()
+
+        with mock.patch.object(self.opsx_plan.sys, "argv", ["opsx-plan", "--help"]), \
+             mock.patch("sys.stdout", io.StringIO()) as stdout, \
+             mock.patch("sys.stderr", stderr):
+            # argparse calls sys.exit on --help; suppress it
+            try:
+                self.opsx_plan.main()
+            except SystemExit:
+                pass
+
+        combined = stdout.getvalue() + stderr.getvalue()
+        self.assertIn("compile", combined)
+
+    def test_compile_subcommand_routes_to_cmd_compile(self) -> None:
+        """Prove ``opsx-plan compile`` routes to ``cmd_compile``."""
+        self._set_model()
+        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
+        out = self.repo / "out.toml"
+
+        valid_toml = (
+            '[plan]\nname = "test"\nadapter = "opencode"\n\n'
+            "[[changes]]\nid = \"c1\"\nphase = 1\n"
+        )
+
+        def fake_run(repo, model, prompt):
+            return valid_toml, ""
+
+        original = self.opsx_plan.run_opencode_for_compile
+        try:
+            self.opsx_plan.run_opencode_for_compile = fake_run
+            with mock.patch.object(
+                self.opsx_plan.sys,
+                "argv",
+                ["opsx-plan", "--repo", str(self.repo),
+                 "compile", "plan.md", "-o", str(out)],
+            ):
+                rc = self.opsx_plan.main()
+            self.assertEqual(rc, 0)
+            self.assertTrue(out.is_file())
+        finally:
+            self.opsx_plan.run_opencode_for_compile = original
+
+    def test_run_opencode_for_compile_raises_on_spawn_failure(self) -> None:
+        def fake_run(*args, **kwargs):
+            raise FileNotFoundError("no opencode")
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+                self.opsx_plan.run_opencode_for_compile(self.repo, "m", "prompt")
+            self.assertIn("could not spawn opencode", str(ctx.exception))
+
+    def test_run_opencode_for_compile_passes_model_in_argv(self) -> None:
+        """Verify ``run_opencode_for_compile`` spawns opencode with the
+        configured model."""
+        model = "configured-model-v1"
+        prompt = "compile this plan"
+
+        real_run = subprocess.run
+
+        def fake_run(args, **kwargs):
+            self.assertEqual(args[0], "opencode")
+            self.assertEqual(args[1], "run")
+            self.assertEqual(args[2], "--model")
+            self.assertEqual(args[3], model)
+            self.assertEqual(args[4], prompt)
+            result = mock.Mock()
+            result.returncode = 0
+            result.stdout = '[plan]\nname = "x"\n\n[[changes]]\nid = "c1"\n'
+            result.stderr = ""
+            return result
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            stdout, stderr = self.opsx_plan.run_opencode_for_compile(
+                self.repo, model, prompt
+            )
+
+    def test_run_opencode_for_compile_raises_on_nonzero_exit(self) -> None:
+        fake_result = mock.Mock()
+        fake_result.returncode = 1
+        fake_result.stdout = ""
+        fake_result.stderr = "some error"
+
+        with mock.patch("subprocess.run", return_value=fake_result):
+            with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+                self.opsx_plan.run_opencode_for_compile(self.repo, "m", "prompt")
+            self.assertIn("exited with code 1", str(ctx.exception))
+
+    def test_build_schema_guidance_includes_load_plan_fields(self) -> None:
+        guidance = self.opsx_plan.build_schema_guidance()
+        for field in ("name", "adapter", "invoke", "implement_invoke",
+                       "review_invoke", "archive_invoke", "timeout_minutes",
+                       "max_rounds", "no_progress_limit", "fast_checks",
+                       "plan_doc", "create_invoke", "pause_before", "depends_on",
+                       "enabled", "phase", "id", "max_attempts", "review_created"):
+            self.assertIn(field, guidance,
+                          f"schema guidance must mention field '{field}' consumed by load_plan()")
+
+
 if __name__ == "__main__":
     unittest.main()

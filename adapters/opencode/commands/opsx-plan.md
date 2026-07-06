@@ -5,7 +5,7 @@ agent: build
 
 Author exactly one phased implementation plan markdown document for this
 repository. The document is both a human planning artifact and machine input:
-`opsx-plan compile` parses it deterministically into a `plan.toml` manifest
+`opsx-plan compile` converts it into a `plan.toml` manifest via model-assisted compilation with local validation
 that drives automated change creation (`/opsx-ff`) and implementation. On
 OpenCode-backed plan runs, `opsx-plan` now dispatches implement/review/archive
 workers directly; `/opsx-drive <change-id>` remains the manual single-change
@@ -70,9 +70,9 @@ Machine-read convention (parsed by `opsx-plan compile` — follow exactly):
    it is a true dependency.
 6. A deferred change includes the word "deferred" in its `**Depends on:**`
    paragraph; it compiles to `enabled = false`.
-7. Any dependency wording outside rules 1-6 compiles to no edges plus a
-   `# REVIEW` marker. Use that only when the dependency is genuinely
-   non-mechanical (e.g. "completion of any active change touching the same
+7. Any dependency wording outside rules 1-6 compiles to no edges.
+   Use that only when the dependency is genuinely non-mechanical
+   (e.g. "completion of any active change touching the same
    requirements") and the operator must decide.
 8. A new capability is marked
    `**Capability:** \`name\` (proposed; see Capability Ownership).` — the
@@ -144,9 +144,9 @@ Self-verification before the final response:
    unintended backticked slug or `Phase N` reference appears in any of them.
 2. If the orchestrator is available (an `opsx-plan` executable on PATH, or a
    script path documented in `AGENTS.md`), run
-   `opsx-plan compile <doc> -o /tmp/opsx-author-selfcheck.toml --force` and fix
-   any REVIEW items that were not intentional, then rerun until the remaining
-   REVIEW items are exactly the intentional ones.
+   `opsx-plan compile <doc> -o /tmp/opsx-author-selfcheck.toml --force` and
+   verify the compile succeeds and produces the expected changes; fix any
+   missing dependencies or malformed entries and rerun until clean.
 3. If the compiler is not available, state that in the final response so the
    operator runs it manually.
 
@@ -154,7 +154,7 @@ Final response requirements:
 
 - Do not repeat the document body.
 - Report: the output path, phase and change counts, proposed capabilities,
-  the compile self-check result (or that it was unavailable), any intentional
-  REVIEW items, and the suggested manual `pause_before` gates.
+  the compile self-check result (or that it was unavailable), and the
+  suggested manual `pause_before` gates.
 - Remind the operator to review the compiled DAG with
   `opsx-plan run <plan> --dry-run` before any unattended run.

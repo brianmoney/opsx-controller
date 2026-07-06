@@ -35,28 +35,39 @@ The OpenCode adapter ships an `/opsx-plan` command
 model to author plan docs in this convention and self-check them against
 the compiler, so generated docs compile cleanly on the first try.
 
-`compile` deterministically derives `plan.toml` from a phased plan doc that
-follows the authoring convention: `## Phase N:` headings, `### Change:
-\`slug\`` headings, a `**Depends on:**` paragraph, and `**Capability:**` /
-`**Capabilities:**` lines. Resolution rules:
+`compile` converts a markdown implementation plan into a runnable TOML
+manifest by invoking OpenCode with the controller model configured in
+`OPSX_CONTROLLER_MODEL`. The compiler builds a self-contained prompt that
+includes the source markdown, the expected TOML schema (derived from the
+plan loader), dependency-resolution rules, adapter defaults, and repository
+template plan pairs from `openspec/plans/` when available.
 
-- backticked known change ids in `Depends on:` become edges; `Phase N`
-  references expand to that phase's changes (preceding-only when
-  self-referential, e.g. "all preceding Phase 3 changes")
-- text starting with "None" or containing independence wording
-  ("independent", "in parallel", "may proceed") produces no edges even when
-  other changes are mentioned, with the mention noted in a comment
-- "deferred" wording sets `enabled = false`
-- the first change of each capability marked `(proposed` gets
-  `pause_before = true`
-- anything unresolvable is emitted with `depends_on = []` and a loud
-  `# REVIEW:` comment — the compiler never guesses
+The generated TOML is validated locally before writing: it must parse as
+valid TOML, pass the existing `load_plan()` path (unique ids, known deps,
+no cycles), and is written through a temporary file with atomic replacement
+so invalid output never replaces an existing manifest.
 
-The generated manifest is round-trip validated (unique ids, known deps, no
-cycles) and a review summary is printed. Two things the compiler cannot do,
-by design: detect a dependency the doc forgot to state, and place judgment
-gates such as phase exit reviews — add those `pause_before = true` entries
-yourself. Always review the DAG (`run --dry-run`) before an unattended run.
+Usage:
+
+```bash
+# Set the controller model (required)
+export OPSX_CONTROLLER_MODEL="your-model-id"
+
+# Compile a markdown plan to TOML
+python3 .../opsx-plan.py compile docs/my-plan.md -o plan.toml
+
+# Overwrite an existing manifest
+python3 .../opsx-plan.py compile docs/my-plan.md -o plan.toml --force
+```
+
+The compile command refuses to overwrite an existing output file unless
+`--force` is passed. It fails before invoking OpenCode if
+`OPSX_CONTROLLER_MODEL` is unset or empty.
+
+Two things the compiler cannot do, by design: detect a dependency the doc
+forgot to state, and place judgment gates such as phase exit reviews — add
+those `pause_before = true` entries yourself. Always review the DAG
+(`run --dry-run`) before an unattended run.
 
 If you author plan docs with a frontier model, telling it to follow this
 convention (backticked slugs in `Depends on:`, explicit `(proposed` capability

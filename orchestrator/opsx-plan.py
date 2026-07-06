@@ -1720,6 +1720,257 @@ def check_controller_model() -> str:
     return model
 
 
+def discover_template_pairs(repo: Path) -> list[tuple[Path, Path | None]]:
+    """Find repository template plan pairs (md + matching toml).
+
+    Returns a list of ``(md_path, toml_path_or_None)`` tuples for each
+    ``.md`` file under ``openspec/plans/`` in ``repo``.
+    """
+    plans_dir = repo / "openspec" / "plans"
+    if not plans_dir.is_dir():
+        return []
+    pairs: list[tuple[Path, Path | None]] = []
+    for md_path in sorted(plans_dir.glob("*.md")):
+        toml_path = md_path.with_suffix(".toml")
+        pairs.append((md_path, toml_path if toml_path.is_file() else None))
+    return pairs
+
+
+def build_schema_guidance() -> str:
+    """Build manifest schema guidance derived from ``load_plan()`` behavior.
+
+    Covers ``[plan]`` fields, ``[[changes]]`` entries, dependency edges,
+    gate defaults, adapter defaults, and fields consumed by the parser.
+    """
+    default_adapter = "opencode"
+    defaults = ADAPTER_DEFAULTS[default_adapter]
+    return (
+        "## Expected TOML manifest shape\n"
+        "\n"
+        "The manifest is a TOML document with a ``[plan]`` table and\n"
+        "one or more ``[[changes]]`` entries.\n"
+        "\n"
+        "### ``[plan]`` table fields (all optional with defaults shown)\n"
+        "\n"
+        "| Field | Type | Default | Description |\n"
+        "|-------|------|---------|-------------|\n"
+        "| name | string | stems from filename | plan display name |\n"
+        "| adapter | string | ``\"opencode\"`` | adapter key (``ADAPTER_DEFAULTS``) |\n"
+        "| invoke | string | ``opencode run \\\"/opsx-drive {change}\\\"`` | legacy drive command |\n"
+        "| state_file | string | ``.opencode/opsx-controller/{change}.json`` | controller state path |\n"
+        "| implement_invoke | string | ``opencode run --agent opsx-implementer`` | direct implement command |\n"
+        "| review_invoke | string | ``opencode run --agent opsx-reviewer`` | direct review command |\n"
+        "| archive_invoke | string | ``opencode run --agent opsx-archiver`` | direct archive command |\n"
+        "| timeout_minutes | float | ``90`` | per-change stage timeout |\n"
+        "| max_attempts | int | ``2`` | legacy drive retry ceiling |\n"
+        "| max_rounds | int | ``5`` | implement-review loop ceiling |\n"
+        "| no_progress_limit | int | ``2`` | consecutive no-progress rounds before failing |\n"
+        "| fast_checks | list[str] | ``[]`` | post-archive CLI checks |\n"
+        "| check_timeout_minutes | float | ``15`` | fast-check timeout |\n"
+        "| require_clean_tracked | bool | ``true`` | refuse to run when tracked tree is dirty |\n"
+        "| plan_doc | string | ``\"\"`` | path to the source markdown plan for ``create_invoke`` |\n"
+        "| create_invoke | string | ``\"\"`` | authoring command for auto-creating changes |\n"
+        "| create_timeout_minutes | float | ``30`` | create stage timeout |\n"
+        "| create_max_attempts | int | ``2`` | create retry ceiling |\n"
+        "| review_created | bool | ``true`` | require operator ``accept`` before driving created changes |\n"
+        "| created_check | string | ``\"openspec validate {change} --strict\"`` | post-create validation command |\n"
+        "\n"
+        "### ``[[changes]]`` entry fields\n"
+        "\n"
+        "| Field | Type | Default | Description |\n"
+        "|-------|------|---------|-------------|\n"
+        "| id | string | **required** | unique change identifier (slug) |\n"
+        "| phase | int | ``None`` | phase number (e.g. 1, 2, 3) |\n"
+        "| depends_on | list[str] | ``[]`` | ids of changes that must complete first |\n"
+        "| pause_before | bool | ``false`` | wait for ``opsx-plan approve`` before running |\n"
+        "| enabled | bool | ``true`` | set ``false`` to defer a change |\n"
+        "| timeout_minutes | float | plan-level timeout | per-change stage timeout override |\n"
+        "| max_attempts | int | plan-level max_attempts | legacy drive attempt override |\n"
+        "| create_invoke | string | ``\"\"`` | per-change authoring command override |\n"
+        "| create_max_attempts | int | plan-level value | per-change create attempt override |\n"
+        "\n"
+        "### Dependency semantics\n"
+        "\n"
+        "- ``depends_on`` lists only canonical change ids (slugs). Each id must\n"
+        "  appear as another ``[[changes]]`` entry.\n"
+        "- A change cannot depend on itself (no self-loops).\n"
+        "- The orchestrator validates that every dependency id is present and\n"
+        "  that the resulting DAG has no cycles.\n"
+        "- ``depends_on = []`` means no dependencies.\n"
+        "- Backticked known change ids from the source doc become edges.\n"
+        "- ``Phase N`` references expand to that phase's changes.\n"
+        "- Text starting with ``None`` or containing independence wording\n"
+        "  (\"independent\", \"in parallel\", \"may proceed\") produces no\n"
+        "  edges even when other changes are mentioned.\n"
+        "\n"
+        "### Gate manual defaults\n"
+        "\n"
+        "- First change of each capability marked ``(proposed`` in the source\n"
+        "  gets ``pause_before = true``.\n"
+        "- ``deferred`` wording sets ``enabled = false``.\n"
+        "- Manual phase-exit gates (``pause_before = true``) are added by the\n"
+        "  operator; the compiler records but does not invent them.\n"
+        "\n"
+        "### Adapter defaults (opencode)\n"
+        "\n"
+        "```toml\n"
+        f"[plan]\n"
+        f"adapter = \"{default_adapter}\"\n"
+        f"invoke = \"{defaults['invoke']}\"\n"
+        f"state_file = \"{defaults['state_file']}\"\n"
+        f"implement_invoke = \"{defaults['implement_invoke']}\"\n"
+        f"review_invoke = \"{defaults['review_invoke']}\"\n"
+        f"archive_invoke = \"{defaults['archive_invoke']}\"\n"
+        "```\n"
+    )
+
+
+def build_compile_prompt(source_content: str, source_path: Path,
+                         repo: Path) -> str:
+    """Build the complete compile prompt for OpenCode.
+
+    Includes: source markdown, manifest schema guidance, template plan
+    pairs from the repository, and model instructions.
+    """
+    try:
+        rel_source = str(source_path.resolve().relative_to(repo.resolve()))
+    except ValueError:
+        rel_source = str(source_path)
+
+    parts: list[str] = []
+
+    parts.append("## Source plan markdown\n")
+    parts.append(source_content)
+
+    parts.append(build_schema_guidance())
+
+    template_pairs = discover_template_pairs(repo)
+    if template_pairs:
+        parts.append("## Repository template plans\n")
+        for md, toml in template_pairs:
+            rel = md.relative_to(repo)
+            parts.append(f"### Template: `{rel}`\n")
+            try:
+                parts.append(md.read_text(encoding="utf-8"))
+            except OSError:
+                pass
+            if toml is not None:
+                rel_toml = toml.relative_to(repo)
+                parts.append(f"### Template manifest: `{rel_toml}`\n")
+                try:
+                    parts.append(toml.read_text(encoding="utf-8"))
+                except OSError:
+                    pass
+    else:
+        parts.append(
+            "## Repository template plans\n\n"
+            "No `openspec/plans/*.md` template plan pairs were found "
+            "in this repository.\n"
+        )
+
+    parts.append(
+        "## Compile instructions\n"
+        "\n"
+        "Convert the source plan markdown above into a valid opsx-plan TOML "
+        "manifest that can be loaded by `opsx-plan status` and "
+        "`opsx-plan run`. Follow these rules:\n"
+        "\n"
+        "1. **Output only TOML.** Do not include any prose, explanation, "
+        "markdown headers, or commentary outside the TOML payload. "
+        "Output raw TOML or a single fenced ```toml block.\n"
+        "2. **Emit a `[plan]` table** with at least `name`, `adapter` "
+        "(\"opencode\"), and `plan_doc` set to exactly "
+        f"\"{rel_source}\".\n"
+        "3. **Emit one `[[changes]]` entry per change** described in the "
+        "source plan, in phase order.\n"
+        "4. **Preserve dependency semantics:** backticked known change ids "
+        "in the source doc become `depends_on` entries. Independence wording "
+        "(\"independent\", \"in parallel\", \"may proceed\") means no "
+        "dependency edge. Deferred wording means `enabled = false`.\n"
+        "5. **Preserve manual gates:** `pause_before = true` for any change "
+        "that introduces a proposed capability (marked with `(proposed` "
+        "in the source) or has an explicit gate note.\n"
+        "6. **Preserve phase numbers** as `phase` fields on each change.\n"
+        "7. **Every change id must be unique** and every `depends_on` id "
+        "must reference another change in the manifest.\n"
+        "8. **The DAG must have no cycles.**\n"
+    )
+
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# OpenCode invocation for compile
+# ---------------------------------------------------------------------------
+
+def run_opencode_for_compile(repo: Path, model: str,
+                              prompt: str) -> tuple[str, str]:
+    """Invoke OpenCode non-interactively for plan compilation.
+
+    Returns ``(stdout, stderr)`` as a tuple.  Raises ``PlanError`` on
+    spawn failure.  A non-zero exit is surfaced in the return value — the
+    caller decides how to interpret it.
+    """
+    try:
+        proc = subprocess.run(
+            ["opencode", "run", "--model", model, prompt],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=600,  # 10 minute timeout for model invocation
+        )
+    except FileNotFoundError:
+        raise PlanError(
+            "could not spawn opencode; is it installed and on PATH?"
+        )
+    except subprocess.TimeoutExpired:
+        raise PlanError("opencode compile invocation timed out after 600s")
+    if proc.returncode != 0:
+        raise PlanError(
+            f"opencode exited with code {proc.returncode}\n"
+            f"stderr: {proc.stderr[:500]}"
+        )
+    return proc.stdout, proc.stderr
+
+
+def extract_toml(output: str) -> str:
+    """Extract a TOML payload from raw model output.
+
+    Accepts a single clean fenced ``toml` block or a bare TOML
+    payload.  Raises ``PlanError`` for ambiguous output: multiple
+    fenced blocks, extra prose or non-whitespace content surrounding a
+    fenced block, or no TOML content at all.
+    """
+    stripped = output.strip()
+    if not stripped:
+        raise PlanError("opencode returned empty output; no TOML to compile")
+
+    fenced_matches = list(re.finditer(r"```(?:toml)?\s*\n(.*?)```", stripped, re.DOTALL))
+    if len(fenced_matches) > 1:
+        raise PlanError(
+            "ambiguous model output: multiple fenced TOML blocks found; "
+            "expected a single clean TOML payload"
+        )
+    if len(fenced_matches) == 1:
+        match = fenced_matches[0]
+        before = stripped[:match.start()].strip()
+        after = stripped[match.end():].strip()
+        if before or after:
+            raise PlanError(
+                "ambiguous model output: extra content found around "
+                "the fenced TOML payload; expected only the TOML block"
+            )
+        return match.group(1).strip()
+
+    if "[" in stripped:
+        return stripped
+
+    raise PlanError(
+        "could not extract TOML from opencode output; "
+        "output does not contain a fenced toml block or bare TOML"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -2088,15 +2339,59 @@ def cmd_compile(args: argparse.Namespace) -> int:
     """opsx-plan compile <source.md> -o <output.toml> [--force]"""
     repo = Path(args.repo).resolve()
 
-    # Validate inputs
     source_path = resolve_compile_source(repo, args.source)
     output_path = resolve_compile_output(repo, args.output, args.force)
     model = check_controller_model()
 
     log(f"compile: {source_path} -> {output_path}  (model: {model})")
-    print(f"Compiling {source_path} ...")
-    print(f"Output will be written to: {output_path}")
-    print("(full implementation coming in later tasks)")
+
+    source_content = source_path.read_text(encoding="utf-8")
+    prompt = build_compile_prompt(source_content, source_path, repo)
+    log(f"  prompt size: {len(prompt)} chars")
+
+    log("  invoking opencode ...")
+    stdout, stderr = run_opencode_for_compile(repo, model, prompt)
+    if stderr.strip():
+        log(f"  opencode stderr: {stderr.strip()[:500]}")
+
+    toml_text = extract_toml(stdout)
+    if not toml_text:
+        raise PlanError("extracted TOML payload is empty")
+
+    # Validate through existing load_plan() path
+    try:
+        parsed = tomllib.loads(toml_text)
+    except Exception as exc:
+        raise PlanError(f"generated TOML is not valid TOML: {exc}")
+
+    tmp_path = output_path.with_suffix(output_path.suffix + ".compile-tmp")
+    try:
+        tmp_path.write_text(toml_text, encoding="utf-8")
+        cfg = load_plan(tmp_path)
+    except PlanError:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+    os.replace(tmp_path, output_path)
+    log(f"  validated: {len(cfg['order'])} changes, {cfg['changes'].get(cfg['order'][0], {}).get('phase', 'no-phase') or 'no phase'}")
+
+    change_count = len(cfg["order"])
+    phases = sorted({cfg["changes"][cid].get("phase") for cid in cfg["order"] if cfg["changes"][cid].get("phase") is not None})
+    gated = [cid for cid in cfg["order"] if cfg["changes"][cid].get("pause_before")]
+    disabled = [cid for cid in cfg["order"] if not cfg["changes"][cid].get("enabled", True)]
+
+    print(f"Compiled: {output_path}")
+    print(f"  Changes: {change_count}")
+    if phases:
+        print(f"  Phases:  {', '.join(str(p) for p in phases)}")
+    if gated:
+        print(f"  Gates:   {len(gated)} change(s) with pause_before")
+    if disabled:
+        print(f"  Deferred: {len(disabled)} change(s) disabled")
+    print(f"  Review the DAG with: opsx-plan status {output_path}")
     return 0
 
 
