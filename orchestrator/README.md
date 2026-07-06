@@ -180,8 +180,8 @@ A change is marked `done` only when all of the following agree:
    change
 2. `openspec/changes/<id>` is absent from the worktree
 3. a dated `openspec/changes/archive/YYYY-MM-DD-<id>` directory exists
-4. an `archive(<id>):` commit is reachable from `HEAD` and matches the stored
-   archive result
+4. an `archive(<id>):` commit recorded by the archive worker is reachable from
+   `HEAD`
 5. all `fast_checks` commands exit 0 (e.g. `openspec validate --all`,
    your fast test suite)
 

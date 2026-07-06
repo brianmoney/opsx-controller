@@ -363,6 +363,139 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
         self.assertEqual(result, self.opsx_plan.DONE)
         self.assertEqual([stage for stage, _, _ in calls], ["implement", "review", "archive"])
 
+    def test_archive_success_is_rejected_when_tracked_tree_stays_dirty(self) -> None:
+        self.cfg["require_clean_tracked"] = True
+
+        def fake_invoke(repo: Path, cfg: dict, cid: str, stage: str, round_num: int, input_block: str):
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            if stage == "implement":
+                payload = {
+                    "status": "implemented",
+                    "change": cid,
+                    "round": round_num,
+                    "progress_made": True,
+                    "completed_tasks": ["1.1"],
+                    "remaining_tasks": ["1.2"],
+                    "task_counts": {"complete": 1, "total": 2},
+                    "files_touched": ["orchestrator/opsx-plan.py"],
+                    "known_change_files": [f"openspec/changes/{cid}/tasks.md"],
+                    "summary": "implemented first round",
+                }
+            elif stage == "review":
+                payload = {
+                    "status": "reviewed",
+                    "change": cid,
+                    "round": round_num,
+                    "verdict": "pass",
+                    "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                    "summary": "review passed",
+                    "fix_prompt": "",
+                    "next_phase": "archive",
+                }
+            else:
+                archive_path, commit = self.archive_change_in_repo(cid)
+                (repo / "tracked.txt").write_text("dirty after archive\n", encoding="utf-8")
+                payload = {
+                    "status": "archived",
+                    "change": cid,
+                    "archive_path": archive_path,
+                    "spec_sync_status": "no-delta",
+                    "commit": commit,
+                    "summary": "archive succeeded",
+                }
+            log_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            return "exited", log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, "stop")
+        record = self.opsx_plan.rec(self.state, self.cid)
+        self.assertEqual(record["status"], self.opsx_plan.FAILED)
+        self.assertEqual(record["archive"]["status"], "failed")
+        self.assertEqual(record["last_result"], "post_archive_dirty_tracked")
+        self.assertIn("post-archive tracked worktree is dirty", record["reason"])
+
+    def test_reconcile_keeps_done_change_when_newer_archive_prefix_commit_exists(self) -> None:
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": ["orchestrator/opsx-plan.py"],
+                        "known_change_files": [f"openspec/changes/{self.cid}/tasks.md"],
+                        "summary": "implemented first round",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 1,
+                        "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "review passed",
+                        "fix_prompt": "",
+                        "next_phase": "archive",
+                    },
+                },
+                {
+                    "stage": "archive",
+                    "archive_repo": True,
+                    "result": {
+                        "status": "archived",
+                        "change": self.cid,
+                        "archive_path": "",
+                        "spec_sync_status": "no-delta",
+                        "commit": "",
+                        "summary": "archive succeeded",
+                    },
+                },
+            ]
+        )
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+        self.assertEqual(result, self.opsx_plan.DONE)
+
+        archived_tasks = (
+            self.repo
+            / "openspec"
+            / "changes"
+            / "archive"
+            / f"2026-07-02-{self.cid}"
+            / "tasks.md"
+        )
+        archived_tasks.write_text("## 1. Tasks\n\n- [x] 1.1 Example task\n", encoding="utf-8")
+        git(self.repo, "add", str(archived_tasks.relative_to(self.repo)))
+        git(
+            self.repo,
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "user.name=Test User",
+            "commit",
+            "-m",
+            f"archive({self.cid}): follow-up archive cleanup",
+        )
+
+        self.opsx_plan.reconcile(self.repo, self.cfg, self.state)
+
+        record = self.opsx_plan.rec(self.state, self.cid)
+        self.assertEqual(record["status"], self.opsx_plan.DONE)
+        self.assertEqual(record["phase"], "done")
+        ok, why = self.opsx_plan.verify_direct_archive_done(self.repo, self.cid, record)
+        self.assertTrue(ok, why)
+
     def test_reconcile_recovers_interrupted_review_from_plan_state(self) -> None:
         record = self.opsx_plan.rec(self.state, self.cid)
         record["status"] = self.opsx_plan.RUNNING

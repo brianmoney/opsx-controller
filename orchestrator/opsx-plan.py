@@ -1077,8 +1077,12 @@ def verify_direct_archive_done(repo: Path, cid: str, record: dict) -> tuple[bool
     resolved_commit = resolve_commit(repo, commit)
     if not resolved_commit:
         return False, f"archive commit could not be resolved: {commit}"
-    if find_archive_commit(repo, cid) != resolved_commit:
-        return False, "archive commit does not match latest archive(<change>) commit"
+    latest_commit = find_archive_commit(repo, cid)
+    if latest_commit and latest_commit != resolved_commit:
+        log(
+            f"  note: {cid} archive state recorded {resolved_commit[:12]} but newer "
+            f"archive(<change>) commit {latest_commit[:12]} is reachable"
+        )
     return True, ""
 
 
@@ -1366,6 +1370,13 @@ def apply_archive_result(repo: Path, cfg: dict, state: dict, cid: str, payload: 
         archive["reason"] = f"post-archive {check_why}"
         r["last_result"] = "post_archive_check_failed"
         set_status(state, cid, FAILED, f"post-archive {check_why}")
+        return "stop"
+    clean_ok, clean_why = verify_post_archive_clean(repo, cfg)
+    if not clean_ok:
+        archive["status"] = "failed"
+        archive["reason"] = f"post-archive {clean_why}"
+        r["last_result"] = "post_archive_dirty_tracked"
+        set_status(state, cid, FAILED, f"post-archive {clean_why}")
         return "stop"
     r["phase"] = "done"
     set_status(state, cid, DONE, "verified + checks passed")
@@ -1705,6 +1716,19 @@ def tracked_tree_clean(repo: Path) -> bool:
         if ln.strip() and not ln[3:].startswith(".opsx-plan/")
     ]
     return not lines
+
+
+def verify_post_archive_clean(repo: Path, cfg: dict) -> tuple[bool, str]:
+    """Refuse completion when archive/check steps leave tracked edits behind."""
+    if not cfg.get("require_clean_tracked", True):
+        return True, ""
+    if tracked_tree_clean(repo):
+        return True, ""
+    return (
+        False,
+        "tracked worktree is dirty; archive must commit or restore tracked changes "
+        "before the next change starts",
+    )
 
 
 # ---------------------------------------------------------------------------
