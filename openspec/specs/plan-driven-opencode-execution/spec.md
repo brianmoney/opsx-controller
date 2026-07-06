@@ -1,3 +1,9 @@
+## Purpose
+
+Define how `opsx-plan` drives OpenCode plan runs by directly dispatching
+bounded implement, review, and archive phase workers per change, owning the
+per-phase state and logs instead of delegating to a nested controller.
+
 ## Requirements
 
 ### Requirement: `opsx-plan` directly dispatches OpenCode phase workers

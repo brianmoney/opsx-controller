@@ -1,3 +1,9 @@
+## Purpose
+
+Define the Codex CLI adapter that packages the OpenSpec controller workflow for
+Codex, providing the skill entrypoint, phase agents, and installer that drive a
+single change through the implement, review, and archive loop.
+
 ## Requirements
 
 ### Requirement: Skill entrypoint for controller orchestration
