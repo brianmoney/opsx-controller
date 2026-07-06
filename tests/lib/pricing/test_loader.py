@@ -459,3 +459,56 @@ class WhitespaceExactMatchTests(unittest.TestCase):
         # Lookup with matching whitespace
         result2 = catalog.resolve(" openai", "gpt-4o ")
         self.assertIsInstance(result2, ResolvedPrice)
+
+
+# ---------------------------------------------------------------------------
+# Regression: ISO 4217 currencies outside the old hardcoded subset (e.g. AED)
+# ---------------------------------------------------------------------------
+
+
+class Iso4217CurrencyRegressionTests(unittest.TestCase):
+    """Ensure that currencies outside the original minimal subset are accepted."""
+
+    def test_aed_currency_accepted(self) -> None:
+        path = _write_catalog(
+            """\
+            [catalog]
+            version = "1.0.0"
+            updated = "2026-01-01"
+
+            [[entries]]
+            provider = "openai"
+            model_id = "gpt-4o"
+            display_name = "GPT-4o"
+            billing_mode = "per_token"
+            currency = "AED"
+            input_price_per_mtok = 2.50
+            effective_date = "2025-01-01"
+            """
+        )
+        catalog = PricingCatalog(catalog_path=path)
+        result = catalog.resolve("openai", "gpt-4o")
+        self.assertIsInstance(result, ResolvedPrice)
+        self.assertEqual(result.currency, "AED")
+
+    def test_sek_currency_accepted(self) -> None:
+        path = _write_catalog(
+            """\
+            [catalog]
+            version = "1.0.0"
+            updated = "2026-01-01"
+
+            [[entries]]
+            provider = "anthropic"
+            model_id = "claude-sonnet-4"
+            display_name = "Claude Sonnet 4"
+            billing_mode = "per_token"
+            currency = "SEK"
+            input_price_per_mtok = 3.00
+            effective_date = "2025-01-01"
+            """
+        )
+        catalog = PricingCatalog(catalog_path=path)
+        result = catalog.resolve("anthropic", "claude-sonnet-4")
+        self.assertIsInstance(result, ResolvedPrice)
+        self.assertEqual(result.currency, "SEK")
