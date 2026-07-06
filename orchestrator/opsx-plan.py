@@ -647,6 +647,255 @@ def write_telemetry_record(repo: Path, plan_name: str, record: dict) -> None:
         os.fsync(fh.fileno())
 
 
+# ---------------------------------------------------------------------------
+# Usage / model metadata extraction for direct stage telemetry
+# ---------------------------------------------------------------------------
+
+# Recognized token field names mapped to normalized schema keys.
+_TOKEN_FIELD_MAP = {
+    "input_tokens": "input_tokens",
+    "inputTokens": "input_tokens",
+    "prompt_tokens": "input_tokens",
+    "promptTokens": "input_tokens",
+    "output_tokens": "output_tokens",
+    "outputTokens": "output_tokens",
+    "completion_tokens": "output_tokens",
+    "completionTokens": "output_tokens",
+    "cached_input_tokens": "cached_input_tokens",
+    "cachedInputTokens": "cached_input_tokens",
+    "cache_read_input_tokens": "cached_input_tokens",
+    "reasoning_tokens": "reasoning_tokens",
+    "reasoningTokens": "reasoning_tokens",
+    "thinking_tokens": "reasoning_tokens",
+    "thinkingTokens": "reasoning_tokens",
+    "total_tokens": "total_tokens",
+    "totalTokens": "total_tokens",
+}
+
+_MODEL_FIELD_MAP = {
+    "provider": "provider",
+    "model_id": "model_id",
+    "modelId": "model_id",
+    "model": "model_id",
+    "model_alias": "model_alias",
+    "modelAlias": "model_alias",
+}
+
+
+def _valid_token_count(value):
+    """Only non-negative ``int`` values are accepted. Booleans are rejected."""
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, int) and value >= 0
+
+
+def _extract_token_fields(obj):
+    """Return ``(normalized_token_dict, found_any)`` from *obj*.
+
+    Inspects top-level keys and a nested ``usage`` sub-dict when
+    present.  Each recognized field is validated as a non-negative
+    integer; the first valid value for each normalized key wins.
+    """
+    result = {
+        "input_tokens": None,
+        "output_tokens": None,
+        "cached_input_tokens": None,
+        "reasoning_tokens": None,
+        "total_tokens": None,
+    }
+    found_any = False
+
+    candidates = [obj]
+    usage = obj.get("usage")
+    if isinstance(usage, dict):
+        candidates.append(usage)
+
+    for source in candidates:
+        for key, value in source.items():
+            norm = _TOKEN_FIELD_MAP.get(key)
+            if norm is None:
+                continue
+            if result[norm] is not None:
+                continue  # first source wins
+            if _valid_token_count(value):
+                result[norm] = int(value)
+                found_any = True
+
+    return result, found_any
+
+
+def _extract_model_fields(obj):
+    """Return normalized ``{provider, model_id, model_alias}`` dict.
+
+    Inspects top-level keys and a nested ``model`` sub-dict when
+    present.  Only non-empty string values are accepted.
+    """
+    result = {
+        "provider": None,
+        "model_id": None,
+        "model_alias": None,
+    }
+
+    candidates = [obj]
+    model = obj.get("model")
+    if isinstance(model, dict):
+        candidates.append(model)
+
+    for source in candidates:
+        for key, value in source.items():
+            norm = _MODEL_FIELD_MAP.get(key)
+            if norm is None:
+                continue
+            if result[norm] is not None:
+                continue
+            if isinstance(value, str) and value.strip():
+                result[norm] = value.strip()
+
+    return result
+
+
+def _try_parse_json_line(line):
+    """Parse *line* as a JSON object dict, or return ``None``."""
+    stripped = line.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return None
+    try:
+        obj = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _scan_log_for_usage(log_path):
+    """Scan every line of *log_path* for JSON objects that carry token fields.
+
+    Returns ``(normalized_token_dict, found_any)``.
+    """
+    result = {
+        "input_tokens": None,
+        "output_tokens": None,
+        "cached_input_tokens": None,
+        "reasoning_tokens": None,
+        "total_tokens": None,
+    }
+    found_any = False
+
+    try:
+        for line in log_path.read_text(encoding="utf-8").splitlines():
+            obj = _try_parse_json_line(line)
+            if obj is None:
+                continue
+            tokens, any_found = _extract_token_fields(obj)
+            if not any_found:
+                continue
+            for key in result:
+                if result[key] is None and tokens[key] is not None:
+                    result[key] = tokens[key]
+                    found_any = True
+    except OSError:
+        pass
+
+    return result, found_any
+
+
+def _scan_log_for_model(log_path):
+    """Scan every line of *log_path* for JSON objects that carry model fields.
+
+    Returns normalized ``{provider, model_id, model_alias}`` dict.
+    """
+    result = {
+        "provider": None,
+        "model_id": None,
+        "model_alias": None,
+    }
+
+    try:
+        for line in log_path.read_text(encoding="utf-8").splitlines():
+            obj = _try_parse_json_line(line)
+            if obj is None:
+                continue
+            model = _extract_model_fields(obj)
+            for key in result:
+                if result[key] is None and model[key] is not None:
+                    result[key] = model[key]
+    except OSError:
+        pass
+
+    return result
+
+
+def extract_usage_and_model(payload, log_path):
+    """Extract usage and model metadata for a completed stage invocation.
+
+    **Precedence:**
+    1. Usage & model from parsed worker JSON (*payload*) are preferred.
+    2. When *payload* carries no token usage, the stage log is scanned for
+       recognizable token metadata.
+    3. When *payload* carries no model identity fields, the stage log is
+       scanned for model identity fields.  Log model scan never
+       supplements a partial worker model.
+
+    Returns ``(usage_dict, model_dict)`` where *usage_dict* includes
+    every normalised token field (int or None), ``usage_available``, and
+    ``usage_source``.
+    """
+    usage = {
+        "input_tokens": None,
+        "output_tokens": None,
+        "cached_input_tokens": None,
+        "reasoning_tokens": None,
+        "total_tokens": None,
+        "usage_available": False,
+        "usage_source": None,
+    }
+    model = {
+        "provider": None,
+        "model_id": None,
+        "model_alias": None,
+    }
+
+    worker_usage_found = False
+    worker_model_found = False
+
+    # 1. Worker JSON -------------------------------------------------------
+    if isinstance(payload, dict):
+        tokens, wu_found = _extract_token_fields(payload)
+        if wu_found:
+            worker_usage_found = True
+            for key in ("input_tokens", "output_tokens", "cached_input_tokens",
+                         "reasoning_tokens", "total_tokens"):
+                if tokens[key] is not None:
+                    usage[key] = tokens[key]
+            usage["usage_available"] = True
+            usage["usage_source"] = "worker_json"
+
+        wm = _extract_model_fields(payload)
+        for key in ("provider", "model_id", "model_alias"):
+            if wm[key] is not None:
+                model[key] = wm[key]
+                worker_model_found = True
+
+    # 2. Log fallback ------------------------------------------------------
+    if log_path is not None:
+        if not worker_usage_found:
+            log_tokens, log_found = _scan_log_for_usage(log_path)
+            if log_found:
+                for key in ("input_tokens", "output_tokens", "cached_input_tokens",
+                             "reasoning_tokens", "total_tokens"):
+                    if log_tokens[key] is not None:
+                        usage[key] = log_tokens[key]
+                usage["usage_available"] = True
+                usage["usage_source"] = "log_metadata"
+
+        if not worker_model_found:
+            log_model = _scan_log_for_model(log_path)
+            for key in ("provider", "model_id", "model_alias"):
+                if model[key] is None and log_model[key] is not None:
+                    model[key] = log_model[key]
+
+    return usage, model
+
+
 def get_or_create_run_id(repo: Path, cfg: dict, state: dict) -> str:
     run_id = state.get("run_id", "")
     if run_id:
@@ -716,6 +965,14 @@ def _record_stage_telemetry(
         warning_count=warning_count,
         note_count=note_count,
     )
+    # Populate usage and model metadata when a payload was parsed
+    # (extraction is best-effort; never fail telemetry write).
+    try:
+        usage, model = extract_usage_and_model(payload, log_path)
+        record["usage"].update(usage)
+        record["model"].update(model)
+    except Exception:
+        pass
     write_telemetry_record(repo, cfg["name"], record)
     rec(state, cid)["telemetry"] = {"latest_telemetry": record["uid"]}
 

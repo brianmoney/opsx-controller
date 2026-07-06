@@ -3500,5 +3500,669 @@ class CompileTests(unittest.TestCase):
                           f"schema guidance must mention field '{field}' consumed by load_plan()")
 
 
+class DirectStageUsageExtractionTests(unittest.TestCase):
+    """Unit tests for usage / model metadata extraction functions."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.log_dir = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _write_log(self, *lines: str) -> Path:
+        p = self.log_dir / f"test-{hash(lines)}.log"
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return p
+
+    # -- Extraction helpers -------------------------------------------------
+
+    def _assert_usage_unavailable(self, usage: dict) -> None:
+        self.assertFalse(usage["usage_available"])
+        self.assertIsNone(usage["usage_source"])
+        self.assertIsNone(usage["input_tokens"])
+        self.assertIsNone(usage["output_tokens"])
+        self.assertIsNone(usage["cached_input_tokens"])
+        self.assertIsNone(usage["reasoning_tokens"])
+        self.assertIsNone(usage["total_tokens"])
+
+    def _assert_model_null(self, model: dict) -> None:
+        self.assertIsNone(model["provider"])
+        self.assertIsNone(model["model_id"])
+        self.assertIsNone(model["model_alias"])
+
+    # -- 4.1 Full token usage from worker JSON ------------------------------
+
+    def test_worker_json_full_usage_populates_all_fields(self) -> None:
+        payload = {
+            "status": "implemented",
+            "change": "ex",
+            "round": 1,
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cached_input_tokens": 10,
+                "reasoning_tokens": 5,
+                "total_tokens": 135,
+            },
+        }
+        usage, model = self.opsx_plan.extract_usage_and_model(payload, None)
+        self.assertTrue(usage["usage_available"])
+        self.assertEqual(usage["usage_source"], "worker_json")
+        self.assertEqual(usage["input_tokens"], 100)
+        self.assertEqual(usage["output_tokens"], 20)
+        self.assertEqual(usage["cached_input_tokens"], 10)
+        self.assertEqual(usage["reasoning_tokens"], 5)
+        self.assertEqual(usage["total_tokens"], 135)
+
+    def test_worker_json_full_usage_top_level_alternate_keys(self) -> None:
+        payload = {
+            "status": "implemented",
+            "change": "ex",
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "cachedInputTokens": 10,
+            "reasoningTokens": 5,
+            "totalTokens": 135,
+        }
+        usage, _ = self.opsx_plan.extract_usage_and_model(payload, None)
+        self.assertTrue(usage["usage_available"])
+        self.assertEqual(usage["usage_source"], "worker_json")
+        self.assertEqual(usage["input_tokens"], 100)
+        self.assertEqual(usage["output_tokens"], 20)
+        self.assertEqual(usage["cached_input_tokens"], 10)
+        self.assertEqual(usage["reasoning_tokens"], 5)
+        self.assertEqual(usage["total_tokens"], 135)
+
+    # -- 4.2 Partial token usage --------------------------------------------
+
+    def test_worker_json_partial_usage_preserves_null(self) -> None:
+        payload = {
+            "status": "implemented",
+            "change": "ex",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+            },
+        }
+        usage, _ = self.opsx_plan.extract_usage_and_model(payload, None)
+        self.assertTrue(usage["usage_available"])
+        self.assertEqual(usage["usage_source"], "worker_json")
+        self.assertEqual(usage["input_tokens"], 100)
+        self.assertEqual(usage["output_tokens"], 20)
+        self.assertIsNone(usage["cached_input_tokens"])
+        self.assertIsNone(usage["reasoning_tokens"])
+        self.assertIsNone(usage["total_tokens"])
+
+    # -- 4.3 Zero token values ---------------------------------------------
+
+    def test_reported_zero_token_values_remain_zero(self) -> None:
+        payload = {
+            "status": "implemented",
+            "change": "ex",
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+        }
+        usage, _ = self.opsx_plan.extract_usage_and_model(payload, None)
+        self.assertTrue(usage["usage_available"])
+        self.assertEqual(usage["input_tokens"], 0)
+        self.assertEqual(usage["output_tokens"], 0)
+        self.assertEqual(usage["total_tokens"], 0)
+        self.assertIsNone(usage["cached_input_tokens"])
+        self.assertIsNone(usage["reasoning_tokens"])
+
+    # -- 4.4 Model metadata from worker JSON -------------------------------
+
+    def test_worker_json_model_identity_populates_fields(self) -> None:
+        payload = {
+            "status": "implemented",
+            "change": "ex",
+            "model": {
+                "provider": "openai",
+                "model_id": "gpt-5.5",
+                "model_alias": "primary",
+            },
+        }
+        _, model = self.opsx_plan.extract_usage_and_model(payload, None)
+        self.assertEqual(model["provider"], "openai")
+        self.assertEqual(model["model_id"], "gpt-5.5")
+        self.assertEqual(model["model_alias"], "primary")
+
+    def test_worker_json_model_top_level_alternate_keys(self) -> None:
+        payload = {
+            "status": "implemented",
+            "change": "ex",
+            "provider": "anthropic",
+            "modelId": "claude-4",
+        }
+        _, model = self.opsx_plan.extract_usage_and_model(payload, None)
+        self.assertEqual(model["provider"], "anthropic")
+        self.assertEqual(model["model_id"], "claude-4")
+        self.assertIsNone(model["model_alias"])
+
+    # -- 4.5 Log metadata fallback -----------------------------------------
+
+    def test_log_metadata_fallback_usage_when_worker_json_has_none(self) -> None:
+        log_path = self._write_log(
+            "# header",
+            '{"input_tokens": 200, "output_tokens": 50}',
+        )
+        # Worker JSON has no usage fields
+        payload = {"status": "implemented", "change": "ex"}
+        usage, _ = self.opsx_plan.extract_usage_and_model(payload, log_path)
+        self.assertTrue(usage["usage_available"])
+        self.assertEqual(usage["usage_source"], "log_metadata")
+        self.assertEqual(usage["input_tokens"], 200)
+        self.assertEqual(usage["output_tokens"], 50)
+
+    def test_log_metadata_fallback_model_when_worker_json_has_none(self) -> None:
+        log_path = self._write_log(
+            "# header",
+            '{"provider": "openai", "model_id": "gpt-5.5"}',
+        )
+        payload = {"status": "implemented", "change": "ex"}
+        _, model = self.opsx_plan.extract_usage_and_model(payload, log_path)
+        self.assertEqual(model["provider"], "openai")
+        self.assertEqual(model["model_id"], "gpt-5.5")
+
+    # -- 4.6 Worker JSON takes precedence over log -------------------------
+
+    def test_worker_json_usage_wins_over_log_metadata(self) -> None:
+        log_path = self._write_log(
+            '{"input_tokens": 999, "output_tokens": 888}',
+        )
+        payload = {
+            "status": "implemented",
+            "change": "ex",
+            "usage": {"input_tokens": 100, "output_tokens": 20},
+        }
+        usage, _ = self.opsx_plan.extract_usage_and_model(payload, log_path)
+        self.assertTrue(usage["usage_available"])
+        self.assertEqual(usage["usage_source"], "worker_json")
+        self.assertEqual(usage["input_tokens"], 100)
+        self.assertEqual(usage["output_tokens"], 20)
+
+    def test_worker_json_model_wins_over_log_metadata(self) -> None:
+        log_path = self._write_log(
+            '{"provider": "log-provider", "model_id": "log-model"}',
+        )
+        payload = {
+            "status": "implemented",
+            "change": "ex",
+            "model": {"provider": "worker-provider", "model_id": "worker-model"},
+        }
+        _, model = self.opsx_plan.extract_usage_and_model(payload, log_path)
+        self.assertEqual(model["provider"], "worker-provider")
+        self.assertEqual(model["model_id"], "worker-model")
+
+    def test_log_model_fallback_blocked_when_worker_has_any_model_field(self) -> None:
+        """Worker provides provider only; log model fallback is blocked because worker already carries a model field."""
+        log_path = self._write_log(
+            '{"model_id": "log-model-id"}',
+        )
+        payload = {"status": "implemented", "change": "ex", "provider": "openai"}
+        _, model = self.opsx_plan.extract_usage_and_model(payload, log_path)
+        self.assertEqual(model["provider"], "openai")
+        self.assertIsNone(model["model_id"])
+
+    def test_log_model_fallback_when_worker_has_no_model(self) -> None:
+        """Log provides model identity when worker JSON has none."""
+        log_path = self._write_log(
+            '{"model_id": "log-model-id", "provider": "log-provider"}',
+        )
+        payload = {"status": "implemented", "change": "ex"}
+        _, model = self.opsx_plan.extract_usage_and_model(payload, log_path)
+        self.assertEqual(model["provider"], "log-provider")
+        self.assertEqual(model["model_id"], "log-model-id")
+
+    # -- 4.7 Unknown formats -----------------------------------------------
+
+    def test_unknown_format_produces_unavailable_usage(self) -> None:
+        payload = {"status": "implemented", "change": "ex"}
+        usage, model = self.opsx_plan.extract_usage_and_model(payload, None)
+        self._assert_usage_unavailable(usage)
+        self._assert_model_null(model)
+
+    def test_log_without_usage_produces_unavailable(self) -> None:
+        log_path = self._write_log(
+            "# just some text",
+            "no json here",
+            '{"some_other_field": 42}',
+        )
+        payload = {"status": "implemented", "change": "ex"}
+        usage, _ = self.opsx_plan.extract_usage_and_model(payload, log_path)
+        self._assert_usage_unavailable(usage)
+
+    def test_none_payload_produces_unavailable(self) -> None:
+        usage, model = self.opsx_plan.extract_usage_and_model(None, None)
+        self._assert_usage_unavailable(usage)
+        self._assert_model_null(model)
+
+    # -- 4.8 Malformed usage values ----------------------------------------
+
+    def test_negative_token_value_ignored(self) -> None:
+        payload = {
+            "status": "implemented",
+            "change": "ex",
+            "usage": {"input_tokens": -1, "output_tokens": 20},
+        }
+        usage, _ = self.opsx_plan.extract_usage_and_model(payload, None)
+        self.assertTrue(usage["usage_available"])
+        self.assertIsNone(usage["input_tokens"])
+        self.assertEqual(usage["output_tokens"], 20)
+
+    def test_floating_point_token_value_ignored(self) -> None:
+        payload = {
+            "status": "implemented",
+            "change": "ex",
+            "usage": {"input_tokens": 100.5},
+        }
+        usage, _ = self.opsx_plan.extract_usage_and_model(payload, None)
+        self._assert_usage_unavailable(usage)
+
+    def test_non_numeric_token_value_ignored(self) -> None:
+        payload = {
+            "status": "implemented",
+            "change": "ex",
+            "usage": {"input_tokens": "100", "total_tokens": None},
+        }
+        usage, _ = self.opsx_plan.extract_usage_and_model(payload, None)
+        self._assert_usage_unavailable(usage)
+
+    def test_boolean_token_value_ignored(self) -> None:
+        payload = {
+            "status": "implemented",
+            "change": "ex",
+            "usage": {"input_tokens": True, "output_tokens": False},
+        }
+        usage, _ = self.opsx_plan.extract_usage_and_model(payload, None)
+        self._assert_usage_unavailable(usage)
+
+    # -- 4.9 Default-unavailable for failure outcomes -----------------------
+
+    def test_timeout_record_usage_default_unavailable(self) -> None:
+        """Simulate payload=None (timeout path) keeps usage unavailable."""
+        usage, model = self.opsx_plan.extract_usage_and_model(None, None)
+        self._assert_usage_unavailable(usage)
+        self._assert_model_null(model)
+
+    def test_spawn_error_record_usage_default_unavailable(self) -> None:
+        usage, model = self.opsx_plan.extract_usage_and_model(None, None)
+        self._assert_usage_unavailable(usage)
+        self._assert_model_null(model)
+
+    def test_invalid_output_record_usage_default_unavailable(self) -> None:
+        usage, model = self.opsx_plan.extract_usage_and_model(None, None)
+        self._assert_usage_unavailable(usage)
+        self._assert_model_null(model)
+
+    # -- Edge cases ---------------------------------------------------------
+
+    def test_extraction_never_raises_on_broken_payload(self) -> None:
+        """Extraction must be best-effort and never raise."""
+        # A payload that is a dict but has weird internal types should not
+        # crash the extractor.
+        payload = {"usage": "not_a_dict"}
+        usage, model = self.opsx_plan.extract_usage_and_model(payload, None)
+        self._assert_usage_unavailable(usage)
+        self._assert_model_null(model)
+
+    def test_log_with_malformed_json_lines_is_ignored(self) -> None:
+        log_path = self._write_log(
+            "{not valid json",
+            '{"input_tokens": 50}',
+            "{still not valid",
+        )
+        payload = {"status": "implemented", "change": "ex"}
+        usage, _ = self.opsx_plan.extract_usage_and_model(payload, log_path)
+        self.assertTrue(usage["usage_available"])
+        self.assertEqual(usage["usage_source"], "log_metadata")
+        self.assertEqual(usage["input_tokens"], 50)
+
+    def test_nested_usage_object_recognized(self) -> None:
+        payload = {
+            "status": "implemented",
+            "change": "ex",
+            "usage": {
+                "input_tokens": 500,
+                "output_tokens": 200,
+            },
+        }
+        usage, _ = self.opsx_plan.extract_usage_and_model(payload, None)
+        self.assertTrue(usage["usage_available"])
+        self.assertEqual(usage["usage_source"], "worker_json")
+        self.assertEqual(usage["input_tokens"], 500)
+        self.assertEqual(usage["output_tokens"], 200)
+
+    def test_nested_model_object_recognized(self) -> None:
+        payload = {
+            "status": "implemented",
+            "change": "ex",
+            "model": {
+                "provider": "openai",
+                "model_id": "gpt-4",
+            },
+        }
+        _, model = self.opsx_plan.extract_usage_and_model(payload, None)
+        self.assertEqual(model["provider"], "openai")
+        self.assertEqual(model["model_id"], "gpt-4")
+
+
+class DirectStageUsageIntegrationTests(unittest.TestCase):
+    """Integration tests that verify usage/model appear in telemetry records
+    written by the full run_direct_change pipeline."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        git(self.repo, "init")
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        git(self.repo, "add", "tracked.txt")
+        git(
+            self.repo,
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "user.name=Test User",
+            "commit",
+            "-m",
+            "init",
+        )
+        self.cid = "add-usage-integration"
+        self.plan_name = f"run-{self.cid}"
+        self.cfg = {
+            "name": self.plan_name,
+            "adapter": "opencode",
+            "implement_invoke": "opencode run --agent opsx-implementer",
+            "review_invoke": "opencode run --agent opsx-reviewer",
+            "archive_invoke": "opencode run --agent opsx-archiver",
+            "invoke": 'opencode run "/opsx-drive {change}"',
+            "state_file": ".opencode/opsx-controller/{change}.json",
+            "timeout_minutes": 1,
+            "max_attempts": 2,
+            "max_rounds": 2,
+            "no_progress_limit": 2,
+            "fast_checks": [],
+            "check_timeout_minutes": 1,
+            "require_clean_tracked": False,
+            "review_created": False,
+            "changes": {
+                self.cid: {
+                    "id": self.cid,
+                    "depends_on": [],
+                    "enabled": True,
+                    "pause_before": False,
+                    "timeout_minutes": 1,
+                    "max_attempts": 2,
+                    "create_invoke": "",
+                    "create_max_attempts": 1,
+                }
+            },
+            "order": [self.cid],
+            "created_check": "",
+            "plan_doc": "",
+            "create_timeout_minutes": 1,
+        }
+        self.state = {"plan": self.plan_name, "approvals": [], "changes": {}}
+        self._saved_invoke = self.opsx_plan.invoke_direct_stage
+        self._saved_checks = self.opsx_plan.run_fast_checks
+
+    def tearDown(self) -> None:
+        self.opsx_plan.invoke_direct_stage = self._saved_invoke
+        self.opsx_plan.run_fast_checks = self._saved_checks
+        self.tmp.cleanup()
+
+    def write_authored_change(self, cid: str) -> None:
+        cdir = self.repo / "openspec" / "changes" / cid
+        cdir.mkdir(parents=True)
+        (cdir / "proposal.md").write_text("## Why\n", encoding="utf-8")
+        (cdir / "tasks.md").write_text(
+            "## 1. Tasks\n\n- [ ] 1.1 Example task\n- [ ] 1.2 Example task\n",
+            encoding="utf-8",
+        )
+
+    def _read_telemetry(self) -> list[dict]:
+        jsonl = self.repo / ".opsx-plan" / "telemetry" / f"{self.plan_name}.jsonl"
+        if not jsonl.is_file():
+            return []
+        records: list[dict] = []
+        for line in jsonl.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                records.append(json.loads(line))
+        return records
+
+    # -- 4.1 integration: full usage in worker JSON -> telemetry record ----
+
+    def test_implement_with_full_usage_payload_produces_populated_record(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+
+        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            result = {
+                "status": "implemented",
+                "change": self.cid,
+                "round": 1,
+                "progress_made": True,
+                "completed_tasks": ["1.1"],
+                "remaining_tasks": ["1.2"],
+                "task_counts": {"complete": 1, "total": 2},
+                "files_touched": [],
+                "known_change_files": [],
+                "summary": "done",
+                "usage": {
+                    "input_tokens": 1500,
+                    "output_tokens": 300,
+                    "cached_input_tokens": 200,
+                    "reasoning_tokens": 100,
+                    "total_tokens": 2100,
+                },
+            }
+            log_path.write_text(json.dumps(result) + "\n", encoding="utf-8")
+            return "exited", log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+        # Second stage (review) must also execute; use timeout to stop.
+        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        records = self._read_telemetry()
+        impl = [r for r in records if r["stage"] == "implement"]
+        self.assertGreaterEqual(len(impl), 1)
+        u = impl[0]["usage"]
+        self.assertTrue(u["usage_available"])
+        self.assertEqual(u["usage_source"], "worker_json")
+        self.assertEqual(u["input_tokens"], 1500)
+        self.assertEqual(u["output_tokens"], 300)
+        self.assertEqual(u["cached_input_tokens"], 200)
+        self.assertEqual(u["reasoning_tokens"], 100)
+        self.assertEqual(u["total_tokens"], 2100)
+
+    # -- 4.5 integration: log metadata fallback in telemetry ----------------
+
+    def test_implement_with_log_usage_produces_populated_record(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+
+        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            # Worker JSON has no usage, but log contains usage metadata
+            log_body = (
+                "# worker run\n"
+                + '{"input_tokens": 800, "output_tokens": 150}\n'
+                + "# more log lines\n"
+                + '{"status":"implemented","change":"add-usage-integration","round":1,'
+                + '"progress_made":true,"completed_tasks":[],"remaining_tasks":[],'
+                + '"task_counts":{"complete":0,"total":2},"files_touched":[],'
+                + '"known_change_files":[],"summary":"done"}\n'
+            )
+            log_path.write_text(log_body, encoding="utf-8")
+            return "exited", log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        records = self._read_telemetry()
+        impl = [r for r in records if r["stage"] == "implement"]
+        self.assertGreaterEqual(len(impl), 1)
+        u = impl[0]["usage"]
+        self.assertTrue(u["usage_available"])
+        self.assertEqual(u["usage_source"], "log_metadata")
+        self.assertEqual(u["input_tokens"], 800)
+        self.assertEqual(u["output_tokens"], 150)
+
+    # -- 4.9 integration: timeout preserves default-unavailable -------------
+
+    def test_timeout_keeps_default_unavailable_usage_in_telemetry(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+
+        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text("# timeout\n", encoding="utf-8")
+            return "timeout", log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        records = self._read_telemetry()
+        self.assertGreaterEqual(len(records), 1)
+        u = records[0]["usage"]
+        self.assertFalse(u["usage_available"])
+        self.assertIsNone(u["usage_source"])
+        self.assertIsNone(u["input_tokens"])
+        self.assertIsNone(u["output_tokens"])
+
+    def test_invalid_output_keeps_default_unavailable_usage_in_telemetry(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+
+        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text("not json\nsecond line\n", encoding="utf-8")
+            return "exited", log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        records = self._read_telemetry()
+        self.assertGreaterEqual(len(records), 1)
+        u = records[0]["usage"]
+        self.assertFalse(u["usage_available"])
+        self.assertIsNone(u["usage_source"])
+
+    # -- Model metadata integration -----------------------------------------
+
+    def test_implement_with_model_payload_produces_populated_record(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+
+        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            result = {
+                "status": "implemented",
+                "change": self.cid,
+                "round": 1,
+                "progress_made": True,
+                "completed_tasks": [],
+                "remaining_tasks": [],
+                "task_counts": {"complete": 0, "total": 2},
+                "files_touched": [],
+                "known_change_files": [],
+                "summary": "done",
+                "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5",
+                    "model_alias": "primary",
+                },
+            }
+            log_path.write_text(json.dumps(result) + "\n", encoding="utf-8")
+            return "exited", log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        records = self._read_telemetry()
+        impl = [r for r in records if r["stage"] == "implement"]
+        self.assertGreaterEqual(len(impl), 1)
+        m = impl[0]["model"]
+        self.assertEqual(m["provider"], "openai")
+        self.assertEqual(m["model_id"], "gpt-5.5")
+        self.assertEqual(m["model_alias"], "primary")
+
+    # -- Telemetry write resilience -----------------------------------------
+
+    def test_extraction_failure_does_not_block_telemetry_write(self) -> None:
+        """Verify that even if extraction raises, the telemetry record is
+        still written with default-unavailable usage."""
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+
+        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            result = {
+                "status": "implemented",
+                "change": self.cid,
+                "round": 1,
+                "progress_made": True,
+                "completed_tasks": [],
+                "remaining_tasks": [],
+                "task_counts": {"complete": 0, "total": 2},
+                "files_touched": [],
+                "known_change_files": [],
+                "summary": "done",
+            }
+            log_path.write_text(json.dumps(result) + "\n", encoding="utf-8")
+            return "exited", log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+
+        class ExtractionError(Exception):
+            pass
+
+        def bad_extraction(payload, log_path):
+            raise ExtractionError("simulated extraction failure")
+
+        with mock.patch.object(
+            self.opsx_plan, "extract_usage_and_model", side_effect=bad_extraction
+        ):
+            self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        records = self._read_telemetry()
+        self.assertGreaterEqual(len(records), 1)
+        u = records[0]["usage"]
+        # Must have default-unavailable (the try/except caught the error)
+        self.assertFalse(u["usage_available"])
+        self.assertIsNone(u["usage_source"])
+
+
 if __name__ == "__main__":
     unittest.main()
