@@ -52,7 +52,7 @@ Document structure requirements:
 - End the document with Recommended Sequence, Overall Completion Criteria,
   and Explicit Non-Goals sections.
 
-Machine-read convention (parsed by `opsx-plan compile` — follow exactly):
+Machine-read convention (interpreted by `opsx-plan compile` — follow exactly):
 
 1. A dependency on specific changes is written as backticked exact slugs in
    the `**Depends on:**` paragraph. Every backticked slug there becomes a DAG
@@ -85,6 +85,9 @@ Machine-read convention (parsed by `opsx-plan compile` — follow exactly):
     compiler. State them in prose AND list them in a final
     `## Suggested Manual Gates` section naming the change ids where the
     operator should add `pause_before = true` to the compiled manifest.
+11. The compiler does not support or emit `# REVIEW` markers. Review-fix
+    cycles are managed by the orchestrator's implement/review/archive loop,
+    not by inline markers in source or compiled output.
 
 Reference example of the four dependency forms:
 
