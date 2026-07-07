@@ -976,7 +976,7 @@ def _record_stage_telemetry(
 
     # Attempt cost estimation (best-effort; never fail telemetry write).
     try:
-        cost = estimate_stage_cost(record["usage"], record["model"])
+        cost = estimate_stage_cost(record["usage"], record["model"], repo=repo)
         record["cost"].update(cost)
     except Exception:
         pass
@@ -998,15 +998,25 @@ SUBSCRIPTION_DENOMINATORS: dict[str, dict[str, float]] = {}
 _cost_catalog: object = None  # PricingCatalog | None
 
 
-def _get_catalog():
+def _get_catalog(repo: Path | None = None):
     """Lazily initialise and return the pricing catalog.
 
-    Returns None when the catalog fails to load.
+    When *repo* is provided, its resolved path is prepended to
+    ``sys.path`` before the deferred import so that installed
+    copies of the orchestrator can discover ``lib.pricing``.
+
+    Returns ``(PricingCatalog, UnresolvedPrice)`` or None on failure.
     """
     global _cost_catalog
     if _cost_catalog is None:
         try:
-            # Deferred import so opsx-plan.py remains usable without lib.pricing
+            # Ensure repo root is on sys.path so an installed
+            # ~/.local/bin/opsx-plan can resolve ``from lib.pricing``.
+            if repo is not None:
+                repo_str = str(repo.resolve())
+                if repo_str not in sys.path:
+                    sys.path.insert(0, repo_str)
+
             from lib.pricing import PricingCatalog, UnresolvedPrice  # noqa: F811
 
             _cost_catalog = (PricingCatalog(), UnresolvedPrice)
@@ -1119,7 +1129,8 @@ def _compute_subscription_cost(usage, resolved_price, denominator):
 
 
 def estimate_stage_cost(usage, model,
-                        subscription_denominators=None):
+                        subscription_denominators=None,
+                        repo: Path | None = None):
     """Estimate stage cost from telemetry *usage*, *model*, and pricing catalog.
 
     Args:
@@ -1128,6 +1139,9 @@ def estimate_stage_cost(usage, model,
         subscription_denominators: Optional ``provider -> model_id -> float``
             mapping.  When ``None``, uses the module-level
             ``SUBSCRIPTION_DENOMINATORS``.
+        repo: Optional repo-root path.  Passed through to the catalog
+            loader so installed orchestrator copies can discover
+            ``lib.pricing``.
 
     Returns a dict matching the telemetry ``cost`` schema with keys
     ``status``, ``pricing_catalog_version``, ``price_snapshot``,
@@ -1156,7 +1170,7 @@ def estimate_stage_cost(usage, model,
         return result
 
     # Resolve pricing --------------------------------------------------------
-    catalog_info = _get_catalog()
+    catalog_info = _get_catalog(repo)
     if catalog_info is None:
         result["status"] = "unresolved"
         result["unresolved_reason"] = "pricing catalog failed to load"

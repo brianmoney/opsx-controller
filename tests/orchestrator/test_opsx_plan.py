@@ -4823,6 +4823,57 @@ class CostEstimationTests(unittest.TestCase):
             result["unresolved_reason"], "pricing catalog failed to load",
         )
 
+    def test_cli_path_regression_repo_arg_loads_real_catalog(self):
+        """CLI-path regression: when repo is passed, the installed
+        opsx-plan/opsx-run can discover lib.pricing and load the real
+        catalog for cost estimation."""
+        import sys
+
+        self.opsx_plan._cost_catalog = None
+        actual_repo = Path(__file__).resolve().parents[2]
+        usage = self._usage(input_tokens=100000, output_tokens=50000)
+        model = self._model("openai", "gpt-4o")
+
+        # Cold-start lib.pricing: earlier tests may have imported
+        # lib.pricing (e.g. via _set_catalog), which caches it in
+        # sys.modules and masks the CLI-path regression.  Pop every
+        # key rooted at 'lib' so the next import is a true cold load.
+        saved_lib_modules = {
+            k: v for k, v in sys.modules.items()
+            if k == "lib" or k.startswith("lib.")
+        }
+        for k in saved_lib_modules:
+            del sys.modules[k]
+
+        # Temporarily remove the repo root from sys.path to simulate
+        # the installed CLI environment where only the script directory
+        # is on the path.
+        repo_str = str(actual_repo)
+        removed: list[str] = []
+        while repo_str in sys.path:
+            sys.path.remove(repo_str)
+            removed.append(repo_str)
+
+        try:
+            result = self.opsx_plan.estimate_stage_cost(usage, model,
+                                                         repo=actual_repo)
+        finally:
+            # Restore whatever we removed.
+            for p in removed:
+                if p not in sys.path:
+                    sys.path.insert(0, p)
+            # Restore saved lib modules so later tests are not affected.
+            for k, v in saved_lib_modules.items():
+                sys.modules[k] = v
+
+        self.assertEqual(result["status"], "estimated",
+                         f"expected estimated, got {result}")
+        self.assertEqual(result["pricing_catalog_version"], "1.0.0")
+        # input 100k * 2.50/mtok + output 50k * 10.00/mtok
+        # = 0.25 + 0.50 = 0.75
+        self.assertEqual(result["estimated_cost"], 0.75)
+        self.assertIsNotNone(result["price_snapshot"])
+
 
 if __name__ == "__main__":
     unittest.main()
