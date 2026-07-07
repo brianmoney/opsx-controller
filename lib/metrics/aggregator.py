@@ -758,21 +758,27 @@ def _stage_aggregation(
     if total_review_stages > 0:
         review_failure_rate = total_review_failures / total_review_stages
 
-    # Averages per change (only changes with estimated cost)
-    estimated_changes = [
+    # Avg tokens from all completed changes with token data (decoupled
+    # from cost — tokens are available even when cost is unresolved).
+    all_with_tokens = [
+        c for c in completed_changes if c.tokens is not None
+    ]
+    average_tokens_per_change: Optional[float] = None
+    if all_with_tokens:
+        average_tokens_per_change = statistics.mean(
+            [c.tokens for c in all_with_tokens]
+        )
+
+    # Avg cost still requires changes with estimated (non-unresolved) cost.
+    estimated_for_cost = [
         c
         for c in completed_changes
         if c.estimated_cost is not None
         and c.cost_status not in ("unresolved", "unavailable")
     ]
-    average_tokens_per_change: Optional[float] = None
     average_cost_per_change: Optional[float] = None
-
-    if estimated_changes:
-        token_vals = [c.tokens for c in estimated_changes if c.tokens is not None]
-        cost_vals = [c.estimated_cost for c in estimated_changes if c.estimated_cost is not None]
-        if token_vals:
-            average_tokens_per_change = statistics.mean(token_vals)
+    if estimated_for_cost:
+        cost_vals = [c.estimated_cost for c in estimated_for_cost]
         if cost_vals:
             average_cost_per_change = statistics.mean(cost_vals)
 
@@ -794,10 +800,15 @@ def _stage_aggregation(
 
 
 def _build_leaderboard(
-    completed_changes: list[ChangeMetrics],
+    all_changes: list[ChangeMetrics],
     records: list[dict],
 ) -> list[ModelLeaderboardEntry]:
-    """Build model-combination leaderboard entries."""
+    """Build model-combination leaderboard entries.
+
+    The triple leaderboard includes all changes — completed, failed,
+    blocked, and incomplete — so every model combination that touched a
+    change produces a row.
+    """
     # Group records by change_id
     by_change: dict[str, list[dict]] = {}
     for r in records:
@@ -817,7 +828,7 @@ def _build_leaderboard(
         n = len(changes_for_entry)
         if n == 0:
             return ModelLeaderboardEntry(
-                implementer_model=impl_model,
+                implementer_model=implementer_model,
                 reviewer_model=reviewer_model,
                 archiver_model=archiver_model,
             )
@@ -829,7 +840,7 @@ def _build_leaderboard(
         first_pass_count = 0
         success_count = 0
 
-        for c in completed_changes:
+        for c in all_changes:
             if c.change_id not in changes_for_entry:
                 continue
             if c.total_rounds > 0:
@@ -885,37 +896,7 @@ def _build_leaderboard(
             average_cost=avg_cost,
         )
 
-    # Per-role groupings
-    def _per_role_grouping(role_stage: str) -> list[ModelLeaderboardEntry]:
-        groups: dict[str, list[str]] = {}  # model_key -> [change_id]
-        for cid, recs in by_change.items():
-            for r in recs:
-                if r.get("stage") != role_stage:
-                    continue
-                mk = _model_key(r)
-                if mk is None:
-                    continue
-                if cid not in groups.setdefault(mk, []):
-                    groups[mk].append(cid)
-
-        return [
-            _compute_entry(
-                implementer_model=mk if role_stage == "implement" else None,
-                reviewer_model=mk if role_stage == "review" else None,
-                archiver_model=mk if role_stage == "archive" else None,
-                changes_for_entry=changes,
-            )
-            for mk, changes in sorted(groups.items())
-        ]
-
-    # 7.1 Implementer model leaderboard
-    entries.extend(_per_role_grouping("implement"))
-    # 7.2 Reviewer model leaderboard
-    entries.extend(_per_role_grouping("review"))
-    # 7.3 Archiver model leaderboard
-    entries.extend(_per_role_grouping("archive"))
-
-    # 7.4 Full triple leaderboard
+    # Full triple leaderboard (model combination for all three roles)
     triple_groups: dict[tuple, list[str]] = {}
     for cid, recs in by_change.items():
         # Get latest implement, review, archive models
@@ -934,16 +915,17 @@ def _build_leaderboard(
                 elif stage == "archive":
                     arch_model = mk
 
-        # 7.6: only completed changes with all 3 known
+        # Include all changes (not only completed) in the triple leaderboard
+        # so model combinations for failed/incomplete changes also produce rows.
         c_metrics = next(
-            (c for c in completed_changes if c.change_id == cid), None
+            (c for c in all_changes if c.change_id == cid), None
         )
-        if c_metrics is None or c_metrics.status != "completed":
-            continue
-        if None in (impl_model, rev_model, arch_model):
+        if c_metrics is None:
             continue
 
-        triple = (impl_model, rev_model, arch_model)
+        triple = (impl_model or "unknown",
+                  rev_model or "unknown",
+                  arch_model or "unknown")
         triple_groups.setdefault(triple, []).append(cid)
 
     for (impl, rev, arch), changes in sorted(triple_groups.items()):
@@ -1027,8 +1009,8 @@ def aggregate(
     ]
     stage_aggregates = _stage_aggregation(completed, selected_records)
 
-    # 7. Model leaderboard
-    leaderboard = _build_leaderboard(completed, selected_records)
+    # 7. Model leaderboard (all changes, not only completed)
+    leaderboard = _build_leaderboard(change_metrics_list, selected_records)
 
     return AggregationResult(
         plan_metrics=plan_metrics,
