@@ -237,3 +237,9 @@ mode, and the archive commit per change keeps each step independently
 revertable. If you later want parallel independent branches, run them in
 separate `git worktree` checkouts with a merge step gated on `fast_checks` —
 that belongs above this script, not inside it.
+
+## Model Efficiency Workflow
+
+See [`core/model-efficiency-workflow.md`](../core/model-efficiency-workflow.md)
+for the operator workflow that uses `opsx-plan compile`, `opsx-plan run`,
+`opsx-plan report`, and `opsx-plan dashboard` to benchmark model choices.

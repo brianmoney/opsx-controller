@@ -16,3 +16,11 @@ Current adapters:
 - `adapters/claude-code/`: Claude Code skill, phase agents, installer, and templates
 - `plugins/opsx-controller/`: Claude Code plugin package for namespaced distribution
 - `skills/opsx-controller/`: Vercel `npx skill` package for discovery and guided use
+
+## Model Efficiency Workflow
+
+- `model-efficiency-workflow.md`: end-to-end operator workflow for benchmarking
+  OPSX model choices using plan-run telemetry, cost estimation, reporting, and
+  dashboards. Covers configuring model sets, running comparable plans,
+  maintaining the pricing catalog, interpreting cost estimates, comparing model
+  combinations, and known limitations.
