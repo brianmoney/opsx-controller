@@ -1,0 +1,82 @@
+[plan]
+name = "operator-workflow-upgrades"
+adapter = "opencode"
+timeout_minutes = 90
+max_attempts = 2
+max_rounds = 5
+no_progress_limit = 2
+require_clean_tracked = true
+plan_doc = "openspec/plans/operator-workflow-upgrades-plan.md"
+create_invoke = "opencode run \"/opsx-ff Please review @{plan_doc} and create a change for {change}\""
+create_timeout_minutes = 30
+create_max_attempts = 2
+created_check = "openspec validate {change} --strict"
+review_created = true
+fast_checks = [
+  "openspec validate --all",
+]
+
+# Phase 1: CLI Ergonomics Foundation
+
+[[changes]]
+id = "add-active-plan-resolution"
+phase = 1
+pause_before = true # first change in proposed `plan-operator-cli` capability
+
+[[changes]]
+id = "add-opsx-plan-doctor-command"
+phase = 1
+depends_on = ["add-active-plan-resolution"]
+
+# Phase 2: Git Delivery
+
+[[changes]]
+id = "define-plan-git-delivery-contract"
+phase = 2
+pause_before = true # first change in proposed `plan-git-delivery` capability
+
+[[changes]]
+id = "create-plan-branch-on-run-start"
+phase = 2
+depends_on = ["define-plan-git-delivery-contract"]
+
+[[changes]]
+id = "open-pr-on-plan-completion"
+phase = 2
+depends_on = ["create-plan-branch-on-run-start"]
+pause_before = true # suggested manual gate before first remote-pushing change
+
+# Phase 3: Run Controls And Attention
+
+[[changes]]
+id = "add-cost-budget-run-flag"
+phase = 3
+
+[[changes]]
+id = "batch-gate-and-reset-commands"
+phase = 3
+depends_on = ["add-active-plan-resolution"]
+
+[[changes]]
+id = "add-plan-logs-command"
+phase = 3
+depends_on = ["add-active-plan-resolution"]
+
+[[changes]]
+id = "add-run-event-notifications"
+phase = 3
+depends_on = ["open-pr-on-plan-completion"]
+
+# Phase 4: Documentation
+
+[[changes]]
+id = "document-operator-workflow-upgrades"
+phase = 4
+depends_on = [
+  "add-opsx-plan-doctor-command",
+  "open-pr-on-plan-completion",
+  "add-cost-budget-run-flag",
+  "batch-gate-and-reset-commands",
+  "add-plan-logs-command",
+  "add-run-event-notifications",
+]

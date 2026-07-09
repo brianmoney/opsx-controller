@@ -1,0 +1,38 @@
+[plan]
+name = "opencode-plugin-token-usage"
+adapter = "opencode"
+timeout_minutes = 90
+max_attempts = 2
+max_rounds = 5
+no_progress_limit = 2
+require_clean_tracked = true
+plan_doc = "openspec/plans/opencode-plugin-token-usage-plan.md"
+create_invoke = "opencode run \"/opsx-ff Please review @{plan_doc} and create a change for {change}\""
+create_timeout_minutes = 30
+create_max_attempts = 2
+created_check = "openspec validate {change} --strict"
+review_created = true
+fast_checks = [
+  "openspec validate --all",
+]
+
+# Phase 1: Usage Contract
+
+[[changes]]
+id = "define-opencode-plugin-usage-contract"
+phase = 1
+pause_before = true
+
+# Phase 2: Plugin Emission
+
+[[changes]]
+id = "add-opencode-usage-emitter-plugin"
+phase = 2
+depends_on = ["define-opencode-plugin-usage-contract"]
+
+# Phase 3: Orchestrator Consumption
+
+[[changes]]
+id = "consume-opencode-usage-sidecar"
+phase = 3
+depends_on = ["add-opencode-usage-emitter-plugin"]
