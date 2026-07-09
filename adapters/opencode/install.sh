@@ -58,6 +58,16 @@ install_support_readme() {
     "$dest_dir/README.md"
 }
 
+install_plugins() {
+  local dest_dir="$1"
+  mkdir -p "$dest_dir"
+  local file
+  for file in "$ROOT_DIR"/adapters/opencode/plugins/*.js; do
+    [[ -e "$file" ]] || continue
+    install -m 0644 "$file" "$dest_dir/$(basename "$file")"
+  done
+}
+
 install_orchestrator() {
   local dest_dir="$HOME/.local/bin"
   mkdir -p "$dest_dir"
@@ -109,21 +119,36 @@ do_verify() {
   fi
 }
 
+verify_plugin_deployed() {
+  local plugins_dir="$1"
+  local plugin_name="opsx-usage-emitter.js"
+  if [[ -f "$plugins_dir/$plugin_name" ]]; then
+    printf '%s\n' "Verify: usage emitter plugin deployed at $plugins_dir/$plugin_name"
+    return 0
+  else
+    printf '%s\n' "Verify: usage emitter plugin MISSING from $plugins_dir/$plugin_name" >&2
+    return 1
+  fi
+}
+
 install_global() {
   require_model_envs
 
   local config_root="$HOME/.config/opencode"
   install_commands "$config_root/commands"
   install_agents "$config_root/agents"
+  install_plugins "$config_root/plugins"
   install_support_readme "$config_root/opsx-controller"
   install_orchestrator
   printf '%s\n' \
     "Installed commands to $config_root/commands" \
     "Installed agents to $config_root/agents" \
+    "Installed plugins to $config_root/plugins" \
     "Installed support files to $config_root/opsx-controller" \
     "Installed opsx-plan to $HOME/.local/bin/opsx-plan" \
     "Installed opsx-run to $HOME/.local/bin/opsx-run"
   do_verify
+  verify_plugin_deployed "$config_root/plugins"
 }
 
 install_project() {
@@ -137,6 +162,7 @@ install_project() {
 
   install_commands "$project_dir/.opencode/commands"
   install_agents "$project_dir/.opencode/agents"
+  install_plugins "$project_dir/.opencode/plugins"
   install_support_readme "$project_dir/.opencode/opsx-controller"
   ensure_project_gitignore "$project_dir"
   ensure_project_config "$project_dir"
@@ -144,9 +170,11 @@ install_project() {
   printf '%s\n' \
     "Installed commands to $project_dir/.opencode/commands" \
     "Installed agents to $project_dir/.opencode/agents" \
+    "Installed plugins to $project_dir/.opencode/plugins" \
     "Installed support files to $project_dir/.opencode/opsx-controller" \
     "Updated $project_dir/.opencode/.gitignore"
   do_verify
+  verify_plugin_deployed "$project_dir/.opencode/plugins"
 }
 
 if [[ $# -eq 0 ]]; then
@@ -178,6 +206,6 @@ case "$1" in
     ;;
 esac
 
-printf '%s\n' 'Restart OpenCode after install so it reloads commands and agents.'
+printf '%s\n' 'Restart OpenCode after install so it reloads commands, agents, and plugins.'
 
 
