@@ -4941,7 +4941,7 @@ class CostEstimationTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "estimated",
                          f"expected estimated, got {result}")
-        self.assertEqual(result["pricing_catalog_version"], "1.0.0")
+        self.assertEqual(result["pricing_catalog_version"], "1.1.0")
         # input 100k * 2.50/mtok + output 50k * 10.00/mtok
         # = 0.25 + 0.50 = 0.75
         self.assertEqual(result["estimated_cost"], 0.75)
@@ -7151,6 +7151,581 @@ class DashboardCommandTests(unittest.TestCase):
             "Plan-summary Total Cost must render missing cost with gray "
             ".cost-missing span",
         )
+
+
+class ActivePlanResolutionTests(unittest.TestCase):
+    """Tests for active plan pointer: resolution, use, auto-activation, and
+    status output (tasks 5.1–5.3)."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        git(self.repo, "init")
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        git(self.repo, "add", "tracked.txt")
+        git(
+            self.repo,
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "user.name=Test User",
+            "commit",
+            "-m",
+            "init",
+        )
+        self._saved_environ = dict(os.environ)
+
+    def tearDown(self) -> None:
+        os.environ.clear()
+        os.environ.update(self._saved_environ)
+        self.tmp.cleanup()
+
+    def _write_plan_toml(self, rel_path: str, content: str | None = None) -> Path:
+        """Write a valid plan TOML that can pass load_plan."""
+        p = self.repo / rel_path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if content is not None:
+            p.write_text(content, encoding="utf-8")
+        else:
+            p.write_text(
+                '[plan]\nname = "test-plan"\nadapter = "opencode"\n\n'
+                "[[changes]]\nid = \"test-change\"\n",
+                encoding="utf-8",
+            )
+        return p
+
+    def _write_plan_md(self, rel_path: str, content: str | None = None) -> Path:
+        p = self.repo / rel_path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if content is not None:
+            p.write_text(content, encoding="utf-8")
+        else:
+            p.write_text(
+                "# Plan\n\n## Phase 1\n\n### Change: `test-change`\n\n**Depends on:** None.\n",
+                encoding="utf-8",
+            )
+        return p
+
+    # ── 5.1: resolve_plan precedence branches ───────────────────────────
+
+    def test_resolve_plan_returns_explicit_argument(self) -> None:
+        result = self.opsx_plan.resolve_plan(self.repo, "explicit-plan.toml")
+        self.assertEqual(result, "explicit-plan.toml")
+
+    def test_resolve_plan_falls_back_to_env_var(self) -> None:
+        os.environ["OPSX_PLAN"] = "env-plan.toml"
+        result = self.opsx_plan.resolve_plan(self.repo, None)
+        self.assertEqual(result, "env-plan.toml")
+
+    def test_resolve_plan_falls_back_to_pointer_file(self) -> None:
+        self._write_plan_toml("my-plan.toml")
+        self.opsx_plan.write_active_plan(self.repo, "my-plan.toml")
+        os.environ.pop("OPSX_PLAN", None)
+        result = self.opsx_plan.resolve_plan(self.repo, None)
+        self.assertEqual(result, "my-plan.toml")
+
+    def test_resolve_plan_raises_when_nothing_set(self) -> None:
+        os.environ.pop("OPSX_PLAN", None)
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan.resolve_plan(self.repo, None)
+        self.assertIn("no plan specified", str(ctx.exception).lower())
+
+    def test_resolve_plan_raises_on_stale_pointer(self) -> None:
+        self.opsx_plan.write_active_plan(self.repo, "deleted-plan.toml")
+        os.environ.pop("OPSX_PLAN", None)
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan.resolve_plan(self.repo, None)
+        self.assertIn("active plan pointer references missing file", str(ctx.exception))
+        self.assertIn("deleted-plan.toml", str(ctx.exception))
+        self.assertIn("opsx-plan use", str(ctx.exception))
+
+    # ── 5.2: explicit and OPSX_PLAN override the pointer ─────────────────
+
+    def test_resolve_plan_explicit_overrides_pointer(self) -> None:
+        self._write_plan_toml("my-plan.toml")
+        self.opsx_plan.write_active_plan(self.repo, "my-plan.toml")
+        os.environ.pop("OPSX_PLAN", None)
+        result = self.opsx_plan.resolve_plan(self.repo, "override.toml")
+        self.assertEqual(result, "override.toml")
+
+    def test_resolve_plan_env_overrides_pointer(self) -> None:
+        self._write_plan_toml("my-plan.toml")
+        self.opsx_plan.write_active_plan(self.repo, "my-plan.toml")
+        os.environ["OPSX_PLAN"] = "env-plan.toml"
+        result = self.opsx_plan.resolve_plan(self.repo, None)
+        self.assertEqual(result, "env-plan.toml")
+
+    # ── 5.3: use, compile activation, run activation, status, stale ─────
+
+    def test_cmd_use_writes_pointer(self) -> None:
+        plan = self._write_plan_toml("my-plan.toml")
+        args = argparse.Namespace(repo=str(self.repo), plan="my-plan.toml")
+        rc = self.opsx_plan.cmd_use(args)
+        self.assertEqual(rc, 0)
+        pointer = self.opsx_plan.read_active_plan(self.repo)
+        self.assertEqual(pointer, "my-plan.toml")
+
+    def test_cmd_use_rejects_nonexistent_plan(self) -> None:
+        args = argparse.Namespace(repo=str(self.repo), plan="missing.toml")
+        rc = self.opsx_plan.cmd_use(args)
+        self.assertEqual(rc, 2)
+        self.assertIsNone(self.opsx_plan.read_active_plan(self.repo))
+
+    def test_cmd_use_rejects_invalid_toml(self) -> None:
+        p = self.repo / "bad.toml"
+        p.write_text("not valid toml {{{", encoding="utf-8")
+        args = argparse.Namespace(repo=str(self.repo), plan="bad.toml")
+        rc = self.opsx_plan.cmd_use(args)
+        self.assertEqual(rc, 2)
+        self.assertIsNone(self.opsx_plan.read_active_plan(self.repo))
+
+    def test_cmd_use_rejects_plan_outside_repo(self) -> None:
+        # Create a plan outside the repo
+        outside = Path(tempfile.gettempdir()) / "outside-plan.toml"
+        outside.write_text(
+            '[plan]\nname = "outside"\nadapter = "opencode"\n\n'
+            "[[changes]]\nid = \"oc\"\n",
+            encoding="utf-8",
+        )
+        try:
+            args = argparse.Namespace(repo=str(self.repo), plan=str(outside))
+            rc = self.opsx_plan.cmd_use(args)
+            self.assertEqual(rc, 2)
+            self.assertIsNone(self.opsx_plan.read_active_plan(self.repo))
+        finally:
+            outside.unlink(missing_ok=True)
+
+    def test_compile_auto_activates_output_plan(self) -> None:
+        source = self._write_plan_md("plan.md")
+        out = self.repo / "out.toml"
+        os.environ["OPSX_CONTROLLER_MODEL"] = "test-model"
+
+        valid_toml = (
+            '[plan]\nname = "test"\nadapter = "opencode"\n\n'
+            "[[changes]]\nid = \"c1\"\nphase = 1\n"
+        )
+        original = self.opsx_plan.run_opencode_for_compile
+        try:
+            self.opsx_plan.run_opencode_for_compile = lambda repo, model, prompt: (valid_toml, "")
+            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
+                                      output=str(out), force=False)
+            rc = self.opsx_plan.cmd_compile(args)
+            self.assertEqual(rc, 0)
+            pointer = self.opsx_plan.read_active_plan(self.repo)
+            self.assertIsNotNone(pointer)
+            self.assertEqual(Path(pointer), Path("out.toml"))
+        finally:
+            self.opsx_plan.run_opencode_for_compile = original
+
+    def test_run_explicit_auto_activates_after_successful_load(self) -> None:
+        plan = self._write_plan_toml("my-plan.toml")
+        # Ensure the plan's referenced change is authored so cmd_run can
+        # process it without hitting the create stage.
+        cdir = self.repo / "openspec" / "changes" / "test-change"
+        cdir.mkdir(parents=True)
+        (cdir / "proposal.md").write_text("## Why\n", encoding="utf-8")
+        (cdir / "tasks.md").write_text("- [ ] 1.1 task\n", encoding="utf-8")
+        os.environ["OPSX_CONTROLLER_MODEL"] = "test-model"
+
+        def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None):
+            return self.opsx_plan.DONE
+
+        original = self.opsx_plan.run_direct_change
+        try:
+            self.opsx_plan.run_direct_change = fake_run_direct_change
+            args = argparse.Namespace(
+                repo=str(self.repo), plan=str(plan),
+                dry_run=False, budget_minutes=0, max_changes=0,
+                only=[], create_only=False,
+            )
+            rc = self.opsx_plan.cmd_run(args)
+            # cmd_run returns 0 on success
+            self.assertEqual(rc, 0)
+            pointer = self.opsx_plan.read_active_plan(self.repo)
+            self.assertEqual(pointer, "my-plan.toml")
+        finally:
+            self.opsx_plan.run_direct_change = original
+
+    def test_run_explicit_failed_load_does_not_activate(self) -> None:
+        """When load_plan fails for an explicit plan, the active-plan pointer
+        must not be written (bug fix verification)."""
+        p = self.repo / "bad-plan.toml"
+        p.write_text("this is not valid toml", encoding="utf-8")
+
+        args = argparse.Namespace(
+            repo=str(self.repo), plan=str(p),
+            dry_run=False, budget_minutes=0, max_changes=0,
+            only=[], create_only=False,
+        )
+
+        # Ensure no pointer exists before the call
+        self.assertIsNone(self.opsx_plan.read_active_plan(self.repo))
+
+        with self.assertRaises(self.opsx_plan.PlanError):
+            self.opsx_plan.cmd_run(args)
+
+        # Pointer must still be absent
+        self.assertIsNone(self.opsx_plan.read_active_plan(self.repo))
+
+    def test_status_shows_active_plan_in_header(self) -> None:
+        plan = self._write_plan_toml("my-plan.toml")
+        self.opsx_plan.write_active_plan(self.repo, "my-plan.toml")
+
+        stdout = io.StringIO()
+
+        def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None):
+            return self.opsx_plan.DONE
+
+        original = self.opsx_plan.run_direct_change
+        try:
+            self.opsx_plan.run_direct_change = fake_run_direct_change
+            with mock.patch("sys.stdout", stdout):
+                args = argparse.Namespace(repo=str(self.repo), plan=str(plan))
+                rc = self.opsx_plan.cmd_status(args)
+                output = stdout.getvalue()
+                self.assertIn("(active: my-plan.toml)", output)
+        finally:
+            self.opsx_plan.run_direct_change = original
+
+    def test_status_shows_inspected_plan_when_differs_from_active(self) -> None:
+        active_plan = self._write_plan_toml("active.toml")
+        other_plan = self._write_plan_toml("other.toml")
+        self.opsx_plan.write_active_plan(self.repo, "active.toml")
+
+        stdout = io.StringIO()
+
+        def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None):
+            return self.opsx_plan.DONE
+
+        original = self.opsx_plan.run_direct_change
+        try:
+            self.opsx_plan.run_direct_change = fake_run_direct_change
+            with mock.patch("sys.stdout", stdout):
+                args = argparse.Namespace(repo=str(self.repo), plan=str(other_plan))
+                rc = self.opsx_plan.cmd_status(args)
+                output = stdout.getvalue()
+                self.assertIn("(active: active.toml)", output)
+                self.assertIn("[inspected:", output)
+        finally:
+            self.opsx_plan.run_direct_change = original
+
+    def test_resolve_plan_stale_pointer_includes_opsx_plan_use_hint(self) -> None:
+        """A stale pointer error must tell the user to run 'opsx-plan use'."""
+        self.opsx_plan.write_active_plan(self.repo, "deleted.toml")
+        os.environ.pop("OPSX_PLAN", None)
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan.resolve_plan(self.repo, None)
+        self.assertIn("opsx-plan use", str(ctx.exception))
+
+    def test_write_and_read_active_plan_roundtrip(self) -> None:
+        self.assertIsNone(self.opsx_plan.read_active_plan(self.repo))
+        self.opsx_plan.write_active_plan(self.repo, "some/plan.toml")
+        self.assertEqual(self.opsx_plan.read_active_plan(self.repo), "some/plan.toml")
+        # Overwrite
+        self.opsx_plan.write_active_plan(self.repo, "other.toml")
+        self.assertEqual(self.opsx_plan.read_active_plan(self.repo), "other.toml")
+
+    def test_read_active_plan_returns_none_for_empty_file(self) -> None:
+        pp = self.opsx_plan.active_plan_pointer_path(self.repo)
+        pp.parent.mkdir(parents=True, exist_ok=True)
+        pp.write_text("   \n", encoding="utf-8")
+        self.assertIsNone(self.opsx_plan.read_active_plan(self.repo))
+
+    def test_validate_active_plan_succeeds_for_valid_plan(self) -> None:
+        self._write_plan_toml("my-plan.toml")
+        result = self.opsx_plan.validate_active_plan(self.repo, "my-plan.toml")
+        self.assertTrue(result.is_file())
+
+    def test_validate_active_plan_raises_for_missing_file(self) -> None:
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan.validate_active_plan(self.repo, "missing.toml")
+        self.assertIn("does not exist", str(ctx.exception))
+        self.assertIn("missing.toml", str(ctx.exception))
+
+    # ── 5.4: resolve_plan_path resolves relative paths against repo ─────
+
+    def test_resolve_plan_path_relative_resolves_against_repo(self) -> None:
+        self._write_plan_toml("rel/plan.toml")
+        result = self.opsx_plan._resolve_plan_path(self.repo, "rel/plan.toml")
+        expected = (self.repo / "rel" / "plan.toml").resolve()
+        self.assertEqual(result, expected)
+
+    def test_resolve_plan_path_absolute_stays_absolute(self) -> None:
+        self._write_plan_toml("some/plan.toml")
+        abs_path = str((self.repo / "some" / "plan.toml").resolve())
+        result = self.opsx_plan._resolve_plan_path(self.repo, abs_path)
+        self.assertEqual(result, Path(abs_path).resolve())
+
+    # ── 5.5: status shows inspected path from OPSX_PLAN ─────────────────
+
+    def test_status_shows_inspected_plan_via_opsx_plan_when_differs(self) -> None:
+        plan_active = self._write_plan_toml("active.toml")
+        plan_env = self._write_plan_toml("env-plan.toml")
+        self.opsx_plan.write_active_plan(self.repo, "active.toml")
+        os.environ["OPSX_PLAN"] = "env-plan.toml"
+
+        stdout = io.StringIO()
+
+        def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None):
+            return self.opsx_plan.DONE
+
+        original = self.opsx_plan.run_direct_change
+        try:
+            self.opsx_plan.run_direct_change = fake_run_direct_change
+            with mock.patch("sys.stdout", stdout):
+                args = argparse.Namespace(repo=str(self.repo), plan=None)
+                rc = self.opsx_plan.cmd_status(args)
+                output = stdout.getvalue()
+                self.assertIn("(active: active.toml)", output)
+                self.assertIn("[inspected: env-plan.toml]", output)
+        finally:
+            self.opsx_plan.run_direct_change = original
+
+    def test_status_no_inspected_note_when_opsx_plan_matches_active(self) -> None:
+        self._write_plan_toml("same.toml")
+        self.opsx_plan.write_active_plan(self.repo, "same.toml")
+        os.environ["OPSX_PLAN"] = "same.toml"
+
+        stdout = io.StringIO()
+
+        def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None):
+            return self.opsx_plan.DONE
+
+        original = self.opsx_plan.run_direct_change
+        try:
+            self.opsx_plan.run_direct_change = fake_run_direct_change
+            with mock.patch("sys.stdout", stdout):
+                args = argparse.Namespace(repo=str(self.repo), plan=None)
+                rc = self.opsx_plan.cmd_status(args)
+                output = stdout.getvalue()
+                self.assertIn("(active: same.toml)", output)
+                self.assertNotIn("[inspected:", output)
+        finally:
+            self.opsx_plan.run_direct_change = original
+
+    # ── 5.6: command-level --repo plan-resolution coverage ─────────────
+
+    def test_cmd_approve_resolves_via_active_pointer(self) -> None:
+        """cmd_approve with plan=None resolves the plan via the active pointer."""
+        self._write_plan_toml("my-plan.toml")
+        self.opsx_plan.write_active_plan(self.repo, "my-plan.toml")
+
+        args = argparse.Namespace(
+            repo=str(self.repo), plan=None, change=["test-change"],
+        )
+        rc = self.opsx_plan.cmd_approve(args)
+
+        self.assertEqual(rc, 0)
+        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        self.assertIn("test-change", state["approvals"])
+
+    def test_cmd_accept_resolves_via_active_pointer(self) -> None:
+        """cmd_accept with plan=None resolves the plan via the active pointer."""
+        self._write_plan_toml(
+            "my-plan.toml",
+            '[plan]\nname = "test-plan"\nadapter = "opencode"\n'
+            'created_check = ""\n\n'
+            "[[changes]]\nid = \"test-change\"\n",
+        )
+        self.opsx_plan.write_active_plan(self.repo, "my-plan.toml")
+        cdir = self.repo / "openspec" / "changes" / "test-change"
+        cdir.mkdir(parents=True)
+        (cdir / "proposal.md").write_text("## Why\n", encoding="utf-8")
+        (cdir / "tasks.md").write_text("- [ ] 1.1 task\n", encoding="utf-8")
+
+        args = argparse.Namespace(
+            repo=str(self.repo), plan=None, change=["test-change"],
+        )
+        rc = self.opsx_plan.cmd_accept(args)
+
+        self.assertEqual(rc, 0)
+        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        self.assertTrue(state["changes"]["test-change"]["accepted"])
+
+    def test_cmd_reset_resolves_via_active_pointer(self) -> None:
+        """cmd_reset with plan=None resolves the plan via the active pointer."""
+        self._write_plan_toml("my-plan.toml")
+        self.opsx_plan.write_active_plan(self.repo, "my-plan.toml")
+
+        args = argparse.Namespace(
+            repo=str(self.repo), plan=None, change=["test-change"],
+        )
+        rc = self.opsx_plan.cmd_reset(args)
+
+        self.assertEqual(rc, 0)
+        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        self.assertEqual(state["changes"]["test-change"]["status"], "pending")
+
+    def test_cmd_run_resolves_via_active_pointer(self) -> None:
+        """cmd_run with plan=None resolves the plan via the active pointer and
+        runs the change successfully."""
+        self._write_plan_toml("my-plan.toml")
+        self.opsx_plan.write_active_plan(self.repo, "my-plan.toml")
+        cdir = self.repo / "openspec" / "changes" / "test-change"
+        cdir.mkdir(parents=True)
+        (cdir / "proposal.md").write_text("## Why\n", encoding="utf-8")
+        (cdir / "tasks.md").write_text("- [ ] 1.1 task\n", encoding="utf-8")
+        os.environ["OPSX_CONTROLLER_MODEL"] = "test-model"
+
+        def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None):
+            return self.opsx_plan.DONE
+
+        original = self.opsx_plan.run_direct_change
+        try:
+            self.opsx_plan.run_direct_change = fake_run_direct_change
+            args = argparse.Namespace(
+                repo=str(self.repo), plan=None,
+                dry_run=False, budget_minutes=0, max_changes=0,
+                only=[], create_only=False,
+            )
+            rc = self.opsx_plan.cmd_run(args)
+            self.assertEqual(rc, 0)
+        finally:
+            self.opsx_plan.run_direct_change = original
+
+    def test_cmd_report_resolves_via_active_pointer(self) -> None:
+        """cmd_report with plan=None resolves the plan via the active pointer."""
+        plan_name = "test-plan"
+        plan = self._write_plan_toml("my-plan.toml")
+        self.opsx_plan.write_active_plan(self.repo, "my-plan.toml")
+
+        # Minimal telemetry and state so the report can produce output.
+        tele_dir = self.repo / ".opsx-plan" / "telemetry"
+        tele_dir.mkdir(parents=True, exist_ok=True)
+        record = {
+            "schema_version": 1,
+            "uid": "uid-001",
+            "plan_name": plan_name,
+            "run_id": "run-001",
+            "change_id": "test-change",
+            "stage": "implement",
+            "round": 1,
+            "status": "completed",
+            "started_at": "2026-07-01T10:00:00",
+            "ended_at": "2026-07-01T10:02:00",
+            "duration_ms": 120000,
+            "usage": {
+                "usage_available": True,
+                "input_tokens": 10000,
+                "output_tokens": 2000,
+                "cached_input_tokens": None,
+                "reasoning_tokens": None,
+                "total_tokens": 12000,
+                "usage_source": "worker_json",
+            },
+            "cost": {
+                "status": "estimated",
+                "estimated_cost": 0.05,
+                "pricing_catalog_version": None,
+                "price_snapshot": None,
+                "unresolved_reason": None,
+            },
+            "model": {
+                "provider": "openai",
+                "model_id": "gpt-4o",
+                "model_alias": None,
+            },
+            "result": {
+                "stage_status": "completed",
+                "verdict": None,
+                "critical_count": 0,
+                "warning_count": 0,
+                "note_count": 0,
+            },
+        }
+        (tele_dir / f"{plan_name}.jsonl").write_text(
+            json.dumps(record) + "\n", encoding="utf-8",
+        )
+        state_dir = self.repo / ".opsx-plan"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / f"{plan_name}.state.json").write_text(
+            json.dumps({"plan": plan_name, "approvals": [], "changes": {
+                "test-change": {"status": "done", "round": 1, "phase": "done"},
+            }}), encoding="utf-8",
+        )
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        args = argparse.Namespace(
+            repo=str(self.repo), plan=None, json=False,
+            change=None, run_id=None, stage=None, model=None,
+        )
+        with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+            rc = self.opsx_plan.cmd_report(args)
+        self.assertEqual(rc, 0)
+        self.assertIn("test-plan", stdout.getvalue())
+
+    def test_cmd_dashboard_resolves_via_active_pointer(self) -> None:
+        """cmd_dashboard with plan=None resolves the plan via the active pointer."""
+        plan_name = "test-plan"
+        self._write_plan_toml("my-plan.toml")
+        self.opsx_plan.write_active_plan(self.repo, "my-plan.toml")
+
+        # Minimal telemetry and state so the dashboard can render.
+        tele_dir = self.repo / ".opsx-plan" / "telemetry"
+        tele_dir.mkdir(parents=True, exist_ok=True)
+        record = {
+            "schema_version": 1,
+            "uid": "uid-001",
+            "plan_name": plan_name,
+            "run_id": "run-001",
+            "change_id": "test-change",
+            "stage": "implement",
+            "round": 1,
+            "status": "completed",
+            "started_at": "2026-07-01T10:00:00",
+            "ended_at": "2026-07-01T10:02:00",
+            "duration_ms": 120000,
+            "usage": {
+                "usage_available": True,
+                "input_tokens": 10000,
+                "output_tokens": 2000,
+                "cached_input_tokens": None,
+                "reasoning_tokens": None,
+                "total_tokens": 12000,
+                "usage_source": "worker_json",
+            },
+            "cost": {
+                "status": "estimated",
+                "estimated_cost": 0.05,
+                "pricing_catalog_version": None,
+                "price_snapshot": None,
+                "unresolved_reason": None,
+            },
+            "model": {
+                "provider": "openai",
+                "model_id": "gpt-4o",
+                "model_alias": None,
+            },
+            "result": {
+                "stage_status": "completed",
+                "verdict": None,
+                "critical_count": 0,
+                "warning_count": 0,
+                "note_count": 0,
+            },
+        }
+        (tele_dir / f"{plan_name}.jsonl").write_text(
+            json.dumps(record) + "\n", encoding="utf-8",
+        )
+        state_dir = self.repo / ".opsx-plan"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / f"{plan_name}.state.json").write_text(
+            json.dumps({"plan": plan_name, "approvals": [], "changes": {
+                "test-change": {"status": "done", "round": 1, "phase": "done"},
+            }}), encoding="utf-8",
+        )
+
+        stdout = io.StringIO()
+        args = argparse.Namespace(
+            repo=str(self.repo), plan=None,
+            output=None, run_id=None, change=None,
+        )
+        with mock.patch("sys.stdout", stdout):
+            rc = self.opsx_plan.cmd_dashboard(args)
+        self.assertEqual(rc, 0)
+        self.assertIn("Dashboard written to:", stdout.getvalue())
 
 
 if __name__ == "__main__":

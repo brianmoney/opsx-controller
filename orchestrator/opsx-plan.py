@@ -95,8 +95,11 @@ class PlanError(Exception):
 
 
 def load_plan(path: Path) -> dict:
-    with open(path, "rb") as fh:
-        raw = tomllib.load(fh)
+    try:
+        with open(path, "rb") as fh:
+            raw = tomllib.load(fh)
+    except Exception as exc:
+        raise PlanError(f"cannot parse plan {path.name}: {exc}") from exc
 
     plan = raw.get("plan", {})
     changes = raw.get("changes", [])
@@ -442,6 +445,122 @@ def change_context_paths(repo: Path, cid: str) -> list[str]:
     if not cdir.is_dir():
         return []
     return sorted(str(path.relative_to(repo)) for path in cdir.rglob("*") if path.is_file())
+
+
+# ---------------------------------------------------------------------------
+# Active plan pointer
+# ---------------------------------------------------------------------------
+
+ACTIVE_PLAN_FILENAME = "active-plan"
+
+
+def active_plan_pointer_path(repo: Path) -> Path:
+    """Path to the active-plan pointer file under .opsx-plan/."""
+    return repo / ".opsx-plan" / ACTIVE_PLAN_FILENAME
+
+
+def read_active_plan(repo: Path) -> str | None:
+    """Read the active plan pointer, returning the repo-relative TOML path or None.
+
+    The pointer file contains a single line with a repo-relative path.
+    Leading/trailing whitespace is stripped.
+    """
+    p = active_plan_pointer_path(repo)
+    if not p.is_file():
+        return None
+    content = p.read_text(encoding="utf-8").strip()
+    if not content:
+        return None
+    return content.splitlines()[0].strip() or None
+
+
+def write_active_plan(repo: Path, plan_rel: str) -> None:
+    """Write or update the active-plan pointer file.
+
+    The pointer is stored as a single line: the repo-relative path to the
+    plan TOML.  The .opsx-plan/ directory (and its .gitignore) is created
+    when missing.
+    """
+    p = active_plan_pointer_path(repo)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    gi = p.parent / ".gitignore"
+    if not gi.exists():
+        gi.write_text("*\n", encoding="utf-8")
+    tmp = p.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(plan_rel.strip() + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, p)
+
+
+def validate_active_plan(repo: Path, plan_rel: str) -> Path:
+    """Validate that the active plan target exists and can be loaded.
+
+    Returns the resolved absolute Path.  Raises PlanError when the target
+    file is missing or the TOML is invalid.
+    """
+    plan_path = (repo / plan_rel).resolve()
+    if not plan_path.is_file():
+        raise PlanError(
+            f"active plan target does not exist: {plan_rel}"
+        )
+    # Verify it is loadable through the existing parser
+    try:
+        load_plan(plan_path)
+    except PlanError as exc:
+        raise PlanError(f"active plan cannot be loaded: {exc}")
+    return plan_path
+
+
+def resolve_plan(repo: Path, explicit: str | None) -> str:
+    """Resolve a plan path using the standard precedence:
+
+    1. Explicit CLI argument
+    2. ``OPSX_PLAN`` environment variable
+    3. Active-plan pointer file under ``.opsx-plan/``
+
+    Raises PlanError when no plan can be resolved or when the stored
+    pointer references a missing file (fail-closed).
+    """
+    if explicit:
+        return explicit
+
+    env_plan = os.environ.get("OPSX_PLAN", "").strip()
+    if env_plan:
+        norm = str(Path(env_plan))
+        log(f"using plan from OPSX_PLAN: {norm}")
+        return norm
+
+    pointer = read_active_plan(repo)
+    if pointer:
+        plan_path = repo / pointer
+        if not plan_path.is_file():
+            raise PlanError(
+                f"active plan pointer references missing file: {pointer}\n"
+                f"Set a new active plan with: opsx-plan use <plan.toml>"
+            )
+        log(f"using active plan: {pointer}")
+        return pointer
+
+    raise PlanError(
+        "no plan specified\n"
+        "Activate a plan with: opsx-plan use <plan.toml>\n"
+        "Or set the OPSX_PLAN environment variable."
+    )
+
+
+def _resolve_plan_path(repo: Path, plan_src: str) -> Path:
+    """Resolve a plan source string to an absolute ``Path``.
+
+    When *plan_src* is relative it is resolved against *repo*, not the
+    current working directory.  This ensures repo-relative active plan
+    pointers and ``OPSX_PLAN`` values work correctly with ``--repo``.
+    """
+    p = Path(plan_src)
+    if p.is_absolute():
+        return p.resolve()
+    return (repo / p).resolve()
 
 
 def worker_state_path(repo: Path, plan_name: str, cid: str) -> Path:
@@ -2601,9 +2720,46 @@ def extract_toml(output: str) -> str:
 # Commands
 # ---------------------------------------------------------------------------
 
+def cmd_use(args: argparse.Namespace) -> int:
+    """opsx-plan use <plan.toml> — activate a plan for subsequent commands."""
+    repo = Path(args.repo).resolve()
+    plan_arg = args.plan
+    plan_path = (repo / plan_arg).resolve()
+    if not plan_path.is_file():
+        print(f"error: plan not found: {plan_arg}", file=sys.stderr)
+        return 2
+    # Validate through the existing plan loader before writing the pointer
+    try:
+        load_plan(plan_path)
+    except (PlanError, Exception) as exc:
+        # tomllib.TOMLDecodeError and PlanError both indicate invalid plan
+        print(f"error: invalid plan: {exc}", file=sys.stderr)
+        return 2
+    try:
+        rel = str(plan_path.relative_to(repo))
+    except ValueError:
+        print(f"error: plan must be inside the repository: {plan_path}", file=sys.stderr)
+        return 2
+    write_active_plan(repo, rel)
+    log(f"active plan set to: {rel}")
+    print(f"Activated: {rel}")
+    return 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
-    cfg = load_plan(Path(args.plan).resolve())
+    plan_src = resolve_plan(repo, args.plan)
+    plan_abs = _resolve_plan_path(repo, plan_src)
+    cfg = load_plan(plan_abs)
+    # Auto-activate when an explicit path was supplied (only after load_plan
+    # succeeds to avoid rewriting the pointer on failed explicit runs).
+    if args.plan:
+        try:
+            rel = str(plan_abs.relative_to(repo))
+            write_active_plan(repo, rel)
+            log(f"active plan set to: {rel}")
+        except ValueError:
+            pass  # plan outside repo — skip auto-activation
     state = load_state(repo, cfg["name"])
     signal.signal(signal.SIGINT, handle_sigint)
 
@@ -2790,12 +2946,27 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
-    cfg = load_plan(Path(args.plan).resolve())
+    plan_src = resolve_plan(repo, args.plan)
+    cfg = load_plan(_resolve_plan_path(repo, plan_src))
     state = load_state(repo, cfg["name"])
     reconcile(repo, cfg, state)
     save_state(repo, cfg["name"], state)
     sync_direct_worker_state(repo, cfg, state)
-    return cmd_status_inner(cfg, state, header=f"plan: {cfg['name']}")
+    header = f"plan: {cfg['name']}"
+    active = read_active_plan(repo)
+    if active:
+        header += f"  (active: {active})"
+    # Determine the effective plan source for the [inspected:] note.
+    inspected = None
+    if args.plan:
+        inspected = args.plan
+    else:
+        env_plan = os.environ.get("OPSX_PLAN", "").strip()
+        if env_plan:
+            inspected = str(Path(env_plan))
+    if inspected and active and inspected != active:
+        header += f"  [inspected: {inspected}]"
+    return cmd_status_inner(cfg, state, header=header)
 
 
 def display_order(cfg: dict) -> list[str]:
@@ -2849,7 +3020,18 @@ def resolve_changes(cfg: dict, args: list[str]) -> list[str] | None:
 
 def cmd_approve(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
-    cfg = load_plan(Path(args.plan).resolve())
+    # Heuristic: when the first positional doesn't look like a TOML path,
+    # reinterpret it as a change ID and resolve the plan.
+    if args.plan is not None and not (
+        args.plan.endswith(".toml") or "/" in args.plan or "\\" in args.plan
+    ):
+        args.change.insert(0, args.plan)
+        args.plan = None
+    if not args.change:
+        print("error: at least one change id is required", file=sys.stderr)
+        return 2
+    plan_path = resolve_plan(repo, args.plan)
+    cfg = load_plan(_resolve_plan_path(repo, plan_path))
     state = load_state(repo, cfg["name"])
     changes = resolve_changes(cfg, args.change)
     if changes is None:
@@ -2865,7 +3047,18 @@ def cmd_approve(args: argparse.Namespace) -> int:
 def cmd_accept(args: argparse.Namespace) -> int:
     """Mark orchestrator-created changes as reviewed so drive may proceed."""
     repo = Path(args.repo).resolve()
-    cfg = load_plan(Path(args.plan).resolve())
+    # Heuristic: when the first positional doesn't look like a TOML path,
+    # reinterpret it as a change ID and resolve the plan.
+    if args.plan is not None and not (
+        args.plan.endswith(".toml") or "/" in args.plan or "\\" in args.plan
+    ):
+        args.change.insert(0, args.plan)
+        args.plan = None
+    if not args.change:
+        print("error: at least one change id is required", file=sys.stderr)
+        return 2
+    plan_path = resolve_plan(repo, args.plan)
+    cfg = load_plan(_resolve_plan_path(repo, plan_path))
     state = load_state(repo, cfg["name"])
     changes = resolve_changes(cfg, args.change)
     if changes is None:
@@ -2883,7 +3076,18 @@ def cmd_accept(args: argparse.Namespace) -> int:
 
 def cmd_reset(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
-    cfg = load_plan(Path(args.plan).resolve())
+    # Heuristic: when the first positional doesn't look like a TOML path,
+    # reinterpret it as a change ID and resolve the plan.
+    if args.plan is not None and not (
+        args.plan.endswith(".toml") or "/" in args.plan or "\\" in args.plan
+    ):
+        args.change.insert(0, args.plan)
+        args.plan = None
+    if not args.change:
+        print("error: at least one change id is required", file=sys.stderr)
+        return 2
+    plan_path = resolve_plan(repo, args.plan)
+    cfg = load_plan(_resolve_plan_path(repo, plan_path))
     state = load_state(repo, cfg["name"])
     changes = resolve_changes(cfg, args.change)
     if changes is None:
@@ -3018,6 +3222,15 @@ def cmd_compile(args: argparse.Namespace) -> int:
     if disabled:
         print(f"  Deferred: {len(disabled)} change(s) disabled")
     print(f"  Review the DAG with: opsx-plan status {output_path}")
+
+    # 4.1 Auto-activate the output plan after successful compile
+    try:
+        rel = str(output_path.resolve().relative_to(repo))
+        write_active_plan(repo, rel)
+        log(f"  active plan set to: {rel}")
+    except ValueError:
+        log(f"  warning: compiled plan {output_path} is outside the repo; cannot auto-activate")
+
     return 0
 
 
@@ -3362,6 +3575,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     """opsx-plan report <plan> [--json] [--change <id>] [--run-id <id>]
        [--stage <stage>] [--model <substr>]"""
     repo = Path(args.repo).resolve()
+    plan_src = resolve_plan(repo, args.plan)
     repo_str = str(repo)
     if repo_str not in sys.path:
         sys.path.insert(0, repo_str)
@@ -3376,7 +3590,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         aggregate,
     )
 
-    cfg = load_plan(Path(args.plan).resolve())
+    cfg = load_plan(_resolve_plan_path(repo, plan_src))
     plan_name = cfg["name"]
     run_id = args.run_id if args.run_id else None
 
@@ -4329,6 +4543,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     """opsx-plan dashboard <plan> [--output <path>] [--run-id <id>]
        [--change <id>]"""
     repo = Path(args.repo).resolve()
+    plan_src = resolve_plan(repo, args.plan)
     repo_str = str(repo)
     if repo_str not in sys.path:
         sys.path.insert(0, repo_str)
@@ -4343,7 +4558,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         aggregate,
     )
 
-    cfg = load_plan(Path(args.plan).resolve())
+    cfg = load_plan(_resolve_plan_path(repo, plan_src))
     plan_name = cfg["name"]
     run_id = args.run_id if args.run_id else None
 
@@ -4463,8 +4678,12 @@ def main() -> int:
     ap.add_argument("--repo", default=".", help="host project root (default: cwd)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    p_use = sub.add_parser("use", help="activate a plan for subsequent commands")
+    p_use.add_argument("plan", help="path to plan TOML")
+    p_use.set_defaults(fn=cmd_use)
+
     p_run = sub.add_parser("run", help="run the plan")
-    p_run.add_argument("plan", help="path to plan TOML")
+    p_run.add_argument("plan", nargs="?", default=None, help="path to plan TOML")
     p_run.add_argument("--dry-run", action="store_true")
     p_run.add_argument("--only", nargs="*", default=None,
                        help="restrict to these change ids (deps must be done)")
@@ -4475,24 +4694,24 @@ def main() -> int:
     p_run.set_defaults(fn=cmd_run)
 
     p_status = sub.add_parser("status", help="reconcile and show plan status")
-    p_status.add_argument("plan")
+    p_status.add_argument("plan", nargs="?", default=None, help="path to plan TOML")
     p_status.set_defaults(fn=cmd_status)
 
     p_approve = sub.add_parser("approve", help="approve pause_before changes")
-    p_approve.add_argument("plan")
-    p_approve.add_argument("change", nargs="+")
+    p_approve.add_argument("plan", nargs="?", default=None, help="path to plan TOML")
+    p_approve.add_argument("change", nargs="*")
     p_approve.set_defaults(fn=cmd_approve)
 
     p_accept = sub.add_parser(
         "accept", help="accept orchestrator-created changes for driving"
     )
-    p_accept.add_argument("plan")
-    p_accept.add_argument("change", nargs="+")
+    p_accept.add_argument("plan", nargs="?", default=None, help="path to plan TOML")
+    p_accept.add_argument("change", nargs="*")
     p_accept.set_defaults(fn=cmd_accept)
 
     p_reset = sub.add_parser("reset", help="reset a failed change to pending")
-    p_reset.add_argument("plan")
-    p_reset.add_argument("change", nargs="+")
+    p_reset.add_argument("plan", nargs="?", default=None, help="path to plan TOML")
+    p_reset.add_argument("change", nargs="*")
     p_reset.set_defaults(fn=cmd_reset)
 
     p_compile = sub.add_parser(
@@ -4517,7 +4736,7 @@ def main() -> int:
             "human-readable tables (default) or JSON (--json)."
         ),
     )
-    p_report.add_argument("plan", help="path to plan TOML")
+    p_report.add_argument("plan", nargs="?", default=None, help="path to plan TOML")
     p_report.add_argument(
         "--json", action="store_true",
         help="emit a single JSON object instead of tables",
@@ -4550,7 +4769,7 @@ def main() -> int:
             "static HTML dashboard file."
         ),
     )
-    p_dashboard.add_argument("plan", help="path to plan TOML")
+    p_dashboard.add_argument("plan", nargs="?", default=None, help="path to plan TOML")
     p_dashboard.add_argument(
         "--output", default=None,
         help="output HTML path (default: .opsx-plan/dashboards/<plan_name>.html)",
