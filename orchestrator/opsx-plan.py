@@ -648,6 +648,52 @@ def next_stage_log_path(repo: Path, cid: str, stage: str, round_num: int) -> Pat
     return log_dir / f"{cid}.{stage}.r{round_num}.{len(existing) + 1}.log"
 
 
+def _build_usage_sidecar_path(
+    repo: Path,
+    plan_name: str,
+    cid: str,
+    stage: str,
+    round_num: int,
+) -> Path:
+    """Create a unique per-stage OpenCode usage sidecar path under
+    ``.opsx-plan/usage/``.
+
+    The path is unique per invocation so concurrent stages and retries never
+    collide.  The caller is responsible for creating the parent directory.
+    """
+    uid_suffix = uuid.uuid4().hex[:12]
+    return (
+        repo
+        / ".opsx-plan"
+        / "usage"
+        / plan_name
+        / cid
+        / f"{stage}-r{round_num}-{uid_suffix}.jsonl"
+    )
+
+
+def _build_usage_sidecar_env(
+    plan_name: str,
+    run_id: str,
+    change_id: str,
+    stage: str,
+    round_num: int,
+    sidecar_path: Path,
+) -> dict[str, str]:
+    """Build the OPSX_* environment dictionary for the OpenCode plugin.
+
+    All values are str typed to match ``subprocess.Popen`` expectations.
+    """
+    return {
+        "OPSX_USAGE_PATH": str(sidecar_path),
+        "OPSX_PLAN_NAME": str(plan_name),
+        "OPSX_RUN_ID": str(run_id),
+        "OPSX_CHANGE_ID": str(change_id),
+        "OPSX_STAGE": str(stage),
+        "OPSX_ROUND": str(round_num),
+    }
+
+
 def record_stage_log(
     state: dict,
     cid: str,
@@ -1035,16 +1081,260 @@ def _extract_invocation_model(worker_command):
     return result
 
 
-def extract_usage_and_model(payload, log_path):
+# Recognized sidecar token field names.  The plugin emits camelCase keys.
+_SIDECAR_TOKEN_FIELD_MAP = {
+    "input_tokens": "input_tokens",
+    "inputTokens": "input_tokens",
+    "output_tokens": "output_tokens",
+    "outputTokens": "output_tokens",
+    "cached_input_tokens": "cached_input_tokens",
+    "cachedInputTokens": "cached_input_tokens",
+    "cache_read_input_tokens": "cached_input_tokens",
+    "reasoning_tokens": "reasoning_tokens",
+    "reasoningTokens": "reasoning_tokens",
+    "thinking_tokens": "reasoning_tokens",
+    "thinkingTokens": "reasoning_tokens",
+    "total_tokens": "total_tokens",
+    "totalTokens": "total_tokens",
+}
+
+_SIDECAR_MODEL_FIELD_MAP = {
+    "provider": "provider",
+    "model_id": "model_id",
+    "modelId": "model_id",
+    "model": "model_id",
+    "model_alias": "model_alias",
+    "modelAlias": "model_alias",
+}
+
+
+def _normalize_sidecar_tokens(obj: dict) -> tuple[dict[str, int | None], bool]:
+    """Extract and validate token counts from a sidecar record.
+
+    Returns ``(normalized, found_any)``.  Only non-negative ``int`` values
+    (not bool) are accepted.  The ``usage`` sub-object is inspected when
+    present.
+    """
+    result: dict[str, int | None] = {
+        "input_tokens": None,
+        "output_tokens": None,
+        "cached_input_tokens": None,
+        "reasoning_tokens": None,
+        "total_tokens": None,
+    }
+    found_any = False
+
+    candidates = [obj]
+    usage = obj.get("usage")
+    if isinstance(usage, dict):
+        candidates.append(usage)
+
+    for source in candidates:
+        for key, value in source.items():
+            norm = _SIDECAR_TOKEN_FIELD_MAP.get(key)
+            if norm is None:
+                continue
+            if result[norm] is not None:
+                continue
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int) and value >= 0:
+                result[norm] = value
+                found_any = True
+
+    return result, found_any
+
+
+def _normalize_sidecar_model(obj: dict) -> dict[str, str | None]:
+    """Extract model identity from a sidecar record.
+
+    Returns ``{provider, model_id, model_alias}`` with non-empty string
+    values or None.
+    """
+    result: dict[str, str | None] = {
+        "provider": None,
+        "model_id": None,
+        "model_alias": None,
+    }
+    candidates = [obj]
+    model = obj.get("model")
+    if isinstance(model, dict):
+        candidates.append(model)
+    for source in candidates:
+        for key, value in source.items():
+            norm = _SIDECAR_MODEL_FIELD_MAP.get(key)
+            if norm is None:
+                continue
+            if result[norm] is not None:
+                continue
+            if isinstance(value, str) and value.strip():
+                result[norm] = value.strip()
+    return result
+
+
+def _parse_sidecar_timestamp(value):
+    """Try to parse *value* as an ISO-8601 datetime.
+
+    Returns a ``datetime`` or ``None``.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+        # Replace naive datetimes with UTC to avoid comparison failures
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, TypeError):
+        return None
+
+
+def _identity_match(record: dict, plan_name: str, run_id: str,
+                    change_id: str, stage: str, round_num: int) -> bool:
+    """Return True when *record* identity fields match the stage invocation."""
+    return (
+        record.get("plan_name") == plan_name
+        and record.get("run_id") == run_id
+        and record.get("change_id") == change_id
+        and record.get("stage") == stage
+        and record.get("round") == round_num
+    )
+
+
+def _read_sidecar_usage(
+    sidecar_path: Path | None,
+    plan_name: str,
+    run_id: str,
+    change_id: str,
+    stage: str,
+    round_num: int,
+    is_normal_completion: bool,
+) -> tuple[dict[str, int | None], dict[str, str | None], bool, str | None]:
+    """Read and select the best valid sidecar usage record.
+
+    Returns ``(token_dict, model_dict, selected, usage_source)``.
+
+    *token_dict* and *model_dict* are caller-owned defaults to fill.
+    *selected* is ``True`` when usable sidecar data was found.
+    *usage_source* is ``"opencode_plugin"`` when sidecar wins.
+    """
+    tokens: dict[str, int | None] = {
+        "input_tokens": None,
+        "output_tokens": None,
+        "cached_input_tokens": None,
+        "reasoning_tokens": None,
+        "total_tokens": None,
+    }
+    model: dict[str, str | None] = {
+        "provider": None,
+        "model_id": None,
+        "model_alias": None,
+    }
+
+    if sidecar_path is None:
+        return tokens, model, False, None
+
+    # 2.1 -- Read file (handle missing, empty, unreadable)
+    try:
+        lines = sidecar_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return tokens, model, False, None
+
+    # 2.2 -- Validate each record
+    final_records: list[dict] = []
+    incremental_records: list[dict] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not (stripped.startswith("{") and stripped.endswith("}")):
+            continue
+        try:
+            record = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+
+        # -- schema version
+        if record.get("schema_version") != 1:
+            continue
+
+        # -- identity match
+        if not _identity_match(record, plan_name, run_id, change_id, stage, round_num):
+            continue
+
+        # -- event type
+        event_type = record.get("event_type")
+        if event_type not in ("final", "incremental"):
+            continue
+
+        # -- usable timestamp
+        emitted_at = _parse_sidecar_timestamp(record.get("emitted_at"))
+        if emitted_at is None:
+            continue
+
+        # -- conservative numeric fields + model identity
+        norm_tokens, tokens_found = _normalize_sidecar_tokens(record)
+        norm_model = _normalize_sidecar_model(record)
+        model_found = any(v is not None for v in norm_model.values())
+        if not tokens_found and not model_found:
+            continue
+
+        entry = {
+            "record": record,
+            "emitted_at": emitted_at,
+            "tokens": norm_tokens,
+            "model": norm_model,
+        }
+
+        if event_type == "final":
+            final_records.append(entry)
+        else:
+            incremental_records.append(entry)
+
+    # 2.3 -- Select latest valid final record
+    if final_records:
+        best = max(final_records, key=lambda e: e["emitted_at"])
+        tokens = best["tokens"]
+        model = best["model"]
+        return tokens, model, True, "opencode_plugin"
+
+    # 2.4 & 2.5 -- Incremental records
+    if incremental_records and not is_normal_completion:
+        best = max(incremental_records, key=lambda e: e["emitted_at"])
+        tokens = best["tokens"]
+        model = best["model"]
+        return tokens, model, True, "opencode_plugin"
+
+    return tokens, model, False, None
+
+
+def extract_usage_and_model(
+    payload,
+    log_path,
+    sidecar_path=None,
+    plan_name: str = "",
+    run_id: str = "",
+    change_id: str = "",
+    stage: str = "",
+    round_num: int = 0,
+    is_normal_completion: bool = True,
+):
     """Extract usage and model metadata for a completed stage invocation.
 
     **Precedence:**
     1. Usage & model from parsed worker JSON (*payload*) are preferred.
     2. When *payload* carries no token usage, the stage log is scanned for
        recognizable token metadata.
-    3. When *payload* carries no model identity fields, the stage log is
+    3. When neither worker JSON nor log metadata provides token usage, the
+       OpenCode plugin sidecar is consulted.
+    4. When *payload* carries no model identity fields, the stage log is
        scanned for model identity fields.  Log model scan never
        supplements a partial worker model.
+    5. When no higher-precedence source provides model identity, the sidecar
+       may supply it.
 
     Returns ``(usage_dict, model_dict)`` where *usage_dict* includes
     every normalised token field (int or None), ``usage_available``, and
@@ -1087,10 +1377,12 @@ def extract_usage_and_model(payload, log_path):
                 worker_model_found = True
 
     # 2. Log fallback ------------------------------------------------------
+    log_usage_found = False
     if log_path is not None:
         if not worker_usage_found:
             log_tokens, log_found = _scan_log_for_usage(log_path)
             if log_found:
+                log_usage_found = True
                 for key in ("input_tokens", "output_tokens", "cached_input_tokens",
                              "reasoning_tokens", "total_tokens"):
                     if log_tokens[key] is not None:
@@ -1103,6 +1395,34 @@ def extract_usage_and_model(payload, log_path):
             for key in ("provider", "model_id", "model_alias"):
                 if model[key] is None and log_model[key] is not None:
                     model[key] = log_model[key]
+
+    # 3. OpenCode plugin sidecar fallback ----------------------------------
+    # Always consult the sidecar for model identity when no higher source
+    # exists, independently of whether usage was provided by worker or log.
+    if sidecar_path is not None:
+        sidecar_tokens, sidecar_model, sidecar_selected, sidecar_source = (
+            _read_sidecar_usage(
+                sidecar_path, plan_name, run_id, change_id, stage, round_num,
+                is_normal_completion,
+            )
+        )
+        # Sidecar token usage only when no higher-precedence source found
+        if not worker_usage_found and not log_usage_found and sidecar_selected:
+            sidecar_token_found = False
+            for key in ("input_tokens", "output_tokens", "cached_input_tokens",
+                         "reasoning_tokens", "total_tokens"):
+                if sidecar_tokens[key] is not None:
+                    usage[key] = sidecar_tokens[key]
+                    sidecar_token_found = True
+            if sidecar_token_found:
+                usage["usage_available"] = True
+                usage["usage_source"] = "opencode_plugin"
+
+        # Sidecar model identity supplements only when no higher source
+        if not worker_model_found:
+            for key in ("provider", "model_id", "model_alias"):
+                if model[key] is None and sidecar_model[key] is not None:
+                    model[key] = sidecar_model[key]
 
     return usage, model
 
@@ -1139,8 +1459,11 @@ def _record_stage_telemetry(
     error_message: str | None,
     payload: dict | None,
     log_path: Path,
+    sidecar_path: Path | None = None,
 ) -> None:
     run_id = get_or_create_run_id(repo, cfg, state)
+    plan_name = cfg["name"]
+    is_normal = telemetry_status == "completed"
     stage_status = payload.get("status") if isinstance(payload, dict) else None
     verdict = None
     critical_count = None
@@ -1179,7 +1502,16 @@ def _record_stage_telemetry(
     # Populate usage and model metadata when a payload was parsed
     # (extraction is best-effort; never fail telemetry write).
     try:
-        usage, model = extract_usage_and_model(payload, log_path)
+        usage, model = extract_usage_and_model(
+            payload, log_path,
+            sidecar_path=sidecar_path,
+            plan_name=plan_name,
+            run_id=run_id,
+            change_id=cid,
+            stage=stage,
+            round_num=round_num,
+            is_normal_completion=is_normal,
+        )
         if model["provider"] is None and model["model_id"] is None:
             invocation_model = _extract_invocation_model(cfg[f"{stage}_invoke"])
             for key in ("provider", "model_id", "model_alias"):
@@ -1608,6 +1940,7 @@ def run_logged_command(
                 stdout=lf,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
+                env=os.environ.copy(),
             )
             _current_proc = proc
             try:
@@ -1880,6 +2213,20 @@ def run_direct_change(
 
         # 3.1 Capture started_at before invocation
         started_at = utcnow()
+        plan_name = cfg["name"]
+        run_id = get_or_create_run_id(repo, cfg, state)
+
+        # ---- usage sidecar for direct OpenCode stages ----
+        sidecar_path: Path | None = None
+        extra_env: dict[str, str] | None = None
+        saved_env: dict[str, str] = {}
+        if plan_name and run_id:
+            sidecar_path = _build_usage_sidecar_path(repo, plan_name, cid, stage, round_num)
+            sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+            extra_env = _build_usage_sidecar_env(plan_name, run_id, cid, stage, round_num, sidecar_path)
+            for key, value in extra_env.items():
+                saved_env[key] = os.environ.get(key, "")
+                os.environ[key] = value
 
         def _write_telemetry(telemetry_status: str, error_message: str | None) -> None:
             """Write a telemetry record. Logs a warning on failure; never raises."""
@@ -1889,11 +2236,19 @@ def run_direct_change(
                     started_at, ended_at, duration_ms,
                     telemetry_status, error_message,
                     payload, log_path,
+                    sidecar_path=sidecar_path,
                 )
             except Exception as exc:
                 log(f"warning: failed to write telemetry for {cid}/{stage} r{round_num}: {exc}")
 
         outcome, log_path = invoke_direct_stage(repo, cfg, cid, stage, round_num, input_block)
+
+        # ---- restore os.environ after subprocess invocation ----
+        if extra_env:
+            for key in extra_env:
+                os.environ.pop(key, None)
+                if key in saved_env:
+                    os.environ[key] = saved_env[key]
         record_stage_log(state, cid, stage, round_num, outcome, log_path)
 
         # 3.2 Capture ended_at, compute duration, determine telemetry status

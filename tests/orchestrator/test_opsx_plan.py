@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -4003,6 +4004,367 @@ class DirectStageUsageExtractionTests(unittest.TestCase):
         self.assertEqual(model["provider"], "openai")
         self.assertEqual(model["model_id"], "gpt-4")
 
+    # -- Sidecar tests (tasks 4.1-4.6) ---------------------------------------
+
+    def _write_sidecar(self, *records: dict) -> Path:
+        """Write a sidecar JSONL file and return its path."""
+        p = self.log_dir / f"sidecar-{id(records)}.jsonl"
+        lines = "\n".join(json.dumps(r) for r in records) + "\n"
+        p.write_text(lines, encoding="utf-8")
+        return p
+
+    def _sidecar_identity(self, plan_name="test-plan", run_id="run-001",
+                          change_id="ex", stage="implement", round_num=1):
+        return {
+            "plan_name": plan_name,
+            "run_id": run_id,
+            "change_id": change_id,
+            "stage": stage,
+            "round": round_num,
+        }
+
+    # 4.1 -- Valid final sidecar populates usage, model, usage_source
+    def test_valid_final_sidecar_populates_usage_and_model(self) -> None:
+        sidecar_path = self._write_sidecar(
+            {
+                "schema_version": 1,
+                "event_type": "final",
+                "emitted_at": "2026-07-01T10:00:05Z",
+                "usage": {
+                    "input_tokens": 500,
+                    "output_tokens": 200,
+                    "total_tokens": 700,
+                },
+                "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-4o",
+                },
+                **self._sidecar_identity(),
+            },
+        )
+        # Worker JSON has no usage or model
+        payload = {"status": "implemented", "change": "ex"}
+        usage, model = self.opsx_plan.extract_usage_and_model(
+            payload, None,
+            sidecar_path=sidecar_path,
+            plan_name="test-plan", run_id="run-001", change_id="ex",
+            stage="implement", round_num=1,
+            is_normal_completion=True,
+        )
+        self.assertTrue(usage["usage_available"])
+        self.assertEqual(usage["usage_source"], "opencode_plugin")
+        self.assertEqual(usage["input_tokens"], 500)
+        self.assertEqual(usage["output_tokens"], 200)
+        self.assertEqual(usage["total_tokens"], 700)
+        self.assertEqual(model["provider"], "openai")
+        self.assertEqual(model["model_id"], "gpt-4o")
+
+    # 4.2 -- Missing sidecar preserves unavailable usage
+    def test_missing_sidecar_preserves_unavailable_usage(self) -> None:
+        missing_path = self.log_dir / "nonexistent.jsonl"
+        payload = {"status": "implemented", "change": "ex"}
+        usage, model = self.opsx_plan.extract_usage_and_model(
+            payload, None,
+            sidecar_path=missing_path,
+            plan_name="test-plan", run_id="run-001", change_id="ex",
+            stage="implement", round_num=1,
+            is_normal_completion=True,
+        )
+        self._assert_usage_unavailable(usage)
+        self._assert_model_null(model)
+
+    # 4.3 -- Malformed JSONL, invalid values, unsupported schemas,
+    #        unknown event types, identity mismatches ignored
+    def test_sidecar_invalid_records_ignored_independently(self) -> None:
+        # Write sidecar manually so we can include a genuinely malformed
+        # JSONL line (not just valid-JSON records with bad content).
+        sidecar_path = self.log_dir / "malformed-sidecar.jsonl"
+        identity = self._sidecar_identity()
+        records: list[str] = [
+            # Truly malformed JSON — not a parseable JSON value at all
+            "{broken json that cannot be parsed",
+            # Garbage text that does not even look like JSON
+            "just some garbage text without braces",
+            # Valid JSON but an array (not a dict) — a subclass of malformed record
+            '[1, 2, 3]',
+            # Unsupported schema
+            json.dumps({
+                "schema_version": 99,
+                "event_type": "final",
+                "emitted_at": "2026-07-01T10:00:00Z",
+                "usage": {"input_tokens": 999},
+                **identity,
+            }),
+            # Unknown event type
+            json.dumps({
+                "schema_version": 1,
+                "event_type": "unknown-type",
+                "emitted_at": "2026-07-01T10:00:01Z",
+                "usage": {"input_tokens": 888},
+                **identity,
+            }),
+            # Identity mismatch
+            json.dumps({
+                "schema_version": 1,
+                "event_type": "final",
+                "emitted_at": "2026-07-01T10:00:02Z",
+                "usage": {"input_tokens": 777},
+                **self._sidecar_identity(change_id="wrong-change"),
+            }),
+            # Negative token value — ignored
+            json.dumps({
+                "schema_version": 1,
+                "event_type": "final",
+                "emitted_at": "2026-07-01T10:00:03Z",
+                "usage": {"input_tokens": -5, "output_tokens": 20},
+                **identity,
+            }),
+            # Valid record — should be selected
+            json.dumps({
+                "schema_version": 1,
+                "event_type": "final",
+                "emitted_at": "2026-07-01T10:00:04Z",
+                "usage": {"input_tokens": 300, "output_tokens": 100},
+                "model": {"provider": "anthropic", "model_id": "claude-4"},
+                **identity,
+            }),
+        ]
+        sidecar_path.write_text("\n".join(records) + "\n", encoding="utf-8")
+
+        payload = {"status": "implemented", "change": "ex"}
+        usage, model = self.opsx_plan.extract_usage_and_model(
+            payload, None,
+            sidecar_path=sidecar_path,
+            plan_name="test-plan", run_id="run-001", change_id="ex",
+            stage="implement", round_num=1,
+            is_normal_completion=True,
+        )
+        # The valid record at the end should have been selected
+        self.assertTrue(usage["usage_available"])
+        self.assertEqual(usage["usage_source"], "opencode_plugin")
+        self.assertEqual(usage["input_tokens"], 300)
+        self.assertEqual(usage["output_tokens"], 100)
+        self.assertEqual(model["provider"], "anthropic")
+        self.assertEqual(model["model_id"], "claude-4")
+
+    # 4.4 -- Timeout uses latest valid incremental record when no final
+    def test_timeout_uses_incremental_when_no_final(self) -> None:
+        sidecar_path = self._write_sidecar(
+            {
+                "schema_version": 1,
+                "event_type": "incremental",
+                "emitted_at": "2026-07-01T10:00:01Z",
+                "usage": {"input_tokens": 100, "output_tokens": 50},
+                **self._sidecar_identity(),
+            },
+            {
+                "schema_version": 1,
+                "event_type": "incremental",
+                "emitted_at": "2026-07-01T10:00:03Z",  # later
+                "usage": {"input_tokens": 400, "output_tokens": 150},
+                **self._sidecar_identity(),
+            },
+        )
+        payload = {"status": "implemented", "change": "ex"}
+        usage, model = self.opsx_plan.extract_usage_and_model(
+            payload, None,
+            sidecar_path=sidecar_path,
+            plan_name="test-plan", run_id="run-001", change_id="ex",
+            stage="implement", round_num=1,
+            is_normal_completion=False,  # timeout = non-normal
+        )
+        self.assertTrue(usage["usage_available"])
+        self.assertEqual(usage["usage_source"], "opencode_plugin")
+        # Latest incremental record wins
+        self.assertEqual(usage["input_tokens"], 400)
+        self.assertEqual(usage["output_tokens"], 150)
+
+    # 4.5 -- Completed stage with only incremental records ignores them
+    def test_completed_stage_ignores_incremental_only_sidecar(self) -> None:
+        sidecar_path = self._write_sidecar(
+            {
+                "schema_version": 1,
+                "event_type": "incremental",
+                "emitted_at": "2026-07-01T10:00:01Z",
+                "usage": {"input_tokens": 200, "output_tokens": 80},
+                **self._sidecar_identity(),
+            },
+        )
+        payload = {"status": "implemented", "change": "ex"}
+        usage, model = self.opsx_plan.extract_usage_and_model(
+            payload, None,
+            sidecar_path=sidecar_path,
+            plan_name="test-plan", run_id="run-001", change_id="ex",
+            stage="implement", round_num=1,
+            is_normal_completion=True,  # normal completion
+        )
+        # Normal completion with only incremental => sidecar ignored
+        self._assert_usage_unavailable(usage)
+        self._assert_model_null(model)
+
+    # 4.6 -- Worker JSON and log metadata keep precedence over sidecar
+    def test_worker_json_precedence_over_sidecar(self) -> None:
+        sidecar_path = self._write_sidecar(
+            {
+                "schema_version": 1,
+                "event_type": "final",
+                "emitted_at": "2026-07-01T10:00:05Z",
+                "usage": {"input_tokens": 999, "output_tokens": 888},
+                "model": {"provider": "sidecar-provider", "model_id": "sidecar-model"},
+                **self._sidecar_identity(),
+            },
+        )
+        # Worker JSON has usage and model — both take precedence
+        payload = {
+            "status": "implemented",
+            "change": "ex",
+            "usage": {"input_tokens": 100, "output_tokens": 50},
+            "model": {"provider": "worker-provider", "model_id": "worker-model"},
+        }
+        usage, model = self.opsx_plan.extract_usage_and_model(
+            payload, None,
+            sidecar_path=sidecar_path,
+            plan_name="test-plan", run_id="run-001", change_id="ex",
+            stage="implement", round_num=1,
+            is_normal_completion=True,
+        )
+        self.assertTrue(usage["usage_available"])
+        self.assertEqual(usage["usage_source"], "worker_json")
+        self.assertEqual(usage["input_tokens"], 100)
+        self.assertEqual(usage["output_tokens"], 50)
+        self.assertEqual(model["provider"], "worker-provider")
+        self.assertEqual(model["model_id"], "worker-model")
+
+    def test_log_metadata_precedence_over_sidecar(self) -> None:
+        sidecar_path = self._write_sidecar(
+            {
+                "schema_version": 1,
+                "event_type": "final",
+                "emitted_at": "2026-07-01T10:00:05Z",
+                "usage": {"input_tokens": 999, "output_tokens": 888},
+                "model": {"provider": "sidecar-provider", "model_id": "sidecar-model"},
+                **self._sidecar_identity(),
+            },
+        )
+        log_path = self._write_log(
+            '{"input_tokens": 500, "output_tokens": 250}',
+            '{"provider": "log-provider", "model_id": "log-model"}',
+        )
+        # Worker JSON has no usage or model — log should win over sidecar
+        payload = {"status": "implemented", "change": "ex"}
+        usage, model = self.opsx_plan.extract_usage_and_model(
+            payload, log_path,
+            sidecar_path=sidecar_path,
+            plan_name="test-plan", run_id="run-001", change_id="ex",
+            stage="implement", round_num=1,
+            is_normal_completion=True,
+        )
+        self.assertTrue(usage["usage_available"])
+        self.assertEqual(usage["usage_source"], "log_metadata")
+        self.assertEqual(usage["input_tokens"], 500)
+        self.assertEqual(usage["output_tokens"], 250)
+        self.assertEqual(model["provider"], "log-provider")
+        self.assertEqual(model["model_id"], "log-model")
+
+    def test_sidecar_model_fallback_when_worker_has_usage_but_no_model(self) -> None:
+        """Sidecar model metadata fills telemetry even when worker/log usage
+        exists but model metadata does not (the key fix for this round)."""
+        sidecar_path = self._write_sidecar(
+            {
+                "schema_version": 1,
+                "event_type": "final",
+                "emitted_at": "2026-07-01T10:00:05Z",
+                # No token usage in sidecar — model-only record
+                "model": {"provider": "openai", "model_id": "gpt-4o"},
+                **self._sidecar_identity(),
+            },
+        )
+        # Worker JSON has usage but no model
+        payload = {
+            "status": "implemented",
+            "change": "ex",
+            "usage": {"input_tokens": 500, "output_tokens": 200},
+        }
+        usage, model = self.opsx_plan.extract_usage_and_model(
+            payload, None,
+            sidecar_path=sidecar_path,
+            plan_name="test-plan", run_id="run-001", change_id="ex",
+            stage="implement", round_num=1,
+            is_normal_completion=True,
+        )
+        # Usage comes from worker
+        self.assertTrue(usage["usage_available"])
+        self.assertEqual(usage["usage_source"], "worker_json")
+        self.assertEqual(usage["input_tokens"], 500)
+        self.assertEqual(usage["output_tokens"], 200)
+        # Model comes from sidecar because worker had none
+        self.assertEqual(model["provider"], "openai")
+        self.assertEqual(model["model_id"], "gpt-4o")
+
+    def test_sidecar_model_fallback_when_log_has_usage_but_no_model(self) -> None:
+        """Sidecar model metadata fills when log provides usage but not model."""
+        sidecar_path = self._write_sidecar(
+            {
+                "schema_version": 1,
+                "event_type": "final",
+                "emitted_at": "2026-07-01T10:00:05Z",
+                "model": {"provider": "anthropic", "model_id": "claude-4"},
+                **self._sidecar_identity(),
+            },
+        )
+        # Log has usage tokens but no model fields
+        log_path = self._write_log(
+            '{"input_tokens": 300, "output_tokens": 100}',
+        )
+        payload = {"status": "implemented", "change": "ex"}
+        usage, model = self.opsx_plan.extract_usage_and_model(
+            payload, log_path,
+            sidecar_path=sidecar_path,
+            plan_name="test-plan", run_id="run-001", change_id="ex",
+            stage="implement", round_num=1,
+            is_normal_completion=True,
+        )
+        # Usage comes from log
+        self.assertTrue(usage["usage_available"])
+        self.assertEqual(usage["usage_source"], "log_metadata")
+        self.assertEqual(usage["input_tokens"], 300)
+        self.assertEqual(usage["output_tokens"], 100)
+        # Model comes from sidecar because log had none
+        self.assertEqual(model["provider"], "anthropic")
+        self.assertEqual(model["model_id"], "claude-4")
+
+    # -- Regression: model-only sidecar with no higher-precedence usage ----
+
+    def test_model_only_sidecar_no_higher_precedence_does_not_mark_usage_available(self) -> None:
+        """Model-only sidecar records only backfill model identity and
+        must never set usage_available, usage_source, or estimated cost
+        when no token counts are present and no higher-precedence source
+        provides usage."""
+        sidecar_path = self._write_sidecar(
+            {
+                "schema_version": 1,
+                "event_type": "final",
+                "emitted_at": "2026-07-01T10:00:05Z",
+                # No usage / token fields at all — model-only record
+                "model": {"provider": "openai", "model_id": "gpt-4o"},
+                **self._sidecar_identity(),
+            },
+        )
+        # Worker JSON has no usage and no model — sidecar is the only source
+        payload = {"status": "implemented", "change": "ex"}
+        usage, model = self.opsx_plan.extract_usage_and_model(
+            payload, None,
+            sidecar_path=sidecar_path,
+            plan_name="test-plan", run_id="run-001", change_id="ex",
+            stage="implement", round_num=1,
+            is_normal_completion=True,
+        )
+        # Model identity comes from sidecar — it was missing from worker
+        self.assertEqual(model["provider"], "openai")
+        self.assertEqual(model["model_id"], "gpt-4o")
+        # Usage must NOT be marked available — no token counts exist
+        self._assert_usage_unavailable(usage)
+
 
 class DirectStageUsageIntegrationTests(unittest.TestCase):
     """Integration tests that verify usage/model appear in telemetry records
@@ -4368,6 +4730,158 @@ class DirectStageUsageIntegrationTests(unittest.TestCase):
         # Must have default-unavailable (the try/except caught the error)
         self.assertFalse(u["usage_available"])
         self.assertIsNone(u["usage_source"])
+
+    # -- Sidecar → estimated-cost telemetry integration (task 4.1) ---------
+
+    def test_sidecar_usage_flows_to_telemetry_with_estimated_cost(self):
+        """Task 4.1: Prove that a valid final sidecar produces estimated cost
+        in the telemetry record when pricing is available."""
+        from lib.pricing import PricingCatalog, UnresolvedPrice
+
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+
+        # Set up pricing catalog so cost estimation produces a real estimate
+        catalog_toml = textwrap.dedent("""\
+            [catalog]
+            version = "1.0.0"
+            updated = "2026-01-01"
+
+            [[entries]]
+            provider = "openai"
+            model_id = "gpt-4o"
+            display_name = "GPT-4o"
+            billing_mode = "per_token"
+            currency = "USD"
+            input_price_per_mtok = 2.0
+            output_price_per_mtok = 8.0
+            effective_date = "2025-01-01"
+        """)
+        tmp_catalog = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".toml", delete=False, encoding="utf-8",
+        )
+        tmp_catalog.write(catalog_toml)
+        tmp_catalog.close()
+        catalog_path = Path(tmp_catalog.name)
+        saved_catalog = self.opsx_plan._cost_catalog
+        try:
+            self.opsx_plan._cost_catalog = (
+                PricingCatalog(catalog_path=catalog_path),
+                UnresolvedPrice,
+            )
+
+            def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+                log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+
+                if stage == "implement":
+                    # Worker JSON has no usage or model — sidecar must provide both
+                    result = {
+                        "status": "implemented",
+                        "change": cid,
+                        "round": round_num,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "done",
+                    }
+                    log_path.write_text(json.dumps(result) + "\n", encoding="utf-8")
+
+                    # Write sidecar file at the path prescribed by OPSX_USAGE_PATH
+                    sidecar_path_str = os.environ.get("OPSX_USAGE_PATH", "")
+                    if sidecar_path_str:
+                        sidecar_record = {
+                            "schema_version": 1,
+                            "event_type": "final",
+                            "emitted_at": "2026-07-01T10:00:05Z",
+                            "usage": {
+                                "input_tokens": 500000,
+                                "output_tokens": 100000,
+                            },
+                            "model": {
+                                "provider": "openai",
+                                "model_id": "gpt-4o",
+                            },
+                            "plan_name": os.environ.get("OPSX_PLAN_NAME", ""),
+                            "run_id": os.environ.get("OPSX_RUN_ID", ""),
+                            "change_id": os.environ.get("OPSX_CHANGE_ID", cid),
+                            "stage": os.environ.get("OPSX_STAGE", stage),
+                            "round": int(os.environ.get("OPSX_ROUND", str(round_num))),
+                        }
+                        Path(sidecar_path_str).write_text(
+                            json.dumps(sidecar_record) + "\n", encoding="utf-8"
+                        )
+                    return "exited", log_path
+
+                elif stage == "review":
+                    result = {
+                        "status": "reviewed",
+                        "change": cid,
+                        "round": round_num,
+                        "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "review passed",
+                        "fix_prompt": "",
+                        "next_phase": "archive",
+                    }
+                    log_path.write_text(json.dumps(result) + "\n", encoding="utf-8")
+                    return "exited", log_path
+
+                else:
+                    # archive — will fail on missing repo archive evidence,
+                    # but implement telemetry is already written by this point
+                    log_path.write_text(json.dumps({
+                        "status": "archived",
+                        "change": cid,
+                        "archive_path": "",
+                        "spec_sync_status": "no-delta",
+                        "commit": "",
+                        "summary": "archive claimed without repo evidence",
+                    }) + "\n", encoding="utf-8")
+                    return "exited", log_path
+
+            saved_invoke = self.opsx_plan.invoke_direct_stage
+            try:
+                self.opsx_plan.invoke_direct_stage = fake_invoke
+                self.opsx_plan.run_direct_change(
+                    self.repo, self.cfg, self.state, self.cid
+                )
+            finally:
+                self.opsx_plan.invoke_direct_stage = saved_invoke
+
+            records = self._read_telemetry()
+            impl = [r for r in records if r["stage"] == "implement"]
+            self.assertGreaterEqual(len(impl), 1, "expected at least one implement record")
+
+            # Usage must come from the sidecar (worker JSON had none)
+            u = impl[0]["usage"]
+            self.assertTrue(u["usage_available"])
+            self.assertEqual(u["usage_source"], "opencode_plugin")
+            self.assertEqual(u["input_tokens"], 500000)
+            self.assertEqual(u["output_tokens"], 100000)
+
+            # Model identity must come from the sidecar
+            m = impl[0]["model"]
+            self.assertEqual(m["provider"], "openai")
+            self.assertEqual(m["model_id"], "gpt-4o")
+
+            # Cost must be estimated (pricing catalog was set up)
+            c = impl[0]["cost"]
+            self.assertEqual(c["status"], "estimated")
+            # 500k input × $2/mtok = $1.00, 100k output × $8/mtok = $0.80
+            self.assertEqual(c["estimated_cost"], 1.80)
+            self.assertEqual(c["pricing_catalog_version"], "1.0.0")
+            self.assertIsNotNone(c["price_snapshot"])
+        finally:
+            self.opsx_plan._cost_catalog = saved_catalog
+            catalog_path.unlink(missing_ok=True)
 
 
 class CostEstimationTests(unittest.TestCase):
