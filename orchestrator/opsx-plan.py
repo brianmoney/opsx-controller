@@ -824,6 +824,98 @@ def _scan_log_for_model(log_path):
     return result
 
 
+def _parse_invocation_model_value(model_value):
+    """Parse an invocation-configured model string into normalized fields.
+
+    Recognizes the common ``provider/model_id`` form used by installed
+    OpenCode agent configs. When no provider prefix is present, preserves the
+    raw value as ``model_id`` and leaves ``provider`` unset.
+    """
+    result = {
+        "provider": None,
+        "model_id": None,
+        "model_alias": None,
+    }
+    if not isinstance(model_value, str):
+        return result
+    value = model_value.strip()
+    if not value:
+        return result
+    if "/" in value:
+        provider, model_id = value.split("/", 1)
+        provider = provider.strip()
+        model_id = model_id.strip()
+        if provider and model_id:
+            result["provider"] = provider
+            result["model_id"] = model_id
+            return result
+    result["model_id"] = value
+    return result
+
+
+def _extract_invocation_model(worker_command):
+    """Return model identity from the configured worker invocation.
+
+    Supports either an explicit ``--model`` argument or an OpenCode
+    ``--agent`` reference whose installed agent frontmatter declares a
+    ``model:`` value.
+    """
+    result = {
+        "provider": None,
+        "model_id": None,
+        "model_alias": None,
+    }
+    if not isinstance(worker_command, str) or not worker_command.strip():
+        return result
+
+    try:
+        parts = shlex.split(worker_command)
+    except ValueError:
+        return result
+
+    agent_name = None
+    i = 0
+    while i < len(parts):
+        part = parts[i]
+        if part == "--model" and i + 1 < len(parts):
+            return _parse_invocation_model_value(parts[i + 1])
+        if part.startswith("--model="):
+            return _parse_invocation_model_value(part.split("=", 1)[1])
+        if part == "--agent" and i + 1 < len(parts):
+            agent_name = parts[i + 1].strip() or None
+            i += 2
+            continue
+        if part.startswith("--agent="):
+            agent_name = part.split("=", 1)[1].strip() or None
+        i += 1
+
+    if not agent_name:
+        return result
+
+    agent_path = Path.home() / ".config" / "opencode" / "agents" / f"{agent_name}.md"
+    try:
+        lines = agent_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return result
+
+    if not lines or lines[0].strip() != "---":
+        return result
+
+    for line in lines[1:]:
+        stripped = line.strip()
+        if stripped == "---":
+            break
+        if not stripped.startswith("model:"):
+            continue
+        _, _, raw_value = stripped.partition(":")
+        model_value = raw_value.strip()
+        if len(model_value) >= 2 and model_value[0] == model_value[-1] and model_value[0] in {'"', "'"}:
+            model_value = model_value[1:-1].strip()
+        return _parse_invocation_model_value(model_value)
+
+    return result
+
+
 def extract_usage_and_model(payload, log_path):
     """Extract usage and model metadata for a completed stage invocation.
 
@@ -969,6 +1061,11 @@ def _record_stage_telemetry(
     # (extraction is best-effort; never fail telemetry write).
     try:
         usage, model = extract_usage_and_model(payload, log_path)
+        if model["provider"] is None and model["model_id"] is None:
+            invocation_model = _extract_invocation_model(cfg[f"{stage}_invoke"])
+            for key in ("provider", "model_id", "model_alias"):
+                if model[key] is None and invocation_model[key] is not None:
+                    model[key] = invocation_model[key]
         record["usage"].update(usage)
         record["model"].update(model)
     except Exception:

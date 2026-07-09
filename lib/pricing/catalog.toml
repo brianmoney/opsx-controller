@@ -81,8 +81,8 @@
 # ---------------------------------------------------------------------------
 
 [catalog]
-version = "1.0.0"
-updated = "2026-07-05"
+version = "1.1.0"
+updated = "2026-07-08"
 
 # ---------------------------------------------------------------------------
 # OpenAI entries
@@ -125,6 +125,42 @@ reasoning_price_per_mtok = 20.00
 effective_date = "2025-04-01"
 notes = "OpenAI o3 reasoning model"
 
+[[entries]]
+provider = "openai"
+model_id = "gpt-5.4"
+display_name = "GPT-5.4"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 2.50
+output_price_per_mtok = 15.00
+cached_input_price_per_mtok = 0.25
+effective_date = "2026-07-08"
+notes = "Mid-tier GPT-5 line; short-context standard rate. Long-context (>~270K input) billed higher."
+
+[[entries]]
+provider = "openai"
+model_id = "gpt-5.4-mini"
+display_name = "GPT-5.4 Mini"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 0.75
+output_price_per_mtok = 4.50
+cached_input_price_per_mtok = 0.075
+effective_date = "2026-07-08"
+notes = "Lightweight GPT-5.4 variant; 400K context window"
+
+[[entries]]
+provider = "openai"
+model_id = "gpt-5.5"
+display_name = "GPT-5.5"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 5.00
+output_price_per_mtok = 30.00
+cached_input_price_per_mtok = 0.50
+effective_date = "2026-07-08"
+notes = "Flagship GPT-5 line (released 2026-04-23); short-context standard rate. 1M context window; long-context billed higher."
+
 # ---------------------------------------------------------------------------
 # Anthropic entries
 # ---------------------------------------------------------------------------
@@ -152,6 +188,42 @@ output_price_per_mtok = 4.00
 cached_input_price_per_mtok = 0.08
 effective_date = "2025-01-01"
 notes = "Claude 3.5 Haiku — fast, cost-effective"
+
+[[entries]]
+provider = "anthropic"
+model_id = "claude-sonnet-5"
+display_name = "Claude Sonnet 5"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 2.00
+output_price_per_mtok = 10.00
+cached_input_price_per_mtok = 0.20
+effective_date = "2026-07-08"
+notes = "Introductory pricing through 2026-08-31; steps up to $3/$15 input/output thereafter"
+
+[[entries]]
+provider = "anthropic"
+model_id = "claude-opus-4-8"
+display_name = "Claude Opus 4.8"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 5.00
+output_price_per_mtok = 25.00
+cached_input_price_per_mtok = 0.50
+effective_date = "2026-07-08"
+notes = "Claude Opus 4.8 standard pricing"
+
+[[entries]]
+provider = "anthropic"
+model_id = "claude-fable-5"
+display_name = "Claude Fable 5"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 10.00
+output_price_per_mtok = 50.00
+cached_input_price_per_mtok = 1.00
+effective_date = "2026-07-08"
+notes = "Mythos-class model; sits above Opus with always-on adaptive thinking"
 
 # ---------------------------------------------------------------------------
 # Google entries
@@ -207,6 +279,34 @@ output_price_per_mtok = 2.19
 reasoning_price_per_mtok = 2.19
 effective_date = "2025-01-20"
 notes = "DeepSeek R1 reasoning model"
+
+[[entries]]
+provider = "deepseek"
+model_id = "deepseek-v4-pro"
+display_name = "DeepSeek V4 Pro"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 0.435
+output_price_per_mtok = 0.870
+cached_input_price_per_mtok = 0.003625
+effective_date = "2026-07-08"
+notes = "Released 2026-04-24; 1M context window. Standard (post-2026-05-31) 1/4-price rate; cheapest DeepSeek-direct provider rate."
+
+# ---------------------------------------------------------------------------
+# Moonshot AI entries
+# ---------------------------------------------------------------------------
+
+[[entries]]
+provider = "moonshotai"
+model_id = "kimi-k2.7-code"
+display_name = "Kimi K2.7 Code"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 0.95
+output_price_per_mtok = 4.00
+cached_input_price_per_mtok = 0.19
+effective_date = "2026-07-08"
+notes = "Released 2026-06-12; agentic coding model. Output $8.00/Mtok on high-speed variant."
 
 # ---------------------------------------------------------------------------
 # Subscription model example (GitHub Copilot)

@@ -3853,6 +3853,24 @@ class DirectStageUsageExtractionTests(unittest.TestCase):
         self.assertEqual(model["provider"], "log-provider")
         self.assertEqual(model["model_id"], "log-model-id")
 
+    def test_invocation_model_fallback_reads_installed_agent_model(self) -> None:
+        home_dir = self.log_dir / "home"
+        agent_dir = home_dir / ".config" / "opencode" / "agents"
+        agent_dir.mkdir(parents=True)
+        (agent_dir / "opsx-reviewer.md").write_text(
+            "---\nmodel: \"openai/gpt-5.4\"\n---\n",
+            encoding="utf-8",
+        )
+
+        with mock.patch.dict(os.environ, {"HOME": str(home_dir)}, clear=False):
+            model = self.opsx_plan._extract_invocation_model(
+                "opencode run --agent opsx-reviewer"
+            )
+
+        self.assertEqual(model["provider"], "openai")
+        self.assertEqual(model["model_id"], "gpt-5.4")
+        self.assertIsNone(model["model_alias"])
+
     # -- 4.7 Unknown formats -----------------------------------------------
 
     def test_unknown_format_produces_unavailable_usage(self) -> None:
@@ -4246,6 +4264,60 @@ class DirectStageUsageIntegrationTests(unittest.TestCase):
         self.assertEqual(m["provider"], "openai")
         self.assertEqual(m["model_id"], "gpt-5.5")
         self.assertEqual(m["model_alias"], "primary")
+
+    def test_implement_without_model_payload_uses_invoked_agent_model(self) -> None:
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+
+        fake_home = self.repo / "fake-home"
+        agent_dir = fake_home / ".config" / "opencode" / "agents"
+        agent_dir.mkdir(parents=True)
+        (agent_dir / "opsx-implementer.md").write_text(
+            "---\nmodel: \"deepseek/deepseek-v4-pro\"\n---\n",
+            encoding="utf-8",
+        )
+
+        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            if stage == "implement":
+                result = {
+                    "status": "implemented",
+                    "change": self.cid,
+                    "round": 1,
+                    "progress_made": True,
+                    "completed_tasks": [],
+                    "remaining_tasks": [],
+                    "task_counts": {"complete": 0, "total": 2},
+                    "files_touched": [],
+                    "known_change_files": [],
+                    "summary": "done",
+                }
+                log_path.write_text(
+                    "> opsx-implementer · deepseek-v4-pro\n"
+                    + json.dumps(result)
+                    + "\n",
+                    encoding="utf-8",
+                )
+                return "exited", log_path
+            log_path.write_text("# timeout\n", encoding="utf-8")
+            return "timeout", log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+        with mock.patch.dict(os.environ, {"HOME": str(fake_home)}, clear=False):
+            self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        records = self._read_telemetry()
+        impl = [r for r in records if r["stage"] == "implement"]
+        self.assertGreaterEqual(len(impl), 1)
+        m = impl[0]["model"]
+        self.assertEqual(m["provider"], "deepseek")
+        self.assertEqual(m["model_id"], "deepseek-v4-pro")
+        self.assertIsNone(m["model_alias"])
 
     # -- Telemetry write resilience -----------------------------------------
 
