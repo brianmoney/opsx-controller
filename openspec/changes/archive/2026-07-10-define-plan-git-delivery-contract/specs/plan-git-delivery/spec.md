@@ -18,6 +18,11 @@ If `plan.git_delivery.create_pull_request` is `true`, the plan SHALL also have `
 - **WHEN** a plan omits `plan.git_delivery` entirely or leaves `plan.git_delivery.enabled = false`
 - **THEN** `opsx-plan` does not require a delivery branch, does not persist branch-delivery state, and does not attempt pull-request delivery
 
+#### Scenario: Optional branch and base ref fields may be unset
+
+- **WHEN** a plan sets `plan.git_delivery.enabled = true` and omits `plan.git_delivery.branch` or `plan.git_delivery.base_ref`
+- **THEN** the plan is valid and the orchestrator resolves the unset values at the start of the first delivery-enabled run without treating the omissions as a plan-level validation error
+
 #### Scenario: Pull-request delivery requires branch delivery
 
 - **WHEN** a plan sets `plan.git_delivery.create_pull_request = true` and `plan.git_delivery.enabled = false`
