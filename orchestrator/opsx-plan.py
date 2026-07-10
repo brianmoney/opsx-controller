@@ -1773,6 +1773,63 @@ def estimate_stage_cost(usage, model,
     return result
 
 
+# ---------------------------------------------------------------------------
+# Spend budget helpers (plan-run-observability cost accumulation)
+# ---------------------------------------------------------------------------
+
+
+def compute_run_spend(repo: Path, plan_name: str, run_id: str) -> dict:
+    """Read telemetry records for *run_id* and return cumulative spend info.
+
+    Returns a dict with keys:
+    - ``cumulative_spend``: float, total estimated cost from resolved records
+    - ``resolved_stages``: int, count of stages with resolved cost
+    - ``unresolved_stages``: int, count of stages whose cost was unresolved or
+      unavailable (excluded from the numeric total)
+    """
+    telemetry_dir = repo / ".opsx-plan" / "telemetry"
+    jsonl_path = telemetry_dir / f"{plan_name}.jsonl"
+
+    cumulative: float = 0.0
+    resolved: int = 0
+    unresolved: int = 0
+
+    if not jsonl_path.is_file():
+        return {"cumulative_spend": 0.0, "resolved_stages": 0, "unresolved_stages": 0}
+
+    try:
+        for line in jsonl_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            if record.get("run_id") != run_id:
+                continue
+            cost = record.get("cost", {})
+            cost_status = cost.get("status", "")
+            if cost_status == "estimated":
+                ec = cost.get("estimated_cost")
+                if isinstance(ec, (int, float)):
+                    cumulative += float(ec)
+                    resolved += 1
+                else:
+                    unresolved += 1
+            elif cost_status in ("unresolved", "unavailable"):
+                unresolved += 1
+    except OSError:
+        pass
+
+    return {
+        "cumulative_spend": cumulative,
+        "resolved_stages": resolved,
+        "unresolved_stages": unresolved,
+    }
+
+
 PERMISSION_REJECTION_MARKERS = [
     "permission requested",
     "auto-rejecting",
@@ -2199,6 +2256,7 @@ def run_direct_change(
     state: dict,
     cid: str,
     budget_deadline: float | None = None,
+    budget_usd: float = 0.0,
 ) -> str:
     r = rec(state, cid)
     while True:
@@ -2216,6 +2274,23 @@ def run_direct_change(
                 set_status(state, cid, FAILED, f"completed state no longer verifiable: {why}")
             persist_direct_state(repo, cfg, state, cid)
             return r["status"]
+        # --- spend-budget pre-dispatch check ---
+        if budget_usd > 0:
+            run_id_for_check = state.get("run_id", "")
+            if run_id_for_check:
+                spend = compute_run_spend(repo, cfg["name"], run_id_for_check)
+                if spend["cumulative_spend"] >= budget_usd:
+                    reason = (
+                        f"spend budget exhausted: "
+                        f"${spend['cumulative_spend']:.2f} >= ${budget_usd:.2f} "
+                        f"({spend['resolved_stages']} stages resolved, "
+                        f"{spend['unresolved_stages']} unresolved)"
+                    )
+                    r["last_result"] = "spend_budget_exhausted"
+                    set_status(state, cid, PENDING, reason)
+                    log(f"  {reason}")
+                    persist_direct_state(repo, cfg, state, cid)
+                    return "budget"
         if stage not in {"implement", "review", "archive"}:
             r["phase"] = "implement"
             stage = "implement"
@@ -3142,6 +3217,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     budget_deadline = (
         time.monotonic() + args.budget_minutes * 60 if args.budget_minutes else None
     )
+    budget_usd = (
+        float(args.budget_usd) if getattr(args, "budget_usd", 0) and float(args.budget_usd) > 0 else 0.0
+    )
     ran = 0
     visited: set[str] = set()  # avoid re-picking the same change this run
 
@@ -3253,7 +3331,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
         if is_direct_opencode(cfg):
             log(f"=== {cid} direct OpenCode execution (round {r['round']}) ===")
-            result = run_direct_change(repo, cfg, state, cid, budget_deadline)
+            result = run_direct_change(repo, cfg, state, cid, budget_deadline, budget_usd)
             if result == DONE:
                 log(f"  done: {cid}")
                 ran += 1
@@ -3514,7 +3592,10 @@ def cmd_run_one(args: argparse.Namespace) -> int:
         return 0
 
     log(f"=== {change_id} direct OpenCode execution (round {r['round']}) ===")
-    result = run_direct_change(repo, cfg, state, change_id)
+    budget_usd = (
+        float(args.budget_usd) if getattr(args, "budget_usd", 0) and float(args.budget_usd) > 0 else 0.0
+    )
+    result = run_direct_change(repo, cfg, state, change_id, budget_usd=budget_usd)
 
     if result == DONE:
         log(f"  done: {change_id}")
@@ -5026,10 +5107,14 @@ def main() -> int:
 
         repo_arg = "."
         change_id = None
+        budget_usd = 0.0
         i = 1
         while i < len(sys.argv):
             if sys.argv[i] == "--repo" and i + 1 < len(sys.argv):
                 repo_arg = sys.argv[i + 1]
+                i += 2
+            elif sys.argv[i] == "--budget-usd" and i + 1 < len(sys.argv):
+                budget_usd = float(sys.argv[i + 1])
                 i += 2
             elif not sys.argv[i].startswith("-") and change_id is None:
                 change_id = sys.argv[i]
@@ -5045,7 +5130,7 @@ def main() -> int:
             print("usage: opsx-run <change-id> [--repo <path>]", file=sys.stderr)
             return 2
 
-        args = argparse.Namespace(repo=repo_arg, change=change_id)
+        args = argparse.Namespace(repo=repo_arg, change=change_id, budget_usd=budget_usd)
         return cmd_run_one(args)
 
     ap = argparse.ArgumentParser(prog="opsx-plan", description=__doc__)
@@ -5063,6 +5148,7 @@ def main() -> int:
                        help="restrict to these change ids (deps must be done)")
     p_run.add_argument("--max-changes", type=int, default=0)
     p_run.add_argument("--budget-minutes", type=float, default=0)
+    p_run.add_argument("--budget-usd", type=float, default=0)
     p_run.add_argument("--create-only", action="store_true",
                        help="create+verify ready changes without driving them")
     p_run.set_defaults(fn=cmd_run)
@@ -5162,6 +5248,7 @@ def main() -> int:
         "run-one", help="run a single authored OpenSpec change directly"
     )
     p_run_one.add_argument("change", help="change id")
+    p_run_one.add_argument("--budget-usd", type=float, default=0)
     p_run_one.set_defaults(fn=cmd_run_one)
 
     args = ap.parse_args()

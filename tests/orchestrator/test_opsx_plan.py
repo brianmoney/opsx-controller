@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import textwrap
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -1245,8 +1246,10 @@ class MainDispatchTests(unittest.TestCase):
             state: dict,
             cid: str,
             budget_deadline: float | None = None,
+            budget_usd: float = 0.0,
         ) -> str:
             self.assertIsNone(budget_deadline)
+            self.assertEqual(budget_usd, 0.0)
             calls.append((repo, cfg["name"], cid))
             return self.opsx_plan.DONE
 
@@ -1273,9 +1276,11 @@ class MainDispatchTests(unittest.TestCase):
             state: dict,
             cid: str,
             budget_deadline: float | None = None,
+            budget_usd: float = 0.0,
         ) -> str:
             self.assertEqual(repo, self.repo.resolve())
             self.assertIsNone(budget_deadline)
+            self.assertEqual(budget_usd, 0.0)
             record = self.opsx_plan.rec(state, cid)
             record["phase"] = "implement"
             self.opsx_plan.set_status(
@@ -7854,7 +7859,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
         (cdir / "tasks.md").write_text("- [ ] 1.1 task\n", encoding="utf-8")
         os.environ["OPSX_CONTROLLER_MODEL"] = "test-model"
 
-        def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None):
+        def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None, budget_usd=0.0):
             return self.opsx_plan.DONE
 
         original = self.opsx_plan.run_direct_change
@@ -7900,7 +7905,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
 
         stdout = io.StringIO()
 
-        def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None):
+        def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None, budget_usd=0.0):
             return self.opsx_plan.DONE
 
         original = self.opsx_plan.run_direct_change
@@ -7921,7 +7926,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
 
         stdout = io.StringIO()
 
-        def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None):
+        def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None, budget_usd=0.0):
             return self.opsx_plan.DONE
 
         original = self.opsx_plan.run_direct_change
@@ -7993,7 +7998,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
 
         stdout = io.StringIO()
 
-        def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None):
+        def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None, budget_usd=0.0):
             return self.opsx_plan.DONE
 
         original = self.opsx_plan.run_direct_change
@@ -8015,7 +8020,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
 
         stdout = io.StringIO()
 
-        def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None):
+        def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None, budget_usd=0.0):
             return self.opsx_plan.DONE
 
         original = self.opsx_plan.run_direct_change
@@ -8135,7 +8140,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
         (cdir / "tasks.md").write_text("- [ ] 1.1 task\n", encoding="utf-8")
         os.environ["OPSX_CONTROLLER_MODEL"] = "test-model"
 
-        def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None):
+        def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None, budget_usd=0.0):
             return self.opsx_plan.DONE
 
         original = self.opsx_plan.run_direct_change
@@ -8293,6 +8298,433 @@ class ActivePlanResolutionTests(unittest.TestCase):
             rc = self.opsx_plan.cmd_dashboard(args)
         self.assertEqual(rc, 0)
         self.assertIn("Dashboard written to:", stdout.getvalue())
+
+
+class SpendBudgetTests(unittest.TestCase):
+    """Tests for spend-budget enforcement and reporting (--budget-usd)."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        git(self.repo, "init")
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        git(self.repo, "add", "tracked.txt")
+        git(
+            self.repo,
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "user.name=Test User",
+            "commit",
+            "-m",
+            "init",
+        )
+        self.cid = "add-budget-test"
+        self.plan_name = f"run-{self.cid}"
+        self.cfg = {
+            "name": self.plan_name,
+            "adapter": "opencode",
+            "implement_invoke": "opencode run --agent opsx-implementer",
+            "review_invoke": "opencode run --agent opsx-reviewer",
+            "archive_invoke": "opencode run --agent opsx-archiver",
+            "invoke": 'opencode run "/opsx-drive {change}"',
+            "state_file": ".opencode/opsx-controller/{change}.json",
+            "timeout_minutes": 1,
+            "max_attempts": 2,
+            "max_rounds": 5,
+            "no_progress_limit": 2,
+            "fast_checks": [],
+            "check_timeout_minutes": 1,
+            "require_clean_tracked": False,
+            "review_created": False,
+            "changes": {
+                self.cid: {
+                    "id": self.cid,
+                    "depends_on": [],
+                    "enabled": True,
+                    "pause_before": False,
+                    "timeout_minutes": 1,
+                    "max_attempts": 2,
+                    "create_invoke": "",
+                    "create_max_attempts": 1,
+                }
+            },
+            "order": [self.cid],
+            "created_check": "",
+            "plan_doc": "",
+            "create_timeout_minutes": 1,
+        }
+        self.state = {"plan": self.plan_name, "approvals": [], "changes": {}}
+        self._saved_invoke = self.opsx_plan.invoke_direct_stage
+        self._saved_checks = self.opsx_plan.run_fast_checks
+
+    def tearDown(self) -> None:
+        self.opsx_plan.invoke_direct_stage = self._saved_invoke
+        self.opsx_plan.run_fast_checks = self._saved_checks
+        self.tmp.cleanup()
+
+    def write_authored_change(self, cid: str) -> None:
+        cdir = self.repo / "openspec" / "changes" / cid
+        cdir.mkdir(parents=True)
+        (cdir / "proposal.md").write_text("## Why\n", encoding="utf-8")
+        (cdir / "tasks.md").write_text(
+            "## 1. Tasks\n\n- [ ] 1.1 Example task\n- [ ] 1.2 Example task\n",
+            encoding="utf-8",
+        )
+
+    def _write_telemetry(self, run_id: str, records: list[dict]) -> None:
+        """Write telemetry records to the plan's JSONL file."""
+        telemetry_dir = self.repo / ".opsx-plan" / "telemetry"
+        telemetry_dir.mkdir(parents=True, exist_ok=True)
+        jsonl = telemetry_dir / f"{self.plan_name}.jsonl"
+        with open(jsonl, "a", encoding="utf-8") as fh:
+            for rec in records:
+                fh.write(json.dumps(rec) + "\n")
+
+    def _telemetry_rec(
+        self,
+        run_id: str,
+        stage: str,
+        cost_status: str,
+        estimated_cost: float | None,
+    ) -> dict:
+        return {
+            "schema_version": self.opsx_plan.TELEMETRY_SCHEMA_VERSION,
+            "uid": str(uuid.uuid4()),
+            "plan_name": self.plan_name,
+            "run_id": run_id,
+            "change_id": self.cid,
+            "stage": stage,
+            "round": 1,
+            "cost": {
+                "status": cost_status,
+                "estimated_cost": estimated_cost,
+            },
+        }
+
+    # -- compute_run_spend unit tests ----------------------------------------
+
+    def test_compute_run_spend_no_telemetry_file(self) -> None:
+        spend = self.opsx_plan.compute_run_spend(self.repo, self.plan_name, "any-run")
+        self.assertEqual(spend["cumulative_spend"], 0.0)
+        self.assertEqual(spend["resolved_stages"], 0)
+        self.assertEqual(spend["unresolved_stages"], 0)
+
+    def test_compute_run_spend_filters_by_run_id(self) -> None:
+        run_a = "run-aaa"
+        run_b = "run-bbb"
+        self._write_telemetry(
+            run_a,
+            [
+                self._telemetry_rec(run_a, "implement", "estimated", 0.50),
+                self._telemetry_rec(run_a, "review", "estimated", 0.25),
+            ],
+        )
+        self._write_telemetry(
+            run_b,
+            [
+                self._telemetry_rec(run_b, "implement", "estimated", 10.00),
+            ],
+        )
+
+        spend = self.opsx_plan.compute_run_spend(self.repo, self.plan_name, run_a)
+        self.assertEqual(spend["cumulative_spend"], 0.75)
+        self.assertEqual(spend["resolved_stages"], 2)
+        self.assertEqual(spend["unresolved_stages"], 0)
+
+    def test_compute_run_spend_counts_unresolved_and_unavailable(self) -> None:
+        run_id = "run-mixed"
+        self._write_telemetry(
+            run_id,
+            [
+                self._telemetry_rec(run_id, "implement", "estimated", 0.40),
+                self._telemetry_rec(run_id, "review", "unresolved", None),
+                self._telemetry_rec(run_id, "implement", "estimated", 0.35),
+                self._telemetry_rec(run_id, "review", "unavailable", None),
+                self._telemetry_rec(run_id, "archive", "unresolved", None),
+            ],
+        )
+
+        spend = self.opsx_plan.compute_run_spend(self.repo, self.plan_name, run_id)
+        self.assertEqual(spend["cumulative_spend"], 0.75)
+        self.assertEqual(spend["resolved_stages"], 2)
+        self.assertEqual(spend["unresolved_stages"], 3)
+
+    def test_compute_run_spend_estimated_without_cost_counts_as_unresolved(self) -> None:
+        run_id = "run-null-estimate"
+        self._write_telemetry(
+            run_id,
+            [
+                self._telemetry_rec(run_id, "implement", "estimated", None),
+            ],
+        )
+
+        spend = self.opsx_plan.compute_run_spend(self.repo, self.plan_name, run_id)
+        self.assertEqual(spend["cumulative_spend"], 0.0)
+        self.assertEqual(spend["resolved_stages"], 0)
+        self.assertEqual(spend["unresolved_stages"], 1)
+
+    # -- budget enforcement integration tests --------------------------------
+
+    def test_run_stops_after_reaching_spend_cap(self) -> None:
+        """4.1: A run with --budget-usd stops dispatching after cumulative
+        estimated spend reaches the cap, and leaves state resumable."""
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+
+        # Seed telemetry that already has partial spend within the budget
+        run_id = "run-budget-001"
+        self.state["run_id"] = run_id
+        self._write_telemetry(
+            run_id,
+            [
+                self._telemetry_rec(run_id, "implement", "estimated", 0.70),
+            ],
+        )
+
+        calls: list[str] = []
+
+        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+            calls.append(stage)
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "status": "implemented",
+                "change": cid,
+                "round": round_num,
+                "progress_made": True,
+                "completed_tasks": ["1.1"],
+                "remaining_tasks": ["1.2"],
+                "task_counts": {"complete": 1, "total": 2},
+                "files_touched": [],
+                "known_change_files": [],
+                "summary": "implemented round",
+            }
+            log_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            return "exited", log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+
+        # Mock compute_run_spend to return below cap on first call (pre-dispatch)
+        # and above cap on second call (post-implement dispatch check)
+        original_compute = self.opsx_plan.compute_run_spend
+
+        spend_values = [
+            {"cumulative_spend": 0.70, "resolved_stages": 1, "unresolved_stages": 0},
+            {"cumulative_spend": 1.05, "resolved_stages": 2, "unresolved_stages": 0},
+        ]
+        call_count = [0]
+
+        def mock_compute(repo, plan_name, rid):
+            idx = min(call_count[0], len(spend_values) - 1)
+            val = spend_values[idx]
+            call_count[0] += 1
+            return val
+
+        self.opsx_plan.compute_run_spend = mock_compute
+
+        try:
+            result = self.opsx_plan.run_direct_change(
+                self.repo, self.cfg, self.state, self.cid, budget_usd=1.00
+            )
+        finally:
+            self.opsx_plan.compute_run_spend = original_compute
+
+        # First dispatch: spend 0.70 < 1.00 → implement runs.
+        # After implement, loop checks again: spend 1.05 >= 1.00 → stop.
+        self.assertEqual(result, "budget")
+        record = self.opsx_plan.rec(self.state, self.cid)
+        self.assertEqual(record["last_result"], "spend_budget_exhausted")
+        # Status must be PENDING (resumable), not FAILED
+        self.assertEqual(record["status"], self.opsx_plan.PENDING)
+        self.assertIn("spend budget exhausted", record["reason"])
+        self.assertIn("resolved", record["reason"])
+        self.assertIn("unresolved", record["reason"])
+
+    def test_run_completes_without_reaching_spend_cap(self) -> None:
+        """4.2: A run with a high --budget-usd completes normally."""
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+
+        # Seed telemetry with low spend
+        run_id = "run-budget-002"
+        self.state["run_id"] = run_id
+        self._write_telemetry(
+            run_id,
+            [
+                self._telemetry_rec(run_id, "implement", "estimated", 0.20),
+            ],
+        )
+
+        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            if stage == "implement":
+                payload = {
+                    "status": "implemented",
+                    "change": cid,
+                    "round": round_num,
+                    "progress_made": True,
+                    "completed_tasks": ["1.1", "1.2"],
+                    "remaining_tasks": [],
+                    "task_counts": {"complete": 2, "total": 2},
+                    "files_touched": [],
+                    "known_change_files": [],
+                    "summary": "implemented",
+                }
+            elif stage == "review":
+                payload = {
+                    "status": "reviewed",
+                    "change": cid,
+                    "round": round_num,
+                    "verdict": "pass",
+                    "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                    "summary": "review passed",
+                    "fix_prompt": "",
+                    "next_phase": "archive",
+                }
+            else:  # archive
+                src = self.repo / "openspec" / "changes" / self.cid
+                archive_rel = f"openspec/changes/archive/2026-07-10-{self.cid}"
+                dst = self.repo / archive_rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                src.rename(dst)
+                git(self.repo, "add", "-A", "openspec")
+                git(
+                    self.repo,
+                    "-c", "user.email=test@example.invalid",
+                    "-c", "user.name=Test User",
+                    "commit", "-m", f"archive({self.cid}): archive completed OpenSpec change",
+                )
+                commit = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=self.repo,
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip()
+                payload = {
+                    "status": "archived",
+                    "change": cid,
+                    "archive_path": archive_rel,
+                    "spec_sync_status": "no-delta",
+                    "commit": commit,
+                    "summary": "archive succeeded",
+                }
+            log_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            return "exited", log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+
+        # Mock compute_run_spend to always return low spend
+        original_compute = self.opsx_plan.compute_run_spend
+
+        def mock_compute(repo, plan_name, rid):
+            return {"cumulative_spend": 0.20, "resolved_stages": 1, "unresolved_stages": 0}
+
+        self.opsx_plan.compute_run_spend = mock_compute
+
+        try:
+            result = self.opsx_plan.run_direct_change(
+                self.repo, self.cfg, self.state, self.cid, budget_usd=999.00
+            )
+        finally:
+            self.opsx_plan.compute_run_spend = original_compute
+
+        self.assertEqual(result, self.opsx_plan.DONE)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        self.assertEqual(record["status"], self.opsx_plan.DONE)
+
+    def test_no_spend_check_when_budget_usd_is_zero(self) -> None:
+        """budget_usd=0 (default/omitted) must not trigger spend checks."""
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+
+        run_id = "run-budget-003"
+        self.state["run_id"] = run_id
+        self._write_telemetry(
+            run_id,
+            [
+                self._telemetry_rec(run_id, "implement", "estimated", 999.00),
+            ],
+        )
+
+        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            if stage == "implement":
+                payload = {
+                    "status": "implemented",
+                    "change": cid,
+                    "round": round_num,
+                    "progress_made": True,
+                    "completed_tasks": ["1.1", "1.2"],
+                    "remaining_tasks": [],
+                    "task_counts": {"complete": 2, "total": 2},
+                    "files_touched": [],
+                    "known_change_files": [],
+                    "summary": "implemented all tasks",
+                }
+            elif stage == "review":
+                payload = {
+                    "status": "reviewed",
+                    "change": cid,
+                    "round": round_num,
+                    "verdict": "pass",
+                    "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                    "summary": "review passed",
+                    "fix_prompt": "",
+                    "next_phase": "archive",
+                }
+            else:  # archive
+                payload = {
+                    "status": "archived",
+                    "change": cid,
+                    "archive_path": "",
+                    "spec_sync_status": "no-delta",
+                    "commit": "",
+                    "summary": "archive skipped for test",
+                }
+            log_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            return "exited", log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+
+        # Mock compute_run_spend to verify it is NOT called
+        call_count = [0]
+        original_compute = self.opsx_plan.compute_run_spend
+
+        def mock_compute(repo, plan_name, rid):
+            call_count[0] += 1
+            return {"cumulative_spend": 999.00, "resolved_stages": 1, "unresolved_stages": 0}
+
+        self.opsx_plan.compute_run_spend = mock_compute
+
+        try:
+            # budget_usd=0 means no spend cap — even 999.00 of spend
+            # should not trigger a budget stop
+            result = self.opsx_plan.run_direct_change(
+                self.repo, self.cfg, self.state, self.cid, budget_usd=0.0
+            )
+        finally:
+            self.opsx_plan.compute_run_spend = original_compute
+
+        # compute_run_spend must NOT be called when budget_usd is 0
+        self.assertEqual(call_count[0], 0,
+                         f"compute_run_spend called {call_count[0]} times; expected 0")
+        # Run should proceed past implement and review; archive returns "stop"
+        # because there's no real archive directory (expected)
+        self.assertIn(result, ("continue", "stop"))
 
 
 if __name__ == "__main__":
