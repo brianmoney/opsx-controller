@@ -3419,15 +3419,20 @@ def cmd_accept(args: argparse.Namespace) -> int:
     changes = resolve_changes(cfg, args.change)
     if changes is None:
         return 2
+    had_failure = False
+    changed = False
     for cid in changes:
         ok, why = verify_change_created(repo, cfg, cid)
         if not ok:
             print(f"refusing to accept {cid}: {why}", file=sys.stderr)
-            return 2
+            had_failure = True
+            continue
         rec(state, cid)["accepted"] = True
         log(f"accepted: {cid}")
-    save_state(repo, cfg["name"], state)
-    return 0
+        changed = True
+    if changed:
+        save_state(repo, cfg["name"], state)
+    return 2 if had_failure else 0
 
 
 def cmd_reset(args: argparse.Namespace) -> int:

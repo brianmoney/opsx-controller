@@ -8057,6 +8057,47 @@ class ActivePlanResolutionTests(unittest.TestCase):
         state = self.opsx_plan.load_state(self.repo, "test-plan")
         self.assertTrue(state["changes"]["test-change"]["accepted"])
 
+    def test_cmd_accept_phase_persists_successes_before_invalid_change(self) -> None:
+        """Phase-wide accept must persist valid accepts even if one change fails."""
+        self._write_plan_toml(
+            "my-plan.toml",
+            '[plan]\nname = "test-plan"\nadapter = "opencode"\n'
+            'created_check = ""\n\n'
+            '[[changes]]\nid = "add-cost-budget-run-flag"\nphase = 3\n'
+            '[[changes]]\nid = "batch-gate-and-reset-commands"\nphase = 3\n'
+            '[[changes]]\nid = "add-plan-logs-command"\nphase = 3\n'
+            '[[changes]]\nid = "add-run-event-notifications"\nphase = 3\n',
+        )
+        self.opsx_plan.write_active_plan(self.repo, "my-plan.toml")
+        for cid in (
+            "add-cost-budget-run-flag",
+            "batch-gate-and-reset-commands",
+            "add-plan-logs-command",
+        ):
+            cdir = self.repo / "openspec" / "changes" / cid
+            cdir.mkdir(parents=True)
+            (cdir / "proposal.md").write_text("## Why\n", encoding="utf-8")
+            (cdir / "tasks.md").write_text("- [ ] 1.1 task\n", encoding="utf-8")
+
+        stderr = io.StringIO()
+        args = argparse.Namespace(repo=str(self.repo), plan=None, change=["P3"])
+        with mock.patch("sys.stderr", stderr):
+            rc = self.opsx_plan.cmd_accept(args)
+
+        self.assertEqual(rc, 2)
+        self.assertIn(
+            "refusing to accept add-run-event-notifications",
+            stderr.getvalue(),
+        )
+        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        for cid in (
+            "add-cost-budget-run-flag",
+            "batch-gate-and-reset-commands",
+            "add-plan-logs-command",
+        ):
+            self.assertTrue(state["changes"][cid]["accepted"])
+        self.assertNotIn("add-run-event-notifications", state["changes"])
+
     def test_cmd_reset_resolves_via_active_pointer(self) -> None:
         """cmd_reset with plan=None resolves the plan via the active pointer."""
         self._write_plan_toml("my-plan.toml")
