@@ -2595,7 +2595,8 @@ def run_stage(
     log_path = log_dir / f"{cid}.{stage}{attempt}.log"
 
     cmd = shlex.split(
-        invoke_tpl.format(change=cid, plan_doc=cfg["plan_doc"])
+        invoke_tpl.format(change=cid, plan_doc=cfg["plan_doc"],
+                          controller_model=os.environ.get("OPSX_CONTROLLER_MODEL", ""))
     )
     timeout_s = timeout_minutes * 60
     log(f"  exec[{stage}]: {' '.join(cmd)}  "
