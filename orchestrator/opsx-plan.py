@@ -1780,6 +1780,13 @@ PERMISSION_REJECTION_MARKERS = [
     "external_directory permission denied",
 ]
 
+PROVIDER_FAILURE_MARKERS = [
+    "Insufficient Balance",
+    "insufficient credits",
+    "quota exceeded",
+    "billing hard limit",
+]
+
 
 def parse_stage_json(log_path: Path) -> tuple[dict | None, str]:
     lines: list[str] = []
@@ -1800,12 +1807,18 @@ def parse_stage_json(log_path: Path) -> tuple[dict | None, str]:
         if not isinstance(payload, dict):
             continue
         return payload, ""
-    # No valid JSON object found: inspect for permission-rejection markers
+    # No valid JSON object found: inspect for known transcript failure markers.
     joined = " ".join(line.lower() for line in lines)
     for marker in PERMISSION_REJECTION_MARKERS:
         if marker.lower() in joined:
             return None, (
                 f"permission denied before JSON output "
+                f"(marker: {marker!r} found in {len(lines)} lines)"
+            )
+    for marker in PROVIDER_FAILURE_MARKERS:
+        if marker.lower() in joined:
+            return None, (
+                f"provider failure before JSON output "
                 f"(marker: {marker!r} found in {len(lines)} lines)"
             )
     return None, f"expected a final JSON object line, got {len(lines)} non-comment lines"

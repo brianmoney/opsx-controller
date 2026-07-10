@@ -1544,6 +1544,18 @@ class ParseStageJsonPermissionTests(unittest.TestCase):
         self.assertIn("permission denied before JSON output", reason)
         self.assertIn("external_directory permission denied", reason)
 
+    def test_insufficient_balance_transcript_is_parsed_as_provider_failure(self) -> None:
+        content = (
+            "# header\n"
+            "> opsx-implementer · deepseek-v4-pro\n"
+            "Error: Insufficient Balance\n"
+        )
+        log_path = self._write_log(content)
+        payload, reason = self.opsx_plan.parse_stage_json(log_path)
+        self.assertIsNone(payload)
+        self.assertIn("provider failure before JSON output", reason)
+        self.assertIn("Insufficient Balance", reason)
+
     def test_no_permission_marker_returns_generic_reason(self) -> None:
         content = (
             "some output\n"
