@@ -1,5 +1,11 @@
 # opsx-plan: plan-level orchestrator
 
+> **Operator workflow guide**: For the full operator workflow — activation,
+> `doctor`, budgets, gate controls, logs, notifications, and branch/PR delivery
+> — see [`docs/opsx-plan-operator-workflow.md`](../docs/opsx-plan-operator-workflow.md).
+> This README is the technical reference for the orchestrator's design,
+> manifest schema, and execution model.
+
 `orchestrator/opsx-plan.py` iterates a TOML plan manifest of OpenSpec changes
 (a dependency DAG) and, for each ready change, runs a staged lifecycle:
 
@@ -126,31 +132,41 @@ Durable state is persisted to `.opsx-plan/run-<change-id>.state.json`, and stage
 logs go to `.opsx-plan/logs/`. Interrupted runs can be resumed by re-invoking
 the same `opsx-run <change-id>` command.
 
-### Plan-level execution
+### Plan-level execution (activate-then-run)
+
+The recommended workflow activates a plan once, then all subsequent commands
+resolve it automatically through the active-plan pointer (or `OPSX_PLAN` env
+var). See the [operator workflow guide](../docs/opsx-plan-operator-workflow.md)
+for full details on activation, budgets, gates, logs, notifications, and
+branch/PR delivery.
 
 From the host project root:
 
 ```bash
 # 0. generate plan.toml from your phased plan doc, then REVIEW the DAG
-python3 /path/to/opsx-controller/orchestrator/opsx-plan.py compile \
-  docs/phased-implementation-plan.md -o plan.toml
+opsx-plan compile docs/phased-implementation-plan.md -o plan.toml
+# Compile auto-activates the output plan.
 
 # preview order, gates, and current status without running anything
-python3 /path/to/opsx-controller/orchestrator/opsx-plan.py run plan.toml --dry-run
+opsx-plan run --dry-run
+
+# preflight checks before an unattended run
+opsx-plan doctor
 
 # run the plan (serial; Ctrl-C is safe — state persists, resume by re-running)
-python3 /path/to/opsx-controller/orchestrator/opsx-plan.py run plan.toml
+opsx-plan run
 
-# approve a pause_before gate, then re-run
-python3 .../opsx-plan.py approve plan.toml add-atomic-runtime-state-writes
+# approve a pause_before gate
+opsx-plan approve add-atomic-runtime-state-writes
 
 # inspect / recover
-python3 .../opsx-plan.py status plan.toml
-python3 .../opsx-plan.py reset plan.toml <change-id>
+opsx-plan status
+opsx-plan reset <change-id>
 ```
 
-Useful run flags: `--max-changes N`, `--budget-minutes N`,
-`--only <id> [<id>...]`, `--repo <path>`.
+Useful run flags: `--max-changes N`, `--budget-minutes N`, `--budget-usd N`,
+`--only <id> [<id>...]`, `--create-only`, `--no-branch`, `--no-pr`,
+`--repo <path>`.
 
 Orchestrator state lives at `.opsx-plan/<plan-name>.state.json` in the host
 project. For OpenCode-backed direct runs, that file is the authoritative

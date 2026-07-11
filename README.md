@@ -10,6 +10,8 @@ to package for different coding clients.
 ## Layout
 
 - `core/`: client-neutral controller contract, state schema, and phase protocol
+- `orchestrator/`: `opsx-plan` deterministic plan-level orchestrator
+- `docs/`: operator workflow and benchmarking guides
 - `adapters/opencode/`: OpenCode commands, agents, installer, support files,
   and templates
 - `adapters/claude-code/`: Claude Code skill, phase agents, installer, support
@@ -37,6 +39,21 @@ Start with:
 - `core/controller-contract.md`
 - `core/state-schema.md`
 - `core/phase-protocol.md`
+
+## Plan-Level Orchestrator
+
+`opsx-plan` drives multi-change OpenSpec plans from compile through archive,
+with preflight checks, budget controls, manual gates, log inspection,
+cost-tracking telemetry, and branch/PR delivery. For single changes, `opsx-run`
+skips the plan manifest.
+
+- [**Operator Workflow Guide**](docs/opsx-plan-operator-workflow.md) — the
+  full operator-facing workflow: activation, `doctor`, budgets, gates, logs,
+  notifications, and branch/PR delivery.
+- [**Model Efficiency Workflow**](core/model-efficiency-workflow.md) — how to
+  benchmark model choices using telemetry, reports, and dashboards.
+- [`orchestrator/README.md`](orchestrator/README.md) — technical reference:
+  manifest schema, execution model, retry policy, and adapter invocation.
 
 ## OpenCode Adapter
 
