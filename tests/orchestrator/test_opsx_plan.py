@@ -9509,5 +9509,567 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
         self.assertIn("\u2192 opsx-plan accept created-b", output)
 
 
+class LogsCommandTests(unittest.TestCase):
+    """Tests for ``opsx-plan logs`` command: log selection, filtering,
+    listing, follow-mode selection, and missing-log handling."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        git(self.repo, "init")
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        git(self.repo, "add", "tracked.txt")
+        git(
+            self.repo,
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "user.name=Test User",
+            "commit",
+            "-m",
+            "init",
+        )
+        self.cid = "add-logs-test"
+        self.plan_name = "run-add-logs-test"
+        self.cfg = {
+            "name": self.plan_name,
+            "adapter": "opencode",
+            "implement_invoke": "opencode run --agent opsx-implementer",
+            "review_invoke": "opencode run --agent opsx-reviewer",
+            "archive_invoke": "opencode run --agent opsx-archiver",
+            "invoke": 'opencode run "/opsx-drive {change}"',
+            "state_file": ".opencode/opsx-controller/{change}.json",
+            "timeout_minutes": 1,
+            "max_attempts": 2,
+            "max_rounds": 2,
+            "no_progress_limit": 2,
+            "fast_checks": [],
+            "check_timeout_minutes": 1,
+            "require_clean_tracked": False,
+            "review_created": False,
+            "changes": {
+                self.cid: {
+                    "id": self.cid,
+                    "depends_on": [],
+                    "enabled": True,
+                    "pause_before": False,
+                    "timeout_minutes": 1,
+                    "max_attempts": 2,
+                    "create_invoke": "",
+                    "create_max_attempts": 1,
+                }
+            },
+            "order": [self.cid],
+            "created_check": "",
+            "plan_doc": "",
+            "create_timeout_minutes": 1,
+        }
+        # Write the plan TOML so opsx-plan can resolve it for the logs subcommand
+        self._write_plan_toml()
+
+        # Create a writable .opsx-plan/logs/ dir
+        self.log_dir = self.repo / ".opsx-plan" / "logs"
+        self.log_dir.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _write_plan_toml(self) -> None:
+        plan_dir = self.repo
+        toml_path = plan_dir / f"{self.plan_name}.toml"
+        toml_path.write_text(
+            textwrap.dedent(f"""\
+                [plan]
+                name = "{self.plan_name}"
+                adapter = "opencode"
+                implement_invoke = "opencode run --agent opsx-implementer"
+                review_invoke = "opencode run --agent opsx-reviewer"
+                archive_invoke = "opencode run --agent opsx-archiver"
+
+                [[changes]]
+                id = "{self.cid}"
+            """),
+            encoding="utf-8",
+        )
+        self.plan_path = toml_path
+
+    def _make_log(self, filename: str, content: str = "log content\n") -> Path:
+        p = self.log_dir / filename
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    # -- 3.1 Default latest-log selection from recorded state metadata --------
+
+    def test_default_selects_log_from_state_last_stage(self) -> None:
+        log = self._make_log(f"{self.cid}.implement.r1.1.log", "implement output\n")
+        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        rec = self.opsx_plan.rec(state, self.cid)
+        rec["last_stage"] = {
+            "name": "implement",
+            "round": 1,
+            "outcome": "exited",
+            "log_path": str(log),
+            "updated_at": self.opsx_plan.utcnow(),
+        }
+        self.opsx_plan.save_state(self.repo, self.plan_name, state)
+
+        selected = self.opsx_plan._select_log_from_state(
+            self.repo, self.plan_name, None, None,
+        )
+        self.assertIsNotNone(selected)
+        self.assertIn("implement", selected["path"])
+        self.assertEqual(selected["change"], self.cid)
+        self.assertEqual(selected["stage"], "implement")
+
+    def test_state_selection_ignores_deleted_log(self) -> None:
+        log = self._make_log(f"{self.cid}.review.r1.1.log", "review notes\n")
+        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        rec = self.opsx_plan.rec(state, self.cid)
+        rec["last_stage"] = {
+            "name": "review",
+            "round": 1,
+            "outcome": "exited",
+            "log_path": str(log),
+            "updated_at": self.opsx_plan.utcnow(),
+        }
+        self.opsx_plan.save_state(self.repo, self.plan_name, state)
+
+        # Delete the log file on disk
+        log.unlink()
+
+        selected = self.opsx_plan._select_log_from_state(
+            self.repo, self.plan_name, None, None,
+        )
+        self.assertIsNone(selected)
+
+    def test_state_selection_picks_newest_across_multi_change(self) -> None:
+        """When multiple changes have recorded last_stage logs, the newest
+        (highest mtime / round / seq) is selected, not the first dict entry."""
+        # Simulate two changes: older change comes first in state dict,
+        # newer change comes second but has a fresher log.
+        older_log = self._make_log("older-change.implement.r1.1.log", "older\n")
+        newer_log = self._make_log("newer-change.implement.r2.1.log", "newer\n")
+
+        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+
+        # Older change inserted first (so it appears first in iterations)
+        rec_older = self.opsx_plan.rec(state, "older-change")
+        rec_older["last_stage"] = {
+            "name": "implement",
+            "round": 1,
+            "outcome": "exited",
+            "log_path": str(older_log),
+            "updated_at": self.opsx_plan.utcnow(),
+        }
+
+        # Newer change inserted second but has a higher round (newer)
+        rec_newer = self.opsx_plan.rec(state, "newer-change")
+        rec_newer["last_stage"] = {
+            "name": "implement",
+            "round": 2,
+            "outcome": "exited",
+            "log_path": str(newer_log),
+            "updated_at": self.opsx_plan.utcnow(),
+        }
+
+        self.opsx_plan.save_state(self.repo, self.plan_name, state)
+
+        # Without filters: should pick the newest (newer-change.r2)
+        selected = self.opsx_plan._select_log_from_state(
+            self.repo, self.plan_name, None, None,
+        )
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["change"], "newer-change")
+        self.assertEqual(selected["stage"], "implement")
+        self.assertEqual(selected["round"], 2)
+
+        # With a change filter: still picks the right one even when it
+        # is not the newest across all changes.
+        selected = self.opsx_plan._select_log_from_state(
+            self.repo, self.plan_name, "older-change", None,
+        )
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["change"], "older-change")
+        self.assertEqual(selected["round"], 1)
+
+    # -- 3.1a Plan-scoped state selection (regression for out-of-plan state entries) --
+
+    def test_state_selection_scoped_to_plan_change_ids(self) -> None:
+        """When no change_filter is given, _select_log_from_state only
+        considers changes that belong to the plan's own change ids."""
+        plan_cid = self.cid
+        plan_change_ids = {plan_cid}
+        plan_log = self._make_log(f"{plan_cid}.implement.r1.1.log", "plan\n")
+        foreign_log = self._make_log("foreign-change.implement.r1.1.log", "foreign\n")
+
+        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+
+        # Record last_stage for the plan change
+        rec_plan = self.opsx_plan.rec(state, plan_cid)
+        rec_plan["last_stage"] = {
+            "name": "implement",
+            "round": 1,
+            "outcome": "exited",
+            "log_path": str(plan_log),
+            "updated_at": self.opsx_plan.utcnow(),
+        }
+
+        # Record last_stage for a foreign change not in the plan
+        rec_foreign = self.opsx_plan.rec(state, "foreign-change")
+        rec_foreign["last_stage"] = {
+            "name": "implement",
+            "round": 1,
+            "outcome": "exited",
+            "log_path": str(foreign_log),
+            "updated_at": self.opsx_plan.utcnow(),
+        }
+
+        self.opsx_plan.save_state(self.repo, self.plan_name, state)
+
+        # When scoped to plan change ids: only the plan change matches
+        selected = self.opsx_plan._select_log_from_state(
+            self.repo, self.plan_name, None, None,
+            plan_change_ids=plan_change_ids,
+        )
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["change"], plan_cid)
+
+    def test_state_selection_with_explicit_change_bypasses_plan_scoping(self) -> None:
+        """An explicit --change filter in state selection ignores plan scoping
+        and matches any change id exactly."""
+        plan_change_ids = {self.cid}
+        foreign_log = self._make_log("foreign-change.implement.r1.1.log", "foreign\n")
+
+        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        rec = self.opsx_plan.rec(state, "foreign-change")
+        rec["last_stage"] = {
+            "name": "implement",
+            "round": 1,
+            "outcome": "exited",
+            "log_path": str(foreign_log),
+            "updated_at": self.opsx_plan.utcnow(),
+        }
+        self.opsx_plan.save_state(self.repo, self.plan_name, state)
+
+        selected = self.opsx_plan._select_log_from_state(
+            self.repo, self.plan_name, "foreign-change", None,
+            plan_change_ids=plan_change_ids,
+        )
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["change"], "foreign-change")
+
+    # -- 3.2 Fallback latest-log selection by log-directory ordering -----------
+
+    def test_fallback_selects_newest_log_by_mtime(self) -> None:
+        older = self._make_log(f"{self.cid}.implement.r1.1.log", "older\n")
+        import time as _time
+        _time.sleep(0.01)
+        new_path = self._make_log(f"{self.cid}.review.r1.1.log", "newer\n")
+
+        selected = self.opsx_plan._select_log_from_directory(
+            self.repo, None, None,
+        )
+        self.assertIsNotNone(selected)
+        self.assertIn("review", selected["path"])
+        self.assertEqual(selected["change"], self.cid)
+        self.assertEqual(selected["stage"], "review")
+
+    def test_fallback_handles_empty_log_dir(self) -> None:
+        selected = self.opsx_plan._select_log_from_directory(
+            self.repo, None, None,
+        )
+        self.assertIsNone(selected)
+
+    def test_fallback_ignores_non_log_files(self) -> None:
+        (self.log_dir / "readme.txt").write_text("not a log\n", encoding="utf-8")
+        selected = self.opsx_plan._select_log_from_directory(
+            self.repo, None, None,
+        )
+        self.assertIsNone(selected)
+
+    # -- 3.3 Change-id and stage filter combinations ---------------------------
+
+    def test_filter_by_change_id_only(self) -> None:
+        self._make_log("change-a.implement.r1.1.log", "a\n")
+        self._make_log("change-b.implement.r1.1.log", "b\n")
+
+        selected = self.opsx_plan._select_log(
+            self.repo, self.plan_name, "change-a", None,
+        )
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["change"], "change-a")
+
+    def test_filter_by_stage_only(self) -> None:
+        self._make_log(f"{self.cid}.implement.r1.1.log", "impl\n")
+        self._make_log(f"{self.cid}.review.r1.1.log", "rev\n")
+
+        selected = self.opsx_plan._select_log(
+            self.repo, self.plan_name, None, "review",
+        )
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["stage"], "review")
+
+    def test_filter_by_change_and_stage(self) -> None:
+        self._make_log("change-a.review.r1.1.log", "a rev\n")
+        self._make_log("change-b.review.r1.1.log", "b rev\n")
+
+        selected = self.opsx_plan._select_log(
+            self.repo, self.plan_name, "change-b", "review",
+        )
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["change"], "change-b")
+        self.assertEqual(selected["stage"], "review")
+
+    def test_filters_applied_across_state_and_directory(self) -> None:
+        """Filters work the same whether selection came from state or directory."""
+        log = self._make_log("change-x.implement.r1.1.log", "x\n")
+        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        rec = self.opsx_plan.rec(state, "change-x")
+        rec["last_stage"] = {
+            "name": "implement",
+            "round": 1,
+            "outcome": "exited",
+            "log_path": str(log),
+            "updated_at": self.opsx_plan.utcnow(),
+        }
+        self.opsx_plan.save_state(self.repo, self.plan_name, state)
+
+        # State-backed match
+        selected = self.opsx_plan._select_log(
+            self.repo, self.plan_name, "change-x", "implement",
+        )
+        self.assertIsNotNone(selected)
+
+        # State-backed filter: wrong change -> should fall through to directory (no match)
+        selected = self.opsx_plan._select_log(
+            self.repo, self.plan_name, "no-such-change", None,
+        )
+        self.assertIsNone(selected)
+
+    # -- 3.4 List output and follow-mode target selection ----------------------
+
+    def test_list_output_shows_matching_logs(self) -> None:
+        self._make_log(f"{self.cid}.implement.r1.1.log", "impl\n")
+        self._make_log(f"{self.cid}.review.r1.1.log", "rev\n")
+        self._make_log("other-change.implement.r1.1.log", "other\n")
+
+        entries = self.opsx_plan._collect_filtered_logs(
+            self.repo, self.cid, None,
+        )
+        self.assertEqual(len(entries), 2)
+        for e in entries:
+            self.assertEqual(e["change"], self.cid)
+
+    def test_list_output_empty_when_no_match(self) -> None:
+        entries = self.opsx_plan._collect_filtered_logs(
+            self.repo, "nonexistent", None,
+        )
+        self.assertEqual(len(entries), 0)
+
+    # -- 3.4a Plan-scoped directory fallback (regression for out-of-plan logs) --
+
+    def test_directory_fallback_scoped_to_plan_change_ids(self) -> None:
+        """When no change_filter is given, the directory fallback only considers
+        logs that belong to the plan's own changes."""
+        plan_cid = self.cid
+        plan_change_ids = {plan_cid}
+        self._make_log(f"{plan_cid}.implement.r1.1.log", "plan log\n")
+        self._make_log("other-plan-change.implement.r1.1.log", "foreign log\n")
+
+        selected = self.opsx_plan._select_log_from_directory(
+            self.repo, None, None, plan_change_ids=plan_change_ids,
+        )
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["change"], plan_cid)
+
+    def test_directory_fallback_with_change_filter_still_exact(self) -> None:
+        """An explicit --change filter selects even out-of-plan logs."""
+        plan_change_ids = {self.cid}
+        foreign_log = self._make_log("foreign-change.implement.r1.1.log", "foreign\n")
+
+        selected = self.opsx_plan._select_log_from_directory(
+            self.repo, "foreign-change", None, plan_change_ids=plan_change_ids,
+        )
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["change"], "foreign-change")
+
+    def test_directory_fallback_no_plan_logs_returns_none(self) -> None:
+        """When only out-of-plan logs exist, the directory fallback returns None."""
+        plan_change_ids = {self.cid}
+        self._make_log("foreign-change.review.r1.1.log", "foreign\n")
+
+        selected = self.opsx_plan._select_log_from_directory(
+            self.repo, None, None, plan_change_ids=plan_change_ids,
+        )
+        self.assertIsNone(selected)
+
+    def test_list_collection_scoped_to_plan_change_ids(self) -> None:
+        """--list mode only shows logs that belong to the plan's changes."""
+        plan_cid = self.cid
+        plan_change_ids = {plan_cid}
+        self._make_log(f"{plan_cid}.implement.r1.1.log", "plan\n")
+        self._make_log(f"{plan_cid}.review.r1.1.log", "plan review\n")
+        self._make_log("other-change.implement.r1.1.log", "other\n")
+
+        entries = self.opsx_plan._collect_filtered_logs(
+            self.repo, None, None, plan_change_ids=plan_change_ids,
+        )
+        self.assertEqual(len(entries), 2)
+        for e in entries:
+            self.assertEqual(e["change"], plan_cid)
+
+    def test_list_collection_with_change_filter_ignores_plan_scoping(self) -> None:
+        """Explicit --change filter in --list mode still matches exactly."""
+        plan_change_ids = {self.cid}
+        self._make_log("foreign.implement.r1.1.log", "foreign\n")
+
+        entries = self.opsx_plan._collect_filtered_logs(
+            self.repo, "foreign", None, plan_change_ids=plan_change_ids,
+        )
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["change"], "foreign")
+
+    def test_cmd_logs_list_mode_excludes_out_of_plan_logs(self) -> None:
+        """End-to-end: opsx-plan logs --list only shows plan-scoped logs."""
+        self._make_log(f"{self.cid}.implement.r1.1.log", "plan log\n")
+        self._make_log("other-plan-change.review.r1.1.log", "foreign log\n")
+
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            plan=str(self.plan_path),
+            change=None,
+            stage=None,
+            list=True,
+            follow=False,
+        )
+        rc = self.opsx_plan.cmd_logs(args)
+        self.assertEqual(rc, 0)
+
+    def test_cmd_logs_default_excludes_out_of_plan_logs(self) -> None:
+        """Default log selection should not surface a log from another plan."""
+        # Create only foreign log — no plan logs exist
+        self._make_log("foreign-change.implement.r1.1.log", "foreign\n")
+
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            plan=str(self.plan_path),
+            change=None,
+            stage=None,
+            list=False,
+            follow=False,
+        )
+        rc = self.opsx_plan.cmd_logs(args)
+        # Should exit nonzero because no plan-scoped log matches
+        self.assertEqual(rc, 1)
+
+    def test_follow_mode_selects_same_log_as_default(self) -> None:
+        log = self._make_log(f"{self.cid}.implement.r1.1.log", "in progress\n")
+        log.touch()
+
+        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        rec = self.opsx_plan.rec(state, self.cid)
+        rec["last_stage"] = {
+            "name": "implement",
+            "round": 1,
+            "outcome": "exited",
+            "log_path": str(log),
+            "updated_at": self.opsx_plan.utcnow(),
+        }
+        self.opsx_plan.save_state(self.repo, self.plan_name, state)
+
+        # --follow mode uses the same _select_log as default
+        selected = self.opsx_plan._select_log(
+            self.repo, self.plan_name, None, None,
+        )
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["stage"], "implement")
+
+    # -- 3.5 Missing-log handling ----------------------------------------------
+
+    def test_select_log_returns_none_when_no_logs_exist(self) -> None:
+        selected = self.opsx_plan._select_log(
+            self.repo, self.plan_name, None, None,
+        )
+        self.assertIsNone(selected)
+
+    def test_select_log_returns_none_when_filter_matches_nothing(self) -> None:
+        self._make_log(f"{self.cid}.implement.r1.1.log", "impl\n")
+
+        selected = self.opsx_plan._select_log(
+            self.repo, self.plan_name, None, "archive",
+        )
+        self.assertIsNone(selected)
+
+    def test_cmd_logs_exits_nonzero_for_missing_log(self) -> None:
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            plan=str(self.plan_path),
+            change=None,
+            stage=None,
+            list=False,
+            follow=False,
+        )
+        rc = self.opsx_plan.cmd_logs(args)
+        self.assertEqual(rc, 1)
+
+    # -- CLI dispatch ----------------------------------------------------------
+
+    def test_logs_subcommand_routes_to_cmd_logs(self) -> None:
+        calls: list[argparse.Namespace] = []
+
+        def fake_cmd_logs(args: argparse.Namespace) -> int:
+            calls.append(args)
+            return 42
+
+        with mock.patch.object(
+            self.opsx_plan, "cmd_logs", side_effect=fake_cmd_logs
+        ) as cmd_logs, mock.patch.object(
+            self.opsx_plan.sys,
+            "argv",
+            ["opsx-plan", "--repo", str(self.repo),
+             "logs", str(self.plan_path)],
+        ):
+            rc = self.opsx_plan.main()
+        self.assertEqual(rc, 42)
+        cmd_logs.assert_called_once()
+
+    def test_logs_list_mode_cli(self) -> None:
+        self._make_log(f"{self.cid}.implement.r1.1.log", "impl\n")
+
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            plan=str(self.plan_path),
+            change=None,
+            stage=None,
+            list=True,
+            follow=False,
+        )
+        rc = self.opsx_plan.cmd_logs(args)
+        self.assertEqual(rc, 0)
+
+    # -- Legacy log filename pattern -------------------------------------------
+
+    def test_parse_legacy_log_name(self) -> None:
+        result = self.opsx_plan._parse_log_name("change-a.drive1.log")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["change"], "change-a")
+        self.assertEqual(result["stage"], "drive")
+        self.assertEqual(result["round"], 0)
+        self.assertEqual(result["seq"], 1)
+
+    def test_parse_direct_log_name(self) -> None:
+        result = self.opsx_plan._parse_log_name("change-a.implement.r2.3.log")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["change"], "change-a")
+        self.assertEqual(result["stage"], "implement")
+        self.assertEqual(result["round"], 2)
+        self.assertEqual(result["seq"], 3)
+
+    def test_parse_unknown_log_name_returns_none(self) -> None:
+        result = self.opsx_plan._parse_log_name("not-a-log.txt")
+        self.assertIsNone(result)
+
+
 if __name__ == "__main__":
     unittest.main()
