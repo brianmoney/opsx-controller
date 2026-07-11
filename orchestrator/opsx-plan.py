@@ -99,6 +99,90 @@ def log(msg: str) -> None:
     print(f"[opsx-plan {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def _build_notification_payload(
+    event_type: str,
+    plan_name: str,
+    summary: str,
+    change_id: str | None = None,
+) -> str:
+    """Build a JSON notification payload conforming to the stable event schema.
+
+    For change-specific events, the payload includes ``change_id``.
+    For plan-wide events (e.g. ``plan_complete``), ``change_id`` is omitted
+    rather than inventing one.
+
+    Field contract:
+      - ``event_type``:  a string naming the event
+      - ``plan_name``:   the resolved plan name
+      - ``timestamp``:   orchestrator-generated event timestamp (UTC ISO-8601)
+      - ``summary``:     short human-readable description of the event
+      - ``change_id``:   present only for change-specific events
+    """
+    payload: dict = {
+        "event_type": event_type,
+        "plan_name": plan_name,
+        "timestamp": utcnow(),
+        "summary": summary,
+    }
+    if change_id:
+        payload["change_id"] = change_id
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _try_notify(
+    cfg: dict,
+    event_type: str,
+    summary: str,
+    change_id: str | None = None,
+) -> None:
+    """Invoke ``plan.notify_cmd`` as a best-effort side effect.
+
+    **Never raises.**  Notification-command failures are logged for operator
+    triage but never change stage verdicts, plan-state transitions, or overall
+    run exit semantics.
+
+    When ``notify_cmd`` is absent (empty or unset), this function is a no-op
+    and the orchestrator behaves exactly as it did before run-event
+    notifications were introduced.
+    """
+    notify_cmd = cfg.get("notify_cmd", "").strip()
+    if not notify_cmd:
+        return
+
+    plan_name = cfg["name"]
+    payload_json = _build_notification_payload(
+        event_type=event_type,
+        plan_name=plan_name,
+        summary=summary,
+        change_id=change_id,
+    )
+
+    try:
+        cmd_parts = shlex.split(notify_cmd)
+        cmd = cmd_parts + [payload_json]
+        log(f"  notify: {event_type} -> {notify_cmd}")
+
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            stderr_tail = (proc.stderr or "").strip().splitlines()[-3:]
+            detail = "; " + " | ".join(stderr_tail) if stderr_tail else ""
+            log(
+                f"  notify failed ({event_type}): "
+                f"exit={proc.returncode}{detail}"
+            )
+    except subprocess.TimeoutExpired:
+        log(f"  notify timed out ({event_type}): {notify_cmd}")
+    except FileNotFoundError:
+        log(f"  notify command not found ({event_type}): {notify_cmd}")
+    except Exception as exc:
+        log(f"  notify error ({event_type}): {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Plan manifest
 # ---------------------------------------------------------------------------
@@ -149,6 +233,8 @@ def load_plan(path: Path) -> dict:
         "fast_checks": list(plan.get("fast_checks", [])),
         "check_timeout_minutes": float(plan.get("check_timeout_minutes", 15)),
         "require_clean_tracked": bool(plan.get("require_clean_tracked", True)),
+        # --- run-event notifications ---
+        "notify_cmd": plan.get("notify_cmd", "").strip() if plan.get("notify_cmd") else "",
         # --- create stage (the /opsx-ff automation) ---
         "plan_doc": plan.get("plan_doc", ""),
         "create_invoke": plan.get("create_invoke", ""),
@@ -229,6 +315,7 @@ def build_single_change_config(repo: Path, change_id: str) -> dict:
         "fast_checks": [],
         "check_timeout_minutes": 15,
         "require_clean_tracked": True,
+        "notify_cmd": "",
         "plan_doc": "",
         "create_invoke": "",
         "create_timeout_minutes": 30,
@@ -416,6 +503,7 @@ def load_state(repo: Path, plan_name: str) -> dict:
         state = {"plan": plan_name, "approvals": [], "changes": {}}
     state.setdefault("plan", plan_name)
     state.setdefault("approvals", [])
+    state.setdefault("notified_events", {})
     state.setdefault("changes", {})
     state.setdefault("git_delivery", _default_git_delivery_state())
     gd = state["git_delivery"]
@@ -2104,10 +2192,12 @@ def apply_implement_result(
             },
         )
         set_status(state, cid, FAILED, payload.get("reason", "implement blocked"))
+        _try_notify(cfg, "change_failed", payload.get("summary", "change blocked"), change_id=cid)
         return "stop"
     if status != "implemented":
         set_status(state, cid, FAILED, f"implement returned unexpected status={status}")
         r["last_result"] = "implement_invalid"
+        _try_notify(cfg, "change_failed", f"implement returned unexpected status={status}", change_id=cid)
         return "stop"
     r["task_counts"] = normalize_task_counts(payload)
     progress = bool(payload.get("progress_made"))
@@ -2156,13 +2246,14 @@ def apply_implement_result(
     if r["no_progress_streak"] >= cfg["no_progress_limit"]:
         r["last_result"] = "no_progress"
         set_status(state, cid, FAILED, "no progress ceiling reached")
+        _try_notify(cfg, "change_failed", "no progress ceiling reached", change_id=cid)
         return "stop"
     r["phase"] = "review"
     set_status(state, cid, PENDING, payload.get("summary", "implementation complete"))
     return "continue"
 
 
-def apply_review_result(repo: Path, state: dict, cid: str, payload: dict) -> str:
+def apply_review_result(repo: Path, cfg: dict, state: dict, cid: str, payload: dict) -> str:
     r = rec(state, cid)
     if payload.get("status") != "reviewed":
         set_status(
@@ -2172,6 +2263,7 @@ def apply_review_result(repo: Path, state: dict, cid: str, payload: dict) -> str
             f"review returned unexpected status={payload.get('status')}",
         )
         r["last_result"] = "review_invalid"
+        _try_notify(cfg, "change_failed", f"review returned unexpected status={payload.get('status')}", change_id=cid)
         return "stop"
     counts = normalize_finding_counts(payload)
     verdict = payload.get("verdict")
@@ -2205,11 +2297,13 @@ def apply_review_result(repo: Path, state: dict, cid: str, payload: dict) -> str
     if verdict not in {"pass", "fail"}:
         set_status(state, cid, FAILED, f"review returned unexpected verdict={verdict}")
         r["last_result"] = "review_invalid"
+        _try_notify(cfg, "change_failed", f"review returned unexpected verdict={verdict}", change_id=cid)
         return "stop"
     r["latest_fix_prompt"] = fix_prompt
     if r["round"] >= r["max_rounds"]:
         r["last_result"] = "max_rounds_reached"
         set_status(state, cid, FAILED, "review retry budget exhausted")
+        _try_notify(cfg, "change_failed", "review retry budget exhausted", change_id=cid)
         return "stop"
     r["last_result"] = "review_failed"
     r["round"] += 1
@@ -2245,6 +2339,7 @@ def apply_archive_result(repo: Path, cfg: dict, state: dict, cid: str, payload: 
             },
         )
         set_status(state, cid, FAILED, payload.get("reason", "archive blocked"))
+        _try_notify(cfg, "change_failed", payload.get("summary", "archive blocked"), change_id=cid)
         return "stop"
     if payload.get("status") != "archived":
         set_status(
@@ -2256,6 +2351,7 @@ def apply_archive_result(repo: Path, cfg: dict, state: dict, cid: str, payload: 
         archive["status"] = "failed"
         archive["reason"] = "invalid archive output"
         r["last_result"] = "archive_invalid"
+        _try_notify(cfg, "change_failed", f"archive returned unexpected status={payload.get('status')}", change_id=cid)
         return "stop"
     archive.update(
         {
@@ -2285,6 +2381,7 @@ def apply_archive_result(repo: Path, cfg: dict, state: dict, cid: str, payload: 
         archive["status"] = "failed"
         archive["reason"] = why
         set_status(state, cid, FAILED, f"archive unverified: {why}")
+        _try_notify(cfg, "change_failed", f"archive unverified: {why}", change_id=cid)
         return "stop"
     checks_ok, check_why = run_fast_checks(repo, cfg)
     if not checks_ok:
@@ -2292,6 +2389,7 @@ def apply_archive_result(repo: Path, cfg: dict, state: dict, cid: str, payload: 
         archive["reason"] = f"post-archive {check_why}"
         r["last_result"] = "post_archive_check_failed"
         set_status(state, cid, FAILED, f"post-archive {check_why}")
+        _try_notify(cfg, "change_failed", f"post-archive {check_why}", change_id=cid)
         return "stop"
     clean_ok, clean_why = verify_post_archive_clean(repo, cfg)
     if not clean_ok:
@@ -2299,9 +2397,11 @@ def apply_archive_result(repo: Path, cfg: dict, state: dict, cid: str, payload: 
         archive["reason"] = f"post-archive {clean_why}"
         r["last_result"] = "post_archive_dirty_tracked"
         set_status(state, cid, FAILED, f"post-archive {clean_why}")
+        _try_notify(cfg, "change_failed", f"post-archive {clean_why}", change_id=cid)
         return "stop"
     r["phase"] = "done"
     set_status(state, cid, DONE, "verified + checks passed")
+    _try_notify(cfg, "change_done", f"change {cid} completed", change_id=cid)
     return "done"
 
 
@@ -2407,6 +2507,7 @@ def run_direct_change(
             )
             rec(state, cid)["last_result"] = f"{stage}_spawn_error"
             set_status(state, cid, FAILED, f"could not spawn {stage}: {cfg[f'{stage}_invoke']}")
+            _try_notify(cfg, "change_failed", f"could not spawn {stage}", change_id=cid)
             persist_direct_state(repo, cfg, state, cid)
             return "spawn_error"
 
@@ -2414,6 +2515,7 @@ def run_direct_change(
             _write_telemetry("timeout", f"{stage} timed out")
             rec(state, cid)["last_result"] = f"{stage}_timeout"
             set_status(state, cid, FAILED, f"{stage} timed out")
+            _try_notify(cfg, "change_failed", f"{stage} timed out", change_id=cid)
             persist_direct_state(repo, cfg, state, cid)
             return "failed"
 
@@ -2425,6 +2527,7 @@ def run_direct_change(
                 rec(state, cid)["archive"]["status"] = "failed"
                 rec(state, cid)["archive"]["reason"] = parse_why
             set_status(state, cid, FAILED, f"{stage} output invalid: {parse_why}")
+            _try_notify(cfg, "change_failed", f"{stage} output invalid", change_id=cid)
             persist_direct_state(repo, cfg, state, cid)
             return "failed"
 
@@ -2433,7 +2536,7 @@ def run_direct_change(
         if stage == "implement":
             action = apply_implement_result(repo, cfg, state, cid, payload)
         elif stage == "review":
-            action = apply_review_result(repo, state, cid, payload)
+            action = apply_review_result(repo, cfg, state, cid, payload)
         else:
             action = apply_archive_result(repo, cfg, state, cid, payload)
         persist_direct_state(repo, cfg, state, cid)
@@ -4067,6 +4170,21 @@ def cmd_run(args: argparse.Namespace) -> int:
     save_state(repo, cfg["name"], state)
     sync_direct_worker_state(repo, cfg, state)
 
+    # --- emit one-time notifications for awaiting states ---
+    notified = state.setdefault("notified_events", {})
+    for cid in cfg["order"]:
+        if not cfg["changes"][cid]["enabled"]:
+            continue
+        status = classify(cfg, state, cid)
+        change_notified = notified.setdefault(cid, [])
+        if status == "awaiting_approval" and "awaiting_approval" not in change_notified:
+            _try_notify(cfg, "awaiting_approval", f"change {cid} awaiting approval", change_id=cid)
+            change_notified.append("awaiting_approval")
+        elif status == "awaiting_acceptance" and "awaiting_acceptance" not in change_notified:
+            _try_notify(cfg, "awaiting_acceptance", f"change {cid} awaiting acceptance", change_id=cid)
+            change_notified.append("awaiting_acceptance")
+    save_state(repo, cfg["name"], state)
+
     # Run preflight checks as warnings only — never change run outcome.
     run_preflight_warnings(repo, plan_src, cfg["adapter"])
 
@@ -4118,6 +4236,19 @@ def cmd_run(args: argparse.Namespace) -> int:
         if args.only:
             ready = [c for c in ready if c in args.only]
         if not ready:
+            # --- emit one-time notifications for any change newly awaiting input ---
+            for cid in cfg["order"]:
+                if not cfg["changes"][cid]["enabled"]:
+                    continue
+                status = classify(cfg, state, cid)
+                change_notified = notified.setdefault(cid, [])
+                if status == "awaiting_approval" and "awaiting_approval" not in change_notified:
+                    _try_notify(cfg, "awaiting_approval", f"change {cid} awaiting approval", change_id=cid)
+                    change_notified.append("awaiting_approval")
+                elif status == "awaiting_acceptance" and "awaiting_acceptance" not in change_notified:
+                    _try_notify(cfg, "awaiting_acceptance", f"change {cid} awaiting acceptance", change_id=cid)
+                    change_notified.append("awaiting_acceptance")
+            save_state(repo, cfg["name"], state)
             break
 
         cid = ready[0]
@@ -4191,6 +4322,10 @@ def cmd_run(args: argparse.Namespace) -> int:
                 if cfg["review_created"]:
                     log(f"  awaiting acceptance — review openspec/changes/{cid}/ "
                         f"then run: opsx-plan accept <plan> {cid}")
+                    change_notified = notified.setdefault(cid, [])
+                    if "awaiting_acceptance" not in change_notified:
+                        _try_notify(cfg, "awaiting_acceptance", f"change {cid} awaiting acceptance", change_id=cid)
+                        change_notified.append("awaiting_acceptance")
             else:
                 if outcome == "timeout":
                     why = f"create timed out; {why}"
@@ -4275,6 +4410,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             if cfg["changes"][cid]["enabled"]
         )
         if all_done:
+            plan_notified = notified.setdefault("_plan_", [])
+            if "plan_complete" not in plan_notified:
+                _try_notify(cfg, "plan_complete", f"plan {cfg['name']} complete")
+                plan_notified.append("plan_complete")
             ok, delivery_err = attempt_pr_delivery(repo, cfg, state, no_pr=no_pr)
             if not ok:
                 print(f"error: {delivery_err}", file=sys.stderr)
@@ -4283,6 +4422,15 @@ def cmd_run(args: argparse.Namespace) -> int:
                 save_state(repo, cfg["name"], state)
                 print()
                 return cmd_status_inner(cfg, state, header="run finished (PR delivery failed)")
+            gd_state = state.get("git_delivery", {})
+            if gd_state.get("delivery_status") == "pr_opened":
+                plan_notified = notified.setdefault("_plan_", [])
+                if "pull_request_opened" not in plan_notified:
+                    _try_notify(
+                        cfg, "pull_request_opened",
+                        f"pull request opened for plan {cfg['name']}: {gd_state.get('pull_request_url', '')}",
+                    )
+                    plan_notified.append("pull_request_opened")
             save_state(repo, cfg["name"], state)
 
     print()

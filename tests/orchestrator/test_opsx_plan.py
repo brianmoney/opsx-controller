@@ -11342,5 +11342,1031 @@ class PRDeliveryTests(unittest.TestCase):
         self.assertIsNone(state["pull_request_url"])
 
 
+class RunEventNotificationTests(unittest.TestCase):
+    """Tests for run-event notification emission points, payload shape, and
+    failure isolation (change add-run-event-notifications)."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        git(self.repo, "init")
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        git(self.repo, "add", "tracked.txt")
+        git(
+            self.repo,
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "user.name=Test User",
+            "commit",
+            "-m",
+            "init",
+        )
+        self.cid = "add-notify-test"
+        self.plan_name = "direct-plan"
+        self.cfg = {
+            "name": self.plan_name,
+            "adapter": "opencode",
+            "implement_invoke": "opencode run --agent opsx-implementer",
+            "review_invoke": "opencode run --agent opsx-reviewer",
+            "archive_invoke": "opencode run --agent opsx-archiver",
+            "invoke": 'opencode run "/opsx-drive {change}"',
+            "state_file": ".opencode/opsx-controller/{change}.json",
+            "timeout_minutes": 1,
+            "max_attempts": 2,
+            "max_rounds": 2,
+            "no_progress_limit": 2,
+            "fast_checks": [],
+            "check_timeout_minutes": 1,
+            "require_clean_tracked": False,
+            "review_created": False,
+            "notify_cmd": "/usr/bin/env echo",
+            "changes": {
+                self.cid: {
+                    "id": self.cid,
+                    "depends_on": [],
+                    "enabled": True,
+                    "pause_before": False,
+                    "timeout_minutes": 1,
+                    "max_attempts": 2,
+                    "create_invoke": "",
+                    "create_max_attempts": 1,
+                }
+            },
+            "order": [self.cid],
+            "created_check": "",
+            "plan_doc": "",
+            "create_timeout_minutes": 1,
+        }
+        self.state = {"plan": self.plan_name, "approvals": [], "notified_events": {}, "changes": {}}
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self._saved_invoke = self.opsx_plan.invoke_direct_stage
+        self._saved_checks = self.opsx_plan.run_fast_checks
+        self._notification_calls: list[tuple[str, str | None, str]] = []
+
+    def tearDown(self) -> None:
+        self.opsx_plan.invoke_direct_stage = self._saved_invoke
+        self.opsx_plan.run_fast_checks = self._saved_checks
+        self.tmp.cleanup()
+
+    def write_authored_change(self, cid: str) -> None:
+        cdir = self.repo / "openspec" / "changes" / cid
+        cdir.mkdir(parents=True)
+        (cdir / "proposal.md").write_text("## Why\n", encoding="utf-8")
+        (cdir / "tasks.md").write_text(
+            "## 1. Tasks\n\n- [ ] 1.1 Example task\n- [ ] 1.2 Example task\n",
+            encoding="utf-8",
+        )
+
+    def archive_change_in_repo(self, cid: str) -> tuple[str, str]:
+        src = self.repo / "openspec" / "changes" / cid
+        archive_rel = f"openspec/changes/archive/2026-07-02-{cid}"
+        dst = self.repo / archive_rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dst)
+        git(self.repo, "add", "-A", "openspec")
+        git(
+            self.repo,
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "user.name=Test User",
+            "commit",
+            "-m",
+            f"archive({cid}): archive completed OpenSpec change",
+        )
+        commit = (
+            subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=self.repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            .stdout.strip()
+        )
+        return archive_rel, commit
+
+    def _patch_notify(self) -> None:
+        """Patch _try_notify to capture calls while the real notify_cmd runs."""
+
+        def recording_notify(cfg, event_type, summary, change_id=None):
+            self._notification_calls.append((event_type, change_id, summary))
+
+        self.opsx_plan._try_notify = recording_notify
+
+    # ---- 4.1: emission point tests -------------------------------------------
+
+    def test_notify_emitted_on_change_done(self) -> None:
+        self._patch_notify()
+        self.cfg["notify_cmd"] = "/usr/bin/env echo"
+
+        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            if stage == "implement":
+                payload = {
+                    "status": "implemented",
+                    "change": cid,
+                    "round": 1,
+                    "progress_made": True,
+                    "completed_tasks": ["1.1"],
+                    "remaining_tasks": ["1.2"],
+                    "task_counts": {"complete": 1, "total": 2},
+                    "files_touched": [],
+                    "known_change_files": [],
+                    "summary": "implemented",
+                }
+            elif stage == "review":
+                payload = {
+                    "status": "reviewed",
+                    "change": cid,
+                    "round": 1,
+                    "verdict": "pass",
+                    "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                    "summary": "review passed",
+                    "fix_prompt": "",
+                    "next_phase": "archive",
+                }
+            else:
+                archive_path, commit = self.archive_change_in_repo(cid)
+                payload = {
+                    "status": "archived",
+                    "change": cid,
+                    "archive_path": archive_path,
+                    "spec_sync_status": "no-delta",
+                    "commit": commit,
+                    "summary": "archive succeeded",
+                }
+            log_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            return "exited", log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, self.opsx_plan.DONE)
+        done_events = [c for c in self._notification_calls if c[0] == "change_done"]
+        self.assertEqual(len(done_events), 1, f"expected 1 change_done, got {self._notification_calls}")
+        self.assertEqual(done_events[0][1], self.cid)
+
+    def test_notify_emitted_on_change_failed_implement_blocked(self) -> None:
+        self._patch_notify()
+
+        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "status": "blocked",
+                "change": cid,
+                "round": 1,
+                "reason": "cannot proceed without spec",
+                "summary": "implement blocked",
+            }
+            log_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            return "exited", log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, "stop")
+        failed_events = [c for c in self._notification_calls if c[0] == "change_failed"]
+        self.assertEqual(len(failed_events), 1, f"expected 1 change_failed, got {self._notification_calls}")
+        self.assertEqual(failed_events[0][1], self.cid)
+
+    def test_notify_emitted_on_change_failed_spawn_error(self) -> None:
+        self._patch_notify()
+
+        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            return "spawn_error", log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, "spawn_error")
+        failed_events = [c for c in self._notification_calls if c[0] == "change_failed"]
+        self.assertEqual(len(failed_events), 1)
+
+    def test_notify_emitted_on_change_failed_timeout(self) -> None:
+        self._patch_notify()
+
+        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            return "timeout", log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, "failed")
+        failed_events = [c for c in self._notification_calls if c[0] == "change_failed"]
+        self.assertEqual(len(failed_events), 1)
+
+    def test_notify_emitted_on_change_failed_parse_error(self) -> None:
+        self._patch_notify()
+
+        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text("not json at all\n", encoding="utf-8")
+            return "exited", log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, "failed")
+        failed_events = [c for c in self._notification_calls if c[0] == "change_failed"]
+        self.assertEqual(len(failed_events), 1)
+
+    def test_notify_emitted_on_review_max_rounds(self) -> None:
+        self._patch_notify()
+        self.cfg["max_rounds"] = 1
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = 1
+
+        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            if stage == "implement":
+                payload = {
+                    "status": "implemented",
+                    "change": cid,
+                    "round": 1,
+                    "progress_made": True,
+                    "completed_tasks": [],
+                    "remaining_tasks": ["1.1", "1.2"],
+                    "task_counts": {"complete": 0, "total": 2},
+                    "files_touched": [],
+                    "known_change_files": [],
+                    "summary": "implemented",
+                }
+            else:
+                payload = {
+                    "status": "reviewed",
+                    "change": cid,
+                    "round": 1,
+                    "verdict": "fail",
+                    "finding_counts": {"critical": 1, "warning": 0, "note": 0},
+                    "summary": "review failed",
+                    "fix_prompt": "Needs more work.",
+                    "next_phase": "implement",
+                }
+            log_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            return "exited", log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, "stop")
+        failed_events = [c for c in self._notification_calls if c[0] == "change_failed"]
+        self.assertEqual(len(failed_events), 1)
+        self.assertIn("retry budget", failed_events[0][2])
+
+    def test_notify_emitted_on_archive_verification_failure(self) -> None:
+        self._patch_notify()
+
+        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            if stage == "implement":
+                payload = {
+                    "status": "implemented",
+                    "change": cid,
+                    "round": 1,
+                    "progress_made": True,
+                    "completed_tasks": ["1.1"],
+                    "remaining_tasks": [],
+                    "task_counts": {"complete": 1, "total": 2},
+                    "files_touched": [],
+                    "known_change_files": [],
+                    "summary": "implemented",
+                }
+            elif stage == "review":
+                payload = {
+                    "status": "reviewed",
+                    "change": cid,
+                    "round": 1,
+                    "verdict": "pass",
+                    "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                    "summary": "review passed",
+                    "fix_prompt": "",
+                    "next_phase": "archive",
+                }
+            else:
+                # Archive claims success but no actual repo evidence
+                payload = {
+                    "status": "archived",
+                    "change": cid,
+                    "archive_path": f"openspec/changes/archive/2026-07-02-{cid}",
+                    "spec_sync_status": "no-delta",
+                    "commit": "deadbeef",
+                    "summary": "archive claimed success",
+                }
+            log_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            return "exited", log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, "stop")
+        failed_events = [c for c in self._notification_calls if c[0] == "change_failed"]
+        self.assertEqual(len(failed_events), 1)
+
+    # ---- 4.2: payload shape tests -------------------------------------------
+
+    def test_change_specific_payload_includes_change_id(self) -> None:
+        payload_json = self.opsx_plan._build_notification_payload(
+            event_type="change_done",
+            plan_name="test-plan",
+            summary="change completed",
+            change_id="my-change",
+        )
+        payload = json.loads(payload_json)
+        self.assertEqual(payload["event_type"], "change_done")
+        self.assertEqual(payload["plan_name"], "test-plan")
+        self.assertIn("timestamp", payload)
+        self.assertEqual(payload["summary"], "change completed")
+        self.assertEqual(payload["change_id"], "my-change")
+
+    def test_plan_wide_payload_omits_change_id(self) -> None:
+        payload_json = self.opsx_plan._build_notification_payload(
+            event_type="plan_complete",
+            plan_name="test-plan",
+            summary="plan finished",
+        )
+        payload = json.loads(payload_json)
+        self.assertEqual(payload["event_type"], "plan_complete")
+        self.assertEqual(payload["plan_name"], "test-plan")
+        self.assertIn("timestamp", payload)
+        self.assertEqual(payload["summary"], "plan finished")
+        self.assertNotIn("change_id", payload)
+
+    def test_plan_wide_payload_with_none_change_id_omits_it(self) -> None:
+        payload_json = self.opsx_plan._build_notification_payload(
+            event_type="plan_complete",
+            plan_name="test-plan",
+            summary="plan finished",
+            change_id=None,
+        )
+        payload = json.loads(payload_json)
+        self.assertNotIn("change_id", payload)
+
+    # ---- 4.3: failure isolation tests ----------------------------------------
+
+    def test_notify_failure_does_not_change_run_outcome(self) -> None:
+        self.cfg["notify_cmd"] = "/nonexistent/command/that/will/fail"
+
+        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            if stage == "implement":
+                payload = {
+                    "status": "implemented",
+                    "change": cid,
+                    "round": 1,
+                    "progress_made": True,
+                    "completed_tasks": ["1.1"],
+                    "remaining_tasks": ["1.2"],
+                    "task_counts": {"complete": 1, "total": 2},
+                    "files_touched": [],
+                    "known_change_files": [],
+                    "summary": "implemented",
+                }
+            elif stage == "review":
+                payload = {
+                    "status": "reviewed",
+                    "change": cid,
+                    "round": 1,
+                    "verdict": "pass",
+                    "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                    "summary": "review passed",
+                    "fix_prompt": "",
+                    "next_phase": "archive",
+                }
+            else:
+                archive_path, commit = self.archive_change_in_repo(cid)
+                payload = {
+                    "status": "archived",
+                    "change": cid,
+                    "archive_path": archive_path,
+                    "spec_sync_status": "no-delta",
+                    "commit": commit,
+                    "summary": "archive succeeded",
+                }
+            log_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            return "exited", log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+
+        # Should still complete successfully despite notification hook failure
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, self.opsx_plan.DONE)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        self.assertEqual(record["status"], self.opsx_plan.DONE)
+
+    def test_notify_cmd_not_set_preserves_behavior(self) -> None:
+        self.cfg["notify_cmd"] = ""
+
+        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            if stage == "implement":
+                payload = {
+                    "status": "implemented",
+                    "change": cid,
+                    "round": 1,
+                    "progress_made": True,
+                    "completed_tasks": ["1.1"],
+                    "remaining_tasks": ["1.2"],
+                    "task_counts": {"complete": 1, "total": 2},
+                    "files_touched": [],
+                    "known_change_files": [],
+                    "summary": "implemented",
+                }
+            elif stage == "review":
+                payload = {
+                    "status": "reviewed",
+                    "change": cid,
+                    "round": 1,
+                    "verdict": "pass",
+                    "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                    "summary": "review passed",
+                    "fix_prompt": "",
+                    "next_phase": "archive",
+                }
+            else:
+                archive_path, commit = self.archive_change_in_repo(cid)
+                payload = {
+                    "status": "archived",
+                    "change": cid,
+                    "archive_path": archive_path,
+                    "spec_sync_status": "no-delta",
+                    "commit": commit,
+                    "summary": "archive succeeded",
+                }
+            log_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            return "exited", log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, self.opsx_plan.DONE)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        self.assertEqual(record["status"], self.opsx_plan.DONE)
+
+    def test_build_notification_payload_has_required_fields(self) -> None:
+        payload_json = self.opsx_plan._build_notification_payload(
+            event_type="awaiting_approval",
+            plan_name="my-plan",
+            summary="awaiting approval for change",
+            change_id="ch-1",
+        )
+        payload = json.loads(payload_json)
+        required = {"event_type", "plan_name", "timestamp", "summary"}
+        self.assertTrue(required.issubset(set(payload.keys())),
+                        f"missing required fields: {required - set(payload.keys())}")
+        self.assertEqual(payload["change_id"], "ch-1")
+
+    def test_build_notification_payload_valid_json(self) -> None:
+        payload_json = self.opsx_plan._build_notification_payload(
+            event_type="change_failed",
+            plan_name="plan-with-unicode-\u2603",
+            summary="failed with special chars: \n\t\"",
+            change_id="ch-fail",
+        )
+        # Must parse without error (ensure_ascii=False keeps unicode)
+        payload = json.loads(payload_json)
+        self.assertEqual(payload["plan_name"], "plan-with-unicode-\u2603")
+
+    # ---- 4.4: awaiting_acceptance + plan_complete / pull_request_opened coverage ----
+
+    def test_awaiting_acceptance_notification_emitted(self) -> None:
+        """Verify that awaiting_acceptance notification is emitted via cmd_run
+        when a created change has not yet been accepted."""
+        self.cid = "accept-change"
+        self.write_authored_change(self.cid)
+        self.plan_name = "accept-plan"
+
+        plan_rel = self._write_plan_toml(
+            self.plan_name,
+            extra_plan='notify_cmd = "/usr/bin/env echo"\nreview_created = true',
+            changes=[{"id": self.cid}],
+        )
+
+        # Pre-populate state: change created by orchestrator but not accepted
+        state_path = self.opsx_plan.state_path(self.repo, self.plan_name)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        initial_state = {
+            "plan": self.plan_name,
+            "approvals": [],
+            "notified_events": {},
+            "changes": {
+                self.cid: {
+                    "status": self.opsx_plan.PENDING,
+                    "phase": "implement",
+                    "round": 1,
+                    "max_rounds": 2,
+                    "no_progress_streak": 0,
+                    "latest_fix_prompt": "",
+                    "last_result": "",
+                    "task_counts": {"complete": 0, "total": 2},
+                    "tracked_change_files": [],
+                    "context_cache": self.opsx_plan.default_context_cache(),
+                    "last_review": self.opsx_plan.default_last_review(),
+                    "archive": self.opsx_plan.default_archive_state(),
+                    "history": [],
+                    "telemetry": {"latest_telemetry": ""},
+                    "change": self.cid,
+                    "attempts": 0,
+                    "reason": "",
+                    "updated_at": "",
+                    "create_attempts": 0,
+                    "created_by_orchestrator": True,
+                    "accepted": False,
+                    "last_stage": self.opsx_plan.default_last_stage(),
+                    "last_log": "",
+                }
+            },
+        }
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(initial_state, f)
+
+        calls: list[tuple[str, str | None, str]] = []
+
+        def capture_notify(cfg, event_type, summary, change_id=None):
+            calls.append((event_type, change_id, summary))
+
+        with mock.patch.object(self.opsx_plan, "_try_notify", side_effect=capture_notify):
+            args = argparse.Namespace(
+                repo=str(self.repo), plan=str(plan_rel),
+                dry_run=False, max_changes=None, budget_minutes=None,
+                budget_usd=None, create_only=False, only=None,
+                no_branch=False, no_pr=False,
+            )
+            rc = self.opsx_plan.cmd_run(args)
+
+        # Verify notification was emitted
+        accepting = [c for c in calls if c[0] == "awaiting_acceptance"]
+        self.assertEqual(len(accepting), 1, f"expected 1 awaiting_acceptance, got {calls}")
+        self.assertEqual(accepting[0][1], self.cid)
+
+        # Verify state persisted with notified_events
+        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        ne = state.get("notified_events", {})
+        self.assertIn(self.cid, ne, f"notified_events missing {self.cid}: {ne}")
+        self.assertIn("awaiting_acceptance", ne[self.cid])
+
+    def test_plan_complete_emitted_when_all_done(self) -> None:
+        """Verify plan_complete notification is emitted when all changes reach
+        done with valid archive evidence so cmd_run reaches the plan-wide branch."""
+        self.cid = "pc-change"
+        self.write_authored_change(self.cid)
+        self.plan_name = "pc-emit-plan"
+
+        # Archive the change for real repo evidence
+        archive_path, commit = self.archive_change_in_repo(self.cid)
+
+        plan_rel = self._write_plan_toml(
+            self.plan_name,
+            extra_plan='notify_cmd = "/usr/bin/env echo"',
+            changes=[{"id": self.cid}],
+        )
+
+        # Pre-populate state: change is done with valid archive evidence
+        state_path = self.opsx_plan.state_path(self.repo, self.plan_name)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        initial_state = {
+            "plan": self.plan_name,
+            "approvals": [],
+            "notified_events": {},
+            "changes": {
+                self.cid: {
+                    "status": self.opsx_plan.DONE,
+                    "phase": "done",
+                    "round": 1,
+                    "max_rounds": 2,
+                    "no_progress_streak": 0,
+                    "latest_fix_prompt": "",
+                    "last_result": "archive_passed",
+                    "task_counts": {"complete": 2, "total": 2},
+                    "tracked_change_files": [],
+                    "context_cache": self.opsx_plan.default_context_cache(),
+                    "last_review": self.opsx_plan.default_last_review(),
+                    "archive": {
+                        "status": "passed",
+                        "path": archive_path,
+                        "commit": commit,
+                        "reason": "",
+                        "spec_sync_status": "no-delta",
+                        "triage": self.opsx_plan.default_archive_state()["triage"],
+                    },
+                    "history": [],
+                    "telemetry": {"latest_telemetry": ""},
+                    "change": self.cid,
+                    "attempts": 1,
+                    "reason": "",
+                    "updated_at": "",
+                    "create_attempts": 0,
+                    "created_by_orchestrator": False,
+                    "accepted": False,
+                    "last_stage": self.opsx_plan.default_last_stage(),
+                    "last_log": "",
+                }
+            },
+        }
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(initial_state, f)
+
+        calls: list[tuple[str, str | None, str]] = []
+
+        def capture_notify(cfg, event_type, summary, change_id=None):
+            calls.append((event_type, change_id, summary))
+
+        with mock.patch.object(self.opsx_plan, "_try_notify", side_effect=capture_notify):
+            args = argparse.Namespace(
+                repo=str(self.repo), plan=str(plan_rel),
+                dry_run=False, max_changes=None, budget_minutes=None,
+                budget_usd=None, create_only=False, only=None,
+                no_branch=False, no_pr=False,
+            )
+            rc = self.opsx_plan.cmd_run(args)
+
+        # plan_complete must have been emitted
+        plan_events = [c for c in calls if c[0] == "plan_complete"]
+        self.assertEqual(len(plan_events), 1,
+                         f"expected 1 plan_complete, got {calls}")
+
+        # Verify state persisted with notified_events._plan_
+        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        ne = state.get("notified_events", {})
+        self.assertIn("_plan_", ne, f"notified_events missing _plan_: {ne}")
+        self.assertIn("plan_complete", ne["_plan_"])
+
+    def test_pull_request_opened_emitted(self) -> None:
+        """Verify pull_request_opened notification is emitted when PR delivery
+        records pr_opened status. Uses a mock for attempt_pr_delivery to avoid
+        real GitHub CLI / git remote dependencies."""
+        self.cid = "pr-emit-change"
+        self.write_authored_change(self.cid)
+        self.plan_name = "pr-emit-plan"
+
+        # Archive the change for real repo evidence
+        archive_path, commit = self.archive_change_in_repo(self.cid)
+
+        plan_rel = self._write_plan_toml(
+            self.plan_name,
+            extra_plan='notify_cmd = "/usr/bin/env echo"',
+            changes=[{"id": self.cid}],
+        )
+
+        # Pre-populate state: change is done with valid archive evidence
+        state_path = self.opsx_plan.state_path(self.repo, self.plan_name)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        initial_state = {
+            "plan": self.plan_name,
+            "approvals": [],
+            "notified_events": {},
+            "changes": {
+                self.cid: {
+                    "status": self.opsx_plan.DONE,
+                    "phase": "done",
+                    "round": 1,
+                    "max_rounds": 2,
+                    "no_progress_streak": 0,
+                    "latest_fix_prompt": "",
+                    "last_result": "archive_passed",
+                    "task_counts": {"complete": 2, "total": 2},
+                    "tracked_change_files": [],
+                    "context_cache": self.opsx_plan.default_context_cache(),
+                    "last_review": self.opsx_plan.default_last_review(),
+                    "archive": {
+                        "status": "passed",
+                        "path": archive_path,
+                        "commit": commit,
+                        "reason": "",
+                        "spec_sync_status": "no-delta",
+                        "triage": self.opsx_plan.default_archive_state()["triage"],
+                    },
+                    "history": [],
+                    "telemetry": {"latest_telemetry": ""},
+                    "change": self.cid,
+                    "attempts": 1,
+                    "reason": "",
+                    "updated_at": "",
+                    "create_attempts": 0,
+                    "created_by_orchestrator": False,
+                    "accepted": False,
+                    "last_stage": self.opsx_plan.default_last_stage(),
+                    "last_log": "",
+                }
+            },
+        }
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(initial_state, f)
+
+        calls: list[tuple[str, str | None, str]] = []
+
+        def capture_notify(cfg, event_type, summary, change_id=None):
+            calls.append((event_type, change_id, summary))
+
+        # Mock attempt_pr_delivery to simulate successful PR delivery
+        pr_url = "https://github.com/example/pr/99"
+
+        def fake_attempt_pr_delivery(repo, cfg, state, no_pr=False):
+            gd = state.setdefault("git_delivery", {
+                "base_ref": None,
+                "branch_name": None,
+                "delivery_status": "disabled",
+                "pull_request_url": None,
+                "remote_name": None,
+            })
+            gd["delivery_status"] = "pr_opened"
+            gd["pull_request_url"] = pr_url
+            return True, None
+
+        with mock.patch.object(self.opsx_plan, "_try_notify", side_effect=capture_notify), \
+             mock.patch.object(self.opsx_plan, "attempt_pr_delivery", side_effect=fake_attempt_pr_delivery):
+            args = argparse.Namespace(
+                repo=str(self.repo), plan=str(plan_rel),
+                dry_run=False, max_changes=None, budget_minutes=None,
+                budget_usd=None, create_only=False, only=None,
+                no_branch=False, no_pr=False,
+            )
+            rc = self.opsx_plan.cmd_run(args)
+
+        # pull_request_opened must have been emitted
+        pr_events = [c for c in calls if c[0] == "pull_request_opened"]
+        self.assertEqual(len(pr_events), 1,
+                         f"expected 1 pull_request_opened, got {calls}")
+        self.assertIn(pr_url, pr_events[0][2])
+
+        # Verify state persisted with notified_events._plan_
+        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        ne = state.get("notified_events", {})
+        self.assertIn("_plan_", ne, f"notified_events missing _plan_: {ne}")
+        self.assertIn("pull_request_opened", ne["_plan_"])
+
+    # ---- 4.5: idempotency / notified_events persistence ----------------------
+
+    def _write_plan_toml(self, plan_name: str, extra_plan: str = "",
+                         changes: list[dict] | None = None) -> Path:
+        """Write a minimal plan TOML and return its repo-relative path."""
+        if changes is None:
+            changes = []
+        lines = [
+            '[plan]',
+            f'name = "{plan_name}"',
+            'adapter = "opencode"',
+            'require_clean_tracked = false',
+        ]
+        if extra_plan:
+            lines.append(extra_plan)
+        lines.append("")
+        for i, c in enumerate(changes):
+            lines.append("[[changes]]")
+            for key, val in c.items():
+                if isinstance(val, bool):
+                    lines.append(f'{key} = {"true" if val else "false"}')
+                elif isinstance(val, list):
+                    lines.append(f'{key} = {json.dumps(val)}')
+                else:
+                    lines.append(f'{key} = "{val}"')
+            if i < len(changes) - 1:
+                lines.append("")
+        toml = "\n".join(lines) + "\n"
+
+        plan_rel = f"test-notify-{plan_name}.toml"
+        plan_path = self.repo / plan_rel
+        plan_path.write_text(toml, encoding="utf-8")
+        return Path(plan_rel)
+
+    def test_awaiting_approval_notification_persisted_in_state(self) -> None:
+        """Verifies that notified_events are persisted when no-ready path emits
+        an awaiting notification."""
+        self.cid = "awaiting-change"
+        self.write_authored_change(self.cid)
+        self.plan_name = "awaiting-plan"
+
+        plan_rel = self._write_plan_toml(
+            self.plan_name,
+            changes=[{"id": self.cid, "pause_before": True}],
+        )
+
+        calls: list[tuple[str, str | None, str]] = []
+
+        def capture_notify(cfg, event_type, summary, change_id=None):
+            calls.append((event_type, change_id, summary))
+
+        def fake_run_direct(repo, cfg, state, cid, budget_deadline=None, budget_usd=0.0):
+            return self.opsx_plan.DONE
+
+        with mock.patch.object(self.opsx_plan, "_try_notify", side_effect=capture_notify), \
+             mock.patch.object(self.opsx_plan, "run_direct_change", side_effect=fake_run_direct):
+            args = argparse.Namespace(
+                repo=str(self.repo), plan=str(plan_rel),
+                dry_run=False, max_changes=None, budget_minutes=None,
+                budget_usd=None, create_only=False, only=None,
+                no_branch=False, no_pr=False,
+            )
+            rc = self.opsx_plan.cmd_run(args)
+
+        # Verify notification was emitted
+        awaiting = [c for c in calls if c[0] == "awaiting_approval"]
+        self.assertEqual(len(awaiting), 1, f"expected 1 awaiting_approval, got {calls}")
+        self.assertEqual(awaiting[0][1], self.cid)
+
+        # Verify state persisted with notified_events
+        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        ne = state.get("notified_events", {})
+        self.assertIn(self.cid, ne, f"notified_events missing {self.cid}: {ne}")
+        self.assertIn("awaiting_approval", ne[self.cid])
+
+    def test_plan_complete_not_reemitted_on_rerun(self) -> None:
+        """Verifies that plan_complete notification is not re-emitted when it
+        already exists in notified_events."""
+        self.cid = "done-change"
+        self.write_authored_change(self.cid)
+        self.plan_name = "completed-plan"
+
+        # Archive the change so reconcile keeps it done via real repository evidence
+        archive_path, commit = self.archive_change_in_repo(self.cid)
+
+        plan_rel = self._write_plan_toml(
+            self.plan_name,
+            changes=[{"id": self.cid}],
+        )
+
+        # Pre-populate state: change is done, plan_complete already notified
+        state_path = self.opsx_plan.state_path(self.repo, self.plan_name)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        initial_state = {
+            "plan": self.plan_name,
+            "approvals": [],
+            "notified_events": {
+                self.cid: [],
+                "_plan_": ["plan_complete"],
+            },
+            "changes": {
+                self.cid: {
+                    "status": self.opsx_plan.DONE,
+                    "phase": "done",
+                    "round": 1,
+                    "max_rounds": 2,
+                    "no_progress_streak": 0,
+                    "latest_fix_prompt": "",
+                    "last_result": "archive_passed",
+                    "task_counts": {"complete": 2, "total": 2},
+                    "tracked_change_files": [],
+                    "context_cache": self.opsx_plan.default_context_cache(),
+                    "last_review": self.opsx_plan.default_last_review(),
+                    "archive": {
+                        "status": "passed",
+                        "path": archive_path,
+                        "commit": commit,
+                        "reason": "",
+                        "spec_sync_status": "no-delta",
+                        "triage": self.opsx_plan.default_archive_state()["triage"],
+                    },
+                    "history": [],
+                    "telemetry": {"latest_telemetry": ""},
+                    "change": self.cid,
+                    "attempts": 1,
+                    "reason": "",
+                    "updated_at": "",
+                    "create_attempts": 0,
+                    "created_by_orchestrator": False,
+                    "accepted": False,
+                    "last_stage": self.opsx_plan.default_last_stage(),
+                    "last_log": "",
+                }
+            },
+        }
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(initial_state, f)
+
+        calls: list[tuple[str, str | None, str]] = []
+
+        def capture_notify(cfg, event_type, summary, change_id=None):
+            calls.append((event_type, change_id, summary))
+
+        with mock.patch.object(self.opsx_plan, "_try_notify", side_effect=capture_notify):
+            args = argparse.Namespace(
+                repo=str(self.repo), plan=str(plan_rel),
+                dry_run=False, max_changes=None, budget_minutes=None,
+                budget_usd=None, create_only=False, only=None,
+                no_branch=False, no_pr=False,
+            )
+            rc = self.opsx_plan.cmd_run(args)
+
+        # plan_complete must NOT be re-emitted
+        plan_events = [c for c in calls if c[0] == "plan_complete"]
+        self.assertEqual(len(plan_events), 0,
+                         f"plan_complete was re-emitted on rerun: {calls}")
+
+    def test_pull_request_opened_not_reemitted_on_rerun(self) -> None:
+        """Verifies that pull_request_opened notification is not re-emitted when
+        it already exists in notified_events."""
+        self.cid = "pr-change"
+        self.write_authored_change(self.cid)
+        self.plan_name = "pr-plan"
+
+        # Archive the change so reconcile keeps it done via real repository evidence
+        archive_path, commit = self.archive_change_in_repo(self.cid)
+
+        plan_rel = self._write_plan_toml(
+            self.plan_name,
+            extra_plan='[plan.git_delivery]\nenabled = false\ncreate_pull_request = false',
+            changes=[{"id": self.cid}],
+        )
+
+        # Pre-populate state: change is done, PR already notified
+        state_path = self.opsx_plan.state_path(self.repo, self.plan_name)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        initial_state = {
+            "plan": self.plan_name,
+            "approvals": [],
+            "notified_events": {
+                self.cid: [],
+                "_plan_": ["plan_complete", "pull_request_opened"],
+            },
+            "git_delivery": {
+                "base_ref": "main",
+                "branch_name": "opsx/pr-plan",
+                "delivery_status": "pr_opened",
+                "pull_request_url": "https://github.com/example/pr/42",
+                "remote_name": "origin",
+            },
+            "changes": {
+                self.cid: {
+                    "status": self.opsx_plan.DONE,
+                    "phase": "done",
+                    "round": 1,
+                    "max_rounds": 2,
+                    "no_progress_streak": 0,
+                    "latest_fix_prompt": "",
+                    "last_result": "archive_passed",
+                    "task_counts": {"complete": 2, "total": 2},
+                    "tracked_change_files": [],
+                    "context_cache": self.opsx_plan.default_context_cache(),
+                    "last_review": self.opsx_plan.default_last_review(),
+                    "archive": {
+                        "status": "passed",
+                        "path": archive_path,
+                        "commit": commit,
+                        "reason": "",
+                        "spec_sync_status": "no-delta",
+                        "triage": self.opsx_plan.default_archive_state()["triage"],
+                    },
+                    "history": [],
+                    "telemetry": {"latest_telemetry": ""},
+                    "change": self.cid,
+                    "attempts": 1,
+                    "reason": "",
+                    "updated_at": "",
+                    "create_attempts": 0,
+                    "created_by_orchestrator": False,
+                    "accepted": False,
+                    "last_stage": self.opsx_plan.default_last_stage(),
+                    "last_log": "",
+                }
+            },
+        }
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(initial_state, f)
+
+        calls: list[tuple[str, str | None, str]] = []
+
+        def capture_notify(cfg, event_type, summary, change_id=None):
+            calls.append((event_type, change_id, summary))
+
+        with mock.patch.object(self.opsx_plan, "_try_notify", side_effect=capture_notify):
+            args = argparse.Namespace(
+                repo=str(self.repo), plan=str(plan_rel),
+                dry_run=False, max_changes=None, budget_minutes=None,
+                budget_usd=None, create_only=False, only=None,
+                no_branch=False, no_pr=False,
+            )
+            rc = self.opsx_plan.cmd_run(args)
+
+        # pull_request_opened must NOT be re-emitted
+        pr_events = [c for c in calls if c[0] == "pull_request_opened"]
+        self.assertEqual(len(pr_events), 0,
+                         f"pull_request_opened was re-emitted on rerun: {calls}")
+
+
 if __name__ == "__main__":
     unittest.main()
