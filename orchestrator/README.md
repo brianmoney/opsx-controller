@@ -145,7 +145,8 @@ From the host project root:
 ```bash
 # 0. generate plan.toml from your phased plan doc, then REVIEW the DAG
 opsx-plan compile docs/phased-implementation-plan.md -o plan.toml
-# Compile auto-activates the output plan.
+# Compile auto-activates the output plan when inside the repository.
+# Plans outside the repository receive a warning and are not activated.
 
 # preview order, gates, and current status without running anything
 opsx-plan run --dry-run

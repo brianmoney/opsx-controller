@@ -37,9 +37,10 @@ opsx-plan report plan.toml
 # 7. When complete: review the delivery branch and PR (if configured)
 ```
 
-The `opsx-plan` command (and `opsx-run`) must be invoked from the host project
-root. The orchestrator places all operational state under `.opsx-plan/`. Add
-this directory to the host project's `.gitignore`.
+The `opsx-plan` command (and `opsx-run`) default to the current working
+directory as the host project root. Use `--repo <path>` to point at a different
+repository; all state is placed under `<repo>/.opsx-plan/`. Add `.opsx-plan/`
+to the host project's `.gitignore`.
 
 ---
 
@@ -54,11 +55,12 @@ You do not need to repeat the plan path on every command.
 |---|---|---|
 | 1 (highest) | Explicit CLI argument | `opsx-plan run plan.toml` |
 | 2 | `OPSX_PLAN` environment variable | `export OPSX_PLAN=plan.toml` |
-| 3 | Active-plan pointer file | Set by `opsx-plan use` or auto-set after `compile`/`run` with an explicit path |
+| 3 | Active-plan pointer file | Set by `opsx-plan use` or auto-set after `compile`/`run` with an explicit in-repository path |
 
-When a plan path is provided explicitly (as a CLI argument), the command also
-auto-sets the active-plan pointer so later commands resolve the same plan
-without repeating the path.
+When a plan path is provided explicitly (as a CLI argument) and the plan
+resides inside the repository, the command also auto-sets the active-plan
+pointer so later commands resolve the same plan without repeating the path.
+Plans outside the repository cannot be auto-activated.
 
 ### Commands for plan activation
 
@@ -118,11 +120,14 @@ opsx-plan doctor
 ### Doctor failure behavior
 
 A doctor check failure prints a cross-mark (✗) with a remediation hint. The
-`doctor` command returns the count of failures as its exit code. Doctor
-**never** blocks a `run` — the same checks run as warnings before each `run`
-(visible as ⚠ lines) without changing the run outcome. A failure is a strong
-signal to fix the issue before continuing, but the orchestrator does not refuse
-to run.
+`doctor` command exits with status 1 on any failed check (0 if all pass).
+The `doctor` command itself does not gate `run` — it is a diagnostic that
+reports findings without blocking anything. The same checks re-run as warnings
+before each `run` (visible as ⚠ lines) without changing the run outcome.
+However, `opsx-plan run` has its **own independent fail-closed guards** (e.g.,
+`require_clean_tracked`, PR delivery preflight) that will refuse to dispatch
+stages regardless of doctor results. Fix doctor failures before an unattended
+run; treat them as actionable, not informational.
 
 ---
 
@@ -209,7 +214,9 @@ opsx-plan compile docs/my-plan.md -o plan.toml --force
 - The generated TOML is validated locally: it must parse as valid TOML, pass
   `load_plan()` (unique ids, known deps, no cycles), and is written through a
   temporary file with atomic replacement.
-- On success, auto-activates the output plan so subsequent commands resolve it.
+- On success, auto-activates the output plan when the output path is inside the
+  repository; plans compiled to a location outside the repository are not
+  auto-activated (a warning is printed instead).
 
 ### Compile inputs
 
@@ -255,8 +262,10 @@ opsx-plan run --create-only
   Untracked leftovers are allowed.
 - **Reconciliation on startup**: The orchestrator reconciles recorded state
   against the repository. A stale `running` status from a killed run is
-  recovered to `pending`; changes archived outside plan control are marked
-  done; inconsistencies are surfaced.
+  recovered to `pending`. For non-OpenCode adapters, changes archived outside
+  plan control may be verified and marked done. For direct OpenCode, when
+  repository archive evidence exists but the plan state lacks matching archive
+  worker evidence, the change is marked as failed (fail-closed).
 
 ### `--only` flag
 
@@ -380,8 +389,9 @@ opsx-plan status plan.toml # inspect a specific plan
 ```
 
 Status reconciles state against the repository and prints each change's
-computed status with phase ordering. Blocked, awaiting-approval, and
-awaiting-acceptance changes print guidance for the next operator command.
+computed status with phase ordering. Awaiting-approval, awaiting-acceptance,
+and failed changes print guidance for the next operator command (approve,
+accept, or reset respectively).
 
 Output example:
 
@@ -498,15 +508,12 @@ For plan-wide events (e.g. `plan_complete`), `change_id` is omitted.
 
 | Event | Scope | Trigger |
 |---|---|---|
-| `create_started` | change | Before create stage starts |
 | `awaiting_approval` | change | A `pause_before` change becomes ready for approval |
 | `awaiting_acceptance` | change | An orchestrator-created change waits for operator review |
-| `change_started` | change | Before implement stage starts |
 | `change_done` | change | After verified archive + fast checks pass |
 | `change_failed` | change | Any failure reason (blocked, timeout, max rounds, etc.) |
 | `plan_complete` | plan | All enabled changes are done |
 | `pull_request_opened` | plan | PR delivery succeeded (includes PR URL) |
-| `plan_abandoned` | plan | Plan aborted early (e.g. budget exhausted or spawn error) |
 
 ### Notification failure isolation
 
@@ -675,7 +682,7 @@ opsx-plan compile docs/my-hardening-plan.md -o plan.toml
 #   Review the DAG with: opsx-plan status plan.toml
 ```
 
-The compile auto-activates the output plan.
+The compile auto-activates the output plan (when inside the repository).
 
 ### 2. Inspect the DAG
 
@@ -864,7 +871,8 @@ Reconcile state against the repository and print per-change status.
 ```
 opsx-plan doctor [plan.toml]
 ```
-Run preflight checks without dispatching stages. Returns count of failures.
+Run preflight checks without dispatching stages. Exits with status 1 on any
+failed check, 0 if all pass.
 
 ### `opsx-plan approve`
 
