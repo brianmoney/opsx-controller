@@ -65,6 +65,19 @@ ADAPTER_DEFAULTS = {
     },
 }
 
+ADAPTER_CLIENTS = {
+    "opencode": "opencode",
+    "claude-code": "claude",
+    "codex-cli": "codex",
+}
+
+_REQUIRED_MODEL_ENV_VARS = [
+    "OPSX_CONTROLLER_MODEL",
+    "OPSX_IMPLEMENTER_MODEL",
+    "OPSX_REVIEWER_MODEL",
+    "OPSX_ARCHIVER_MODEL",
+]
+
 DONE = "done"
 PENDING = "pending"
 RUNNING = "running"
@@ -2639,6 +2652,174 @@ def verify_post_archive_clean(repo: Path, cfg: dict) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
+# Doctor / preflight checks
+# ---------------------------------------------------------------------------
+
+
+def _check_stale_install(repo: Path) -> tuple[bool, str, str]:
+    """Check that installed ~/.local/bin/opsx-plan matches repo copy by content hash."""
+    import hashlib
+
+    label = "Installed orchestrator matches repo copy"
+    installed = Path.home() / ".local" / "bin" / "opsx-plan"
+    repo_copy = repo / "orchestrator" / "opsx-plan.py"
+
+    if not installed.is_file():
+        return (False, label, "Installed opsx-plan not found at ~/.local/bin/opsx-plan; run the installer")
+    if not repo_copy.is_file():
+        return (True, label, "")
+
+    try:
+        if hashlib.sha256(repo_copy.read_bytes()).digest() != hashlib.sha256(installed.read_bytes()).digest():
+            return (False, label, "Installed copy is stale; rerun the installer")
+    except OSError:
+        return (True, label, "")
+
+    return (True, label, "")
+
+
+def _check_required_env_vars() -> tuple[bool, str, str]:
+    """Check that required OPSX_*_MODEL environment variables are set."""
+    label = "Required OPSX_*_MODEL environment variables"
+    missing = [v for v in _REQUIRED_MODEL_ENV_VARS if not os.environ.get(v, "").strip()]
+    if missing:
+        return (False, label, f"Missing: {', '.join(missing)}")
+    return (True, label, "")
+
+
+def _check_openspec_on_path() -> tuple[bool, str, str]:
+    """Check that openspec is on PATH."""
+    label = "openspec on PATH"
+    if shutil.which("openspec"):
+        return (True, label, "")
+    return (False, label, "Install openspec (e.g. npm install -g @openspec/cli)")
+
+
+def _check_adapter_client_on_path(adapter: str) -> tuple[bool, str, str]:
+    """Check that the configured adapter client executable is on PATH."""
+    client = ADAPTER_CLIENTS.get(adapter, adapter)
+    label = f"{client} on PATH"
+    if shutil.which(client):
+        return (True, label, "")
+    return (False, label, f"Install {client} or add it to PATH")
+
+
+def _check_tracked_bytecode(repo: Path) -> tuple[bool, str, str]:
+    """Check that no tracked __pycache__ dirs or .pyc files exist."""
+    label = "No tracked __pycache__ or .pyc files"
+    res = git(repo, "ls-files", "--", ":(glob)**/__pycache__/**", ":(glob)**/*.pyc")
+    if res.returncode != 0:
+        return (True, label, "")
+    lines = [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
+    if not lines:
+        return (True, label, "")
+    sample = ", ".join(lines[:3])
+    if len(lines) > 3:
+        sample += f"... and {len(lines) - 3} more"
+    return (False, label, f"Tracked bytecode found: {sample}. Remove from version control and add to .gitignore")
+
+
+def _check_tracked_tree_clean(repo: Path) -> tuple[bool, str, str]:
+    """Check that the tracked tree has no uncommitted modifications."""
+    label = "Tracked tree is clean"
+    if tracked_tree_clean(repo):
+        return (True, label, "")
+    return (False, label, "Tracked files have uncommitted modifications; commit or stash before running unattended work")
+
+
+def _check_plan_loads(repo: Path, plan_src: str | None) -> tuple[bool, str, str]:
+    """Validate that the resolved plan loads successfully."""
+    label = "Plan loads successfully"
+    if plan_src is None:
+        return (True, label, "")
+    try:
+        load_plan(_resolve_plan_path(repo, plan_src))
+        return (True, label, "")
+    except PlanError as exc:
+        return (False, label, f"Plan load failed: {exc}")
+    except Exception as exc:
+        return (False, label, f"Plan load error: {exc}")
+
+
+def _check_pr_delivery(repo: Path, plan_src: str | None) -> tuple[bool, str, str]:
+    """When plan enables pull-request delivery, require gh on PATH and a git remote."""
+    label = "PR delivery prerequisites (gh + git remote)"
+    if plan_src is None:
+        return (True, label, "")
+
+    plan_path = _resolve_plan_path(repo, plan_src)
+    try:
+        with open(plan_path, "rb") as fh:
+            raw = tomllib.load(fh)
+    except Exception:
+        return (False, label, "Plan failed to load — cannot verify PR delivery prerequisites")
+
+    plan_table = raw.get("plan", {})
+    delivery = (plan_table.get("delivery") or "").strip().lower()
+    if delivery != "pull-request":
+        return (True, label, "")
+
+    if not shutil.which("gh"):
+        return (False, label, "gh not on PATH; install GitHub CLI for PR delivery")
+
+    res = git(repo, "remote")
+    if res.returncode != 0 or not res.stdout.strip():
+        return (False, label, "No git remote configured; add a remote for PR delivery")
+
+    return (True, label, "")
+
+
+def run_doctor_checks(repo: Path, plan_src: str | None,
+                      adapter: str = "opencode") -> int:
+    """Run all doctor preflight checks. Returns count of failures."""
+    checks: list[tuple[bool, str, str]] = []
+
+    # Plan-independent checks
+    checks.append(_check_stale_install(repo))
+    checks.append(_check_required_env_vars())
+    checks.append(_check_openspec_on_path())
+    checks.append(_check_adapter_client_on_path(adapter))
+    checks.append(_check_tracked_bytecode(repo))
+    checks.append(_check_tracked_tree_clean(repo))
+
+    # Plan-dependent checks
+    checks.append(_check_plan_loads(repo, plan_src))
+    checks.append(_check_pr_delivery(repo, plan_src))
+
+    failures = 0
+    for passed, label, remediation in checks:
+        if passed:
+            print(f"  \u2713 {label}")
+        else:
+            print(f"  \u2717 {label}")
+            if remediation:
+                print(f"    \u2192 {remediation}")
+            failures += 1
+
+    return failures
+
+
+def run_preflight_warnings(repo: Path, plan_src: str | None,
+                           adapter: str = "opencode") -> None:
+    """Run the same checks as doctor but emit warnings without changing outcome."""
+    checks: list[tuple[bool, str, str]] = []
+
+    checks.append(_check_stale_install(repo))
+    checks.append(_check_required_env_vars())
+    checks.append(_check_openspec_on_path())
+    checks.append(_check_adapter_client_on_path(adapter))
+    checks.append(_check_tracked_bytecode(repo))
+    checks.append(_check_tracked_tree_clean(repo))
+    checks.append(_check_plan_loads(repo, plan_src))
+    checks.append(_check_pr_delivery(repo, plan_src))
+
+    for passed, label, remediation in checks:
+        if not passed:
+            detail = f"{label}: {remediation}" if remediation else label
+            log(f"  \u26a0 {detail}")
+
+
+# ---------------------------------------------------------------------------
 # Retry policy: read the controller's own schema-v3 state to decide whether
 # re-invoking /opsx-drive can plausibly succeed.
 # ---------------------------------------------------------------------------
@@ -3210,6 +3391,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     reconcile(repo, cfg, state)
     save_state(repo, cfg["name"], state)
     sync_direct_worker_state(repo, cfg, state)
+
+    # Run preflight checks as warnings only — never change run outcome.
+    run_preflight_warnings(repo, plan_src, cfg["adapter"])
 
     if args.dry_run:
         return cmd_status_inner(cfg, state, header="dry run: planned order")
@@ -5094,6 +5278,72 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """opsx-plan doctor [plan] — run preflight checks."""
+    repo = Path(args.repo).resolve()
+
+    # Try to resolve plan; continue without plan if resolution fails and
+    # no explicit plan argument was given.
+    plan_src: str | None = None
+    if args.plan is not None:
+        # Explicit plan argument: fail hard when plan can't be resolved/loaded.
+        plan_src = args.plan
+        plan_abs = _resolve_plan_path(repo, plan_src)
+        if not plan_abs.is_file():
+            print(f"error: plan not found: {plan_src}", file=sys.stderr)
+            return 2
+    else:
+        try:
+            plan_src = resolve_plan(repo, None)
+        except PlanError:
+            # Surface stale active-plan pointer errors; do not swallow them.
+            pointer = read_active_plan(repo)
+            if pointer:
+                plan_path = repo / pointer
+                if not plan_path.is_file():
+                    print(
+                        f"warning: active plan pointer references missing file: {pointer}",
+                        file=sys.stderr,
+                    )
+                    print(
+                        "  Set a new active plan with: opsx-plan use <plan.toml>",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"error: active plan could not be loaded: {pointer}",
+                        file=sys.stderr,
+                    )
+                    return 2
+            # No active plan; run plan-independent checks only.
+
+    # Determine adapter from resolved plan.
+    adapter = "opencode"
+    if plan_src:
+        try:
+            cfg = load_plan(_resolve_plan_path(repo, plan_src))
+            adapter = cfg["adapter"]
+        except PlanError:
+            print(f"error: cannot load plan: {plan_src}", file=sys.stderr)
+            return 2
+
+    print(f"opsx-plan doctor (repo: {repo})")
+    if plan_src:
+        print(f"  plan: {plan_src}")
+    else:
+        print("  plan: (none; running plan-independent checks only)")
+    print()
+
+    failures = run_doctor_checks(repo, plan_src, adapter)
+
+    print()
+    if failures:
+        print(f"{failures} check(s) failed")
+        return 1
+    print("All checks passed")
+    return 0
+
+
 def main() -> int:
     # Executable-name dispatch: opsx-run <change-id> [--repo <path>]
     exe_name = os.path.basename(sys.argv[0])
@@ -5250,6 +5500,12 @@ def main() -> int:
     p_run_one.add_argument("change", help="change id")
     p_run_one.add_argument("--budget-usd", type=float, default=0)
     p_run_one.set_defaults(fn=cmd_run_one)
+
+    p_doctor = sub.add_parser(
+        "doctor", help="run preflight checks before a run"
+    )
+    p_doctor.add_argument("plan", nargs="?", default=None, help="path to plan TOML")
+    p_doctor.set_defaults(fn=cmd_doctor)
 
     args = ap.parse_args()
     try:
