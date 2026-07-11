@@ -158,6 +158,8 @@ def load_plan(path: Path) -> dict:
         "created_check": plan.get(
             "created_check", "openspec validate {change} --strict"
         ),
+        # --- git delivery ---
+        "git_delivery": _parse_git_delivery_config(plan.get("git_delivery", {})),
     }
 
     by_id: dict[str, dict] = {}
@@ -233,6 +235,7 @@ def build_single_change_config(repo: Path, change_id: str) -> dict:
         "create_max_attempts": 2,
         "review_created": False,
         "created_check": "openspec validate {change} --strict",
+        "git_delivery": _parse_git_delivery_config({}),
     }
 
     by_id = {
@@ -252,6 +255,28 @@ def build_single_change_config(repo: Path, change_id: str) -> dict:
     cfg["order"] = [change_id]
     cfg["changes"] = by_id
     return cfg
+
+
+def _parse_git_delivery_config(raw: dict) -> dict:
+    """Parse ``[plan.git_delivery]`` from a TOML plan into a validated cfg dict."""
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        enabled = False
+    branch = str(raw.get("branch", "")).strip() if raw.get("branch") else ""
+    base_ref = str(raw.get("base_ref", "")).strip() if raw.get("base_ref") else ""
+    create_pull_request = raw.get("create_pull_request", False)
+    if not isinstance(create_pull_request, bool):
+        create_pull_request = False
+    if create_pull_request and not enabled:
+        raise PlanError(
+            "plan.git_delivery.create_pull_request requires plan.git_delivery.enabled = true"
+        )
+    return {
+        "enabled": enabled,
+        "branch": branch,
+        "base_ref": base_ref,
+        "create_pull_request": create_pull_request,
+    }
 
 
 def topo_sort(by_id: dict[str, dict]) -> list[str]:
@@ -372,6 +397,14 @@ def merge_defaults(target: dict, defaults: dict) -> dict:
     return target
 
 
+def _default_git_delivery_state() -> dict:
+    return {
+        "base_ref": None,
+        "branch_name": None,
+        "delivery_status": "disabled",
+    }
+
+
 def load_state(repo: Path, plan_name: str) -> dict:
     p = state_path(repo, plan_name)
     if p.exists():
@@ -382,6 +415,13 @@ def load_state(repo: Path, plan_name: str) -> dict:
     state.setdefault("plan", plan_name)
     state.setdefault("approvals", [])
     state.setdefault("changes", {})
+    state.setdefault("git_delivery", _default_git_delivery_state())
+    gd = state["git_delivery"]
+    if not isinstance(gd, dict):
+        state["git_delivery"] = _default_git_delivery_state()
+    else:
+        for key, value in _default_git_delivery_state().items():
+            gd.setdefault(key, value)
     for cid, record in state["changes"].items():
         if isinstance(record, dict):
             merge_defaults(record, new_change_record())
@@ -2638,6 +2678,143 @@ def tracked_tree_clean(repo: Path) -> bool:
     return not lines
 
 
+# ---------------------------------------------------------------------------
+# Git delivery helpers
+# ---------------------------------------------------------------------------
+
+def _git_current_branch(repo: Path) -> str | None:
+    """Return the current symbolic HEAD branch name, or None when detached."""
+    res = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    if res.returncode != 0:
+        return None
+    name = res.stdout.strip()
+    return name if name and name != "HEAD" else None
+
+
+def _git_branch_exists(repo: Path, branch_name: str) -> bool:
+    """Return True when *branch_name* exists in the local repository."""
+    res = git(repo, "rev-parse", "--verify", f"refs/heads/{branch_name}")
+    return res.returncode == 0
+
+
+def _git_create_and_checkout_branch(
+    repo: Path, branch_name: str, base_ref: str
+) -> str | None:
+    """Create and checkout *branch_name* from *base_ref*.  Returns None on
+    success or an error message string on failure."""
+    res = git(repo, "checkout", "-b", branch_name, base_ref)
+    if res.returncode != 0:
+        return f"git checkout -b {branch_name} {base_ref} failed: {res.stderr.strip()}"
+    return None
+
+
+def _git_current_head_on_branch(repo: Path, branch_name: str) -> bool:
+    """Return True when HEAD points to *branch_name*."""
+    current = _git_current_branch(repo)
+    return current == branch_name
+
+
+def resolve_delivery_branch_name(plan_name: str, git_delivery_cfg: dict) -> str:
+    """Resolve the delivery branch name from config or derive from plan name."""
+    configured = (git_delivery_cfg.get("branch") or "").strip()
+    if configured:
+        return configured
+    return f"opsx/{plan_name}"
+
+
+def resolve_delivery_base_ref(
+    repo: Path, git_delivery_cfg: dict
+) -> tuple[str | None, str | None]:
+    """Resolve the delivery base ref from config or current HEAD.
+
+    Returns ``(base_ref, error_message)``.  When *error_message* is None,
+    *base_ref* is the resolved base ref.
+    """
+    configured = (git_delivery_cfg.get("base_ref") or "").strip()
+    if configured:
+        return configured, None
+    current = _git_current_branch(repo)
+    if current is None:
+        return None, "HEAD is detached; cannot resolve base ref for delivery branch"
+    return current, None
+
+
+def ensure_delivery_branch(
+    repo: Path,
+    cfg: dict,
+    state: dict,
+    no_branch: bool = False,
+) -> tuple[bool, str | None]:
+    """Ensure the delivery branch is created/verified before plan dispatch.
+
+    Returns ``(proceed, error)``.  When *proceed* is True, the run may continue.
+    When *error* is not None, the run must stop with that error message.
+    """
+    git_delivery_cfg = cfg.get("git_delivery", {})
+    if not git_delivery_cfg.get("enabled", False):
+        return True, None
+
+    gd_state = state.get("git_delivery", {})
+    recorded_branch = gd_state.get("branch_name")
+
+    # --- Resume guard: branch already recorded ---
+    if recorded_branch:
+        if no_branch:
+            return False, (
+                f"cannot use --no-branch: delivery branch "
+                f"'{recorded_branch}' has already been recorded for this plan state"
+            )
+        if not _git_current_head_on_branch(repo, recorded_branch):
+            actual = _git_current_branch(repo) or "(detached)"
+            return False, (
+                f"expected delivery branch '{recorded_branch}' but HEAD is on "
+                f"'{actual}'; checkout the recorded branch to resume this plan run"
+            )
+        return True, None
+
+    # --- First run: create delivery branch ---
+    if no_branch:
+        log("--no-branch: skipping delivery branch creation for this run")
+        return True, None
+
+    if not tracked_tree_clean(repo):
+        return False, (
+            "tracked worktree is dirty; commit or stash changes before "
+            "delivery branch creation"
+        )
+
+    branch_name = resolve_delivery_branch_name(cfg["name"], git_delivery_cfg)
+    base_ref, err = resolve_delivery_base_ref(repo, git_delivery_cfg)
+    if err:
+        return False, err
+
+    log(f"git delivery: creating branch '{branch_name}' from '{base_ref}'")
+
+    if _git_branch_exists(repo, branch_name):
+        # Branch exists but state doesn't record it — transition state
+        # (branch may have been created manually or from a previous
+        # interrupted run).  We treat this as the recorded branch.
+        log(f"  branch '{branch_name}' already exists; recording in state")
+    else:
+        create_err = _git_create_and_checkout_branch(repo, branch_name, base_ref)
+        if create_err:
+            return False, create_err
+
+    # Checkout again in case branch already existed (ensures it's checked out)
+    if not _git_current_head_on_branch(repo, branch_name):
+        res = git(repo, "checkout", branch_name)
+        if res.returncode != 0:
+            return False, f"failed to checkout existing branch '{branch_name}': {res.stderr.strip()}"
+
+    # Persist delivery branch identity in plan state
+    gd_state["base_ref"] = base_ref
+    gd_state["branch_name"] = branch_name
+    gd_state["delivery_status"] = "branch_ready"
+    log(f"git delivery: branch '{branch_name}' ready (base: {base_ref})")
+
+    return True, None
+
+
 def verify_post_archive_clean(repo: Path, cfg: dict) -> tuple[bool, str]:
     """Refuse completion when archive/check steps leave tracked edits behind."""
     if not cfg.get("require_clean_tracked", True):
@@ -3584,6 +3761,15 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     # Run preflight checks as warnings only — never change run outcome.
     run_preflight_warnings(repo, plan_src, cfg["adapter"])
+
+    # --- git delivery: ensure delivery branch before any stage dispatch ---
+    if not args.dry_run:
+        no_branch = getattr(args, "no_branch", False)
+        proceed, delivery_err = ensure_delivery_branch(repo, cfg, state, no_branch=no_branch)
+        if not proceed:
+            print(f"error: {delivery_err}", file=sys.stderr)
+            return 2
+        save_state(repo, cfg["name"], state)
 
     if args.dry_run:
         return cmd_status_inner(cfg, state, header="dry run: planned order")
@@ -5785,6 +5971,9 @@ def main() -> int:
     p_run.add_argument("--budget-usd", type=float, default=0)
     p_run.add_argument("--create-only", action="store_true",
                        help="create+verify ready changes without driving them")
+    p_run.add_argument("--no-branch", action="store_true",
+                       help="skip delivery branch creation on first run "
+                            "(rejected if branch already recorded)")
     p_run.set_defaults(fn=cmd_run)
 
     p_status = sub.add_parser("status", help="reconcile and show plan status")

@@ -10071,5 +10071,576 @@ class LogsCommandTests(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class GitDeliveryConfigParsingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+
+    def test_default_disabled(self) -> None:
+        cfg = self.opsx_plan._parse_git_delivery_config({})
+        self.assertFalse(cfg["enabled"])
+        self.assertEqual(cfg["branch"], "")
+        self.assertEqual(cfg["base_ref"], "")
+        self.assertFalse(cfg["create_pull_request"])
+
+    def test_enabled_with_explicit_branch_and_base(self) -> None:
+        cfg = self.opsx_plan._parse_git_delivery_config({
+            "enabled": True,
+            "branch": "opsx/custom",
+            "base_ref": "release/next",
+        })
+        self.assertTrue(cfg["enabled"])
+        self.assertEqual(cfg["branch"], "opsx/custom")
+        self.assertEqual(cfg["base_ref"], "release/next")
+
+    def test_create_pull_request_requires_enabled(self) -> None:
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan._parse_git_delivery_config({
+                "enabled": False,
+                "create_pull_request": True,
+            })
+        self.assertIn("requires", str(ctx.exception))
+
+    def test_non_bool_enabled_treated_as_false(self) -> None:
+        cfg = self.opsx_plan._parse_git_delivery_config({"enabled": "yes"})
+        self.assertFalse(cfg["enabled"])
+
+    def test_empty_string_branch_and_base_normalized(self) -> None:
+        cfg = self.opsx_plan._parse_git_delivery_config({
+            "enabled": True,
+            "branch": "  ",
+            "base_ref": "  ",
+        })
+        self.assertEqual(cfg["branch"], "")
+        self.assertEqual(cfg["base_ref"], "")
+
+
+class GitDeliveryBranchNameResolutionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+
+    def test_configured_branch_is_used(self) -> None:
+        git_delivery_cfg = {"branch": "opsx/my-branch"}
+        name = self.opsx_plan.resolve_delivery_branch_name("my-plan", git_delivery_cfg)
+        self.assertEqual(name, "opsx/my-branch")
+
+    def test_derives_from_plan_name_when_unconfigured(self) -> None:
+        git_delivery_cfg = {"branch": ""}
+        name = self.opsx_plan.resolve_delivery_branch_name("operator-workflow-upgrades", git_delivery_cfg)
+        self.assertEqual(name, "opsx/operator-workflow-upgrades")
+
+    def test_whitespace_only_treated_as_unconfigured(self) -> None:
+        git_delivery_cfg = {"branch": "   "}
+        name = self.opsx_plan.resolve_delivery_branch_name("my-plan", git_delivery_cfg)
+        self.assertEqual(name, "opsx/my-plan")
+
+
+class GitDeliveryBaseRefResolutionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        subprocess.run(["git", "init"], cwd=self.repo, check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=T",
+             "commit", "--allow-empty", "-m", "init"],
+            cwd=self.repo, check=True, capture_output=True, text=True,
+        )
+        self.default_branch = self.opsx_plan._git_current_branch(self.repo)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_configured_base_ref_is_used(self) -> None:
+        git_delivery_cfg = {"base_ref": "release/next"}
+        base_ref, err = self.opsx_plan.resolve_delivery_base_ref(self.repo, git_delivery_cfg)
+        self.assertIsNone(err)
+        self.assertEqual(base_ref, "release/next")
+
+    def test_defaults_to_current_branch(self) -> None:
+        git_delivery_cfg = {"base_ref": ""}
+        base_ref, err = self.opsx_plan.resolve_delivery_base_ref(self.repo, git_delivery_cfg)
+        self.assertIsNone(err)
+        self.assertEqual(base_ref, self.default_branch)
+
+
+class GitDeliveryEnsureBranchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        subprocess.run(["git", "init"], cwd=self.repo, check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=T",
+             "commit", "--allow-empty", "-m", "init"],
+            cwd=self.repo, check=True, capture_output=True, text=True,
+        )
+        self.default_branch = self.opsx_plan._git_current_branch(self.repo)
+        self.cfg = {
+            "name": "test-plan",
+            "git_delivery": {
+                "enabled": True,
+                "branch": "",
+                "base_ref": "",
+                "create_pull_request": False,
+            },
+        }
+        self.state = {"plan": "test-plan", "approvals": [], "changes": {},
+                       "git_delivery": self.opsx_plan._default_git_delivery_state()}
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    # 3.1
+    def test_first_run_creates_configured_delivery_branch(self) -> None:
+        self.cfg["git_delivery"]["branch"] = "opsx/custom-delivery"
+        self.cfg["git_delivery"]["base_ref"] = self.default_branch
+
+        proceed, err = self.opsx_plan.ensure_delivery_branch(
+            self.repo, self.cfg, self.state,
+        )
+        self.assertTrue(proceed, f"expected proceed, got error: {err}")
+        self.assertIsNone(err)
+        gd = self.state["git_delivery"]
+        self.assertEqual(gd["base_ref"], self.default_branch)
+        self.assertEqual(gd["branch_name"], "opsx/custom-delivery")
+        self.assertEqual(gd["delivery_status"], "branch_ready")
+        # Verify branch was created
+        self.assertTrue(self.opsx_plan._git_branch_exists(self.repo, "opsx/custom-delivery"))
+        self.assertTrue(self.opsx_plan._git_current_head_on_branch(self.repo, "opsx/custom-delivery"))
+
+    # 3.2
+    def test_first_run_derives_branch_and_default_base_ref(self) -> None:
+        proceed, err = self.opsx_plan.ensure_delivery_branch(
+            self.repo, self.cfg, self.state,
+        )
+        self.assertTrue(proceed, f"expected proceed, got error: {err}")
+        gd = self.state["git_delivery"]
+        self.assertEqual(gd["base_ref"], self.default_branch)
+        self.assertEqual(gd["branch_name"], "opsx/test-plan")
+        self.assertTrue(self.opsx_plan._git_branch_exists(self.repo, "opsx/test-plan"))
+
+    # 3.3
+    def test_resume_on_recorded_branch_proceeds(self) -> None:
+        # First create the branch and record state
+        self.state["git_delivery"]["branch_name"] = "opsx/test-plan"
+        self.state["git_delivery"]["base_ref"] = self.default_branch
+        self.state["git_delivery"]["delivery_status"] = "branch_ready"
+        subprocess.run(
+            ["git", "checkout", "-b", "opsx/test-plan"],
+            cwd=self.repo, check=True, capture_output=True, text=True,
+        )
+
+        proceed, err = self.opsx_plan.ensure_delivery_branch(
+            self.repo, self.cfg, self.state,
+        )
+        self.assertTrue(proceed, f"expected proceed, got error: {err}")
+        self.assertIsNone(err)
+        # State should be unchanged
+        self.assertEqual(self.state["git_delivery"]["branch_name"], "opsx/test-plan")
+
+    def test_refuse_on_wrong_branch(self) -> None:
+        self.state["git_delivery"]["branch_name"] = "opsx/test-plan"
+        self.state["git_delivery"]["base_ref"] = self.default_branch
+        self.state["git_delivery"]["delivery_status"] = "branch_ready"
+
+        proceed, err = self.opsx_plan.ensure_delivery_branch(
+            self.repo, self.cfg, self.state,
+        )
+        self.assertFalse(proceed)
+        self.assertIn("expected delivery branch", err)
+        self.assertIn(self.default_branch, err)
+
+    # 3.4
+    def test_dirty_tracked_tree_blocks_branch_creation(self) -> None:
+        # Add and commit a tracked file, then dirty it
+        (self.repo / "tracked.txt").write_text("clean\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "tracked.txt"], cwd=self.repo, check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=T",
+             "commit", "-m", "add tracked"],
+            cwd=self.repo, check=True, capture_output=True, text=True,
+        )
+        (self.repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+
+        proceed, err = self.opsx_plan.ensure_delivery_branch(
+            self.repo, self.cfg, self.state,
+        )
+        self.assertFalse(proceed)
+        self.assertIn("dirty", err)
+        self.assertIsNone(self.state["git_delivery"]["branch_name"])
+
+    # 3.5
+    def test_no_branch_skips_first_run_creation(self) -> None:
+        proceed, err = self.opsx_plan.ensure_delivery_branch(
+            self.repo, self.cfg, self.state, no_branch=True,
+        )
+        self.assertTrue(proceed, f"expected proceed, got error: {err}")
+        self.assertIsNone(err)
+        self.assertIsNone(self.state["git_delivery"]["branch_name"])
+        self.assertEqual(self.state["git_delivery"]["delivery_status"], "disabled")
+
+    def test_no_branch_rejected_when_branch_already_recorded(self) -> None:
+        self.state["git_delivery"]["branch_name"] = "opsx/test-plan"
+        self.state["git_delivery"]["base_ref"] = self.default_branch
+        self.state["git_delivery"]["delivery_status"] = "branch_ready"
+        subprocess.run(
+            ["git", "checkout", "-b", "opsx/test-plan"],
+            cwd=self.repo, check=True, capture_output=True, text=True,
+        )
+
+        proceed, err = self.opsx_plan.ensure_delivery_branch(
+            self.repo, self.cfg, self.state, no_branch=True,
+        )
+        self.assertFalse(proceed)
+        self.assertIn("cannot use --no-branch", err)
+        self.assertIn("already been recorded", err)
+
+    # 3.6
+    def test_plan_without_git_delivery_proceeds_normally(self) -> None:
+        self.cfg["git_delivery"] = {"enabled": False, "branch": "", "base_ref": "", "create_pull_request": False}
+        proceed, err = self.opsx_plan.ensure_delivery_branch(
+            self.repo, self.cfg, self.state,
+        )
+        self.assertTrue(proceed)
+        self.assertIsNone(err)
+        self.assertEqual(self.state["git_delivery"]["delivery_status"], "disabled")
+
+    def test_disabled_no_git_operations_performed(self) -> None:
+        self.cfg["git_delivery"]["enabled"] = False
+        branches_before = subprocess.run(
+            ["git", "branch"], cwd=self.repo, check=True,
+            capture_output=True, text=True,
+        ).stdout
+        proceed, err = self.opsx_plan.ensure_delivery_branch(
+            self.repo, self.cfg, self.state,
+        )
+        self.assertTrue(proceed)
+        branches_after = subprocess.run(
+            ["git", "branch"], cwd=self.repo, check=True,
+            capture_output=True, text=True,
+        ).stdout
+        self.assertEqual(branches_before, branches_after)
+
+    def test_existing_branch_with_unrecorded_state_transitions(self) -> None:
+        """When branch exists on disk but state doesn't record it, the branch
+        is adopted and state is updated (handles interrupted first runs)."""
+        subprocess.run(
+            ["git", "checkout", "-b", "opsx/test-plan"],
+            cwd=self.repo, check=True, capture_output=True, text=True,
+        )
+        # Switch back to default so the "first run" doesn't see branch as checked out
+        subprocess.run(
+            ["git", "checkout", self.default_branch],
+            cwd=self.repo, check=True, capture_output=True, text=True,
+        )
+
+        proceed, err = self.opsx_plan.ensure_delivery_branch(
+            self.repo, self.cfg, self.state,
+        )
+        self.assertTrue(proceed, f"expected proceed, got error: {err}")
+        self.assertIsNone(err)
+        gd = self.state["git_delivery"]
+        self.assertEqual(gd["branch_name"], "opsx/test-plan")
+        self.assertEqual(gd["base_ref"], self.default_branch)
+        self.assertEqual(gd["delivery_status"], "branch_ready")
+        # Branch should now be checked out
+        self.assertTrue(self.opsx_plan._git_current_head_on_branch(self.repo, "opsx/test-plan"))
+
+
+class GitDeliveryCmdRunIntegrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        subprocess.run(["git", "init"], cwd=self.repo, check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=T",
+             "commit", "--allow-empty", "-m", "init"],
+            cwd=self.repo, check=True, capture_output=True, text=True,
+        )
+        # Create a minimal plan TOML
+        self.plan_path = self.repo / "test.toml"
+        self.plan_path.write_text(textwrap.dedent("""\
+            [plan]
+            name = "test-gd"
+            adapter = "opencode"
+
+            [plan.git_delivery]
+            enabled = true
+
+            [[changes]]
+            id = "test-change"
+        """), encoding="utf-8")
+        # Create the authored change directory so the orchestrator can drive it
+        cdir = self.repo / "openspec" / "changes" / "test-change"
+        cdir.mkdir(parents=True)
+        (cdir / "proposal.md").write_text("## Why\n", encoding="utf-8")
+        (cdir / "tasks.md").write_text("## 1. Tasks\n\n- [ ] 1.1 Task\n", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_cmd_run_creates_delivery_branch(self) -> None:
+        writes: list[str] = []
+
+        def fake_write_active(repo, rel):
+            writes.append(rel)
+
+        def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None, budget_usd=0.0):
+            return self.opsx_plan.DONE
+
+        def fake_reconcile(repo, cfg, state):
+            pass
+
+        def fake_preflight(repo, plan_src, adapter):
+            pass
+
+        def fake_cmd_status_inner(cfg, state, header="", plan_arg=None):
+            return 0
+
+        with mock.patch.object(self.opsx_plan, "write_active_plan", side_effect=fake_write_active), \
+             mock.patch.object(self.opsx_plan, "run_direct_change", side_effect=fake_run_direct_change), \
+             mock.patch.object(self.opsx_plan, "reconcile", side_effect=fake_reconcile), \
+             mock.patch.object(self.opsx_plan, "run_preflight_warnings", side_effect=fake_preflight), \
+             mock.patch.object(self.opsx_plan, "cmd_status_inner", side_effect=fake_cmd_status_inner):
+
+            args = argparse.Namespace(
+                repo=str(self.repo),
+                plan="test.toml",
+                dry_run=False,
+                only=None,
+                max_changes=0,
+                budget_minutes=0,
+                budget_usd=0,
+                create_only=False,
+                no_branch=False,
+            )
+            rc = self.opsx_plan.cmd_run(args)
+            self.assertEqual(rc, 0)
+            # Branch should have been created
+            self.assertTrue(self.opsx_plan._git_branch_exists(self.repo, "opsx/test-gd"))
+
+    def test_cmd_run_with_no_branch_skips_creation(self) -> None:
+        def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None, budget_usd=0.0):
+            return self.opsx_plan.DONE
+
+        def fake_reconcile(repo, cfg, state):
+            pass
+
+        def fake_preflight(repo, plan_src, adapter):
+            pass
+
+        def fake_cmd_status_inner(cfg, state, header="", plan_arg=None):
+            return 0
+
+        with mock.patch.object(self.opsx_plan, "write_active_plan"), \
+             mock.patch.object(self.opsx_plan, "run_direct_change", side_effect=fake_run_direct_change), \
+             mock.patch.object(self.opsx_plan, "reconcile", side_effect=fake_reconcile), \
+             mock.patch.object(self.opsx_plan, "run_preflight_warnings", side_effect=fake_preflight), \
+             mock.patch.object(self.opsx_plan, "cmd_status_inner", side_effect=fake_cmd_status_inner):
+
+            args = argparse.Namespace(
+                repo=str(self.repo),
+                plan="test.toml",
+                dry_run=False,
+                only=None,
+                max_changes=0,
+                budget_minutes=0,
+                budget_usd=0,
+                create_only=False,
+                no_branch=True,
+            )
+            rc = self.opsx_plan.cmd_run(args)
+            self.assertEqual(rc, 0)
+            # Branch should NOT have been created
+            self.assertFalse(self.opsx_plan._git_branch_exists(self.repo, "opsx/test-gd"))
+
+    def test_cmd_run_refuses_with_delivery_error(self) -> None:
+        """When ensure_delivery_branch returns an error, cmd_run exits early."""
+        # Make the worktree dirty by adding and modifying a tracked file
+        (self.repo / "tracked.txt").write_text("clean\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "tracked.txt"], cwd=self.repo, check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=T",
+             "commit", "-m", "add tracked"],
+            cwd=self.repo, check=True, capture_output=True, text=True,
+        )
+        (self.repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+
+        def fake_reconcile(repo, cfg, state):
+            pass
+
+        def fake_preflight(repo, plan_src, adapter):
+            pass
+
+        with mock.patch.object(self.opsx_plan, "write_active_plan"), \
+             mock.patch.object(self.opsx_plan, "reconcile", side_effect=fake_reconcile), \
+             mock.patch.object(self.opsx_plan, "run_preflight_warnings", side_effect=fake_preflight):
+
+            args = argparse.Namespace(
+                repo=str(self.repo),
+                plan="test.toml",
+                dry_run=False,
+                only=None,
+                max_changes=0,
+                budget_minutes=0,
+                budget_usd=0,
+                create_only=False,
+                no_branch=False,
+            )
+            rc = self.opsx_plan.cmd_run(args)
+            self.assertEqual(rc, 2)
+
+    def test_cmd_run_dry_run_does_not_create_branch(self) -> None:
+        """Dry-run must not create or record a delivery branch."""
+        def fake_reconcile(repo, cfg, state):
+            pass
+
+        def fake_preflight(repo, plan_src, adapter):
+            pass
+
+        def fake_cmd_status_inner(cfg, state, header="", plan_arg=None):
+            return 0
+
+        with mock.patch.object(self.opsx_plan, "write_active_plan"), \
+             mock.patch.object(self.opsx_plan, "reconcile", side_effect=fake_reconcile), \
+             mock.patch.object(self.opsx_plan, "run_preflight_warnings", side_effect=fake_preflight), \
+             mock.patch.object(self.opsx_plan, "cmd_status_inner", side_effect=fake_cmd_status_inner):
+
+            args = argparse.Namespace(
+                repo=str(self.repo),
+                plan="test.toml",
+                dry_run=True,
+                only=None,
+                max_changes=0,
+                budget_minutes=0,
+                budget_usd=0,
+                create_only=False,
+                no_branch=False,
+            )
+            rc = self.opsx_plan.cmd_run(args)
+            self.assertEqual(rc, 0)
+            # Branch must NOT have been created
+            self.assertFalse(self.opsx_plan._git_branch_exists(self.repo, "opsx/test-gd"))
+            # State must NOT have a recorded delivery branch
+            state = self.opsx_plan.load_state(self.repo, "test-gd")
+            gd = state.get("git_delivery", {})
+            self.assertIsNone(gd.get("branch_name"))
+            self.assertEqual(gd.get("delivery_status"), "disabled")
+
+
+class GitDeliveryStatePersistenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_load_state_adds_default_git_delivery(self) -> None:
+        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        self.assertIn("git_delivery", state)
+        gd = state["git_delivery"]
+        self.assertEqual(gd["base_ref"], None)
+        self.assertEqual(gd["branch_name"], None)
+        self.assertEqual(gd["delivery_status"], "disabled")
+
+    def test_load_state_preserves_existing_git_delivery(self) -> None:
+        state_path = self.opsx_plan.state_path(self.repo, "test-plan")
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = {
+            "plan": "test-plan",
+            "approvals": [],
+            "changes": {},
+            "git_delivery": {
+                "base_ref": "main",
+                "branch_name": "opsx/test-plan",
+                "delivery_status": "branch_ready",
+            },
+        }
+        state_path.write_text(json.dumps(existing), encoding="utf-8")
+        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        gd = state["git_delivery"]
+        self.assertEqual(gd["base_ref"], "main")
+        self.assertEqual(gd["branch_name"], "opsx/test-plan")
+        self.assertEqual(gd["delivery_status"], "branch_ready")
+
+    def test_load_state_merges_missing_git_delivery_keys(self) -> None:
+        state_path = self.opsx_plan.state_path(self.repo, "test-plan")
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = {
+            "plan": "test-plan",
+            "approvals": [],
+            "changes": {},
+            "git_delivery": {"base_ref": "release/next"},
+        }
+        state_path.write_text(json.dumps(existing), encoding="utf-8")
+        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        gd = state["git_delivery"]
+        self.assertEqual(gd["base_ref"], "release/next")
+        self.assertEqual(gd["branch_name"], None)
+        self.assertEqual(gd["delivery_status"], "disabled")
+
+    def test_load_state_handles_non_dict_git_delivery(self) -> None:
+        state_path = self.opsx_plan.state_path(self.repo, "test-plan")
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = {
+            "plan": "test-plan",
+            "approvals": [],
+            "changes": {},
+            "git_delivery": "bad-value",
+        }
+        state_path.write_text(json.dumps(existing), encoding="utf-8")
+        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        gd = state["git_delivery"]
+        self.assertIsInstance(gd, dict)
+        self.assertEqual(gd["delivery_status"], "disabled")
+
+
+class GitDeliveryDefaultOffTests(unittest.TestCase):
+    """Verify that plans without git_delivery config behave exactly as today."""
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        subprocess.run(["git", "init"], cwd=self.repo, check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=T",
+             "commit", "--allow-empty", "-m", "init"],
+            cwd=self.repo, check=True, capture_output=True, text=True,
+        )
+        self.cfg = {
+            "name": "default-off-plan",
+            "git_delivery": self.opsx_plan._parse_git_delivery_config({}),
+        }
+        self.state = {"plan": "default-off-plan", "approvals": [], "changes": {},
+                       "git_delivery": self.opsx_plan._default_git_delivery_state()}
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_disabled_by_default_proceeds_without_branch_creation(self) -> None:
+        proceed, err = self.opsx_plan.ensure_delivery_branch(
+            self.repo, self.cfg, self.state,
+        )
+        self.assertTrue(proceed)
+        self.assertIsNone(err)
+        self.assertIsNone(self.state["git_delivery"]["branch_name"])
+
+    def test_build_single_change_config_has_disabled_git_delivery(self) -> None:
+        cdir = self.repo / "openspec" / "changes" / "test-change"
+        cdir.mkdir(parents=True)
+        (cdir / "proposal.md").write_text("## Why\n", encoding="utf-8")
+        (cdir / "tasks.md").write_text("## 1. Tasks\n\n- [ ] 1.1 Task\n", encoding="utf-8")
+        cfg = self.opsx_plan.build_single_change_config(self.repo, "test-change")
+        self.assertIn("git_delivery", cfg)
+        self.assertFalse(cfg["git_delivery"]["enabled"])
+
+
 if __name__ == "__main__":
     unittest.main()
