@@ -3597,7 +3597,14 @@ def cmd_status(args: argparse.Namespace) -> int:
             inspected = str(Path(env_plan))
     if inspected and active and inspected != active:
         header += f"  [inspected: {inspected}]"
-    return cmd_status_inner(cfg, state, header=header)
+    # Short-form commands when the plan was resolved through the active-plan
+    # flow (no explicit plan argument). Long-form when an explicit plan path
+    # that differs from the active pointer is used.
+    plan_arg = (
+        None if args.plan is None or (active and args.plan == active)
+        else plan_src
+    )
+    return cmd_status_inner(cfg, state, header=header, plan_arg=plan_arg)
 
 
 def display_order(cfg: dict) -> list[str]:
@@ -3613,7 +3620,8 @@ def display_order(cfg: dict) -> list[str]:
     return sorted(cfg["order"], key=key)
 
 
-def cmd_status_inner(cfg: dict, state: dict, header: str) -> int:
+def cmd_status_inner(cfg: dict, state: dict, header: str,
+                     plan_arg: str | None = None) -> int:
     print(header)
     width = max(len(c) for c in cfg["order"])
     failed = 0
@@ -3626,6 +3634,22 @@ def cmd_status_inner(cfg: dict, state: dict, header: str) -> int:
         print(f"  {phase_s}{cid.ljust(width)}  {status}{extra}")
         if status in (FAILED, "blocked"):
             failed += 1
+        # Next-command guidance for blocked changes
+        if status == "awaiting_approval":
+            if plan_arg:
+                print(f"    \u2192 opsx-plan approve {plan_arg} {cid}")
+            else:
+                print(f"    \u2192 opsx-plan approve {cid}")
+        elif status == "awaiting_acceptance":
+            if plan_arg:
+                print(f"    \u2192 opsx-plan accept {plan_arg} {cid}")
+            else:
+                print(f"    \u2192 opsx-plan accept {cid}")
+        elif status == FAILED:
+            if plan_arg:
+                print(f"    \u2192 opsx-plan reset {plan_arg} {cid}")
+            else:
+                print(f"    \u2192 opsx-plan reset {cid}")
     return 1 if failed else 0
 
 
@@ -3658,12 +3682,30 @@ def cmd_approve(args: argparse.Namespace) -> int:
     ):
         args.change.insert(0, args.plan)
         args.plan = None
-    if not args.change:
-        print("error: at least one change id is required", file=sys.stderr)
-        return 2
+
     plan_path = resolve_plan(repo, args.plan)
     cfg = load_plan(_resolve_plan_path(repo, plan_path))
     state = load_state(repo, cfg["name"])
+
+    if args.approve_all:
+        affected = [
+            cid for cid in cfg["order"]
+            if classify(cfg, state, cid) == "awaiting_approval"
+        ]
+        if not affected:
+            print("No changes are currently awaiting approval.")
+            return 0
+        for cid in affected:
+            if cid not in state["approvals"]:
+                state["approvals"].append(cid)
+                log(f"approved: {cid}")
+        print(f"Approved: {', '.join(affected)}")
+        save_state(repo, cfg["name"], state)
+        return 0
+
+    if not args.change:
+        print("error: at least one change id is required", file=sys.stderr)
+        return 2
     changes = resolve_changes(cfg, args.change)
     if changes is None:
         return 2
@@ -3685,12 +3727,38 @@ def cmd_accept(args: argparse.Namespace) -> int:
     ):
         args.change.insert(0, args.plan)
         args.plan = None
-    if not args.change:
-        print("error: at least one change id is required", file=sys.stderr)
-        return 2
+
     plan_path = resolve_plan(repo, args.plan)
     cfg = load_plan(_resolve_plan_path(repo, plan_path))
     state = load_state(repo, cfg["name"])
+
+    if args.accept_all:
+        affected = [
+            cid for cid in cfg["order"]
+            if classify(cfg, state, cid) == "awaiting_acceptance"
+        ]
+        if not affected:
+            print("No changes are currently awaiting acceptance.")
+            return 0
+        had_failure = False
+        accepted: list[str] = []
+        for cid in affected:
+            ok, why = verify_change_created(repo, cfg, cid)
+            if not ok:
+                print(f"refusing to accept {cid}: {why}", file=sys.stderr)
+                had_failure = True
+                continue
+            rec(state, cid)["accepted"] = True
+            log(f"accepted: {cid}")
+            accepted.append(cid)
+        if accepted:
+            print(f"Accepted: {', '.join(accepted)}")
+            save_state(repo, cfg["name"], state)
+        return 2 if had_failure else 0
+
+    if not args.change:
+        print("error: at least one change id is required", file=sys.stderr)
+        return 2
     changes = resolve_changes(cfg, args.change)
     if changes is None:
         return 2
@@ -3719,12 +3787,32 @@ def cmd_reset(args: argparse.Namespace) -> int:
     ):
         args.change.insert(0, args.plan)
         args.plan = None
-    if not args.change:
-        print("error: at least one change id is required", file=sys.stderr)
-        return 2
+
     plan_path = resolve_plan(repo, args.plan)
     cfg = load_plan(_resolve_plan_path(repo, plan_path))
     state = load_state(repo, cfg["name"])
+
+    if args.failed:
+        affected = [
+            cid for cid in cfg["order"]
+            if classify(cfg, state, cid) == FAILED
+        ]
+        if not affected:
+            print("No failed changes to reset.")
+            return 0
+        for cid in affected:
+            state["changes"][cid] = new_change_record()
+            state["changes"][cid]["max_rounds"] = cfg["max_rounds"]
+            state["changes"][cid]["reason"] = "reset by operator"
+            state["changes"][cid]["updated_at"] = utcnow()
+            log(f"reset: {cid}")
+        print(f"Reset: {', '.join(affected)}")
+        save_state(repo, cfg["name"], state)
+        return 0
+
+    if not args.change:
+        print("error: at least one change id is required", file=sys.stderr)
+        return 2
     changes = resolve_changes(cfg, args.change)
     if changes is None:
         return 2
@@ -5410,6 +5498,10 @@ def main() -> int:
     p_approve = sub.add_parser("approve", help="approve pause_before changes")
     p_approve.add_argument("plan", nargs="?", default=None, help="path to plan TOML")
     p_approve.add_argument("change", nargs="*")
+    p_approve.add_argument(
+        "--all", dest="approve_all", action="store_true",
+        help="approve all changes currently awaiting approval",
+    )
     p_approve.set_defaults(fn=cmd_approve)
 
     p_accept = sub.add_parser(
@@ -5417,11 +5509,19 @@ def main() -> int:
     )
     p_accept.add_argument("plan", nargs="?", default=None, help="path to plan TOML")
     p_accept.add_argument("change", nargs="*")
+    p_accept.add_argument(
+        "--all", dest="accept_all", action="store_true",
+        help="accept all changes currently awaiting acceptance",
+    )
     p_accept.set_defaults(fn=cmd_accept)
 
     p_reset = sub.add_parser("reset", help="reset a failed change to pending")
     p_reset.add_argument("plan", nargs="?", default=None, help="path to plan TOML")
     p_reset.add_argument("change", nargs="*")
+    p_reset.add_argument(
+        "--failed", action="store_true",
+        help="reset all failed changes to pending",
+    )
     p_reset.set_defaults(fn=cmd_reset)
 
     p_compile = sub.add_parser(
