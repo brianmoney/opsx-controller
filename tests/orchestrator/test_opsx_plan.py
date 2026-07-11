@@ -10642,5 +10642,705 @@ class GitDeliveryDefaultOffTests(unittest.TestCase):
         self.assertFalse(cfg["git_delivery"]["enabled"])
 
 
+class PRDeliveryTests(unittest.TestCase):
+    """Tests for PR delivery: preflight, creation, idempotency, --no-pr,
+    body generation, and fail-closed behaviour."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        git(self.repo, "init")
+        git(
+            self.repo,
+            "remote", "add", "origin",
+            "git@github.com:example/repo.git",
+        )
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        git(self.repo, "add", "tracked.txt")
+        git(
+            self.repo,
+            "-c", "user.email=test@example.invalid",
+            "-c", "user.name=Test User",
+            "commit", "-m", "init",
+        )
+        self._saved_which = self.opsx_plan.shutil.which
+
+    def tearDown(self) -> None:
+        self.opsx_plan.shutil.which = self._saved_which
+        self.tmp.cleanup()
+
+    def _cfg_with_pr_delivery(self, enabled=True, create_pr=True):
+        return {
+            "name": "test-plan",
+            "adapter": "opencode",
+            "git_delivery": {
+                "enabled": enabled,
+                "branch": "",
+                "base_ref": "main",
+                "create_pull_request": create_pr,
+            },
+        }
+
+    def _state_with_delivery(self, branch_name="opsx/test-plan",
+                              base_ref="main", delivery_status="branch_ready",
+                              pull_request_url=None):
+        return {
+            "plan": "test-plan",
+            "approvals": [],
+            "changes": {},
+            "git_delivery": {
+                "base_ref": base_ref,
+                "branch_name": branch_name,
+                "delivery_status": delivery_status,
+                "pull_request_url": pull_request_url,
+            },
+        }
+
+    # -- Preflight tests ---------------------------------------------------
+
+    def test_pr_preflight_passes_when_gh_and_remote_exist(self) -> None:
+        self.opsx_plan.shutil.which = lambda cmd: cmd == "gh"
+        cfg = self._cfg_with_pr_delivery()
+        ok, err, remote = self.opsx_plan.check_pr_delivery_prerequisites(self.repo, cfg)
+        self.assertTrue(ok, err)
+        self.assertIsNone(err)
+        self.assertEqual(remote, "origin")
+
+    def test_pr_preflight_fails_when_gh_missing(self) -> None:
+        self.opsx_plan.shutil.which = lambda cmd: False
+        cfg = self._cfg_with_pr_delivery()
+        ok, err, remote = self.opsx_plan.check_pr_delivery_prerequisites(self.repo, cfg)
+        self.assertFalse(ok)
+        self.assertIsNotNone(err)
+        self.assertIsNone(remote)
+        self.assertIn("gh", err.lower())
+
+    def test_pr_preflight_skipped_when_create_pr_false(self) -> None:
+        self.opsx_plan.shutil.which = lambda cmd: False
+        cfg = self._cfg_with_pr_delivery(create_pr=False)
+        ok, err, remote = self.opsx_plan.check_pr_delivery_prerequisites(self.repo, cfg)
+        self.assertTrue(ok, err)
+        self.assertIsNone(err)
+        self.assertIsNone(remote)
+
+    def test_pr_preflight_fails_when_no_remote(self) -> None:
+        self.opsx_plan.shutil.which = lambda cmd: cmd == "gh"
+        git(self.repo, "remote", "remove", "origin")
+        cfg = self._cfg_with_pr_delivery()
+        ok, err, remote = self.opsx_plan.check_pr_delivery_prerequisites(self.repo, cfg)
+        self.assertFalse(ok)
+        self.assertIsNotNone(err)
+        self.assertIsNone(remote)
+        self.assertIn("remote", err.lower())
+
+    def test_pr_preflight_resolves_non_origin_remote(self) -> None:
+        """Preflight must pick up a non-origin remote and return its name."""
+        self.opsx_plan.shutil.which = lambda cmd: cmd == "gh"
+        git(self.repo, "remote", "remove", "origin")
+        git(self.repo, "remote", "add", "upstream",
+            "git@github.com:example/repo.git")
+        cfg = self._cfg_with_pr_delivery()
+        ok, err, remote = self.opsx_plan.check_pr_delivery_prerequisites(self.repo, cfg)
+        self.assertTrue(ok, f"preflight should pass with non-origin remote: {err}")
+        self.assertIsNone(err)
+        self.assertEqual(remote, "upstream")
+
+    def test_pr_preflight_prefers_origin_when_multiple_remotes(self) -> None:
+        """When multiple remotes exist, preflight must prefer 'origin'."""
+        self.opsx_plan.shutil.which = lambda cmd: cmd == "gh"
+        git(self.repo, "remote", "add", "upstream",
+            "git@github.com:example/upstream.git")
+        cfg = self._cfg_with_pr_delivery()
+        ok, err, remote = self.opsx_plan.check_pr_delivery_prerequisites(self.repo, cfg)
+        self.assertTrue(ok, err)
+        self.assertIsNone(err)
+        self.assertEqual(remote, "origin",
+                         "must prefer origin when multiple remotes exist")
+
+    # -- --no-pr tests -----------------------------------------------------
+
+    def test_no_pr_skips_preflight(self) -> None:
+        """Even when gh is missing, --no-pr should skip the preflight
+        check because it suppresses PR delivery entirely."""
+        self.opsx_plan.shutil.which = lambda cmd: False
+        # The pgm-level test: cmd_run should not call preflight when no_pr
+        cfg = self._cfg_with_pr_delivery()
+        state = self._state_with_delivery()
+        # Unit test the attempt_pr_delivery function directly
+        ok, err = self.opsx_plan.attempt_pr_delivery(
+            self.repo, cfg, state, no_pr=True,
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        # PR URL should not be set
+        self.assertIsNone(state["git_delivery"]["pull_request_url"])
+
+    # -- Push tests --------------------------------------------------------
+
+    def test_push_delivery_branch_succeeds(self) -> None:
+        cfg = self._cfg_with_pr_delivery()
+        state = self._state_with_delivery(branch_name="opsx/test-plan")
+
+        real_git = self.opsx_plan.git
+
+        def fake_git(repo, *args):
+            if args[0] == "push":
+                result = mock.Mock()
+                result.returncode = 0
+                result.stderr = ""
+                return result
+            return real_git(repo, *args)
+
+        with mock.patch.object(self.opsx_plan, "git", side_effect=fake_git):
+            ok, err = self.opsx_plan.push_delivery_branch(self.repo, cfg, state)
+        self.assertTrue(ok, err)
+        self.assertIsNone(err)
+
+    def test_push_delivery_branch_fails_closed(self) -> None:
+        cfg = self._cfg_with_pr_delivery()
+        state = self._state_with_delivery(branch_name="opsx/test-plan")
+
+        real_git = self.opsx_plan.git
+
+        def fake_git(repo, *args):
+            if args[0] == "push":
+                result = mock.Mock()
+                result.returncode = 1
+                result.stderr = "push rejected: permission denied"
+                return result
+            return real_git(repo, *args)
+
+        with mock.patch.object(self.opsx_plan, "git", side_effect=fake_git):
+            ok, err = self.opsx_plan.push_delivery_branch(self.repo, cfg, state)
+        self.assertFalse(ok)
+        self.assertIsNotNone(err)
+        self.assertIn("failed", err.lower())
+
+    def test_push_uses_remote_from_state_instead_of_hardcoding_origin(self) -> None:
+        """push_delivery_branch must use the remote_name stored in state,
+        not hardcode 'origin'."""
+        cfg = self._cfg_with_pr_delivery()
+        state = self._state_with_delivery(branch_name="opsx/test-plan")
+        state["git_delivery"]["remote_name"] = "upstream"
+
+        push_args: list[tuple] = []
+
+        def fake_git(repo, *args):
+            if args[0] == "push":
+                push_args.append(tuple(args))
+                result = mock.Mock()
+                result.returncode = 0
+                result.stderr = ""
+                return result
+            return self.opsx_plan.git(repo, *args)
+
+        with mock.patch.object(self.opsx_plan, "git", side_effect=fake_git):
+            ok, err = self.opsx_plan.push_delivery_branch(self.repo, cfg, state)
+        self.assertTrue(ok, err)
+        self.assertIsNone(err)
+        self.assertGreaterEqual(len(push_args), 1)
+        # The remote in the push command must be "upstream", not "origin"
+        self.assertIn("upstream", push_args[0])
+        self.assertNotIn("origin", push_args[0])
+
+    # -- gh pr create tests ------------------------------------------------
+
+    def test_create_pr_succeeds_and_records_url(self) -> None:
+        cfg = self._cfg_with_pr_delivery()
+        state = self._state_with_delivery(branch_name="opsx/test-plan")
+
+        real_run = subprocess.run
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "gh" and cmd[1] == "pr":
+                result = mock.Mock()
+                result.returncode = 0
+                result.stdout = "https://github.com/example/repo/pull/42"
+                result.stderr = ""
+                return result
+            return real_run(cmd, **kwargs)
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            ok, err, pr_url = self.opsx_plan.create_github_pull_request(
+                self.repo, cfg, state, "test body",
+            )
+        self.assertTrue(ok, err)
+        self.assertIsNone(err)
+        self.assertEqual(pr_url, "https://github.com/example/repo/pull/42")
+
+    def test_create_pr_fails_closed_on_gh_error(self) -> None:
+        cfg = self._cfg_with_pr_delivery()
+        state = self._state_with_delivery(branch_name="opsx/test-plan")
+
+        real_run = subprocess.run
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "gh" and cmd[1] == "pr":
+                result = mock.Mock()
+                result.returncode = 1
+                result.stdout = ""
+                result.stderr = "pull request already exists"
+                return result
+            return real_run(cmd, **kwargs)
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            ok, err, pr_url = self.opsx_plan.create_github_pull_request(
+                self.repo, cfg, state, "test body",
+            )
+        self.assertFalse(ok)
+        self.assertIsNotNone(err)
+        self.assertIsNone(pr_url)
+        self.assertIn("failed", err.lower())
+
+    # -- Idempotency tests ------------------------------------------------
+
+    def test_idempotent_rerun_skips_pr_when_already_recorded(self) -> None:
+        cfg = self._cfg_with_pr_delivery()
+        pr_url = "https://github.com/example/repo/pull/99"
+        state = self._state_with_delivery(
+            branch_name="opsx/test-plan",
+            delivery_status="pr_opened",
+            pull_request_url=pr_url,
+        )
+
+        # Mock push to ensure it's NOT called (idempotency should skip)
+        with mock.patch.object(
+            self.opsx_plan, "push_delivery_branch",
+        ) as mock_push:
+            ok, err = self.opsx_plan.attempt_pr_delivery(
+                self.repo, cfg, state,
+            )
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        mock_push.assert_not_called()
+        # PR URL must remain unchanged
+        self.assertEqual(state["git_delivery"]["pull_request_url"], pr_url)
+
+    # -- Full delivery flow tests -----------------------------------------
+
+    def test_full_delivery_flow_records_pr(self) -> None:
+        cfg = {
+            "name": "test-plan",
+            "adapter": "opencode",
+            "git_delivery": {
+                "enabled": True,
+                "branch": "",
+                "base_ref": "main",
+                "create_pull_request": True,
+            },
+            "order": [],
+            "changes": {},
+        }
+        state = self._state_with_delivery(branch_name="opsx/test-plan")
+
+        call_count = {"push": 0, "pr": 0}
+        real_run = subprocess.run
+        real_git = self.opsx_plan.git
+
+        def fake_git(repo, *args):
+            if args[0] == "push":
+                call_count["push"] += 1
+                result = mock.Mock()
+                result.returncode = 0
+                result.stderr = ""
+                return result
+            return real_git(repo, *args)
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "gh" and cmd[1] == "pr":
+                call_count["pr"] += 1
+                result = mock.Mock()
+                result.returncode = 0
+                result.stdout = "https://github.com/example/repo/pull/123"
+                result.stderr = ""
+                return result
+            return real_run(cmd, **kwargs)
+
+        with mock.patch.object(self.opsx_plan, "git", side_effect=fake_git), \
+             mock.patch("subprocess.run", side_effect=fake_run):
+            ok, err = self.opsx_plan.attempt_pr_delivery(
+                self.repo, cfg, state,
+            )
+
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        self.assertEqual(call_count["push"], 1)
+        self.assertEqual(call_count["pr"], 1)
+        self.assertEqual(
+            state["git_delivery"]["pull_request_url"],
+            "https://github.com/example/repo/pull/123",
+        )
+        self.assertEqual(state["git_delivery"]["delivery_status"], "pr_opened")
+
+    def test_push_failure_leaves_state_unambiguous(self) -> None:
+        cfg = self._cfg_with_pr_delivery()
+        state = self._state_with_delivery(branch_name="opsx/test-plan")
+
+        real_git = self.opsx_plan.git
+
+        def fake_git(repo, *args):
+            if args[0] == "push":
+                result = mock.Mock()
+                result.returncode = 1
+                result.stderr = "push rejected"
+                return result
+            return real_git(repo, *args)
+
+        with mock.patch.object(self.opsx_plan, "git", side_effect=fake_git):
+            ok, err = self.opsx_plan.attempt_pr_delivery(
+                self.repo, cfg, state,
+            )
+
+        self.assertFalse(ok)
+        self.assertIsNotNone(err)
+        # State must NOT claim PR opened
+        self.assertIsNone(state["git_delivery"]["pull_request_url"])
+        self.assertNotEqual(state["git_delivery"]["delivery_status"], "pr_opened")
+
+    def test_pr_creation_failure_after_push_leaves_state_unambiguous(self) -> None:
+        cfg = {
+            "name": "test-plan",
+            "adapter": "opencode",
+            "git_delivery": {
+                "enabled": True,
+                "branch": "",
+                "base_ref": "main",
+                "create_pull_request": True,
+            },
+            "order": [],
+            "changes": {},
+        }
+        state = self._state_with_delivery(branch_name="opsx/test-plan")
+
+        real_git = self.opsx_plan.git
+        real_run = subprocess.run
+
+        def fake_git(repo, *args):
+            if args[0] == "push":
+                result = mock.Mock()
+                result.returncode = 0
+                result.stderr = ""
+                return result
+            return real_git(repo, *args)
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "gh" and cmd[1] == "pr":
+                result = mock.Mock()
+                result.returncode = 1
+                result.stdout = ""
+                result.stderr = "pull request creation failed"
+                return result
+            return real_run(cmd, **kwargs)
+
+        with mock.patch.object(self.opsx_plan, "git", side_effect=fake_git), \
+             mock.patch("subprocess.run", side_effect=fake_run):
+            ok, err = self.opsx_plan.attempt_pr_delivery(
+                self.repo, cfg, state,
+            )
+
+        self.assertFalse(ok)
+        self.assertIsNotNone(err)
+        # State must NOT claim PR opened
+        self.assertIsNone(state["git_delivery"]["pull_request_url"])
+        self.assertNotEqual(state["git_delivery"]["delivery_status"], "pr_opened")
+
+    # -- Body generation tests --------------------------------------------
+
+    def test_generate_pr_body_includes_change_summary(self) -> None:
+        cfg = {
+            "name": "test-plan",
+            "adapter": "opencode",
+            "git_delivery": {"create_pull_request": True},
+            "order": [],
+            "changes": {},
+        }
+        state = {"changes": {}}
+        body = self.opsx_plan.generate_pr_body(self.repo, cfg, state)
+        self.assertIn("test-plan", body)
+        self.assertIn("opsx-plan", body)
+
+    def test_pr_body_fallback_lists_per_change_status_when_no_telemetry(self) -> None:
+        """When metrics aggregator is unavailable, the fallback path must
+        list per-change status and mention the plan name."""
+        cfg = {
+            "name": "test-plan",
+            "adapter": "opencode",
+            "git_delivery": {"create_pull_request": True},
+            "order": ["add-example", "fix-bug"],
+            "changes": {
+                "add-example": {"id": "add-example", "enabled": True},
+                "fix-bug": {"id": "fix-bug", "enabled": True},
+            },
+        }
+        state = {
+            "changes": {
+                "add-example": {"status": "done"},
+                "fix-bug": {"status": "running"},
+            },
+        }
+        body = self.opsx_plan.generate_pr_body(self.repo, cfg, state)
+        self.assertIn("test-plan", body)
+        self.assertIn("add-example", body)
+        self.assertIn("done", body.lower())
+        self.assertIn("fix-bug", body)
+        self.assertIn("running", body.lower())
+
+    def test_pr_body_fallback_excludes_disabled_changes(self) -> None:
+        """Fallback body must not list disabled changes."""
+        cfg = {
+            "name": "test-plan",
+            "adapter": "opencode",
+            "git_delivery": {"create_pull_request": True},
+            "order": ["enabled-change", "disabled-change"],
+            "changes": {
+                "enabled-change": {"id": "enabled-change", "enabled": True},
+                "disabled-change": {"id": "disabled-change", "enabled": False},
+            },
+        }
+        state = {
+            "changes": {
+                "enabled-change": {"status": "done"},
+                "disabled-change": {"status": "pending"},
+            },
+        }
+        body = self.opsx_plan.generate_pr_body(self.repo, cfg, state)
+        self.assertIn("enabled-change", body)
+        self.assertNotIn("disabled-change", body)
+
+    def test_pr_body_with_telemetry_includes_table_and_cost(self) -> None:
+        """When metrics aggregator returns change data with cost, the PR
+        body must include the summary table and total cost estimate."""
+        cfg = {
+            "name": "test-plan",
+            "adapter": "opencode",
+            "git_delivery": {"create_pull_request": True},
+            "order": ["add-example"],
+            "changes": {
+                "add-example": {"id": "add-example", "enabled": True},
+            },
+        }
+        state = {"changes": {}}
+
+        # Build a fake AggregationError for the except clause fallback,
+        # and a fake change metric for the imported path.
+        FakeChangeMetric = mock.MagicMock()
+        FakeChangeMetric.change_id = "add-example"
+        FakeChangeMetric.status = "done"
+        FakeChangeMetric.total_rounds = 3
+        FakeChangeMetric.duration_ms = 125000  # 2m5s
+        FakeChangeMetric.tokens = 1_500_000  # 1.5M
+        FakeChangeMetric.cost_status = "estimated"
+        FakeChangeMetric.estimated_cost = 0.42
+
+        def fake_read_telemetry(repo, plan_name):
+            return ([], None)
+
+        def fake_select_run(records, run_id):
+            return [], None, None
+
+        def fake_read_state(repo, plan_name):
+            return state, None
+
+        def fake_change_aggregation(state_for_cm, selected_records,
+                                    plan_name, extra):
+            return [FakeChangeMetric], None
+
+        fake_aggregator = mock.MagicMock()
+        fake_aggregator.AggregationError = type("AggregationError", (Exception,), {})
+        fake_aggregator._change_aggregation = fake_change_aggregation
+        fake_aggregator._read_state = fake_read_state
+        fake_aggregator._read_telemetry = fake_read_telemetry
+        fake_aggregator._select_run = fake_select_run
+
+        with mock.patch.dict(
+            "sys.modules",
+            {"lib.metrics": mock.MagicMock(), "lib.metrics.aggregator": fake_aggregator},
+        ):
+            body = self.opsx_plan.generate_pr_body(self.repo, cfg, state)
+
+        self.assertIn("Change Summary", body)
+        self.assertIn("add-example", body)
+        self.assertIn("done", body)
+        self.assertIn("3", body)  # rounds
+        self.assertIn("2m5s", body)  # duration
+        self.assertIn("1.5M", body)  # tokens
+        self.assertIn("$0.42", body)  # cost
+        self.assertIn("Total estimated cost", body)
+
+    def test_pr_body_with_telemetry_handles_unresolved_cost(self) -> None:
+        """When cost is unresolved, the body must show 'unresolved' in the
+        cost column and note 'partial' on the total cost line."""
+        cfg = {
+            "name": "test-plan",
+            "adapter": "opencode",
+            "git_delivery": {"create_pull_request": True},
+            "order": ["add-example"],
+            "changes": {
+                "add-example": {"id": "add-example", "enabled": True},
+            },
+        }
+        state = {"changes": {}}
+
+        FakeChangeMetric = mock.MagicMock()
+        FakeChangeMetric.change_id = "add-example"
+        FakeChangeMetric.status = "done"
+        FakeChangeMetric.total_rounds = 1
+        FakeChangeMetric.duration_ms = None
+        FakeChangeMetric.tokens = None
+        FakeChangeMetric.cost_status = "unresolved"
+        FakeChangeMetric.estimated_cost = None
+
+        fake_aggregator = mock.MagicMock()
+        fake_aggregator.AggregationError = type("AggregationError", (Exception,), {})
+        fake_aggregator._change_aggregation = lambda *a, **kw: ([FakeChangeMetric], None)
+        fake_aggregator._read_state = lambda *a, **kw: (state, None)
+        fake_aggregator._read_telemetry = lambda *a, **kw: ([], None)
+        fake_aggregator._select_run = lambda *a, **kw: ([], None, None)
+
+        with mock.patch.dict(
+            "sys.modules",
+            {"lib.metrics": mock.MagicMock(), "lib.metrics.aggregator": fake_aggregator},
+        ):
+            body = self.opsx_plan.generate_pr_body(self.repo, cfg, state)
+
+        self.assertIn("unresolved", body)
+        self.assertNotIn("Total estimated cost", body)
+
+    def test_pr_body_with_telemetry_handles_partial_cost(self) -> None:
+        """When cost_status is 'partial' (mixed estimated + unresolved),
+        the body must show the estimated cost amount with '(partial)' in the
+        per-change column, include it in the total, and mark the total as
+        partial."""
+        cfg = {
+            "name": "test-plan",
+            "adapter": "opencode",
+            "git_delivery": {"create_pull_request": True},
+            "order": ["add-example", "fix-bug"],
+            "changes": {
+                "add-example": {"id": "add-example", "enabled": True},
+                "fix-bug": {"id": "fix-bug", "enabled": True},
+            },
+        }
+        state = {"changes": {}}
+
+        PartialMetric = mock.MagicMock()
+        PartialMetric.change_id = "add-example"
+        PartialMetric.status = "done"
+        PartialMetric.total_rounds = 3
+        PartialMetric.duration_ms = 125000
+        PartialMetric.tokens = 1_500_000
+        PartialMetric.cost_status = "partial"
+        PartialMetric.estimated_cost = 0.42
+
+        UnresolvedMetric = mock.MagicMock()
+        UnresolvedMetric.change_id = "fix-bug"
+        UnresolvedMetric.status = "done"
+        UnresolvedMetric.total_rounds = 2
+        UnresolvedMetric.duration_ms = None
+        UnresolvedMetric.tokens = None
+        UnresolvedMetric.cost_status = "unresolved"
+        UnresolvedMetric.estimated_cost = None
+
+        cm_list = [PartialMetric, UnresolvedMetric]
+
+        fake_aggregator = mock.MagicMock()
+        fake_aggregator.AggregationError = type("AggregationError", (Exception,), {})
+        fake_aggregator._change_aggregation = lambda *a, **kw: (cm_list, None)
+        fake_aggregator._read_state = lambda *a, **kw: (state, None)
+        fake_aggregator._read_telemetry = lambda *a, **kw: ([], None)
+        fake_aggregator._select_run = lambda *a, **kw: ([], None, None)
+
+        with mock.patch.dict(
+            "sys.modules",
+            {"lib.metrics": mock.MagicMock(), "lib.metrics.aggregator": fake_aggregator},
+        ):
+            body = self.opsx_plan.generate_pr_body(self.repo, cfg, state)
+
+        # Per-change column: partial change shows dollar amount with "(partial)"
+        self.assertIn("$0.42 (partial)", body)
+        # Pure unresolved still shows "unresolved"
+        self.assertIn("unresolved", body)
+        # Total cost line appears with "(partial)" marker
+        self.assertIn("Total estimated cost (partial):", body)
+        self.assertIn("$0.42", body)
+
+    def test_pr_body_with_telemetry_excludes_disabled_changes(self) -> None:
+        """Telemetry-backed PR body must not render disabled changes or include
+        their cost in the total."""
+        cfg = {
+            "name": "test-plan",
+            "adapter": "opencode",
+            "git_delivery": {"create_pull_request": True},
+            "order": ["enabled-change", "disabled-change"],
+            "changes": {
+                "enabled-change": {"id": "enabled-change", "enabled": True},
+                "disabled-change": {"id": "disabled-change", "enabled": False},
+            },
+        }
+        state = {"changes": {}}
+
+        EnabledMetric = mock.MagicMock()
+        EnabledMetric.change_id = "enabled-change"
+        EnabledMetric.status = "done"
+        EnabledMetric.total_rounds = 2
+        EnabledMetric.duration_ms = 90000
+        EnabledMetric.tokens = 500_000
+        EnabledMetric.cost_status = "estimated"
+        EnabledMetric.estimated_cost = 0.25
+
+        DisabledMetric = mock.MagicMock()
+        DisabledMetric.change_id = "disabled-change"
+        DisabledMetric.status = "skipped"
+        DisabledMetric.total_rounds = 0
+        DisabledMetric.duration_ms = None
+        DisabledMetric.tokens = None
+        DisabledMetric.cost_status = "unavailable"
+        DisabledMetric.estimated_cost = None
+
+        cm_list = [EnabledMetric, DisabledMetric]
+
+        fake_aggregator = mock.MagicMock()
+        fake_aggregator.AggregationError = type("AggregationError", (Exception,), {})
+        fake_aggregator._change_aggregation = lambda *a, **kw: (cm_list, None)
+        fake_aggregator._read_state = lambda *a, **kw: (state, None)
+        fake_aggregator._read_telemetry = lambda *a, **kw: ([], None)
+        fake_aggregator._select_run = lambda *a, **kw: ([], None, None)
+
+        with mock.patch.dict(
+            "sys.modules",
+            {"lib.metrics": mock.MagicMock(), "lib.metrics.aggregator": fake_aggregator},
+        ):
+            body = self.opsx_plan.generate_pr_body(self.repo, cfg, state)
+
+        self.assertIn("enabled-change", body)
+        self.assertNotIn("disabled-change", body)
+        self.assertIn("$0.25", body)
+        self.assertIn("Total estimated cost", body)
+        # Total cost must be only the enabled change's cost
+        self.assertIn("$0.25", body)
+
+    # -- Delivery skipped when disabled -----------------------------------
+
+    def test_attempt_pr_delivery_skips_when_create_pr_false(self) -> None:
+        cfg = self._cfg_with_pr_delivery(create_pr=False)
+        state = self._state_with_delivery(branch_name="opsx/test-plan")
+        with mock.patch.object(
+            self.opsx_plan, "push_delivery_branch",
+        ) as mock_push:
+            ok, err = self.opsx_plan.attempt_pr_delivery(
+                self.repo, cfg, state,
+            )
+        self.assertTrue(ok)
+        mock_push.assert_not_called()
+
+    # -- Default delivery state includes pull_request_url -----------------
+
+    def test_default_git_delivery_state_includes_pull_request_url(self) -> None:
+        state = self.opsx_plan._default_git_delivery_state()
+        self.assertIn("pull_request_url", state)
+        self.assertIsNone(state["pull_request_url"])
+
+
 if __name__ == "__main__":
     unittest.main()
