@@ -37,6 +37,23 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Resolve bundled runtime modules before considering the host repository. The
+# global installer places these under ~/.local/lib/opsx-controller.
+_SCRIPT_ROOT = Path(__file__).resolve().parents[1]
+_RUNTIME_ROOTS = (_SCRIPT_ROOT, _SCRIPT_ROOT / "lib" / "opsx-controller")
+
+
+def _ensure_runtime_modules() -> None:
+    for runtime_root in _RUNTIME_ROOTS:
+        if (runtime_root / "lib" / "metrics").is_dir():
+            runtime_root_str = str(runtime_root)
+            if runtime_root_str not in sys.path:
+                sys.path.insert(0, runtime_root_str)
+            return
+
+
+_ensure_runtime_modules()
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover
@@ -1692,22 +1709,12 @@ _cost_catalog: object = None  # PricingCatalog | None
 def _get_catalog(repo: Path | None = None):
     """Lazily initialise and return the pricing catalog.
 
-    When *repo* is provided, its resolved path is prepended to
-    ``sys.path`` before the deferred import so that installed
-    copies of the orchestrator can discover ``lib.pricing``.
-
     Returns ``(PricingCatalog, UnresolvedPrice)`` or None on failure.
     """
     global _cost_catalog
     if _cost_catalog is None:
         try:
-            # Ensure repo root is on sys.path so an installed
-            # ~/.local/bin/opsx-plan can resolve ``from lib.pricing``.
-            if repo is not None:
-                repo_str = str(repo.resolve())
-                if repo_str not in sys.path:
-                    sys.path.insert(0, repo_str)
-
+            _ensure_runtime_modules()
             from lib.pricing import PricingCatalog, UnresolvedPrice  # noqa: F811
 
             _cost_catalog = (PricingCatalog(), UnresolvedPrice)
@@ -3009,9 +3016,6 @@ def generate_pr_body(repo: Path, cfg: dict, state: dict) -> str:
     lines.append("")
 
     # Collect per-change evidence from state + telemetry
-    repo_str = str(repo)
-    if repo_str not in sys.path:
-        sys.path.insert(0, repo_str)
     try:
         from lib.metrics.aggregator import (
             AggregationError,
@@ -5165,10 +5169,6 @@ def cmd_report(args: argparse.Namespace) -> int:
        [--stage <stage>] [--model <substr>]"""
     repo = Path(args.repo).resolve()
     plan_src = resolve_plan(repo, args.plan)
-    repo_str = str(repo)
-    if repo_str not in sys.path:
-        sys.path.insert(0, repo_str)
-
     from lib.metrics.aggregator import (
         AggregationError,
         _build_leaderboard,
@@ -6133,10 +6133,6 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
        [--change <id>]"""
     repo = Path(args.repo).resolve()
     plan_src = resolve_plan(repo, args.plan)
-    repo_str = str(repo)
-    if repo_str not in sys.path:
-        sys.path.insert(0, repo_str)
-
     from lib.metrics.aggregator import (
         AggregationError,
         _build_leaderboard,

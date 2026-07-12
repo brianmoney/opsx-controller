@@ -70,7 +70,12 @@ install_plugins() {
 
 install_orchestrator() {
   local dest_dir="$HOME/.local/bin"
+  local runtime_dir="$HOME/.local/lib/opsx-controller"
   mkdir -p "$dest_dir"
+  rm -rf "$runtime_dir/lib"
+  mkdir -p "$runtime_dir/lib"
+  cp -R "$ROOT_DIR/lib/metrics" "$runtime_dir/lib/"
+  cp -R "$ROOT_DIR/lib/pricing" "$runtime_dir/lib/"
   install -m 0755 \
     "$ROOT_DIR/orchestrator/opsx-plan.py" \
     "$dest_dir/opsx-plan"
@@ -145,6 +150,7 @@ install_global() {
     "Installed agents to $config_root/agents" \
     "Installed plugins to $config_root/plugins" \
     "Installed support files to $config_root/opsx-controller" \
+    "Installed opsx-plan runtime libraries to $HOME/.local/lib/opsx-controller" \
     "Installed opsx-plan to $HOME/.local/bin/opsx-plan" \
     "Installed opsx-run to $HOME/.local/bin/opsx-run"
   do_verify
@@ -207,5 +213,4 @@ case "$1" in
 esac
 
 printf '%s\n' 'Restart OpenCode after install so it reloads commands, agents, and plugins.'
-
 

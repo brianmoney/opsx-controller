@@ -1,0 +1,24 @@
+[plan]
+name = "fix-claude"
+adapter = "opencode"
+timeout_minutes = 90
+max_attempts = 2
+max_rounds = 5
+no_progress_limit = 2
+require_clean_tracked = true
+plan_doc = "openspec/plans/plan-fix-claude.md"
+create_invoke = "opencode run \"/opsx-ff Please review @{plan_doc} and create a change for {change}\""
+create_timeout_minutes = 30
+create_max_attempts = 2
+created_check = "openspec validate {change} --strict"
+review_created = true
+fast_checks = [
+  "openspec validate --all",
+]
+
+# Phase 1: Claude Code Plan Authoring
+
+[[changes]]
+id = "add-claude-code-plan-authoring"
+phase = 1
+pause_before = true # first change in the Claude Code plan-authoring capability

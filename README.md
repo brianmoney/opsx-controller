@@ -150,9 +150,13 @@ What it contains:
 
 - `adapters/claude-code/skills/opsx-drive/SKILL.md`: main Claude Code slash
   command entrypoint
+- `adapters/claude-code/skills/opsx-plan/SKILL.md`: implementation-plan
+  authoring skill
 - `adapters/claude-code/agents/opsx-implementer.md`: implementation phase agent
 - `adapters/claude-code/agents/opsx-reviewer.md`: strict review phase agent
 - `adapters/claude-code/agents/opsx-archiver.md`: archive phase agent
+- `adapters/claude-code/agents/opsx-plan-author.md`: implementation-plan
+  authoring agent
 - `adapters/claude-code/support/opsx-controller-state-README.md`: state contract
 - `adapters/claude-code/templates/project/`: host-project setup snippets
 - `adapters/claude-code/install.sh`: Claude Code installer
@@ -187,8 +191,17 @@ Project install behavior:
 Usage from the host project root:
 
 ```text
+/opsx-plan <planning request>
 /opsx-drive <change-id>
 ```
+
+Compilation note:
+
+- `/opsx-plan` authors the markdown implementation plan in Claude Code.
+- `opsx-plan compile` still requires an OpenCode-configured environment plus
+  `OPSX_CONTROLLER_MODEL`.
+- A Claude-only installation can author the markdown but cannot claim TOML
+  compilation succeeded until that OpenCode-backed compile step runs.
 
 If you want the host repo instructions to advertise the controller path, merge
 `adapters/claude-code/templates/project/CLAUDE.snippet.md` into that project's
@@ -279,6 +292,7 @@ claude --plugin-dir ./plugins/opsx-controller
 Usage:
 
 ```text
+/opsx-controller:opsx-plan <planning request>
 /opsx-controller:opsx-drive <change-id>
 ```
 
@@ -287,6 +301,13 @@ Why use the plugin package:
 - namespaced Claude skill for sharing across projects
 - self-contained `skills/` and `agents/` layout
 - ready to evolve toward marketplace distribution
+
+Compilation note:
+
+- `/opsx-controller:opsx-plan` authors the markdown plan document.
+- `opsx-plan compile` still depends on OpenCode plus `OPSX_CONTROLLER_MODEL`,
+  so the plugin must report when compilation was unavailable instead of
+  implying success.
 
 ## Vercel Skill Package
 

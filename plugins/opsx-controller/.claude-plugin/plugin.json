@@ -1,6 +1,6 @@
 {
   "name": "opsx-controller",
-  "description": "OpenSpec controller workflow for Claude Code with a namespaced /opsx-controller:opsx-drive skill and supporting phase agents.",
+  "description": "OpenSpec controller workflow for Claude Code with namespaced /opsx-controller:opsx-drive and /opsx-controller:opsx-plan skills plus supporting agents.",
   "version": "1.0.0",
   "author": {
     "name": "brianmoney"
