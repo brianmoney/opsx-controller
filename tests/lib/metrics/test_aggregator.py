@@ -534,6 +534,34 @@ class ChangeLevelTests(unittest.TestCase):
         cm = result.change_metrics[0]
         self.assertTrue(cm.archive_failed)
 
+    def test_archived_stage_status_is_completed(self):
+        """Direct archiver telemetry records successful archives as archived."""
+        archive = _make_telemetry_record(
+            uid="3", change_id="change-a", stage="archive", round_num=1,
+        )
+        archive["result"]["stage_status"] = "archived"
+        records = [
+            _make_telemetry_record(
+                uid="1", change_id="change-a", stage="implement", round_num=1,
+            ),
+            _make_telemetry_record(
+                uid="2", change_id="change-a", stage="review", round_num=1,
+                verdict="pass",
+            ),
+            archive,
+        ]
+        state = _make_state(
+            changes={"change-a": _make_change_record(status="done")}
+        )
+        repo = _setup_fixture_dir(
+            tempfile.mkdtemp(), telemetry_records=records, state=state
+        )
+
+        result = aggregate(str(repo), "test-plan")
+        cm = result.change_metrics[0]
+        self.assertEqual(cm.status, "completed")
+        self.assertFalse(cm.archive_failed)
+
     def test_fast_check_failed(self):
         """First-round implement unsuccessful."""
         records = [

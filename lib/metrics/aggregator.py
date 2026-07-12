@@ -276,7 +276,11 @@ def _is_completed_stage(record: dict) -> bool:
     if status == "completed":
         return True
     result = record.get("result", {})
-    if isinstance(result, dict) and result.get("stage_status") == "completed":
+    if isinstance(result, dict) and result.get("stage_status") in (
+        "completed",
+        "passed",
+        "archived",
+    ):
         return True
     return False
 
@@ -583,10 +587,7 @@ def _change_aggregation(
             # Archive stages
             if stage == "archive":
                 has_archive = True
-                r_status = r.get("status", "")
-                result_data = r.get("result", {})
-                stage_status = result_data.get("stage_status", r_status)
-                if stage_status in ("completed", "passed"):
+                if _is_completed_stage(r):
                     archive_completed = True
 
         if not any_duration:
