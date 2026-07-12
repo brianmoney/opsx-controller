@@ -18,14 +18,18 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 VERIFY=false
 
 # Parse optional flags
+declare -a _verify_filtered=()
 for arg in "$@"; do
   case "$arg" in
     --verify)
       VERIFY=true
-      shift
+      ;;
+    *)
+      _verify_filtered+=("$arg")
       ;;
   esac
 done
+set -- "${_verify_filtered[@]}"
 
 install_skills() {
   local dest_root="$1"
@@ -120,14 +124,14 @@ fi
 
 case "$1" in
   --global)
-    if [[ $# -lt 1 || $# -gt 2 ]]; then
+    if [[ $# -ne 1 ]]; then
       usage
       exit 1
     fi
     install_global
     ;;
   --project)
-    if [[ $# -lt 2 || $# -gt 3 ]]; then
+    if [[ $# -ne 2 ]]; then
       usage
       exit 1
     fi
