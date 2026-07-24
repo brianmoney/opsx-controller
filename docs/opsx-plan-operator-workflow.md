@@ -188,6 +188,36 @@ The plan manifest is a TOML file with a `[plan]` table and one or more
 **Constraint:** `create_pull_request = true` requires `enabled = true`. Setting
 `create_pull_request` without `enabled` is a plan-load error.
 
+### Unrecognized manifest keys are silently ignored
+
+`load_plan()` in `orchestrator/opsx-plan.py` builds its config from an explicit
+`.get()` per known key. Any other key in `[plan]` or in a `[[changes]]` entry is
+dropped with no warning and no load error. A manifest that configures behavior
+this controller does not implement therefore loads clean and runs as if the key
+were never written, which reads as "configured and working" in review.
+
+**Known instance: `escalate_after_review_fails`.** Manifests in circulation set
+it — for example `docs/archived/post-refactor-hardening-plan.toml` in the
+knowledge-forge repo sets `escalate_after_review_fails = 2` with the comment
+"promote implementer to `$OPSX_SMART_MODEL` after 3 failed reviews". No such key
+and no such behavior exists here: as of 2026-07-24, `escalat` and `SMART_MODEL`
+both return zero hits across this entire repo, including the adapters and agent
+definitions. There is no model promotion on repeated review failure, and plans
+carrying the key get none.
+
+Consequences for plan authors:
+
+- Do not rely on automatic implementer escalation. Bound repeated review
+  failures with `max_rounds` and `no_progress_limit` instead, and treat a
+  `failed` change as work needing a human.
+- Treat any key not listed in the three tables above as decorative. Compiled
+  manifests in particular carry descriptive metadata (`title`, `purpose`,
+  `planning_principles`, `pause_reason`, and similar) that the runtime never
+  reads.
+
+Worth fixing at the source: a plan-load warning that lists unknown keys would
+catch this whole class of drift at `doctor` time rather than after a run.
+
 ---
 
 ## Compiling a Plan

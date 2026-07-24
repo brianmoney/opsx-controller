@@ -1,0 +1,11 @@
+{
+  "version": "1.0.0",
+  "organization": "OpenSpec",
+  "date": "July 2026",
+  "abstract": "Authoring workflow for opsx-plan TOML manifests: reconcile a markdown implementation plan against the repository, encode the remaining work as a dependency graph with deliberate gates, and verify with graph validation plus a manifest audit that catches silently-ignored keys and stale change ids.",
+  "references": [
+    "https://github.com/brianmoney/opsx-controller",
+    "https://github.com/vercel-labs/agent-skills",
+    "https://docs.anthropic.com/en/docs/claude-code"
+  ]
+}
