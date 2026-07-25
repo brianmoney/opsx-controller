@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import subprocess
 import tempfile
 import textwrap
@@ -848,7 +849,7 @@ class SingleChangeConfigTests(unittest.TestCase):
         self.assertTrue(cfg["require_clean_tracked"])
         self.assertFalse(cfg["review_created"])
         self.assertTrue(
-            self.opsx_plan.is_direct_opencode(cfg),
+            self.opsx_plan.is_direct_mode(cfg),
             "single-change config must route through direct workers",
         )
 
@@ -1390,9 +1391,206 @@ class OpsxDriveCompatibilityTests(unittest.TestCase):
 
         cfg = {"adapter": "opencode", **defaults}
         self.assertTrue(
-            self.opsx_plan.is_direct_opencode(cfg),
+            self.opsx_plan.is_direct_mode(cfg),
             "default OpenCode config must route through direct workers, not /opsx-drive",
         )
+
+
+class IsDirectModeGateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+
+    def test_opencode_plan_takes_direct_path_with_no_manifest_change(self) -> None:
+        defaults = self.opsx_plan.ADAPTER_DEFAULTS["opencode"]
+        cfg = {"adapter": "opencode", **defaults}
+        self.assertTrue(
+            self.opsx_plan.is_direct_mode(cfg),
+            "OpenCode plan must still take the direct path unchanged",
+        )
+
+    def test_plan_with_fewer_than_three_invokes_takes_nested_controller_path(self) -> None:
+        cfg = {
+            "adapter": "claude-code",
+            "implement_invoke": "claude -p --agent opsx-implementer",
+            "review_invoke": "claude -p --agent opsx-reviewer",
+            "archive_invoke": "",
+        }
+        self.assertFalse(
+            self.opsx_plan.is_direct_mode(cfg),
+            "a plan missing one of the three stage invokes must not take the direct path",
+        )
+
+    def test_gate_is_independent_of_adapter_identity(self) -> None:
+        cfg = {
+            "adapter": "codex-cli",
+            "implement_invoke": "codex exec --agent opsx-implementer",
+            "review_invoke": "codex exec --agent opsx-reviewer",
+            "archive_invoke": "codex exec --agent opsx-archiver",
+        }
+        self.assertTrue(
+            self.opsx_plan.is_direct_mode(cfg),
+            "the gate must be configuration-driven, not conditioned on adapter identity",
+        )
+
+
+class ClaudeCodeAdapterDefaultsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _write_plan(self, name: str, body: str) -> Path:
+        p = self.repo / name
+        p.write_text(body, encoding="utf-8")
+        return p
+
+    def test_claude_code_plan_resolves_all_three_defaults_and_takes_direct_path(self) -> None:
+        plan = self._write_plan(
+            "plan.toml",
+            '[plan]\nname = "test"\nadapter = "claude-code"\n\n'
+            '[[changes]]\nid = "c1"\n',
+        )
+        cfg = self.opsx_plan.load_plan(plan)
+
+        for stage, env_var in (
+            ("implement", "OPSX_IMPLEMENTER_MODEL"),
+            ("review", "OPSX_REVIEWER_MODEL"),
+            ("archive", "OPSX_ARCHIVER_MODEL"),
+        ):
+            invoke = cfg[f"{stage}_invoke"]
+            self.assertIn("claude", invoke)
+            self.assertIn(f"opsx-{stage}er" if stage != "archive" else "opsx-archiver", invoke)
+            self.assertIn(f"${env_var}", invoke)
+            self.assertIn("--permission-mode bypassPermissions", invoke)
+            self.assertIn("--output-format json", invoke)
+
+        self.assertTrue(
+            self.opsx_plan.is_direct_mode(cfg),
+            "claude-code plan with no invoke overrides must resolve to the direct path",
+        )
+
+    def test_single_overridden_stage_invoke_is_honored_others_fall_back(self) -> None:
+        defaults = self.opsx_plan.ADAPTER_DEFAULTS["claude-code"]
+        plan = self._write_plan(
+            "plan.toml",
+            '[plan]\nname = "test"\nadapter = "claude-code"\n'
+            'review_invoke = "claude -p --agent custom-reviewer --output-format json"\n\n'
+            '[[changes]]\nid = "c1"\n',
+        )
+        cfg = self.opsx_plan.load_plan(plan)
+
+        self.assertEqual(
+            cfg["review_invoke"],
+            "claude -p --agent custom-reviewer --output-format json",
+        )
+        self.assertEqual(cfg["implement_invoke"], defaults["implement_invoke"])
+        self.assertEqual(cfg["archive_invoke"], defaults["archive_invoke"])
+        self.assertTrue(self.opsx_plan.is_direct_mode(cfg))
+
+
+class InvokeDirectStageEnvExpansionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _cfg(self, invoke: str) -> dict:
+        return {
+            "implement_invoke": invoke,
+            "changes": {"c1": {"timeout_minutes": 1}},
+        }
+
+    def test_successful_expansion_reaches_subprocess(self) -> None:
+        os.environ["OPSX_TEST_EXPANSION_MODEL"] = "sonnet-test"
+        try:
+            cfg = self._cfg('echo --model "$OPSX_TEST_EXPANSION_MODEL"')
+            outcome, log_path = self.opsx_plan.invoke_direct_stage(
+                self.repo, cfg, "c1", "implement", 1, "INPUT_BLOCK"
+            )
+        finally:
+            del os.environ["OPSX_TEST_EXPANSION_MODEL"]
+
+        self.assertEqual(outcome, "exited")
+        content = log_path.read_text(encoding="utf-8")
+        self.assertIn("sonnet-test", content)
+        self.assertNotIn("$OPSX_TEST_EXPANSION_MODEL", content)
+
+    def test_unset_variable_fails_before_spawning(self) -> None:
+        var = "OPSX_TEST_MISSING_MODEL_VAR"
+        os.environ.pop(var, None)
+        cfg = self._cfg(f'echo --model "${var}"')
+        outcome, log_path = self.opsx_plan.invoke_direct_stage(
+            self.repo, cfg, "c1", "implement", 1, "INPUT_BLOCK"
+        )
+        self.assertEqual(outcome, "env_error")
+        content = log_path.read_text(encoding="utf-8")
+        self.assertIn(var, content)
+
+    def test_invoke_with_no_variable_references(self) -> None:
+        cfg = self._cfg("echo hello world")
+        outcome, log_path = self.opsx_plan.invoke_direct_stage(
+            self.repo, cfg, "c1", "implement", 1, "INPUT_BLOCK"
+        )
+        self.assertEqual(outcome, "exited")
+        content = log_path.read_text(encoding="utf-8")
+        self.assertIn("hello world", content)
+
+    def test_input_block_is_trailing_positional_argument(self) -> None:
+        argv_dump = self.repo / "argv.json"
+        script = (
+            "import sys, json, pathlib; "
+            f"pathlib.Path({str(argv_dump)!r}).write_text(json.dumps(sys.argv))"
+        )
+        cfg = self._cfg(f"python3 -c {shlex.quote(script)}")
+        input_block = "THE INPUT BLOCK\nwith multiple lines"
+        outcome, _log_path = self.opsx_plan.invoke_direct_stage(
+            self.repo, cfg, "c1", "implement", 1, input_block
+        )
+        self.assertEqual(outcome, "exited")
+        argv = json.loads(argv_dump.read_text(encoding="utf-8"))
+        self.assertEqual(argv[-1], input_block)
+        self.assertEqual(len(argv), 2)
+
+    def test_exec_log_line_shows_command_with_input_block_elided(self) -> None:
+        cfg = self._cfg('echo --model "$OPSX_TEST_EXPANSION_MODEL_2"')
+        os.environ["OPSX_TEST_EXPANSION_MODEL_2"] = "sonnet-test-2"
+        input_block = "THIS SHOULD NOT APPEAR IN THE EXEC LOG LINE"
+        try:
+            with mock.patch("sys.stdout", io.StringIO()) as stdout:
+                outcome, _log_path = self.opsx_plan.invoke_direct_stage(
+                    self.repo, cfg, "c1", "implement", 1, input_block
+                )
+        finally:
+            del os.environ["OPSX_TEST_EXPANSION_MODEL_2"]
+
+        self.assertEqual(outcome, "exited")
+        printed = stdout.getvalue()
+        exec_lines = [line for line in printed.splitlines() if "exec[implement]" in line]
+        self.assertEqual(len(exec_lines), 1)
+        exec_line = exec_lines[0]
+        self.assertIn("sonnet-test-2", exec_line)
+        self.assertNotIn(input_block, exec_line)
+        self.assertIn("<input>", exec_line)
+
+    def test_stage_log_header_elides_multiline_input_block(self) -> None:
+        cfg = self._cfg("true")
+        input_block = "THE INPUT BLOCK\nwith multiple lines\nand a third line"
+        outcome, log_path = self.opsx_plan.invoke_direct_stage(
+            self.repo, cfg, "c1", "implement", 1, input_block
+        )
+        self.assertEqual(outcome, "exited")
+        content = log_path.read_text(encoding="utf-8")
+        header_line = content.splitlines()[0]
+        self.assertIn("<input>", header_line)
+        self.assertIn("attempt 1", header_line)
+        self.assertNotIn("THE INPUT BLOCK", content)
+        self.assertNotIn("multiple lines", content)
 
 
 class OpenCodeAgentModeTests(unittest.TestCase):
@@ -1517,7 +1715,7 @@ class ParseStageJsonPermissionTests(unittest.TestCase):
             "auto-rejecting request\n"
         )
         log_path = self._write_log(content)
-        payload, reason = self.opsx_plan.parse_stage_json(log_path)
+        payload, reason, envelope = self.opsx_plan.parse_stage_json(log_path)
         self.assertIsNone(payload)
         self.assertIn("permission denied before JSON output", reason)
 
@@ -1532,7 +1730,7 @@ class ParseStageJsonPermissionTests(unittest.TestCase):
             '"files_touched":[],"known_change_files":[],"summary":"done"}\n'
         )
         log_path = self._write_log(content)
-        payload, reason = self.opsx_plan.parse_stage_json(log_path)
+        payload, reason, envelope = self.opsx_plan.parse_stage_json(log_path)
         self.assertIsNotNone(payload, f"should have parsed JSON, got reason={reason}")
         self.assertEqual(payload["status"], "implemented")
         self.assertEqual(reason, "")
@@ -1544,7 +1742,7 @@ class ParseStageJsonPermissionTests(unittest.TestCase):
             "aborting\n"
         )
         log_path = self._write_log(content)
-        payload, reason = self.opsx_plan.parse_stage_json(log_path)
+        payload, reason, envelope = self.opsx_plan.parse_stage_json(log_path)
         self.assertIsNone(payload)
         self.assertIn("permission denied before JSON output", reason)
         self.assertIn("external_directory permission denied", reason)
@@ -1556,7 +1754,7 @@ class ParseStageJsonPermissionTests(unittest.TestCase):
             "Error: Insufficient Balance\n"
         )
         log_path = self._write_log(content)
-        payload, reason = self.opsx_plan.parse_stage_json(log_path)
+        payload, reason, envelope = self.opsx_plan.parse_stage_json(log_path)
         self.assertIsNone(payload)
         self.assertIn("provider failure before JSON output", reason)
         self.assertIn("Insufficient Balance", reason)
@@ -1568,10 +1766,133 @@ class ParseStageJsonPermissionTests(unittest.TestCase):
             "nothing parseable\n"
         )
         log_path = self._write_log(content)
-        payload, reason = self.opsx_plan.parse_stage_json(log_path)
+        payload, reason, envelope = self.opsx_plan.parse_stage_json(log_path)
         self.assertIsNone(payload)
         self.assertIn("expected a final JSON object line", reason)
         self.assertNotIn("permission denied", reason)
+
+    def test_plain_unwrapped_output_still_parses_unchanged(self) -> None:
+        content = (
+            '{"status":"implemented","change":"ex","round":1,"progress_made":true,'
+            '"completed_tasks":[],"remaining_tasks":[],'
+            '"task_counts":{"complete":0,"total":0},'
+            '"files_touched":[],"known_change_files":[],"summary":"done"}\n'
+        )
+        log_path = self._write_log(content)
+        payload, reason, envelope = self.opsx_plan.parse_stage_json(log_path)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["status"], "implemented")
+        self.assertEqual(reason, "")
+        self.assertIsNone(envelope)
+
+
+class ClaudeCodeResultEnvelopeParsingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.log_dir = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _write_log(self, content: str) -> Path:
+        p = self.log_dir / f"test-{id(content)}.log"
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    def test_worker_json_is_recovered_from_an_envelope(self) -> None:
+        worker_json = (
+            '{"status":"implemented","change":"ex","round":1,"progress_made":true,'
+            '"completed_tasks":[],"remaining_tasks":[],'
+            '"task_counts":{"complete":0,"total":0},'
+            '"files_touched":[],"known_change_files":[],"summary":"done"}'
+        )
+        envelope_obj = {
+            "type": "result",
+            "result": f"Some preamble text.\n{worker_json}",
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        }
+        content = "# header\n" + json.dumps(envelope_obj) + "\n"
+        log_path = self._write_log(content)
+
+        payload, reason, envelope = self.opsx_plan.parse_stage_json(log_path)
+        self.assertIsNotNone(payload, f"expected recovered worker JSON, reason={reason}")
+        self.assertEqual(payload["status"], "implemented")
+        self.assertEqual(reason, "")
+        self.assertIsNotNone(envelope)
+        self.assertEqual(envelope["type"], "result")
+
+    def test_envelope_with_no_worker_json_is_invalid_output(self) -> None:
+        envelope_obj = {
+            "type": "result",
+            "result": "The assistant produced no final JSON line, just prose.",
+        }
+        content = json.dumps(envelope_obj) + "\n"
+        log_path = self._write_log(content)
+
+        payload, reason, envelope = self.opsx_plan.parse_stage_json(log_path)
+        self.assertIsNone(payload)
+        self.assertIn("expected a final JSON object line", reason)
+        self.assertIsNotNone(envelope)
+
+    def test_permission_rejection_inside_envelope_is_reported_actionably(self) -> None:
+        envelope_obj = {
+            "type": "result",
+            "result": "auto-rejecting request\nThe user rejected permission for external_directory",
+        }
+        content = json.dumps(envelope_obj) + "\n"
+        log_path = self._write_log(content)
+
+        payload, reason, envelope = self.opsx_plan.parse_stage_json(log_path)
+        self.assertIsNone(payload)
+        self.assertIn("permission denied before JSON output", reason)
+        self.assertIsNotNone(envelope)
+
+    def test_unwrapping_correct_under_streamed_multiline_log(self) -> None:
+        worker_json = (
+            '{"status":"reviewed","change":"ex","round":1,"verdict":"pass",'
+            '"finding_counts":{"critical":0,"warning":0,"note":0},'
+            '"summary":"ok","fix_prompt":""}'
+        )
+        intermediate = {
+            "type": "assistant",
+            "usage": {"input_tokens": 999, "output_tokens": 999},
+        }
+        final_envelope = {
+            "type": "result",
+            "result": worker_json,
+            "usage": {"input_tokens": 20, "output_tokens": 8},
+        }
+        content = "\n".join(
+            [
+                json.dumps(intermediate),
+                json.dumps({"type": "assistant", "text": "partial"}),
+                json.dumps(final_envelope),
+            ]
+        ) + "\n"
+        log_path = self._write_log(content)
+
+        payload, reason, envelope = self.opsx_plan.parse_stage_json(log_path)
+        self.assertIsNotNone(payload, f"reason={reason}")
+        self.assertEqual(payload["status"], "reviewed")
+        self.assertEqual(envelope["usage"]["input_tokens"], 20)
+
+    def test_stderr_side_marker_reported_when_result_text_has_no_marker(self) -> None:
+        envelope_obj = {
+            "type": "result",
+            "result": "The assistant produced no final JSON line, just prose.",
+        }
+        content = (
+            "The user rejected permission for external_directory\n"
+            + json.dumps(envelope_obj)
+            + "\n"
+        )
+        log_path = self._write_log(content)
+
+        payload, reason, envelope = self.opsx_plan.parse_stage_json(log_path)
+        self.assertIsNone(payload)
+        self.assertIn("permission denied before JSON output", reason)
+        self.assertIsNotNone(envelope)
 
 
 class DirectStageTelemetryTests(unittest.TestCase):
@@ -3889,6 +4210,109 @@ class DirectStageUsageExtractionTests(unittest.TestCase):
         self.assertEqual(model["model_id"], "gpt-5.4")
         self.assertIsNone(model["model_alias"])
 
+    def test_invocation_model_resolution_unchanged_for_opencode_with_explicit_adapter(self) -> None:
+        home_dir = self.log_dir / "home-opencode"
+        agent_dir = home_dir / ".config" / "opencode" / "agents"
+        agent_dir.mkdir(parents=True)
+        (agent_dir / "opsx-reviewer.md").write_text(
+            "---\nmodel: \"openai/gpt-5.4\"\n---\n",
+            encoding="utf-8",
+        )
+
+        with mock.patch.dict(os.environ, {"HOME": str(home_dir)}, clear=False):
+            model = self.opsx_plan._extract_invocation_model(
+                "opencode run --agent opsx-reviewer", "opencode"
+            )
+
+        self.assertEqual(model["provider"], "openai")
+        self.assertEqual(model["model_id"], "gpt-5.4")
+
+    def test_invocation_model_resolved_from_claude_code_agent_directory(self) -> None:
+        home_dir = self.log_dir / "home-claude"
+        agent_dir = home_dir / ".claude" / "agents"
+        agent_dir.mkdir(parents=True)
+        (agent_dir / "opsx-implementer.md").write_text(
+            "---\nmodel: \"anthropic/claude-opus-5\"\n---\n",
+            encoding="utf-8",
+        )
+
+        with mock.patch.dict(os.environ, {"HOME": str(home_dir)}, clear=False):
+            model = self.opsx_plan._extract_invocation_model(
+                "claude -p --agent opsx-implementer", "claude-code"
+            )
+
+        self.assertEqual(model["provider"], "anthropic")
+        self.assertEqual(model["model_id"], "claude-opus-5")
+        self.assertIsNone(model["model_alias"])
+
+    def test_invocation_model_claude_code_does_not_read_opencode_agent_dir(self) -> None:
+        """A claude-code invocation must not resolve against the opencode
+        agent directory even if a same-named agent file exists there."""
+        home_dir = self.log_dir / "home-mixed"
+        opencode_agent_dir = home_dir / ".config" / "opencode" / "agents"
+        opencode_agent_dir.mkdir(parents=True)
+        (opencode_agent_dir / "opsx-implementer.md").write_text(
+            "---\nmodel: \"openai/gpt-5.4\"\n---\n",
+            encoding="utf-8",
+        )
+        # No .claude/agents directory exists under this fake home.
+
+        with mock.patch.dict(os.environ, {"HOME": str(home_dir)}, clear=False):
+            model = self.opsx_plan._extract_invocation_model(
+                "claude -p --agent opsx-implementer", "claude-code"
+            )
+
+        self.assertIsNone(model["provider"])
+        self.assertIsNone(model["model_id"])
+
+    def test_invocation_model_resolved_from_repo_local_claude_code_agent_directory(self) -> None:
+        home_dir = self.log_dir / "home-claude-repo-fallback"
+        home_dir.mkdir(parents=True, exist_ok=True)
+        repo_dir = self.log_dir / "repo-claude"
+        agent_dir = repo_dir / ".claude" / "agents"
+        agent_dir.mkdir(parents=True)
+        (agent_dir / "opsx-implementer.md").write_text(
+            "---\nmodel: \"anthropic/claude-opus-5\"\n---\n",
+            encoding="utf-8",
+        )
+        # No agent file at all under the fake home; only the repo-local install has it.
+
+        with mock.patch.dict(os.environ, {"HOME": str(home_dir)}, clear=False):
+            model = self.opsx_plan._extract_invocation_model(
+                "claude -p --agent opsx-implementer", "claude-code", repo_dir
+            )
+
+        self.assertEqual(model["provider"], "anthropic")
+        self.assertEqual(model["model_id"], "claude-opus-5")
+        self.assertIsNone(model["model_alias"])
+
+    def test_invocation_model_fallback_expands_env_var_model_flag(self) -> None:
+        """Regression test: the invocation-model fallback must resolve the
+        model that was actually dispatched, not the unexpanded $VAR
+        placeholder still stored in the plan config's invoke string."""
+        var = "OPSX_TEST_TELEMETRY_MODEL"
+        os.environ[var] = "sonnet"
+        try:
+            expanded = self.opsx_plan._best_effort_expand_invoke(
+                f'claude -p --agent opsx-implementer --model "${var}"'
+            )
+            model = self.opsx_plan._extract_invocation_model(expanded, "claude-code")
+        finally:
+            del os.environ[var]
+
+        self.assertEqual(model["model_id"], "sonnet")
+        self.assertIsNone(model["provider"])
+
+    def test_best_effort_expand_invoke_leaves_unset_var_unexpanded(self) -> None:
+        """Best-effort expansion must not raise or fail-closed like the
+        dispatch-time expansion — it just leaves an unset reference as-is."""
+        var = "OPSX_TEST_TELEMETRY_MODEL_UNSET"
+        os.environ.pop(var, None)
+        expanded = self.opsx_plan._best_effort_expand_invoke(
+            f'claude -p --model "${var}"'
+        )
+        self.assertIn(f"${var}", expanded)
+
     # -- 4.7 Unknown formats -----------------------------------------------
 
     def test_unknown_format_produces_unavailable_usage(self) -> None:
@@ -4381,6 +4805,209 @@ class DirectStageUsageExtractionTests(unittest.TestCase):
         self.assertEqual(model["model_id"], "gpt-4o")
         # Usage must NOT be marked available — no token counts exist
         self._assert_usage_unavailable(usage)
+
+
+class ClaudeResultEnvelopeUsagePrecedenceTests(unittest.TestCase):
+    """Tests for the claude_result_json usage/model source and its precedence."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.log_dir = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _write_log(self, *lines: str) -> Path:
+        p = self.log_dir / f"test-{hash(lines)}.log"
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return p
+
+    def test_envelope_is_only_usage_source(self) -> None:
+        payload = {"status": "implemented", "change": "ex"}
+        envelope = {
+            "type": "result",
+            "result": "...",
+            "usage": {"input_tokens": 30, "output_tokens": 12},
+        }
+        usage, model = self.opsx_plan.extract_usage_and_model(
+            payload, None, envelope=envelope,
+        )
+        self.assertTrue(usage["usage_available"])
+        self.assertEqual(usage["usage_source"], "claude_result_json")
+        self.assertEqual(usage["input_tokens"], 30)
+        self.assertEqual(usage["output_tokens"], 12)
+
+    def test_worker_json_wins_over_envelope(self) -> None:
+        payload = {
+            "status": "implemented",
+            "change": "ex",
+            "usage": {"input_tokens": 100, "output_tokens": 50},
+        }
+        envelope = {
+            "type": "result",
+            "result": "...",
+            "usage": {"input_tokens": 999, "output_tokens": 888},
+        }
+        usage, _ = self.opsx_plan.extract_usage_and_model(
+            payload, None, envelope=envelope,
+        )
+        self.assertEqual(usage["usage_source"], "worker_json")
+        self.assertEqual(usage["input_tokens"], 100)
+        self.assertEqual(usage["output_tokens"], 50)
+
+    def test_envelope_outranks_log_metadata(self) -> None:
+        log_path = self._write_log(
+            '{"input_tokens": 777, "output_tokens": 666}',
+        )
+        payload = {"status": "implemented", "change": "ex"}
+        envelope = {
+            "type": "result",
+            "result": "...",
+            "usage": {"input_tokens": 40, "output_tokens": 15},
+        }
+        usage, _ = self.opsx_plan.extract_usage_and_model(
+            payload, log_path, envelope=envelope,
+        )
+        self.assertEqual(usage["usage_source"], "claude_result_json")
+        self.assertEqual(usage["input_tokens"], 40)
+        self.assertEqual(usage["output_tokens"], 15)
+
+    def test_log_metadata_wins_when_no_envelope(self) -> None:
+        log_path = self._write_log(
+            '{"input_tokens": 777, "output_tokens": 666}',
+        )
+        payload = {"status": "implemented", "change": "ex"}
+        usage, _ = self.opsx_plan.extract_usage_and_model(
+            payload, log_path, envelope=None,
+        )
+        self.assertEqual(usage["usage_source"], "log_metadata")
+        self.assertEqual(usage["input_tokens"], 777)
+
+    def test_envelope_model_identity_recorded_when_worker_json_has_none(self) -> None:
+        payload = {"status": "implemented", "change": "ex"}
+        envelope = {
+            "type": "result",
+            "result": "...",
+            "model": {"provider": "anthropic", "model_id": "claude-opus-5"},
+        }
+        _, model = self.opsx_plan.extract_usage_and_model(
+            payload, None, envelope=envelope,
+        )
+        self.assertEqual(model["provider"], "anthropic")
+        self.assertEqual(model["model_id"], "claude-opus-5")
+
+    def test_worker_json_model_wins_over_envelope_model(self) -> None:
+        payload = {
+            "status": "implemented",
+            "change": "ex",
+            "model": {"provider": "worker-provider", "model_id": "worker-model"},
+        }
+        envelope = {
+            "type": "result",
+            "result": "...",
+            "model": {"provider": "anthropic", "model_id": "claude-opus-5"},
+        }
+        _, model = self.opsx_plan.extract_usage_and_model(
+            payload, None, envelope=envelope,
+        )
+        self.assertEqual(model["provider"], "worker-provider")
+        self.assertEqual(model["model_id"], "worker-model")
+
+    def test_streamed_intermediate_usage_does_not_displace_envelope_totals(self) -> None:
+        """The orchestrator passes the *selected* (final) envelope only, so an
+        intermediate streamed message's partial usage never reaches here."""
+        payload = {"status": "implemented", "change": "ex"}
+        final_envelope = {
+            "type": "result",
+            "result": "...",
+            "usage": {"input_tokens": 50, "output_tokens": 25},
+        }
+        usage, _ = self.opsx_plan.extract_usage_and_model(
+            payload, None, envelope=final_envelope,
+        )
+        self.assertEqual(usage["input_tokens"], 50)
+        self.assertEqual(usage["output_tokens"], 25)
+
+    def test_cache_creation_input_tokens_populates_cached_input(self) -> None:
+        payload = {"status": "implemented", "change": "ex"}
+        envelope = {
+            "type": "result",
+            "result": "...",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": 7,
+            },
+        }
+        usage, _ = self.opsx_plan.extract_usage_and_model(
+            payload, None, envelope=envelope,
+        )
+        self.assertEqual(usage["cached_input_tokens"], 7)
+
+    def test_real_envelope_model_usage_shape_resolves_model_identity(self) -> None:
+        """Regression test against the real Claude Code CLI envelope shape,
+        which carries model identity under `modelUsage` (keyed by canonical
+        model id), not a flat/nested `model` field."""
+        payload = {"status": "implemented", "change": "ex"}
+        envelope = {
+            "type": "result",
+            "result": "...",
+            "usage": {"input_tokens": 34, "output_tokens": 2515},
+            "modelUsage": {
+                "claude-haiku-4-5-20251001": {
+                    "inputTokens": 687,
+                    "outputTokens": 2528,
+                    "cacheReadInputTokens": 26178,
+                    "cacheCreationInputTokens": 11204,
+                    "canonicalModel": "claude-haiku-4-5",
+                    "provider": "firstParty",
+                }
+            },
+        }
+        _, model = self.opsx_plan.extract_usage_and_model(
+            payload, None, envelope=envelope,
+        )
+        self.assertEqual(model["provider"], "anthropic")
+        self.assertEqual(model["model_id"], "claude-haiku-4-5")
+
+    def test_real_envelope_model_usage_picks_highest_token_entry(self) -> None:
+        payload = {"status": "implemented", "change": "ex"}
+        envelope = {
+            "type": "result",
+            "result": "...",
+            "modelUsage": {
+                "claude-haiku-4-5-20251001": {
+                    "inputTokens": 10, "outputTokens": 5,
+                    "canonicalModel": "claude-haiku-4-5",
+                },
+                "claude-sonnet-4-5-20250929": {
+                    "inputTokens": 500, "outputTokens": 200,
+                    "canonicalModel": "claude-sonnet-4-5",
+                },
+            },
+        }
+        _, model = self.opsx_plan.extract_usage_and_model(
+            payload, None, envelope=envelope,
+        )
+        self.assertEqual(model["model_id"], "claude-sonnet-4-5")
+
+    def test_generic_model_field_still_wins_over_model_usage(self) -> None:
+        payload = {"status": "implemented", "change": "ex"}
+        envelope = {
+            "type": "result",
+            "result": "...",
+            "model": {"provider": "anthropic", "model_id": "claude-opus-5"},
+            "modelUsage": {
+                "claude-haiku-4-5-20251001": {
+                    "inputTokens": 999, "canonicalModel": "claude-haiku-4-5",
+                }
+            },
+        }
+        _, model = self.opsx_plan.extract_usage_and_model(
+            payload, None, envelope=envelope,
+        )
+        self.assertEqual(model["model_id"], "claude-opus-5")
 
 
 class DirectStageUsageIntegrationTests(unittest.TestCase):
@@ -4896,6 +5523,145 @@ class DirectStageUsageIntegrationTests(unittest.TestCase):
             self.assertEqual(c["estimated_cost"], 1.80)
             self.assertEqual(c["pricing_catalog_version"], "1.0.0")
             self.assertIsNotNone(c["price_snapshot"])
+        finally:
+            self.opsx_plan._cost_catalog = saved_catalog
+            catalog_path.unlink(missing_ok=True)
+
+    # -- Claude Code envelope -> telemetry integration (task 5.5) -----------
+
+    def test_claude_code_envelope_flows_to_telemetry_with_resolved_cost(self):
+        """A Claude Code stage's result envelope must resolve real cost, and
+        the resulting record must be renderable by report/dashboard without
+        any schema change (they read usage/model/cost generically)."""
+        from lib.pricing import PricingCatalog, UnresolvedPrice
+
+        self.cfg["adapter"] = "claude-code"
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+
+        catalog_toml = textwrap.dedent("""\
+            [catalog]
+            version = "1.0.0"
+            updated = "2026-01-01"
+
+            [[entries]]
+            provider = "anthropic"
+            model_id = "claude-opus-5"
+            display_name = "Claude Opus 5"
+            billing_mode = "per_token"
+            currency = "USD"
+            input_price_per_mtok = 5.0
+            output_price_per_mtok = 25.0
+            effective_date = "2025-01-01"
+        """)
+        tmp_catalog = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".toml", delete=False, encoding="utf-8",
+        )
+        tmp_catalog.write(catalog_toml)
+        tmp_catalog.close()
+        catalog_path = Path(tmp_catalog.name)
+        saved_catalog = self.opsx_plan._cost_catalog
+        try:
+            self.opsx_plan._cost_catalog = (
+                PricingCatalog(catalog_path=catalog_path),
+                UnresolvedPrice,
+            )
+
+            def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+                log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+
+                if stage == "implement":
+                    worker_json = json.dumps({
+                        "status": "implemented",
+                        "change": cid,
+                        "round": round_num,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "done",
+                    })
+                    envelope = {
+                        "type": "result",
+                        "result": f"Implemented the change.\n{worker_json}",
+                        "usage": {
+                            "input_tokens": 200000,
+                            "output_tokens": 40000,
+                        },
+                        "model": {
+                            "provider": "anthropic",
+                            "model_id": "claude-opus-5",
+                        },
+                    }
+                    log_path.write_text(json.dumps(envelope) + "\n", encoding="utf-8")
+                    return "exited", log_path
+
+                elif stage == "review":
+                    result = {
+                        "status": "reviewed",
+                        "change": cid,
+                        "round": round_num,
+                        "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "review passed",
+                        "fix_prompt": "",
+                        "next_phase": "archive",
+                    }
+                    log_path.write_text(json.dumps(result) + "\n", encoding="utf-8")
+                    return "exited", log_path
+
+                else:
+                    log_path.write_text(json.dumps({
+                        "status": "archived",
+                        "change": cid,
+                        "archive_path": "",
+                        "spec_sync_status": "no-delta",
+                        "commit": "",
+                        "summary": "archive claimed without repo evidence",
+                    }) + "\n", encoding="utf-8")
+                    return "exited", log_path
+
+            saved_invoke = self.opsx_plan.invoke_direct_stage
+            try:
+                self.opsx_plan.invoke_direct_stage = fake_invoke
+                self.opsx_plan.run_direct_change(
+                    self.repo, self.cfg, self.state, self.cid
+                )
+            finally:
+                self.opsx_plan.invoke_direct_stage = saved_invoke
+
+            records = self._read_telemetry()
+            impl = [r for r in records if r["stage"] == "implement"]
+            self.assertGreaterEqual(len(impl), 1, "expected at least one implement record")
+
+            u = impl[0]["usage"]
+            self.assertTrue(u["usage_available"])
+            self.assertEqual(u["usage_source"], "claude_result_json")
+            self.assertEqual(u["input_tokens"], 200000)
+            self.assertEqual(u["output_tokens"], 40000)
+
+            m = impl[0]["model"]
+            self.assertEqual(m["provider"], "anthropic")
+            self.assertEqual(m["model_id"], "claude-opus-5")
+
+            c = impl[0]["cost"]
+            self.assertEqual(c["status"], "estimated")
+            # 200k input x $5/mtok = $1.00, 40k output x $25/mtok = $1.00
+            self.assertEqual(c["estimated_cost"], 2.00)
+
+            # report/dashboard consume telemetry generically (no adapter- or
+            # usage_source-specific branching), so aggregation must not choke
+            # on this record.
+            from lib.metrics.aggregator import aggregate
+            result = aggregate(self.repo, self.plan_name, None)
+            self.assertEqual(result.plan_metrics.plan_name, self.plan_name)
         finally:
             self.opsx_plan._cost_catalog = saved_catalog
             catalog_path.unlink(missing_ok=True)
@@ -5472,7 +6238,7 @@ class CostEstimationTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "estimated",
                          f"expected estimated, got {result}")
-        self.assertEqual(result["pricing_catalog_version"], "1.1.0")
+        self.assertEqual(result["pricing_catalog_version"], "1.2.0")
         # input 100k * 2.50/mtok + output 50k * 10.00/mtok
         # = 0.25 + 0.50 = 0.75
         self.assertEqual(result["estimated_cost"], 0.75)
@@ -9076,7 +9842,7 @@ class DoctorPreflightTests(unittest.TestCase):
         # Verify plan loads and run_preflight_warnings is called
         preflight_called: list[bool] = []
 
-        def fake_preflight(repo, plan_src_, adapter):
+        def fake_preflight(repo, plan_src_, adapter, cfg=None):
             preflight_called.append(True)
 
         with mock.patch.object(
@@ -9095,6 +9861,133 @@ class DoctorPreflightTests(unittest.TestCase):
             )
             rc = self.opsx_plan.cmd_run(args)
         self.assertTrue(preflight_called, "run_preflight_warnings was not called")
+
+
+class DirectWorkerAgentDoctorCheckTests(unittest.TestCase):
+    """Tests for the doctor check that verifies worker agents are installed
+    for a direct-dispatch plan (task 7)."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.fake_home = Path(self.tmp.name) / "home"
+        self.fake_home.mkdir()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _direct_cfg(self, adapter: str = "claude-code") -> dict:
+        return {
+            "adapter": adapter,
+            "implement_invoke": "claude -p --agent opsx-implementer",
+            "review_invoke": "claude -p --agent opsx-reviewer",
+            "archive_invoke": "claude -p --agent opsx-archiver",
+        }
+
+    def _write_agents(self, agent_dir: Path, names: tuple[str, ...]) -> None:
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            (agent_dir / f"{name}.md").write_text(
+                f"---\nname: {name}\n---\n", encoding="utf-8"
+            )
+
+    def test_reports_missing_agents_by_name_with_installer(self) -> None:
+        agent_dir = self.fake_home / ".claude" / "agents"
+        self._write_agents(agent_dir, ("opsx-implementer",))  # reviewer + archiver missing
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.fake_home)}, clear=False):
+            passed, label, remediation = self.opsx_plan._check_direct_worker_agents(
+                self._direct_cfg()
+            )
+
+        self.assertFalse(passed)
+        self.assertIn("opsx-reviewer", remediation)
+        self.assertIn("opsx-archiver", remediation)
+        self.assertNotIn("opsx-implementer", remediation)
+        self.assertIn("adapters/claude-code/install.sh", remediation)
+
+    def test_passes_when_all_worker_agents_present(self) -> None:
+        agent_dir = self.fake_home / ".claude" / "agents"
+        self._write_agents(
+            agent_dir, ("opsx-implementer", "opsx-reviewer", "opsx-archiver")
+        )
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.fake_home)}, clear=False):
+            passed, label, remediation = self.opsx_plan._check_direct_worker_agents(
+                self._direct_cfg()
+            )
+
+        self.assertTrue(passed, remediation)
+
+    def test_skipped_when_no_plan_resolved(self) -> None:
+        passed, label, remediation = self.opsx_plan._check_direct_worker_agents(None)
+        self.assertTrue(passed)
+        self.assertEqual(remediation, "")
+
+    def test_skipped_when_plan_does_not_use_direct_dispatch(self) -> None:
+        cfg = self._direct_cfg()
+        cfg["archive_invoke"] = ""  # fewer than three invokes -> nested-controller path
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.fake_home)}, clear=False):
+            passed, label, remediation = self.opsx_plan._check_direct_worker_agents(cfg)
+
+        self.assertTrue(passed)
+
+    def test_opencode_direct_plan_checks_opencode_agent_directory(self) -> None:
+        agent_dir = self.fake_home / ".config" / "opencode" / "agents"
+        self._write_agents(
+            agent_dir, ("opsx-implementer", "opsx-reviewer", "opsx-archiver")
+        )
+        cfg = self._direct_cfg(adapter="opencode")
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.fake_home)}, clear=False):
+            passed, label, remediation = self.opsx_plan._check_direct_worker_agents(cfg)
+
+        self.assertTrue(passed, remediation)
+
+    def test_passes_when_agents_only_in_repo_local_install(self) -> None:
+        repo = Path(self.tmp.name) / "repo"
+        agent_dir = repo / ".claude" / "agents"
+        self._write_agents(
+            agent_dir, ("opsx-implementer", "opsx-reviewer", "opsx-archiver")
+        )
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.fake_home)}, clear=False):
+            passed, label, remediation = self.opsx_plan._check_direct_worker_agents(
+                self._direct_cfg(), repo
+            )
+
+        self.assertTrue(passed, remediation)
+
+    def test_passes_when_agents_only_in_home_install_with_repo_given(self) -> None:
+        repo = Path(self.tmp.name) / "repo"
+        repo.mkdir()
+        agent_dir = self.fake_home / ".claude" / "agents"
+        self._write_agents(
+            agent_dir, ("opsx-implementer", "opsx-reviewer", "opsx-archiver")
+        )
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.fake_home)}, clear=False):
+            passed, label, remediation = self.opsx_plan._check_direct_worker_agents(
+                self._direct_cfg(), repo
+            )
+
+        self.assertTrue(passed, remediation)
+
+    def test_fails_naming_missing_agents_when_in_neither_location(self) -> None:
+        repo = Path(self.tmp.name) / "repo"
+        repo.mkdir()
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.fake_home)}, clear=False):
+            passed, label, remediation = self.opsx_plan._check_direct_worker_agents(
+                self._direct_cfg(), repo
+            )
+
+        self.assertFalse(passed)
+        self.assertIn("opsx-implementer", remediation)
+        self.assertIn("opsx-reviewer", remediation)
+        self.assertIn("opsx-archiver", remediation)
+        self.assertIn("adapters/claude-code/install.sh", remediation)
 
 
 class BatchGateAndResetCommandTests(unittest.TestCase):
@@ -10394,7 +11287,7 @@ class GitDeliveryCmdRunIntegrationTests(unittest.TestCase):
         def fake_reconcile(repo, cfg, state):
             pass
 
-        def fake_preflight(repo, plan_src, adapter):
+        def fake_preflight(repo, plan_src, adapter, cfg=None):
             pass
 
         def fake_cmd_status_inner(cfg, state, header="", plan_arg=None):
@@ -10429,7 +11322,7 @@ class GitDeliveryCmdRunIntegrationTests(unittest.TestCase):
         def fake_reconcile(repo, cfg, state):
             pass
 
-        def fake_preflight(repo, plan_src, adapter):
+        def fake_preflight(repo, plan_src, adapter, cfg=None):
             pass
 
         def fake_cmd_status_inner(cfg, state, header="", plan_arg=None):
@@ -10474,7 +11367,7 @@ class GitDeliveryCmdRunIntegrationTests(unittest.TestCase):
         def fake_reconcile(repo, cfg, state):
             pass
 
-        def fake_preflight(repo, plan_src, adapter):
+        def fake_preflight(repo, plan_src, adapter, cfg=None):
             pass
 
         with mock.patch.object(self.opsx_plan, "write_active_plan"), \
@@ -10500,7 +11393,7 @@ class GitDeliveryCmdRunIntegrationTests(unittest.TestCase):
         def fake_reconcile(repo, cfg, state):
             pass
 
-        def fake_preflight(repo, plan_src, adapter):
+        def fake_preflight(repo, plan_src, adapter, cfg=None):
             pass
 
         def fake_cmd_status_inner(cfg, state, header="", plan_arg=None):

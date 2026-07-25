@@ -75,6 +75,18 @@ ADAPTER_DEFAULTS = {
     "claude-code": {
         "invoke": 'claude -p "/opsx-drive {change}"',
         "state_file": ".claude/opsx-controller/{change}.json",
+        "implement_invoke": (
+            'claude -p --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL" '
+            "--permission-mode bypassPermissions --output-format json"
+        ),
+        "review_invoke": (
+            'claude -p --agent opsx-reviewer --model "$OPSX_REVIEWER_MODEL" '
+            "--permission-mode bypassPermissions --output-format json"
+        ),
+        "archive_invoke": (
+            'claude -p --agent opsx-archiver --model "$OPSX_ARCHIVER_MODEL" '
+            "--permission-mode bypassPermissions --output-format json"
+        ),
     },
     "codex-cli": {
         "invoke": 'codex exec "$opsx-drive {change}"',
@@ -299,11 +311,13 @@ def load_plan(path: Path) -> dict:
 
 
 def build_single_change_config(repo: Path, change_id: str) -> dict:
-    """Build a minimal one-change OpenCode direct-execution config.
+    """Build a minimal one-change direct-execution config, pinned to OpenCode.
 
     Synthesizes a config dict that mirrors the output of ``load_plan`` for
     exactly one already-authored OpenSpec change, without requiring a TOML
-    manifest.  Fails early when the change dir is missing or unauthored.
+    manifest.  Always uses ``ADAPTER_DEFAULTS["opencode"]``; there is no
+    ``--adapter`` flag on ``run-one`` to select ``claude-code`` here. Fails
+    early when the change dir is missing or unauthored.
     """
     cdir = change_dir(repo, change_id)
     if not cdir.is_dir():
@@ -563,8 +577,8 @@ def set_status(state: dict, cid: str, status: str, reason: str = "") -> None:
     r["updated_at"] = utcnow()
 
 
-def is_direct_opencode(cfg: dict) -> bool:
-    return cfg["adapter"] == "opencode" and all(
+def is_direct_mode(cfg: dict) -> bool:
+    return all(
         cfg.get(name) for name in ("implement_invoke", "review_invoke", "archive_invoke")
     )
 
@@ -738,7 +752,7 @@ def save_json(path: Path, payload: dict) -> None:
 
 
 def save_worker_state(repo: Path, cfg: dict, state: dict, cid: str) -> None:
-    if not is_direct_opencode(cfg):
+    if not is_direct_mode(cfg):
         return
     r = rec(state, cid)
     payload = {
@@ -772,7 +786,7 @@ def persist_direct_state(repo: Path, cfg: dict, state: dict, cid: str) -> None:
 
 
 def sync_direct_worker_state(repo: Path, cfg: dict, state: dict) -> None:
-    if not is_direct_opencode(cfg):
+    if not is_direct_mode(cfg):
         return
     for cid in cfg["order"]:
         save_worker_state(repo, cfg, state, cid)
@@ -989,6 +1003,7 @@ _TOKEN_FIELD_MAP = {
     "cached_input_tokens": "cached_input_tokens",
     "cachedInputTokens": "cached_input_tokens",
     "cache_read_input_tokens": "cached_input_tokens",
+    "cache_creation_input_tokens": "cached_input_tokens",
     "reasoning_tokens": "reasoning_tokens",
     "reasoningTokens": "reasoning_tokens",
     "thinking_tokens": "reasoning_tokens",
@@ -1075,6 +1090,54 @@ def _extract_model_fields(obj):
                 continue
             if isinstance(value, str) and value.strip():
                 result[norm] = value.strip()
+
+    return result
+
+
+def _claude_model_usage_tokens(entry) -> int:
+    """Sum recognized token fields on one ``modelUsage`` entry, for ranking."""
+    if not isinstance(entry, dict):
+        return -1
+    total = 0
+    for key in ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"):
+        value = entry.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            total += value
+    return total
+
+
+def _extract_claude_envelope_model(envelope: dict) -> dict:
+    """Extract model identity from a Claude Code result envelope.
+
+    Prefers the generic top-level/nested ``model`` fields (matching every
+    other usage source), then falls back to the envelope's own
+    ``modelUsage`` map — a dict keyed by canonical model id, each carrying a
+    ``canonicalModel`` and a hosting ``provider`` (e.g. ``"firstParty"``).
+    When more than one model billed against a stage (sub-agent delegation),
+    the entry with the most combined tokens wins. Provider is normalized to
+    ``"anthropic"`` — the envelope's ``provider`` field describes hosting
+    infrastructure, not the model vendor, and every model Claude Code can
+    dispatch is an Anthropic model regardless of hosting.
+    """
+    result = _extract_model_fields(envelope)
+    if result["provider"] is not None or result["model_id"] is not None:
+        return result
+
+    model_usage = envelope.get("modelUsage")
+    if not isinstance(model_usage, dict) or not model_usage:
+        return result
+
+    best_id, best_entry = max(
+        model_usage.items(), key=lambda kv: _claude_model_usage_tokens(kv[1])
+    )
+    if not isinstance(best_entry, dict):
+        return result
+
+    canonical = best_entry.get("canonicalModel")
+    model_id = canonical if isinstance(canonical, str) and canonical.strip() else best_id
+    if isinstance(model_id, str) and model_id.strip():
+        result["provider"] = "anthropic"
+        result["model_id"] = model_id.strip()
 
     return result
 
@@ -1178,12 +1241,54 @@ def _parse_invocation_model_value(model_value):
     return result
 
 
-def _extract_invocation_model(worker_command):
+_ADAPTER_AGENT_DIR_PARTS = {
+    "opencode": (".config", "opencode", "agents"),
+    "claude-code": (".claude", "agents"),
+}
+
+_ADAPTER_REPO_AGENT_DIR_PARTS = {
+    "opencode": (".opencode", "agents"),
+    "claude-code": (".claude", "agents"),
+}
+
+
+def _adapter_agent_dir(adapter: str, repo: Path | None = None) -> list[Path]:
+    """Return candidate installed agent directories for *adapter*, in lookup
+    order: the repo-local install (when *repo* is given) first, then the
+    home-rooted install location. Empty when *adapter* is unknown."""
+    candidates: list[Path] = []
+    if repo is not None:
+        repo_parts = _ADAPTER_REPO_AGENT_DIR_PARTS.get(adapter)
+        if repo_parts is not None:
+            candidates.append(repo.joinpath(*repo_parts))
+    home_parts = _ADAPTER_AGENT_DIR_PARTS.get(adapter)
+    if home_parts is not None:
+        candidates.append(Path.home().joinpath(*home_parts))
+    return candidates
+
+
+def _best_effort_expand_invoke(invoke: str) -> str:
+    """Expand ``$VAR``/``${VAR}`` references in *invoke* for telemetry fallback.
+
+    Unlike the fail-closed expansion in ``invoke_direct_stage``, this never
+    raises or blocks: it is read-only best-effort parsing of a command that
+    already ran, so an unset variable just leaves that token as-is rather
+    than failing telemetry extraction.
+    """
+    try:
+        tokens = shlex.split(invoke)
+    except ValueError:
+        return invoke
+    return shlex.join(os.path.expandvars(token) for token in tokens)
+
+
+def _extract_invocation_model(worker_command, adapter: str = "opencode", repo: Path | None = None):
     """Return model identity from the configured worker invocation.
 
-    Supports either an explicit ``--model`` argument or an OpenCode
-    ``--agent`` reference whose installed agent frontmatter declares a
-    ``model:`` value.
+    Supports either an explicit ``--model`` argument or an ``--agent``
+    reference whose installed agent frontmatter (in *adapter*'s own agent
+    directory) declares a ``model:`` value. When *repo* is given, a
+    repo-local agent install is checked before the home-rooted one.
     """
     result = {
         "provider": None,
@@ -1217,26 +1322,29 @@ def _extract_invocation_model(worker_command):
     if not agent_name:
         return result
 
-    agent_path = Path.home() / ".config" / "opencode" / "agents" / f"{agent_name}.md"
-    try:
-        lines = agent_path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return result
-
-    if not lines or lines[0].strip() != "---":
-        return result
-
-    for line in lines[1:]:
-        stripped = line.strip()
-        if stripped == "---":
-            break
-        if not stripped.startswith("model:"):
+    for agent_dir in _adapter_agent_dir(adapter, repo):
+        agent_path = agent_dir / f"{agent_name}.md"
+        try:
+            lines = agent_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
             continue
-        _, _, raw_value = stripped.partition(":")
-        model_value = raw_value.strip()
-        if len(model_value) >= 2 and model_value[0] == model_value[-1] and model_value[0] in {'"', "'"}:
-            model_value = model_value[1:-1].strip()
-        return _parse_invocation_model_value(model_value)
+
+        if not lines or lines[0].strip() != "---":
+            return result
+
+        for line in lines[1:]:
+            stripped = line.strip()
+            if stripped == "---":
+                break
+            if not stripped.startswith("model:"):
+                continue
+            _, _, raw_value = stripped.partition(":")
+            model_value = raw_value.strip()
+            if len(model_value) >= 2 and model_value[0] == model_value[-1] and model_value[0] in {'"', "'"}:
+                model_value = model_value[1:-1].strip()
+            return _parse_invocation_model_value(model_value)
+
+        return result
 
     return result
 
@@ -1481,20 +1589,21 @@ def extract_usage_and_model(
     stage: str = "",
     round_num: int = 0,
     is_normal_completion: bool = True,
+    envelope=None,
 ):
     """Extract usage and model metadata for a completed stage invocation.
 
     **Precedence:**
     1. Usage & model from parsed worker JSON (*payload*) are preferred.
-    2. When *payload* carries no token usage, the stage log is scanned for
-       recognizable token metadata.
-    3. When neither worker JSON nor log metadata provides token usage, the
-       OpenCode plugin sidecar is consulted.
-    4. When *payload* carries no model identity fields, the stage log is
-       scanned for model identity fields.  Log model scan never
-       supplements a partial worker model.
-    5. When no higher-precedence source provides model identity, the sidecar
-       may supply it.
+    2. When *payload* carries no token usage, the selected Claude Code
+       result *envelope* (if any) is consulted.
+    3. When neither worker JSON nor the envelope provides token usage, the
+       stage log is scanned for recognizable token metadata.
+    4. When none of the above provide token usage, the OpenCode plugin
+       sidecar is consulted.
+    5. Model identity follows the same order: worker JSON, then envelope,
+       then log scan, then sidecar. A lower-precedence source never
+       supplements a partial higher-precedence model.
 
     Returns ``(usage_dict, model_dict)`` where *usage_dict* includes
     every normalised token field (int or None), ``usage_available``, and
@@ -1536,10 +1645,32 @@ def extract_usage_and_model(
                 model[key] = wm[key]
                 worker_model_found = True
 
-    # 2. Log fallback ------------------------------------------------------
+    # 2. Claude Code result envelope ---------------------------------------
+    envelope_usage_found = False
+    envelope_model_found = False
+    if isinstance(envelope, dict):
+        if not worker_usage_found:
+            env_tokens, eu_found = _extract_token_fields(envelope)
+            if eu_found:
+                envelope_usage_found = True
+                for key in ("input_tokens", "output_tokens", "cached_input_tokens",
+                             "reasoning_tokens", "total_tokens"):
+                    if env_tokens[key] is not None:
+                        usage[key] = env_tokens[key]
+                usage["usage_available"] = True
+                usage["usage_source"] = "claude_result_json"
+
+        if not worker_model_found:
+            env_model = _extract_claude_envelope_model(envelope)
+            for key in ("provider", "model_id", "model_alias"):
+                if env_model[key] is not None:
+                    model[key] = env_model[key]
+                    envelope_model_found = True
+
+    # 3. Log fallback ------------------------------------------------------
     log_usage_found = False
     if log_path is not None:
-        if not worker_usage_found:
+        if not worker_usage_found and not envelope_usage_found:
             log_tokens, log_found = _scan_log_for_usage(log_path)
             if log_found:
                 log_usage_found = True
@@ -1550,15 +1681,15 @@ def extract_usage_and_model(
                 usage["usage_available"] = True
                 usage["usage_source"] = "log_metadata"
 
-        if not worker_model_found:
+        if not worker_model_found and not envelope_model_found:
             log_model = _scan_log_for_model(log_path)
             for key in ("provider", "model_id", "model_alias"):
                 if model[key] is None and log_model[key] is not None:
                     model[key] = log_model[key]
 
-    # 3. OpenCode plugin sidecar fallback ----------------------------------
+    # 4. OpenCode plugin sidecar fallback ----------------------------------
     # Always consult the sidecar for model identity when no higher source
-    # exists, independently of whether usage was provided by worker or log.
+    # exists, independently of whether usage was provided by a higher source.
     if sidecar_path is not None:
         sidecar_tokens, sidecar_model, sidecar_selected, sidecar_source = (
             _read_sidecar_usage(
@@ -1567,7 +1698,7 @@ def extract_usage_and_model(
             )
         )
         # Sidecar token usage only when no higher-precedence source found
-        if not worker_usage_found and not log_usage_found and sidecar_selected:
+        if not worker_usage_found and not envelope_usage_found and not log_usage_found and sidecar_selected:
             sidecar_token_found = False
             for key in ("input_tokens", "output_tokens", "cached_input_tokens",
                          "reasoning_tokens", "total_tokens"):
@@ -1579,7 +1710,7 @@ def extract_usage_and_model(
                 usage["usage_source"] = "opencode_plugin"
 
         # Sidecar model identity supplements only when no higher source
-        if not worker_model_found:
+        if not worker_model_found and not envelope_model_found:
             for key in ("provider", "model_id", "model_alias"):
                 if model[key] is None and sidecar_model[key] is not None:
                     model[key] = sidecar_model[key]
@@ -1620,6 +1751,7 @@ def _record_stage_telemetry(
     payload: dict | None,
     log_path: Path,
     sidecar_path: Path | None = None,
+    envelope: dict | None = None,
 ) -> None:
     run_id = get_or_create_run_id(repo, cfg, state)
     plan_name = cfg["name"]
@@ -1671,9 +1803,11 @@ def _record_stage_telemetry(
             stage=stage,
             round_num=round_num,
             is_normal_completion=is_normal,
+            envelope=envelope,
         )
         if model["provider"] is None and model["model_id"] is None:
-            invocation_model = _extract_invocation_model(cfg[f"{stage}_invoke"])
+            expanded_invoke = _best_effort_expand_invoke(cfg[f"{stage}_invoke"])
+            invocation_model = _extract_invocation_model(expanded_invoke, cfg["adapter"], repo)
             for key in ("provider", "model_id", "model_alias"):
                 if model[key] is None and invocation_model[key] is not None:
                     model[key] = invocation_model[key]
@@ -1995,13 +2129,17 @@ PROVIDER_FAILURE_MARKERS = [
 ]
 
 
-def parse_stage_json(log_path: Path) -> tuple[dict | None, str]:
+def _clean_log_lines(text: str) -> list[str]:
     lines: list[str] = []
-    for raw in log_path.read_text(encoding="utf-8").splitlines():
+    for raw in text.splitlines():
         stripped = ANSI_ESCAPE_RE.sub("", raw).strip()
         if not stripped or stripped.startswith("# "):
             continue
         lines.append(stripped)
+    return lines
+
+
+def _find_last_json_object(lines: list[str]) -> dict | None:
     for candidate in reversed(lines):
         if candidate.startswith("`") and candidate.endswith("`"):
             candidate = candidate.strip("`").strip()
@@ -2013,22 +2151,82 @@ def parse_stage_json(log_path: Path) -> tuple[dict | None, str]:
             continue
         if not isinstance(payload, dict):
             continue
-        return payload, ""
-    # No valid JSON object found: inspect for known transcript failure markers.
+        return payload
+    return None
+
+
+def _is_claude_result_envelope(obj: dict) -> bool:
+    return obj.get("type") == "result" and isinstance(obj.get("result"), str)
+
+
+def _find_last_envelope(lines: list[str]) -> dict | None:
+    """Return the last Claude Code result envelope object among *lines*.
+
+    Scans forward so the *last* ``type: result`` object wins, which keeps
+    ``--output-format stream-json`` (JSONL, one object per line) correct: an
+    intermediate streamed message must never shadow the final result.
+    """
+    last_envelope: dict | None = None
+    for candidate in lines:
+        if candidate.startswith("`") and candidate.endswith("`"):
+            candidate = candidate.strip("`").strip()
+        if not (candidate.startswith("{") and candidate.endswith("}")):
+            continue
+        try:
+            obj = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and _is_claude_result_envelope(obj):
+            last_envelope = obj
+    return last_envelope
+
+
+def _scan_for_failure_marker(lines: list[str]) -> str:
     joined = " ".join(line.lower() for line in lines)
     for marker in PERMISSION_REJECTION_MARKERS:
         if marker.lower() in joined:
-            return None, (
+            return (
                 f"permission denied before JSON output "
                 f"(marker: {marker!r} found in {len(lines)} lines)"
             )
     for marker in PROVIDER_FAILURE_MARKERS:
         if marker.lower() in joined:
-            return None, (
+            return (
                 f"provider failure before JSON output "
                 f"(marker: {marker!r} found in {len(lines)} lines)"
             )
-    return None, f"expected a final JSON object line, got {len(lines)} non-comment lines"
+    return ""
+
+
+def parse_stage_json(log_path: Path) -> tuple[dict | None, str, dict | None]:
+    """Parse the worker's final JSON object from a stage log.
+
+    Returns ``(payload, reason, envelope)``. *envelope* is the selected
+    Claude Code result envelope object when one was found in the log
+    (``None`` for adapters that write worker JSON directly, e.g. OpenCode).
+    """
+    lines = _clean_log_lines(log_path.read_text(encoding="utf-8"))
+
+    envelope = _find_last_envelope(lines)
+    if envelope is not None:
+        result_lines = _clean_log_lines(envelope.get("result", ""))
+        payload = _find_last_json_object(result_lines)
+        if payload is not None:
+            return payload, "", envelope
+        marker_reason = _scan_for_failure_marker(result_lines) or _scan_for_failure_marker(lines)
+        if marker_reason:
+            return None, marker_reason, envelope
+        return None, (
+            f"expected a final JSON object line, got {len(result_lines)} non-comment lines"
+        ), envelope
+
+    payload = _find_last_json_object(lines)
+    if payload is not None:
+        return payload, "", None
+    marker_reason = _scan_for_failure_marker(lines)
+    if marker_reason:
+        return None, marker_reason, None
+    return None, f"expected a final JSON object line, got {len(lines)} non-comment lines", None
 
 
 def record_archive_evidence(repo: Path, record: dict, cid: str) -> bool:
@@ -2123,6 +2321,29 @@ def normalize_finding_counts(payload: dict) -> dict:
     }
 
 
+_ENV_VAR_RE = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
+
+
+def _expand_invoke_token(token: str) -> tuple[str | None, str]:
+    """Expand ``$VAR``/``${VAR}`` references in *token*.
+
+    Returns ``(expanded, "")`` on success. When a referenced variable is
+    unset, returns ``(None, var_name)`` naming the first such variable.
+    """
+    if "$" not in token:
+        return token, ""
+    expanded = os.path.expandvars(token)
+    unresolved = _ENV_VAR_RE.search(expanded)
+    if unresolved:
+        # Reference survived expansion: the variable is entirely unset.
+        return None, unresolved.group(1) or unresolved.group(2)
+    if not expanded:
+        # Fully expanded but empty: the variable was set to an empty string.
+        original = _ENV_VAR_RE.search(token)
+        return None, (original.group(1) or original.group(2)) if original else token
+    return expanded, ""
+
+
 def invoke_direct_stage(
     repo: Path,
     cfg: dict,
@@ -2131,7 +2352,22 @@ def invoke_direct_stage(
     round_num: int,
     input_block: str,
 ) -> tuple[str, Path]:
-    cmd = shlex.split(cfg[f"{stage}_invoke"]) + [input_block]
+    tokens = shlex.split(cfg[f"{stage}_invoke"])
+    expanded_tokens: list[str] = []
+    for token in tokens:
+        value, missing_var = _expand_invoke_token(token)
+        if value is None:
+            message = (
+                f"stage invoke references unset environment variable "
+                f"'{missing_var}'"
+            )
+            log_path = next_stage_log_path(repo, cid, stage, round_num)
+            log_path.write_text(f"# {utcnow()} {stage}: {message}\n", encoding="utf-8")
+            log(f"  exec[{stage}]: aborted - {message}")
+            return "env_error", log_path
+        expanded_tokens.append(value)
+
+    cmd = expanded_tokens + [input_block]
     log_path = next_stage_log_path(repo, cid, stage, round_num)
     timeout_s = cfg["changes"][cid]["timeout_minutes"] * 60
     log(
@@ -2150,9 +2386,16 @@ def run_logged_command(
     attempt: int,
 ) -> tuple[str, Path]:
     global _current_proc
+    header_cmd = cmd
+    if cmd and "\n" in cmd[-1]:
+        # The trailing argument is a multi-line worker input block; elide it
+        # from the header the same way exec[stage] does, so its raw text
+        # (which carries no JSON but may contain phrases that look like
+        # failure markers) never lands in the log as ordinary lines.
+        header_cmd = cmd[:-1] + ["<input>"]
     try:
         with open(log_path, "w", encoding="utf-8") as lf:
-            lf.write(f"# {utcnow()} {stage} attempt {attempt}: {' '.join(cmd)}\n")
+            lf.write(f"# {utcnow()} {stage} attempt {attempt}: {' '.join(header_cmd)}\n")
             lf.flush()
             proc = subprocess.Popen(
                 cmd,
@@ -2466,7 +2709,7 @@ def run_direct_change(
         plan_name = cfg["name"]
         run_id = get_or_create_run_id(repo, cfg, state)
 
-        # ---- usage sidecar for direct OpenCode stages ----
+        # ---- usage sidecar (OpenCode plugin only; harmless no-op for other adapters) ----
         sidecar_path: Path | None = None
         extra_env: dict[str, str] | None = None
         saved_env: dict[str, str] = {}
@@ -2487,6 +2730,7 @@ def run_direct_change(
                     telemetry_status, error_message,
                     payload, log_path,
                     sidecar_path=sidecar_path,
+                    envelope=envelope,
                 )
             except Exception as exc:
                 log(f"warning: failed to write telemetry for {cid}/{stage} r{round_num}: {exc}")
@@ -2506,6 +2750,16 @@ def run_direct_change(
         duration_ms = compute_duration_ms(started_at, ended_at)
         payload: dict | None = None
         parse_why = ""
+        envelope: dict | None = None
+
+        if outcome == "env_error":
+            reason = log_path.read_text(encoding="utf-8").splitlines()[0].split(": ", 1)[-1]
+            _write_telemetry("spawn_error", reason)
+            rec(state, cid)["last_result"] = f"{stage}_env_error"
+            set_status(state, cid, FAILED, reason)
+            _try_notify(cfg, "change_failed", reason, change_id=cid)
+            persist_direct_state(repo, cfg, state, cid)
+            return "spawn_error"
 
         if outcome == "spawn_error":
             _write_telemetry(
@@ -2526,7 +2780,7 @@ def run_direct_change(
             persist_direct_state(repo, cfg, state, cid)
             return "failed"
 
-        payload, parse_why = parse_stage_json(log_path)
+        payload, parse_why, envelope = parse_stage_json(log_path)
         if payload is None:
             _write_telemetry("invalid_output", parse_why)
             rec(state, cid)["last_result"] = "subagent_output_invalid"
@@ -3361,8 +3615,46 @@ def _check_pr_delivery(repo: Path, plan_src: str | None) -> tuple[bool, str, str
     return (True, label, "")
 
 
+_DIRECT_STAGE_AGENT_NAMES = ("opsx-implementer", "opsx-reviewer", "opsx-archiver")
+
+_ADAPTER_INSTALLERS = {
+    "opencode": "adapters/opencode/install.sh",
+    "claude-code": "adapters/claude-code/install.sh",
+}
+
+
+def _check_direct_worker_agents(cfg: dict | None, repo: Path | None = None) -> tuple[bool, str, str]:
+    """When the resolved plan uses direct dispatch, verify the configured
+    adapter's implement/review/archive worker agents are installed, in
+    either a repo-local install (when *repo* is given) or the home-rooted
+    one."""
+    label = "Direct-dispatch worker agents installed"
+    if cfg is None or not is_direct_mode(cfg):
+        return (True, label, "")
+
+    adapter = cfg["adapter"]
+    agent_dirs = _adapter_agent_dir(adapter, repo)
+    if not agent_dirs:
+        return (True, label, "")
+
+    missing = [
+        name for name in _DIRECT_STAGE_AGENT_NAMES
+        if not any((agent_dir / f"{name}.md").is_file() for agent_dir in agent_dirs)
+    ]
+    if not missing:
+        return (True, label, "")
+
+    installer = _ADAPTER_INSTALLERS.get(adapter, f"the {adapter} adapter installer")
+    return (
+        False,
+        label,
+        f"Missing {adapter} worker agent(s): {', '.join(missing)}; "
+        f"run {installer} to install them",
+    )
+
+
 def run_doctor_checks(repo: Path, plan_src: str | None,
-                      adapter: str = "opencode") -> int:
+                      adapter: str = "opencode", cfg: dict | None = None) -> int:
     """Run all doctor preflight checks. Returns count of failures."""
     checks: list[tuple[bool, str, str]] = []
 
@@ -3377,6 +3669,7 @@ def run_doctor_checks(repo: Path, plan_src: str | None,
     # Plan-dependent checks
     checks.append(_check_plan_loads(repo, plan_src))
     checks.append(_check_pr_delivery(repo, plan_src))
+    checks.append(_check_direct_worker_agents(cfg, repo))
 
     failures = 0
     for passed, label, remediation in checks:
@@ -3392,7 +3685,7 @@ def run_doctor_checks(repo: Path, plan_src: str | None,
 
 
 def run_preflight_warnings(repo: Path, plan_src: str | None,
-                           adapter: str = "opencode") -> None:
+                           adapter: str = "opencode", cfg: dict | None = None) -> None:
     """Run the same checks as doctor but emit warnings without changing outcome."""
     checks: list[tuple[bool, str, str]] = []
 
@@ -3404,6 +3697,7 @@ def run_preflight_warnings(repo: Path, plan_src: str | None,
     checks.append(_check_tracked_tree_clean(repo))
     checks.append(_check_plan_loads(repo, plan_src))
     checks.append(_check_pr_delivery(repo, plan_src))
+    checks.append(_check_direct_worker_agents(cfg, repo))
 
     for passed, label, remediation in checks:
         if not passed:
@@ -3533,7 +3827,7 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
         archived_on_disk = (
             not change_dir(repo, cid).exists() and find_archive_dir(repo, cid) is not None
         )
-        if is_direct_opencode(cfg):
+        if is_direct_mode(cfg):
             r["max_rounds"] = cfg["max_rounds"]
         if r["status"] == RUNNING:  # stale from a killed run
             set_status(state, cid, PENDING, "recovered from interrupted run")
@@ -3553,7 +3847,7 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
             log(f"reconcile: {cid} create config now present; re-queued")
             continue
         if r["status"] != DONE:
-            if is_direct_opencode(cfg):
+            if is_direct_mode(cfg):
                 if archived_on_disk and record_archive_evidence(repo, r, cid):
                     ok, why = verify_direct_archive_done(repo, cid, r)
                     if ok:
@@ -3623,7 +3917,7 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
                         f"create verification pending: {created_why}",
                     )
         else:
-            if is_direct_opencode(cfg):
+            if is_direct_mode(cfg):
                 ok, why = verify_direct_archive_done(repo, cid, r)
             else:
                 ok, why = verify_change_done(repo, cfg, cid)
@@ -4190,7 +4484,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     save_state(repo, cfg["name"], state)
 
     # Run preflight checks as warnings only — never change run outcome.
-    run_preflight_warnings(repo, plan_src, cfg["adapter"])
+    run_preflight_warnings(repo, plan_src, cfg["adapter"], cfg)
 
     # --- git delivery: ensure delivery branch before any stage dispatch ---
     if not args.dry_run:
@@ -4347,8 +4641,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             visited.add(cid)  # exists already; nothing to create, don't drive
             continue
 
-        if is_direct_opencode(cfg):
-            log(f"=== {cid} direct OpenCode execution (round {r['round']}) ===")
+        if is_direct_mode(cfg):
+            log(f"=== {cid} direct {cfg['adapter']} execution (round {r['round']}) ===")
             result = run_direct_change(repo, cfg, state, cid, budget_deadline, budget_usd)
             if result == DONE:
                 log(f"  done: {cid}")
@@ -4693,7 +4987,11 @@ def cmd_reset(args: argparse.Namespace) -> int:
 
 
 def cmd_run_one(args: argparse.Namespace) -> int:
-    """Run exactly one authored OpenSpec change through the direct OpenCode loop."""
+    """Run exactly one authored OpenSpec change through the direct OpenCode loop.
+
+    Pinned to the OpenCode adapter via ``build_single_change_config``; there
+    is no ``--adapter`` flag to select ``claude-code`` for this entry point.
+    """
     repo = Path(args.repo).resolve()
     change_id = args.change
 
@@ -4729,7 +5027,7 @@ def cmd_run_one(args: argparse.Namespace) -> int:
         log(f"{change_id} is already done")
         return 0
 
-    log(f"=== {change_id} direct OpenCode execution (round {r['round']}) ===")
+    log(f"=== {change_id} direct {cfg['adapter']} execution (round {r['round']}) ===")
     budget_usd = (
         float(args.budget_usd) if getattr(args, "budget_usd", 0) and float(args.budget_usd) > 0 else 0.0
     )
@@ -6265,6 +6563,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     # Determine adapter from resolved plan.
     adapter = "opencode"
+    cfg: dict | None = None
     if plan_src:
         try:
             cfg = load_plan(_resolve_plan_path(repo, plan_src))
@@ -6280,7 +6579,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print("  plan: (none; running plan-independent checks only)")
     print()
 
-    failures = run_doctor_checks(repo, plan_src, adapter)
+    failures = run_doctor_checks(repo, plan_src, adapter, cfg)
 
     print()
     if failures:

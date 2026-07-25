@@ -81,8 +81,8 @@
 # ---------------------------------------------------------------------------
 
 [catalog]
-version = "1.1.0"
-updated = "2026-07-08"
+version = "1.2.0"
+updated = "2026-07-25"
 
 # ---------------------------------------------------------------------------
 # OpenAI entries
@@ -212,6 +212,18 @@ output_price_per_mtok = 25.00
 cached_input_price_per_mtok = 0.50
 effective_date = "2026-07-08"
 notes = "Claude Opus 4.8 standard pricing"
+
+[[entries]]
+provider = "anthropic"
+model_id = "claude-haiku-4-5"
+display_name = "Claude Haiku 4.5"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 1.00
+output_price_per_mtok = 5.00
+cached_input_price_per_mtok = 0.10
+effective_date = "2026-07-25"
+notes = "Added for direct claude-code dispatch: real envelope from the add-claude-code-direct-execution e2e verification run reported canonicalModel 'claude-haiku-4-5' for --model claude-haiku-4-5-20251001, and this id was previously missing from the catalog (usage resolved, cost did not)."
 
 [[entries]]
 provider = "anthropic"

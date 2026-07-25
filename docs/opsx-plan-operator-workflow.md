@@ -116,6 +116,7 @@ opsx-plan doctor
 | Tracked tree is clean | No uncommitted modifications to tracked files |
 | Plan loads successfully | The resolved plan TOML is valid and parses without errors |
 | PR delivery prerequisites | When `create_pull_request = true`: `gh` on PATH and a git remote configured |
+| Direct-dispatch worker agents installed | When the resolved plan uses direct dispatch: the configured adapter's `opsx-implementer`, `opsx-reviewer`, and `opsx-archiver` agents exist in that adapter's agent directory. Skipped when no plan is resolved or the plan does not use direct dispatch. |
 
 ### Doctor failure behavior
 
@@ -158,9 +159,9 @@ The plan manifest is a TOML file with a `[plan]` table and one or more
 | `created_check` | string | `"openspec validate {change} --strict"` | Post-create validation |
 | `invoke` | string | adapter default | Legacy single-command controller invocation |
 | `state_file` | string | adapter default | Controller state file path |
-| `implement_invoke` | string | `opencode run --agent opsx-implementer` | Direct implement command (OpenCode) |
-| `review_invoke` | string | `opencode run --agent opsx-reviewer` | Direct review command (OpenCode) |
-| `archive_invoke` | string | `opencode run --agent opsx-archiver` | Direct archive command (OpenCode) |
+| `implement_invoke` | string | adapter default | Direct implement command |
+| `review_invoke` | string | adapter default | Direct review command |
+| `archive_invoke` | string | adapter default | Direct archive command |
 
 ### `[[changes]]` entry fields
 
@@ -187,6 +188,64 @@ The plan manifest is a TOML file with a `[plan]` table and one or more
 
 **Constraint:** `create_pull_request = true` requires `enabled = true`. Setting
 `create_pull_request` without `enabled` is a plan-load error.
+
+### Direct dispatch is adapter-neutral
+
+A plan takes the direct implement-review-archive path — bounded per-stage
+worker subprocesses, plan-owned round control, stage logs under
+`.opsx-plan/logs/`, and telemetry — whenever all three of `implement_invoke`,
+`review_invoke`, and `archive_invoke` resolve to a non-empty command. This is
+a configuration test only; it does not depend on which `adapter` is
+configured. A plan missing one or more of the three stage invokes instead
+launches the legacy `invoke` command as a nested controller (`/opsx-drive`).
+
+`ADAPTER_DEFAULTS` supplies all three stage invokes for both `opencode` and
+`claude-code`, so plans using either adapter take the direct path with no
+manifest changes. The `claude-code` defaults are:
+
+```
+implement_invoke = claude -p --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL" --permission-mode bypassPermissions --output-format json
+review_invoke    = claude -p --agent opsx-reviewer   --model "$OPSX_REVIEWER_MODEL"   --permission-mode bypassPermissions --output-format json
+archive_invoke   = claude -p --agent opsx-archiver   --model "$OPSX_ARCHIVER_MODEL"   --permission-mode bypassPermissions --output-format json
+```
+
+`--permission-mode bypassPermissions` is required for unattended runs — in
+print mode an interactive permission prompt cannot be answered. Tool scope is
+still bounded by each worker agent's own `tools:` frontmatter (installed at
+`~/.claude/agents/` or `<project>/.claude/agents/`), the same place OpenCode
+bounds tool scope via its `permission:` block.
+
+`codex-cli` has no `implement_invoke`/`review_invoke`/`archive_invoke`
+defaults. Because the gate is configuration-driven, an operator can still
+opt `codex-cli` (or any adapter) into direct dispatch by hand-writing all
+three invokes in `[plan]` — this is reachable but unvalidated.
+
+Any stage invoke may be overridden per-plan by setting the corresponding key
+in `[plan]`; overriding one stage leaves the other two on their adapter
+defaults.
+
+#### Environment variable expansion in stage invokes
+
+Before dispatching a stage, `opsx-plan` expands `$VAR`/`${VAR}` references in
+each argument of the resolved invoke string — this is how `OPSX_*_MODEL`
+selects the per-stage model for `claude-code`, whose agent frontmatter has no
+environment interpolation (OpenCode agents interpolate the model directly in
+frontmatter instead). If a referenced variable is unset, the stage fails
+immediately with a message naming the variable — no client subprocess is
+started. The `exec[stage]` log line always shows the already-expanded
+command (with the worker input block elided).
+
+**`doctor` does not validate model-string format.** The `Required
+OPSX_*_MODEL environment variables` check in `opsx-plan doctor` only confirms
+the four `OPSX_*_MODEL` variables are set to a non-empty value — it does not
+check that the value is a model identifier the configured adapter's client
+can dispatch. OpenCode-style provider-prefixed ids (for example
+`deepseek/deepseek-v4-pro` or `openai/gpt-5.6-luna`) are valid for the
+`opencode` adapter but are not valid `--model` arguments for the Claude Code
+CLI. Under `claude-code`, `doctor` passes with such a value set, and the
+stage then fails at dispatch time when the client rejects the model. Set
+Anthropic model ids (for example `claude-sonnet-5`) for the three
+`OPSX_*_MODEL` variables when running a `claude-code` plan.
 
 ### Unrecognized manifest keys are silently ignored
 
@@ -292,8 +351,9 @@ opsx-plan run --create-only
   Untracked leftovers are allowed.
 - **Reconciliation on startup**: The orchestrator reconciles recorded state
   against the repository. A stale `running` status from a killed run is
-  recovered to `pending`. For non-OpenCode adapters, changes archived outside
-  plan control may be verified and marked done. For direct OpenCode, when
+  recovered to `pending`. For the legacy nested-controller path, changes
+  archived outside plan control may be verified and marked done. For direct
+  dispatch (any adapter with all three stage invokes configured), when
   repository archive evidence exists but the plan state lacks matching archive
   worker evidence, the change is marked as failed (fail-closed).
 
@@ -478,6 +538,21 @@ The report includes:
 - **Per-Change Metrics**: status, rounds, duration, tokens, cost per change
 - **Stage Aggregates**: average durations, review failure rate, cost per change
 - **Model Leaderboard**: grouped by `(implementer, reviewer, archiver)` tuple
+
+#### Usage source provenance
+
+Each telemetry record's `usage.usage_source` field names where its token
+counts and model identity came from, in deterministic precedence order:
+
+| Source | Meaning |
+|---|---|
+| `worker_json` | Parsed from the worker's one-line JSON result — highest precedence |
+| `claude_result_json` | Extracted from a Claude Code result envelope (`--output-format json`/`stream-json`) when worker JSON had no usable usage or model fields |
+| `log_metadata` | Recovered by scanning the raw stage log for recognizable token/model fields, when neither of the above applied |
+| `opencode_plugin` | Read from the OpenCode usage-emitter plugin sidecar, used only when no higher-precedence source provided usage |
+
+A record with no usable source anywhere in the chain reports usage as
+unavailable rather than guessing.
 
 ### Dashboard
 
@@ -764,11 +839,14 @@ Output during the run shows per-change dispatch, stage outcomes, and budget
 checks:
 
 ```
-[opsx-plan 14:30:00] === add-unit-tests direct OpenCode execution (round 1) ===
+[opsx-plan 14:30:00] === add-unit-tests direct opencode execution (round 1) ===
 [opsx-plan 14:30:01]   exec[implement]: opencode run --agent opsx-implementer <input> (timeout 90m, log .opsx-plan/logs/...)
 [opsx-plan 14:31:00]   done: add-unit-tests
 ...
 ```
+
+The run-log line names whichever adapter is configured — e.g. `direct
+claude-code execution` for a Claude Code plan.
 
 ### 6. Handle a manual gate
 
@@ -961,6 +1039,14 @@ opsx-plan run-one <change-id> [--budget-usd N]
 ```
 Run a single authored OpenSpec change directly through the OpenCode
 implement-review-archive loop.
+
+`run-one` has no `--adapter` flag: `build_single_change_config` always builds
+its config from `ADAPTER_DEFAULTS["opencode"]`, regardless of which adapter
+is configured elsewhere. There is no way to run a single change directly
+through the `claude-code` (or `codex-cli`) loop via `run-one` — use a
+plan manifest with `adapter = "claude-code"` and `opsx-plan run` instead.
+Adding an `--adapter` flag to `run-one` is tracked as follow-up work, not
+implemented here.
 
 ### `opsx-run` (executable-name alias)
 

@@ -151,17 +151,19 @@ review is for.
 
 ### 7. Verify
 
-Three checks, and they cover different things:
+Three checks, covering different things. `$OPSX` below is whichever env var the
+repo uses for the controller checkout — `KF_OPSX_CONTROLLER` in knowledge-forge,
+`OPSX_CONTROLLER` elsewhere, or just the path.
 
 ```bash
 # Graph: parses, ids unique, deps known, no cycles, correct ready/pending state
-python3 $KF_OPSX_CONTROLLER/orchestrator/opsx-plan.py status <manifest>
+python3 $OPSX/orchestrator/opsx-plan.py status <manifest>
 
 # Silent-drop keys and change-ids that don't match the repo
 python3 <skill>/scripts/audit_manifest.py <manifest> --repo <repo-root>
 
 # Full gate config and DAG as the orchestrator will actually walk it
-python3 $KF_OPSX_CONTROLLER/orchestrator/opsx-plan.py run --dry-run <manifest>
+python3 $OPSX/orchestrator/opsx-plan.py run --dry-run <manifest>
 ```
 
 Read the `status` output rather than just checking it exits clean. Every change
@@ -169,6 +171,10 @@ should be in the state you intended: exactly the changes you expect showing
 `ready`, disabled ones showing `skipped`, and dependent ones `pending`. A change
 sitting `ready` that you meant to gate is a real bug and `status` will show it
 plainly.
+
+Before an actual unattended run, `opsx-plan.py doctor` checks the environment
+(models configured, client reachable, tree clean) — worth running once, since
+those failures otherwise surface several minutes into a run.
 
 ## Failure modes worth knowing
 
