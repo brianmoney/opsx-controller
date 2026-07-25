@@ -1,0 +1,44 @@
+# Example opsx-controller model configuration.
+#
+# Copy this file to one of:
+#   ~/.config/opsx-controller/models.toml   (primary, user-global)
+#   <repo>/.opsx-plan/models.toml           (machine-local override, gitignored)
+#
+# `opsx-plan models init` seeds the user-global file from your current
+# environment. Resolution precedence, highest first:
+#   1. [adapters.<adapter>].<role>  in the repo-local file
+#   2. [adapters.<adapter>].<role>  in the user-global file
+#   3. [defaults].<role>            in the repo-local file, then user-global
+#   4. the ambient OPSX_<ROLE>_MODEL environment variable
+#   5. unresolved (the run fails closed)
+#
+# Roles: controller, implementer, reviewer, archiver.
+#
+# Identifier syntax is adapter-specific:
+#   - opencode requires "provider/model" (e.g. "deepseek/deepseek-v4-pro")
+#   - claude-code requires a bare Anthropic alias (e.g. "claude-sonnet-5")
+#   - codex-cli requires a bare OpenAI id (e.g. "gpt-5.4")
+# `opsx-plan doctor` and `opsx-plan models show` flag identifiers that don't
+# match the target adapter's syntax.
+
+[defaults]
+controller = "github-copilot/gpt-5.4"
+implementer = "deepseek/deepseek-v4-pro"
+reviewer = "github-copilot/gpt-5.4"
+archiver = "github-copilot/gpt-5.4"
+
+[adapters.opencode]
+controller = "github-copilot/gpt-5.4"
+implementer = "deepseek/deepseek-v4-pro"
+reviewer = "github-copilot/gpt-5.4"
+archiver = "github-copilot/gpt-5.4"
+
+[adapters.claude-code]
+implementer = "claude-sonnet-5"
+reviewer = "claude-opus-5"
+archiver = "claude-sonnet-5"
+
+[adapters.codex-cli]
+implementer = "gpt-5.4"
+reviewer = "gpt-5.4"
+archiver = "gpt-5.4"

@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
+from lib.models.types import ResolvedModel
 
 SCRIPT = Path(__file__).resolve().parents[2] / "orchestrator" / "opsx-plan.py"
 
@@ -1491,6 +1492,101 @@ class ClaudeCodeAdapterDefaultsTests(unittest.TestCase):
         self.assertTrue(self.opsx_plan.is_direct_mode(cfg))
 
 
+class ModelResolutionWiringTests(unittest.TestCase):
+    """7.4, 7.7: load_plan populates cfg["models"] per adapter, and the
+    nested-controller deprecation warning fires only when expected."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        # Isolate model resolution from the real machine's home directory.
+        from lib.models import resolver as _resolver
+        self._models_patch = mock.patch.object(
+            _resolver, "USER_CONFIG_PATH", Path(self.tmp.name) / "unused-home" / "models.toml"
+        )
+        self._models_patch.start()
+        self.addCleanup(self._models_patch.stop)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _write_config(self, content: str) -> None:
+        cfg_path = self.repo / ".opsx-plan" / "models.toml"
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(textwrap.dedent(content), encoding="utf-8")
+
+    def _write_plan(self, name: str, adapter: str) -> Path:
+        p = self.repo / name
+        p.write_text(
+            f'[plan]\nname = "test"\nadapter = "{adapter}"\n\n[[changes]]\nid = "c1"\n',
+            encoding="utf-8",
+        )
+        return p
+
+    def test_load_plan_populates_cfg_models_for_all_roles(self) -> None:
+        self._write_config(
+            """\
+            [adapters.opencode]
+            implementer = "deepseek/deepseek-v4-pro"
+            controller = "github-copilot/gpt-5.4"
+            reviewer = "github-copilot/gpt-5.4"
+            archiver = "github-copilot/gpt-5.4"
+            """
+        )
+        plan = self._write_plan("plan.toml", "opencode")
+        cfg = self.opsx_plan.load_plan(plan, repo=self.repo)
+
+        self.assertIn("models", cfg)
+        for role in self.opsx_plan.ROLES:
+            self.assertIn(role, cfg["models"])
+        self.assertEqual(cfg["models"]["implementer"].model, "deepseek/deepseek-v4-pro")
+
+    def test_two_adapters_resolve_different_identifiers_from_one_config_file(self) -> None:
+        self._write_config(
+            """\
+            [adapters.opencode]
+            implementer = "deepseek/deepseek-v4-pro"
+
+            [adapters.claude-code]
+            implementer = "claude-sonnet-5"
+            """
+        )
+        opencode_plan = self._write_plan("opencode.toml", "opencode")
+        claude_plan = self._write_plan("claude.toml", "claude-code")
+
+        opencode_cfg = self.opsx_plan.load_plan(opencode_plan, repo=self.repo)
+        claude_cfg = self.opsx_plan.load_plan(claude_plan, repo=self.repo)
+
+        self.assertEqual(opencode_cfg["models"]["implementer"].model, "deepseek/deepseek-v4-pro")
+        self.assertEqual(claude_cfg["models"]["implementer"].model, "claude-sonnet-5")
+
+    def test_nested_controller_plan_triggers_deprecation_warning(self) -> None:
+        plan = self.repo / "nested.toml"
+        plan.write_text(
+            '[plan]\nname = "nested"\nadapter = "claude-code"\n'
+            'implement_invoke = ""\nreview_invoke = ""\narchive_invoke = ""\n\n'
+            '[[changes]]\nid = "c1"\n',
+            encoding="utf-8",
+        )
+        logs: list[str] = []
+        with mock.patch.object(self.opsx_plan, "log", side_effect=logs.append):
+            self.opsx_plan.load_plan(plan, repo=self.repo)
+
+        deprecation_logs = [m for m in logs if "deprecated" in m.lower()]
+        self.assertTrue(deprecation_logs, f"expected a deprecation warning, got: {logs}")
+        self.assertIn("opsx-run", deprecation_logs[0])
+
+    def test_direct_dispatch_plan_emits_no_deprecation_warning(self) -> None:
+        plan = self._write_plan("direct.toml", "claude-code")
+        logs: list[str] = []
+        with mock.patch.object(self.opsx_plan, "log", side_effect=logs.append):
+            self.opsx_plan.load_plan(plan, repo=self.repo)
+
+        deprecation_logs = [m for m in logs if "deprecated" in m.lower()]
+        self.assertEqual(deprecation_logs, [])
+
+
 class InvokeDirectStageEnvExpansionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.opsx_plan = load_opsx_plan()
@@ -1591,6 +1687,49 @@ class InvokeDirectStageEnvExpansionTests(unittest.TestCase):
         self.assertIn("attempt 1", header_line)
         self.assertNotIn("THE INPUT BLOCK", content)
         self.assertNotIn("multiple lines", content)
+
+    def test_apply_model_env_populates_variable_invoke_expands(self) -> None:
+        """7.5: after apply_model_env, invoke_direct_stage expands
+        $OPSX_IMPLEMENTER_MODEL to the adapter-specific resolved value."""
+        # apply_model_env writes all four OPSX_*_MODEL vars into the real
+        # process environment, so all four must be saved and restored.
+        saved_vars = {
+            var: os.environ.get(var) for var in self.opsx_plan.ROLE_ENV.values()
+        }
+        try:
+            cfg = {
+                "adapter": "claude-code",
+                "models": {
+                    "controller": ResolvedModel(
+                        role="controller", model="claude-sonnet-5", source="test"
+                    ),
+                    "implementer": ResolvedModel(
+                        role="implementer", model="claude-sonnet-5", source="test"
+                    ),
+                    "reviewer": ResolvedModel(
+                        role="reviewer", model="claude-opus-5", source="test"
+                    ),
+                    "archiver": ResolvedModel(
+                        role="archiver", model="claude-sonnet-5", source="test"
+                    ),
+                },
+            }
+            self.opsx_plan.apply_model_env(cfg)
+
+            cfg["implement_invoke"] = 'echo --model "$OPSX_IMPLEMENTER_MODEL"'
+            cfg["changes"] = {"c1": {"timeout_minutes": 1}}
+            outcome, log_path = self.opsx_plan.invoke_direct_stage(
+                self.repo, cfg, "c1", "implement", 1, "INPUT_BLOCK"
+            )
+            self.assertEqual(outcome, "exited")
+            content = log_path.read_text(encoding="utf-8")
+            self.assertIn("claude-sonnet-5", content)
+        finally:
+            for var, value in saved_vars.items():
+                if value is not None:
+                    os.environ[var] = value
+                else:
+                    os.environ.pop(var, None)
 
 
 class OpenCodeAgentModeTests(unittest.TestCase):
@@ -2216,6 +2355,62 @@ class DirectStageTelemetryTests(unittest.TestCase):
         self.assertIsNotNone(r["started_at"])
         self.assertIn("log_path", r["result"])
         self.assertIsNotNone(r["result"]["log_path"])
+
+    # 7.6: model environment set once (as apply_model_env would) survives the
+    # usage-sidecar env restore and is still readable when telemetry
+    # attribution re-expands the stage invoke string.
+    def test_model_env_still_populated_after_sidecar_restore_for_telemetry(self) -> None:
+        saved = os.environ.get("OPSX_IMPLEMENTER_MODEL")
+        os.environ["OPSX_IMPLEMENTER_MODEL"] = "deepseek/deepseek-v4-pro"
+        try:
+            self.cfg["implement_invoke"] = (
+                'opencode run --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL"'
+            )
+            self.write_authored_change(self.cid)
+            record = self.opsx_plan.rec(self.state, self.cid)
+            record["max_rounds"] = self.cfg["max_rounds"]
+            record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+                self.repo, self.cid
+            )
+            self.stage_runner(
+                [
+                    {
+                        "stage": "implement",
+                        "result": {
+                            "status": "implemented",
+                            "change": self.cid,
+                            "round": 1,
+                            "progress_made": True,
+                            "completed_tasks": ["1.1"],
+                            "remaining_tasks": ["1.2"],
+                            "task_counts": {"complete": 1, "total": 2},
+                            "files_touched": ["orchestrator/opsx-plan.py"],
+                            "known_change_files": [],
+                            "summary": "implemented first round",
+                        },
+                    },
+                    {"stage": "review", "outcome": "timeout"},
+                ]
+            )
+
+            self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+            # The env var must still be set post-run: run_direct_change's
+            # usage-sidecar restore only ever touches OPSX_USAGE_PATH and
+            # friends, never OPSX_*_MODEL.
+            self.assertEqual(os.environ.get("OPSX_IMPLEMENTER_MODEL"), "deepseek/deepseek-v4-pro")
+
+            records = self._read_telemetry()
+            self.assertGreaterEqual(len(records), 1)
+            r = records[0]
+            self.assertEqual(r["stage"], "implement")
+            self.assertEqual(r["model"]["provider"], "deepseek")
+            self.assertEqual(r["model"]["model_id"], "deepseek-v4-pro")
+        finally:
+            if saved is not None:
+                os.environ["OPSX_IMPLEMENTER_MODEL"] = saved
+            else:
+                os.environ.pop("OPSX_IMPLEMENTER_MODEL", None)
 
     # 6.2
     def test_successful_review_stage_populates_verdict_and_findings(self) -> None:
@@ -3601,6 +3796,24 @@ class CompileTests(unittest.TestCase):
             "init",
             "--allow-empty",
         )
+        # Isolate model resolution from whatever the real machine's home
+        # directory happens to contain, so these tests are hermetic.
+        from lib.models import resolver as _resolver
+        self._models_patch = mock.patch.object(
+            _resolver, "USER_CONFIG_PATH", Path(self.tmp.name) / "unused-home" / "models.toml"
+        )
+        self._models_patch.start()
+        self.addCleanup(self._models_patch.stop)
+        # _set_model/_clear_model mutate OPSX_CONTROLLER_MODEL directly;
+        # restore it so later test classes don't observe leftover state.
+        self._original_controller_model = os.environ.get("OPSX_CONTROLLER_MODEL")
+        self.addCleanup(self._restore_controller_model)
+
+    def _restore_controller_model(self) -> None:
+        if self._original_controller_model is not None:
+            os.environ["OPSX_CONTROLLER_MODEL"] = self._original_controller_model
+        else:
+            os.environ.pop("OPSX_CONTROLLER_MODEL", None)
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -3651,7 +3864,7 @@ class CompileTests(unittest.TestCase):
         self._clear_model()
         with self.assertRaises(self.opsx_plan.PlanError) as ctx:
             self.opsx_plan.check_controller_model()
-        self.assertIn("OPSX_CONTROLLER_MODEL", str(ctx.exception))
+        self.assertIn("controller model", str(ctx.exception))
 
     def test_check_controller_model_succeeds_when_set(self) -> None:
         self._set_model()
@@ -3739,7 +3952,7 @@ class CompileTests(unittest.TestCase):
                                   output=str(out), force=False)
         with self.assertRaises(self.opsx_plan.PlanError) as ctx:
             self.opsx_plan.cmd_compile(args)
-        self.assertIn("OPSX_CONTROLLER_MODEL", str(ctx.exception))
+        self.assertIn("controller model", str(ctx.exception))
 
     def test_cmd_compile_fails_when_output_exists_without_force(self) -> None:
         self._set_model()
@@ -9643,6 +9856,14 @@ class DoctorPreflightTests(unittest.TestCase):
             "-c", "user.name=Test User",
             "commit", "-m", "init",
         )
+        # Isolate model resolution from whatever the real machine's home
+        # directory happens to contain, so these tests are hermetic.
+        from lib.models import resolver as _resolver
+        self._models_patch = mock.patch.object(
+            _resolver, "USER_CONFIG_PATH", Path(self.tmp.name) / "unused-home" / "models.toml"
+        )
+        self._models_patch.start()
+        self.addCleanup(self._models_patch.stop)
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -9666,15 +9887,17 @@ class DoctorPreflightTests(unittest.TestCase):
 
     # -- 4.1: failing check classes ---------------------------------------
 
-    def test_check_required_env_vars_missing_reports_failures(self) -> None:
-        """Missing OPSX_*_MODEL vars should produce a failing check."""
+    def test_check_model_resolution_missing_reports_failures(self) -> None:
+        """Unresolved OPSX_*_MODEL roles should produce a failing check."""
         saved_env = {}
-        for v in self.opsx_plan._REQUIRED_MODEL_ENV_VARS:
+        for v in self.opsx_plan.ROLE_ENV.values():
             saved_env[v] = os.environ.pop(v, None)
         try:
-            passed, label, remediation = self.opsx_plan._check_required_env_vars()
+            passed, label, remediation = self.opsx_plan._check_model_resolution(
+                self.repo, "opencode"
+            )
             self.assertFalse(passed)
-            self.assertIn("Missing", remediation)
+            self.assertIn("Unresolved role", remediation)
         finally:
             for v, val in saved_env.items():
                 if val is not None:
@@ -9682,14 +9905,72 @@ class DoctorPreflightTests(unittest.TestCase):
                 elif v in os.environ:
                     del os.environ[v]
 
-    def test_check_required_env_vars_passes_when_all_set(self) -> None:
-        """When all OPSX_*_MODEL vars are set, the check passes."""
+    def test_check_model_resolution_passes_when_all_set(self) -> None:
+        """When all OPSX_*_MODEL vars resolve, the check passes."""
         saved_env = {}
-        for v in self.opsx_plan._REQUIRED_MODEL_ENV_VARS:
+        for v in self.opsx_plan.ROLE_ENV.values():
             saved_env[v] = os.environ.get(v)
-            os.environ[v] = "test-model-value"
+            os.environ[v] = "provider/test-model-value"
         try:
-            passed, label, remediation = self.opsx_plan._check_required_env_vars()
+            passed, label, remediation = self.opsx_plan._check_model_resolution(
+                self.repo, "opencode"
+            )
+            self.assertTrue(passed, f"check failed: {remediation}")
+        finally:
+            for v, val in saved_env.items():
+                if val is not None:
+                    os.environ[v] = val
+                elif v in os.environ:
+                    del os.environ[v]
+
+    def test_check_model_identifier_syntax_fails_on_provider_prefix_for_claude_code(self) -> None:
+        """A provider-prefixed identifier under claude-code fails the syntax check."""
+        saved_env = {}
+        for v in self.opsx_plan.ROLE_ENV.values():
+            saved_env[v] = os.environ.get(v)
+            os.environ[v] = "deepseek/deepseek-v4-pro"
+        try:
+            passed, label, remediation = self.opsx_plan._check_model_identifier_syntax(
+                self.repo, "claude-code"
+            )
+            self.assertFalse(passed)
+            self.assertIn("provider-prefixed", remediation)
+        finally:
+            for v, val in saved_env.items():
+                if val is not None:
+                    os.environ[v] = val
+                elif v in os.environ:
+                    del os.environ[v]
+
+    def test_check_model_identifier_syntax_fails_on_bare_identifier_for_opencode(self) -> None:
+        """A bare identifier under opencode fails the syntax check."""
+        saved_env = {}
+        for v in self.opsx_plan.ROLE_ENV.values():
+            saved_env[v] = os.environ.get(v)
+            os.environ[v] = "gpt-5.4"
+        try:
+            passed, label, remediation = self.opsx_plan._check_model_identifier_syntax(
+                self.repo, "opencode"
+            )
+            self.assertFalse(passed)
+            self.assertIn("provider/", remediation)
+        finally:
+            for v, val in saved_env.items():
+                if val is not None:
+                    os.environ[v] = val
+                elif v in os.environ:
+                    del os.environ[v]
+
+    def test_check_model_identifier_syntax_passes_for_matching_syntax(self) -> None:
+        """A correctly-shaped identifier passes the syntax check."""
+        saved_env = {}
+        for v in self.opsx_plan.ROLE_ENV.values():
+            saved_env[v] = os.environ.get(v)
+            os.environ[v] = "provider/test-model-value"
+        try:
+            passed, label, remediation = self.opsx_plan._check_model_identifier_syntax(
+                self.repo, "opencode"
+            )
             self.assertTrue(passed, f"check failed: {remediation}")
         finally:
             for v, val in saved_env.items():
@@ -9871,7 +10152,7 @@ class DoctorPreflightTests(unittest.TestCase):
         stdout = io.StringIO()
         # Simulate missing required env vars to force a failure
         saved_env = {}
-        for v in self.opsx_plan._REQUIRED_MODEL_ENV_VARS:
+        for v in self.opsx_plan.ROLE_ENV.values():
             saved_env[v] = os.environ.pop(v, None)
         try:
             with mock.patch("sys.stdout", stdout):
@@ -9899,6 +10180,10 @@ class DoctorPreflightTests(unittest.TestCase):
         self.assertIn(plan_src, stdout.getvalue())
         # Should report 0 failures if environment is clean
         self.assertEqual(rc, 0)
+        # 4.2: each resolved role's source is reported alongside the model
+        output = stdout.getvalue()
+        self.assertIn("controller", output)
+        self.assertIn("ambient environment", output)
 
     def test_cmd_doctor_with_missing_explicit_plan_exits_nonzero(self) -> None:
         """Doctor with a non-existent explicit plan should fail hard."""

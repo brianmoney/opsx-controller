@@ -99,14 +99,31 @@ From `ADAPTER_DEFAULTS`:
 | `claude-code` | `claude -p "/opsx-drive {change}"` | `.claude/opsx-controller/{change}.json` |
 | `codex-cli` | `codex exec "$opsx-drive {change}"` | `.opsx-controller/{change}.json` |
 
-Only `opencode` defines `implement_invoke` / `review_invoke` /
-`archive_invoke` (`opencode run --agent opsx-{implementer,reviewer,archiver}`).
-The other adapters fall back to the single-command `invoke` path, so a plan
-using them runs the legacy drive loop rather than the direct stage loop.
+Both `opencode` and `claude-code` define `implement_invoke` / `review_invoke`
+/ `archive_invoke`, so a plan using either adapter takes the direct
+implement-review-archive path with no manifest changes:
 
-For direct OpenCode plan runs, `.opsx-plan/<plan-name>.state.json` is the
-authoritative durable state — not `.opencode/opsx-controller/<change>.json`,
-which belongs to manual `/opsx-drive` invocations.
+- `opencode run --agent opsx-{implementer,reviewer,archiver} --model
+  "$OPSX_{IMPLEMENTER,REVIEWER,ARCHIVER}_MODEL"`
+- `claude -p --agent opsx-{implementer,reviewer,archiver} --model
+  "$OPSX_{IMPLEMENTER,REVIEWER,ARCHIVER}_MODEL" --permission-mode
+  bypassPermissions --output-format json`
+
+`codex-cli` defines neither and falls back to the single-command `invoke`
+path (`/opsx-drive`), so a `codex-cli` plan runs the legacy nested-controller
+loop rather than the direct stage loop unless an operator hand-writes all
+three stage invokes in `[plan]`. The `$OPSX_*_MODEL` references in both sets
+of defaults are resolved once per adapter when the plan loads, from
+`~/.config/opsx-controller/models.toml` — see
+`docs/opsx-plan-operator-workflow.md`'s Model Configuration section.
+
+`/opsx-drive` is **deprecated**; `opsx-plan` logs a warning when a resolved
+plan takes the nested-controller path.
+
+For direct plan runs, `.opsx-plan/<plan-name>.state.json` is the
+authoritative durable state — not `.opencode/opsx-controller/<change>.json`
+or `.claude/opsx-controller/<change>.json`, which belong to manual
+`/opsx-drive` invocations.
 
 ## Dependency semantics
 

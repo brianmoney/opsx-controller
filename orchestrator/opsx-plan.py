@@ -59,6 +59,14 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     sys.exit("opsx-plan requires Python 3.11+ (tomllib)")
 
+try:
+    from lib.models.resolver import USER_CONFIG_PATH, ModelConfigError
+    from lib.models.resolver import resolve as resolve_models
+    from lib.models.resolver import validate as validate_models
+    from lib.models.types import ROLE_ENV, ROLES
+except ModuleNotFoundError as exc:  # pragma: no cover
+    sys.exit(f"opsx-plan requires the lib.models runtime package: {exc}")
+
 # ---------------------------------------------------------------------------
 # Adapter defaults. Both fields accept a {change} placeholder and may be
 # overridden in the [plan] table. Verify the invoke command for your client
@@ -68,9 +76,15 @@ ADAPTER_DEFAULTS = {
     "opencode": {
         "invoke": 'opencode run "/opsx-drive {change}"',
         "state_file": ".opencode/opsx-controller/{change}.json",
-        "implement_invoke": "opencode run --agent opsx-implementer",
-        "review_invoke": "opencode run --agent opsx-reviewer",
-        "archive_invoke": "opencode run --agent opsx-archiver",
+        "implement_invoke": (
+            'opencode run --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL"'
+        ),
+        "review_invoke": (
+            'opencode run --agent opsx-reviewer --model "$OPSX_REVIEWER_MODEL"'
+        ),
+        "archive_invoke": (
+            'opencode run --agent opsx-archiver --model "$OPSX_ARCHIVER_MODEL"'
+        ),
     },
     "claude-code": {
         "invoke": 'claude -p "/opsx-drive {change}"',
@@ -99,13 +113,6 @@ ADAPTER_CLIENTS = {
     "claude-code": "claude",
     "codex-cli": "codex",
 }
-
-_REQUIRED_MODEL_ENV_VARS = [
-    "OPSX_CONTROLLER_MODEL",
-    "OPSX_IMPLEMENTER_MODEL",
-    "OPSX_REVIEWER_MODEL",
-    "OPSX_ARCHIVER_MODEL",
-]
 
 DONE = "done"
 PENDING = "pending"
@@ -220,7 +227,7 @@ class PlanError(Exception):
     pass
 
 
-def load_plan(path: Path) -> dict:
+def load_plan(path: Path, repo: Path | None = None) -> dict:
     try:
         with open(path, "rb") as fh:
             raw = tomllib.load(fh)
@@ -307,6 +314,20 @@ def load_plan(path: Path) -> dict:
 
     cfg["order"] = topo_sort(by_id)
     cfg["changes"] = by_id
+
+    try:
+        cfg["models"] = resolve_models(adapter, repo=repo)
+    except ModelConfigError as exc:
+        raise PlanError(str(exc)) from exc
+
+    if not is_direct_mode(cfg):
+        log(
+            f"warning: plan '{cfg['name']}' resolves to the deprecated nested-controller "
+            f"'/opsx-drive' path (fewer than all three stage invokes configured); "
+            f"direct dispatch (opsx-run <change-id> or full implement/review/archive "
+            f"stage invokes) is the supported replacement"
+        )
+
     return cfg
 
 
@@ -372,7 +393,41 @@ def build_single_change_config(repo: Path, change_id: str) -> dict:
 
     cfg["order"] = [change_id]
     cfg["changes"] = by_id
+
+    try:
+        cfg["models"] = resolve_models("opencode", repo=repo)
+    except ModelConfigError as exc:
+        raise PlanError(str(exc)) from exc
+    apply_model_env(cfg)
+
     return cfg
+
+
+def apply_model_env(cfg: dict) -> None:
+    """Export ``cfg["models"]`` into ``os.environ`` for the process lifetime.
+
+    Resolution happens once per process (``opsx-plan`` handles exactly one
+    plan per invocation), so no save/restore is needed: everything
+    downstream — direct stage dispatch, the legacy nested-controller
+    ``{controller_model}`` substitution, and the telemetry fallback that
+    re-expands the stage invoke string after a stage completes — reads the
+    same ``os.environ`` values for the rest of the process.
+
+    Raises ``PlanError`` naming every unresolved role rather than letting a
+    worker dispatch with an empty or defaulted model.
+    """
+    models: dict = cfg.get("models") or {}
+    unresolved = [role for role in ROLES if not (models.get(role) and models[role].model)]
+    if unresolved:
+        raise PlanError(
+            f"cannot activate models for adapter '{cfg.get('adapter', '?')}': "
+            f"unresolved role(s): {', '.join(unresolved)}\n"
+            f"Run `opsx-plan models show --adapter {cfg.get('adapter', '?')}` to "
+            f"inspect resolution, or `opsx-plan models init` to seed a "
+            f"configuration file."
+        )
+    for role in ROLES:
+        os.environ[ROLE_ENV[role]] = models[role].model
 
 
 def _parse_git_delivery_config(raw: dict) -> dict:
@@ -681,7 +736,7 @@ def validate_active_plan(repo: Path, plan_rel: str) -> Path:
         )
     # Verify it is loadable through the existing parser
     try:
-        load_plan(plan_path)
+        load_plan(plan_path, repo=repo)
     except PlanError as exc:
         raise PlanError(f"active plan cannot be loaded: {exc}")
     return plan_path
@@ -3515,13 +3570,53 @@ def _check_stale_install(repo: Path) -> tuple[bool, str, str]:
     return (True, label, "")
 
 
-def _check_required_env_vars() -> tuple[bool, str, str]:
-    """Check that required OPSX_*_MODEL environment variables are set."""
-    label = "Required OPSX_*_MODEL environment variables"
-    missing = [v for v in _REQUIRED_MODEL_ENV_VARS if not os.environ.get(v, "").strip()]
-    if missing:
-        return (False, label, f"Missing: {', '.join(missing)}")
+def _check_model_resolution(repo: Path, adapter: str) -> tuple[bool, str, str]:
+    """Check that every model role resolves for *adapter*."""
+    label = "Model roles resolve for the target adapter"
+    try:
+        resolved = resolve_models(adapter, repo=repo)
+    except ModelConfigError as exc:
+        return (False, label, str(exc))
+    unresolved = [role for role in ROLES if not resolved[role].model]
+    if unresolved:
+        return (
+            False,
+            label,
+            f"Unresolved role(s) for '{adapter}': {', '.join(unresolved)}; "
+            f"run `opsx-plan models init` to seed a configuration file, or edit "
+            f"models.toml directly",
+        )
     return (True, label, "")
+
+
+def _check_model_identifier_syntax(repo: Path, adapter: str) -> tuple[bool, str, str]:
+    """Check that resolved model identifiers match *adapter*'s identifier syntax."""
+    label = "Resolved model identifiers match adapter syntax"
+    try:
+        resolved = resolve_models(adapter, repo=repo)
+    except ModelConfigError:
+        # Already reported by _check_model_resolution; nothing new to add here.
+        return (True, label, "")
+    warnings = validate_models(adapter, resolved)
+    if not warnings:
+        return (True, label, "")
+    return (
+        False,
+        label,
+        "; ".join(warnings) + " (edit models.toml or the ambient OPSX_*_MODEL value)",
+    )
+
+
+def _print_model_resolution_detail(repo: Path, adapter: str) -> None:
+    """Print each role's resolved model and source under the model check line."""
+    try:
+        resolved = resolve_models(adapter, repo=repo)
+    except ModelConfigError:
+        return
+    for role in ROLES:
+        entry = resolved[role]
+        value = entry.model if entry.model else "(unresolved)"
+        print(f"      {role:<12} {value}  [{entry.source}]")
 
 
 def _check_openspec_on_path() -> tuple[bool, str, str]:
@@ -3570,7 +3665,7 @@ def _check_plan_loads(repo: Path, plan_src: str | None) -> tuple[bool, str, str]
     if plan_src is None:
         return (True, label, "")
     try:
-        load_plan(_resolve_plan_path(repo, plan_src))
+        load_plan(_resolve_plan_path(repo, plan_src), repo=repo)
         return (True, label, "")
     except PlanError as exc:
         return (False, label, f"Plan load failed: {exc}")
@@ -3660,7 +3755,8 @@ def run_doctor_checks(repo: Path, plan_src: str | None,
 
     # Plan-independent checks
     checks.append(_check_stale_install(repo))
-    checks.append(_check_required_env_vars())
+    checks.append(_check_model_resolution(repo, adapter))
+    checks.append(_check_model_identifier_syntax(repo, adapter))
     checks.append(_check_openspec_on_path())
     checks.append(_check_adapter_client_on_path(adapter))
     checks.append(_check_tracked_bytecode(repo))
@@ -3680,6 +3776,8 @@ def run_doctor_checks(repo: Path, plan_src: str | None,
             if remediation:
                 print(f"    \u2192 {remediation}")
             failures += 1
+        if label == "Model roles resolve for the target adapter":
+            _print_model_resolution_detail(repo, adapter)
 
     return failures
 
@@ -3690,7 +3788,8 @@ def run_preflight_warnings(repo: Path, plan_src: str | None,
     checks: list[tuple[bool, str, str]] = []
 
     checks.append(_check_stale_install(repo))
-    checks.append(_check_required_env_vars())
+    checks.append(_check_model_resolution(repo, adapter))
+    checks.append(_check_model_identifier_syntax(repo, adapter))
     checks.append(_check_openspec_on_path())
     checks.append(_check_adapter_client_on_path(adapter))
     checks.append(_check_tracked_bytecode(repo))
@@ -3962,16 +4061,28 @@ def resolve_compile_output(repo: Path, output: str, force: bool) -> Path:
     return p
 
 
-def check_controller_model() -> str:
-    """Return the configured controller model for compile.
+def check_controller_model(repo: Path | None = None) -> str:
+    """Return the controller model resolved for the ``opencode`` adapter.
 
-    Raises ``PlanError`` when ``OPSX_CONTROLLER_MODEL`` is unset or empty.
+    ``compile`` always shells out to the ``opencode`` binary regardless of
+    the active plan's adapter, so this resolves against ``opencode``
+    specifically rather than against the active plan's adapter — handing a
+    Claude Code or Codex identifier to OpenCode would fail at dispatch.
+
+    Raises ``PlanError`` when the ``controller`` role cannot be resolved
+    for ``opencode``.
     """
-    model = os.environ.get("OPSX_CONTROLLER_MODEL", "").strip()
+    try:
+        resolved = resolve_models("opencode", repo=repo)
+    except ModelConfigError as exc:
+        raise PlanError(str(exc)) from exc
+    model = resolved["controller"].model
     if not model:
         raise PlanError(
-            "OPSX_CONTROLLER_MODEL is not set; "
-            "compile requires a controller model to invoke OpenCode"
+            "controller model is not configured for the opencode adapter; "
+            "compile requires a controller model to invoke OpenCode "
+            "(run `opsx-plan models show --adapter opencode` to inspect, "
+            "or `opsx-plan models init` to seed a configuration file)"
         )
     return model
 
@@ -4431,7 +4542,7 @@ def cmd_use(args: argparse.Namespace) -> int:
         return 2
     # Validate through the existing plan loader before writing the pointer
     try:
-        load_plan(plan_path)
+        load_plan(plan_path, repo=repo)
     except (PlanError, Exception) as exc:
         # tomllib.TOMLDecodeError and PlanError both indicate invalid plan
         print(f"error: invalid plan: {exc}", file=sys.stderr)
@@ -4451,7 +4562,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
     plan_src = resolve_plan(repo, args.plan)
     plan_abs = _resolve_plan_path(repo, plan_src)
-    cfg = load_plan(plan_abs)
+    cfg = load_plan(plan_abs, repo=repo)
+    try:
+        apply_model_env(cfg)
+    except PlanError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     # Auto-activate when an explicit path was supplied (only after load_plan
     # succeeds to avoid rewriting the pointer on failed explicit runs).
     if args.plan:
@@ -4738,7 +4854,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
     plan_src = resolve_plan(repo, args.plan)
-    cfg = load_plan(_resolve_plan_path(repo, plan_src))
+    cfg = load_plan(_resolve_plan_path(repo, plan_src), repo=repo)
     state = load_state(repo, cfg["name"])
     reconcile(repo, cfg, state)
     save_state(repo, cfg["name"], state)
@@ -4844,7 +4960,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
         args.plan = None
 
     plan_path = resolve_plan(repo, args.plan)
-    cfg = load_plan(_resolve_plan_path(repo, plan_path))
+    cfg = load_plan(_resolve_plan_path(repo, plan_path), repo=repo)
     state = load_state(repo, cfg["name"])
 
     if args.approve_all:
@@ -4889,7 +5005,7 @@ def cmd_accept(args: argparse.Namespace) -> int:
         args.plan = None
 
     plan_path = resolve_plan(repo, args.plan)
-    cfg = load_plan(_resolve_plan_path(repo, plan_path))
+    cfg = load_plan(_resolve_plan_path(repo, plan_path), repo=repo)
     state = load_state(repo, cfg["name"])
 
     if args.accept_all:
@@ -4949,7 +5065,7 @@ def cmd_reset(args: argparse.Namespace) -> int:
         args.plan = None
 
     plan_path = resolve_plan(repo, args.plan)
-    cfg = load_plan(_resolve_plan_path(repo, plan_path))
+    cfg = load_plan(_resolve_plan_path(repo, plan_path), repo=repo)
     state = load_state(repo, cfg["name"])
 
     if args.failed:
@@ -5062,7 +5178,7 @@ def cmd_compile(args: argparse.Namespace) -> int:
 
     source_path = resolve_compile_source(repo, args.source)
     output_path = resolve_compile_output(repo, args.output, args.force)
-    model = check_controller_model()
+    model = check_controller_model(repo)
 
     log(f"compile: {source_path} -> {output_path}  (model: {model})")
 
@@ -5088,7 +5204,7 @@ def cmd_compile(args: argparse.Namespace) -> int:
     tmp_path = output_path.with_suffix(output_path.suffix + ".compile-tmp")
     try:
         tmp_path.write_text(toml_text, encoding="utf-8")
-        cfg = load_plan(tmp_path)
+        cfg = load_plan(tmp_path, repo=repo)
     except PlanError:
         tmp_path.unlink(missing_ok=True)
         raise
@@ -5477,7 +5593,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         aggregate,
     )
 
-    cfg = load_plan(_resolve_plan_path(repo, plan_src))
+    cfg = load_plan(_resolve_plan_path(repo, plan_src), repo=repo)
     plan_name = cfg["name"]
     run_id = args.run_id if args.run_id else None
 
@@ -6441,7 +6557,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         aggregate,
     )
 
-    cfg = load_plan(_resolve_plan_path(repo, plan_src))
+    cfg = load_plan(_resolve_plan_path(repo, plan_src), repo=repo)
     plan_name = cfg["name"]
     run_id = args.run_id if args.run_id else None
 
@@ -6522,6 +6638,119 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# models subcommand group
+# ---------------------------------------------------------------------------
+
+def _resolve_models_adapter(args: argparse.Namespace, repo: Path) -> str:
+    """Resolve the target adapter for ``models show``/``models env``.
+
+    Uses ``--adapter`` when given. Otherwise resolves the active plan the
+    same way other operator commands do, so the two subcommands can run
+    with no plan active as long as ``--adapter`` is supplied.
+    """
+    adapter = getattr(args, "adapter", None)
+    if adapter:
+        return adapter
+    plan_src = resolve_plan(repo, None)
+    cfg = load_plan(_resolve_plan_path(repo, plan_src), repo=repo)
+    return cfg["adapter"]
+
+
+def cmd_models_show(args: argparse.Namespace) -> int:
+    """opsx-plan models show [--adapter <name>] — print resolved models."""
+    repo = Path(args.repo).resolve()
+    try:
+        adapter = _resolve_models_adapter(args, repo)
+    except PlanError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        resolved = resolve_models(adapter, repo=repo)
+    except ModelConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"adapter: {adapter}")
+    for role in ROLES:
+        entry = resolved[role]
+        value = entry.model if entry.model else "(unresolved)"
+        print(f"  {role:<12} {value}  [{entry.source}]")
+
+    warnings = validate_models(adapter, resolved)
+    if warnings:
+        print("\nidentifier-syntax warnings:")
+        for warning in warnings:
+            print(f"  - {warning}")
+
+    return 0
+
+
+def cmd_models_env(args: argparse.Namespace) -> int:
+    """opsx-plan models env [--adapter <name>] — print shell export statements."""
+    repo = Path(args.repo).resolve()
+    try:
+        adapter = _resolve_models_adapter(args, repo)
+    except PlanError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        resolved = resolve_models(adapter, repo=repo)
+    except ModelConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    unresolved = [role for role in ROLES if not resolved[role].model]
+    if unresolved:
+        print(
+            f"error: cannot emit environment for adapter '{adapter}': "
+            f"unresolved role(s): {', '.join(unresolved)}",
+            file=sys.stderr,
+        )
+        return 1
+
+    for role in ROLES:
+        print(f"export {ROLE_ENV[role]}={shlex.quote(resolved[role].model)}")
+    return 0
+
+
+def cmd_models_init(args: argparse.Namespace) -> int:
+    """opsx-plan models init [--force] — seed the user-global config file."""
+    path = USER_CONFIG_PATH
+    if path.exists() and not getattr(args, "force", False):
+        print(
+            f"error: {path} already exists; use --force to overwrite",
+            file=sys.stderr,
+        )
+        return 1
+
+    lines = [
+        "# Generated by `opsx-plan models init`.",
+        "# See models.example.toml in the opsx-controller repo for the full",
+        "# per-adapter precedence explanation.",
+        "",
+        "[defaults]",
+    ]
+    seeded = 0
+    for role in ROLES:
+        value = os.environ.get(ROLE_ENV[role], "").strip()
+        if value:
+            lines.append(f"{role} = {json.dumps(value)}")
+            seeded += 1
+    if seeded == 0:
+        lines.append("# no OPSX_*_MODEL variables were set in the environment;")
+        lines.append("# edit this file directly, e.g.:")
+        lines.append('# controller = "github-copilot/gpt-5.4"')
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if seeded:
+        print(f"Created {path} ({seeded} role(s) seeded from the environment)")
+    else:
+        print(f"Created {path} (no environment values found; edit it directly)")
+    return 0
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """opsx-plan doctor [plan] — run preflight checks."""
     repo = Path(args.repo).resolve()
@@ -6566,7 +6795,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     cfg: dict | None = None
     if plan_src:
         try:
-            cfg = load_plan(_resolve_plan_path(repo, plan_src))
+            cfg = load_plan(_resolve_plan_path(repo, plan_src), repo=repo)
             adapter = cfg["adapter"]
         except PlanError:
             print(f"error: cannot load plan: {plan_src}", file=sys.stderr)
@@ -6593,7 +6822,7 @@ def cmd_logs(args: argparse.Namespace) -> int:
     """opsx-plan logs [plan] [--change <id>] [--stage <stage>] [--list] [--follow]"""
     repo = Path(args.repo).resolve()
     plan_src = resolve_plan(repo, args.plan)
-    cfg = load_plan(_resolve_plan_path(repo, plan_src))
+    cfg = load_plan(_resolve_plan_path(repo, plan_src), repo=repo)
     plan_name = cfg["name"]
 
     change_filter = args.change if args.change else None
@@ -6875,6 +7104,37 @@ def main() -> int:
     )
     p_doctor.add_argument("plan", nargs="?", default=None, help="path to plan TOML")
     p_doctor.set_defaults(fn=cmd_doctor)
+
+    p_models = sub.add_parser(
+        "models", help="inspect and seed per-adapter model configuration"
+    )
+    models_sub = p_models.add_subparsers(dest="models_cmd", required=True)
+
+    p_models_show = models_sub.add_parser(
+        "show", help="print resolved models, their source, and any syntax warnings"
+    )
+    p_models_show.add_argument(
+        "--adapter", default=None,
+        help="adapter to resolve against (default: active plan's adapter)",
+    )
+    p_models_show.set_defaults(fn=cmd_models_show)
+
+    p_models_env = models_sub.add_parser(
+        "env", help="print shell export statements for the four resolved variables"
+    )
+    p_models_env.add_argument(
+        "--adapter", default=None,
+        help="adapter to resolve against (default: active plan's adapter)",
+    )
+    p_models_env.set_defaults(fn=cmd_models_env)
+
+    p_models_init = models_sub.add_parser(
+        "init", help="seed ~/.config/opsx-controller/models.toml from the environment"
+    )
+    p_models_init.add_argument(
+        "--force", action="store_true", help="overwrite an existing file"
+    )
+    p_models_init.set_defaults(fn=cmd_models_init)
 
     p_logs = sub.add_parser(
         "logs", help="inspect the latest or filtered stage log for a resolved plan",

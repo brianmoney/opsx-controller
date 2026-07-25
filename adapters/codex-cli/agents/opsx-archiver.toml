@@ -1,7 +1,7 @@
 name = "opsx-archiver"
 description = "Archives one OpenSpec change non-interactively after a clean review and returns a machine-readable outcome."
 sandbox_mode = "danger-full-access"
-model = "gpt-5.4"
+model = "{env:OPSX_ARCHIVER_MODEL}"
 model_reasoning_effort = "high"
 developer_instructions = """
 You are the archive phase for the OpenSpec controller.

@@ -3,6 +3,12 @@ name: opsx-drive
 description: Start or resume the OpenSpec controller for one accepted change. Use when you want a strict implement-review-archive loop in Codex or VS Code with durable state, blocking review findings, and explicit archive scope.
 ---
 
+**Deprecated.** This nested-controller path is superseded by direct dispatch.
+Use `opsx-run <change-id>` (equivalently `opsx-plan run-one <change-id>`)
+instead — it drives the same implement/review/archive loop with the same
+gates and requires no manifest. This skill remains functional during the
+deprecation period but will be removed in a later change.
+
 Start or resume the OpenSpec controller for exactly one change.
 
 Resolved controller inputs:

@@ -11,20 +11,21 @@ OPSX_CONTROLLER_ROOT="${OPSX_CONTROLLER_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}
 # Model environment helpers
 # ---------------------------------------------------------------------------
 
-require_model_env() {
-  local name="$1"
-  if [[ -z "${!name:-}" ]]; then
-    printf 'Required model environment variable is not set: %s\n' "$name" >&2
-    printf 'Source your opsx-controller .env before installing.\n' >&2
+# Resolve models for <adapter> through the resolver (reached via the
+# controller source tree, not PATH, so installing one adapter never depends
+# on another adapter's orchestrator install) and export OPSX_*_MODEL into
+# the current shell. Exits non-zero with actionable guidance when any role
+# is unresolved, so no artifact is ever installed with an empty model value.
+load_model_env() {
+  local adapter="$1"
+  local output
+  if ! output="$(python3 "$OPSX_CONTROLLER_ROOT/orchestrator/opsx-plan.py" models env --adapter "$adapter" 2>&1)"; then
+    printf 'Could not resolve model configuration for adapter: %s\n' "$adapter" >&2
+    printf '%s\n' "$output" >&2
+    printf 'Run `opsx-plan models show --adapter %s` to inspect resolution, or `opsx-plan models init` to seed a configuration file.\n' "$adapter" >&2
     exit 1
   fi
-}
-
-require_model_envs() {
-  require_model_env OPSX_CONTROLLER_MODEL
-  require_model_env OPSX_IMPLEMENTER_MODEL
-  require_model_env OPSX_REVIEWER_MODEL
-  require_model_env OPSX_ARCHIVER_MODEL
+  eval "$output"
 }
 
 # ---------------------------------------------------------------------------
@@ -64,6 +65,12 @@ install_agents_with_models() {
   done
 }
 
+# Role names as they appear in OPSX_<ROLE>_MODEL, matching lib/models/types.py ROLES.
+OPSX_MODEL_ROLES=(CONTROLLER IMPLEMENTER REVIEWER ARCHIVER)
+
+# Line-based {env:OPSX_<ROLE>_MODEL} substitution. Works for any text agent
+# format (OpenCode's .md frontmatter, Codex's .toml) since it only ever
+# rewrites matching placeholder tokens on each line.
 install_agent() {
   local src="$1"
   local dest="$2"
@@ -71,10 +78,11 @@ install_agent() {
   tmp="$(mktemp)"
 
   while IFS= read -r line || [[ -n "$line" ]]; do
-    line="${line//\{env:OPSX_CONTROLLER_MODEL\}/${OPSX_CONTROLLER_MODEL}}"
-    line="${line//\{env:OPSX_IMPLEMENTER_MODEL\}/${OPSX_IMPLEMENTER_MODEL}}"
-    line="${line//\{env:OPSX_REVIEWER_MODEL\}/${OPSX_REVIEWER_MODEL}}"
-    line="${line//\{env:OPSX_ARCHIVER_MODEL\}/${OPSX_ARCHIVER_MODEL}}"
+    local role var
+    for role in "${OPSX_MODEL_ROLES[@]}"; do
+      var="OPSX_${role}_MODEL"
+      line="${line//\{env:${var}\}/${!var}}"
+    done
     printf '%s\n' "$line"
   done <"$src" >"$tmp"
 

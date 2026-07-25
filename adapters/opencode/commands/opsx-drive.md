@@ -4,6 +4,12 @@ agent: opsx-controller
 subtask: false
 ---
 
+**Deprecated.** This nested-controller path is superseded by direct dispatch.
+Use `opsx-run <change-id>` (equivalently `opsx-plan run-one <change-id>`)
+instead — it drives the same implement/review/archive loop with the same
+gates and requires no manifest. This command remains functional during the
+deprecation period but will be removed in a later change.
+
 Start or resume the OpenSpec controller for exactly one change.
 
 Resolved controller inputs:

@@ -12,23 +12,25 @@ collection and comparison methodology and lets you apply your own criteria
 
 ## Quick Start
 
-The benchmarking loop has six steps. Model selection uses `OPSX_*_MODEL`
-environment variables, but these are **install-time** inputs, not per-run
-exports. The installer bakes them into OpenCode agent configs as concrete
-`model:` values (see `lib/install-common.sh` and `~/.config/opencode/agents/`).
-Changing models requires re‑running the installer.
+The benchmarking loop has six steps. Model selection is resolved per
+adapter and per role from `~/.config/opsx-controller/models.toml` (with an
+optional machine-local `<repo>/.opsx-plan/models.toml` override), by
+`opsx-plan`'s built-in resolver. Resolution happens once when a plan loads
+and stays active for the whole run — changing `models.toml` takes effect on
+the next `opsx-plan run`, with **no installer re-run required** for direct
+dispatch (the default execution path for every adapter). See
+[Configuring Model Sets](#configuring-model-sets) below for the full
+precedence rules and the one remaining case that still needs a reinstall.
 
 ```bash
 # 0. Record the baseline commit (required for clean re-runs)
 git rev-parse HEAD > .baseline-commit
 
-# 1. Set model environment variables and install agents with the target models
-set -a
-source .env
-set +a
-# Verify the .env contains values for OPSX_CONTROLLER_MODEL,
-# OPSX_IMPLEMENTER_MODEL, OPSX_REVIEWER_MODEL, and OPSX_ARCHIVER_MODEL.
-bash adapters/opencode/install.sh --global --verify
+# 1. Seed and edit your model configuration (one-time)
+opsx-plan models init                   # seeds ~/.config/opsx-controller/models.toml
+# Edit the file's [adapters.<adapter>] tables with the models you want, then:
+opsx-plan models show --adapter opencode  # confirm resolution and catch syntax issues
+opsx-plan doctor                          # confirms resolution, source, and identifier syntax
 
 # 2. Compile a markdown plan to TOML (one-time)
 opsx-plan compile docs/my-plan.md -o plan.toml
@@ -54,8 +56,8 @@ is omitted.
 To produce a second comparable data point you must first restore a clean
 baseline: a completed plan run leaves archive commits and orchestrator
 state that prevent a straightforward re-run (see `orchestrator/README.md`).
-Reset the worktree to the recorded baseline, update the model values in
-`.env`, re-install the agents, and re-run the same plan:
+Reset the worktree to the recorded baseline, edit `models.toml` with the
+second model set, and re-run the same plan — no installer step required:
 
 ```bash
 # Restore repo to the pre-run baseline
@@ -63,11 +65,9 @@ git reset --hard $(cat .baseline-commit)
 git clean -fd
 rm -f .opsx-plan/<plan_name>.state.json
 
-# Edit .env with a second model set, then re-install
-set -a
-source .env
-set +a
-bash adapters/opencode/install.sh --global --verify
+# Edit ~/.config/opsx-controller/models.toml (or the repo-local override)
+# with a second model set, then confirm resolution:
+opsx-plan models show --adapter opencode
 
 # Re-run with the second model set
 opsx-plan run plan.toml
@@ -91,57 +91,64 @@ opsx-plan dashboard plan.toml --run-id <run_id_b> \
 
 ## Configuring Model Sets
 
-### Model selection is install-time, not per-run
+### Model selection is per-run, resolved once at plan load
 
-The `OPSX_*_MODEL` environment variables are **install-time** inputs. The
-OpenCode adapter installer (`adapters/opencode/install.sh` via
-`lib/install-common.sh`) reads these variables and substitutes `{env:OPSX_*_MODEL}`
-placeholders with concrete `provider/model` values in the agent YAML frontmatter
-(`~/.config/opencode/agents/`). OpenCode dispatches each agent to the model
-specified in its `model:` field — there is no further runtime resolution or
-fallback inside `opsx-plan`.
+Model selection is stored in `~/.config/opsx-controller/models.toml`, keyed
+by adapter and role (`controller`, `implementer`, `reviewer`, `archiver`),
+with an optional `<repo>/.opsx-plan/models.toml` machine-local override.
+`opsx-plan` resolves all four roles for the active plan's adapter when the
+plan loads and exports them as `OPSX_*_MODEL` for the rest of the process —
+so the active plan's adapter automatically gets the right model set, with no
+manual switching and no installer step.
 
-| Variable | Baked into agent | Agent role |
+Precedence, highest first: repo-local `[adapters.<adapter>]`, user-global
+`[adapters.<adapter>]`, repo-local `[defaults]`, user-global `[defaults]`,
+then the ambient `OPSX_<ROLE>_MODEL` environment variable as a fallback while
+no `models.toml` exists. See `models.example.toml` at the repository root
+for the full file shape.
+
+| Role | Env var exported at plan load | Agent role |
 |---|---|---|
-| `OPSX_CONTROLLER_MODEL` | `opsx-controller.md` | plan‑drive orchestrator |
-| `OPSX_IMPLEMENTER_MODEL` | `opsx-implementer.md` | implement phase |
-| `OPSX_REVIEWER_MODEL` | `opsx-reviewer.md` | review phase |
-| `OPSX_ARCHIVER_MODEL` | `opsx-archiver.md` | archive phase |
+| `controller` | `OPSX_CONTROLLER_MODEL` | plan‑drive orchestrator (nested-controller path only) |
+| `implementer` | `OPSX_IMPLEMENTER_MODEL` | implement phase |
+| `reviewer` | `OPSX_REVIEWER_MODEL` | review phase |
+| `archiver` | `OPSX_ARCHIVER_MODEL` | archive phase |
 
-The baked model value is captured in telemetry as `model.model_id` (and
+The resolved model value is captured in telemetry as `model.model_id` (and
 `model.provider` when the identifier follows `provider/model-id` convention).
 It flows into aggregation, leaderboard grouping, and cost‑estimation lookups.
 
-**To change models**, update the variables in your `.env` file and re‑run the
-installer:
+**To change models**, edit `models.toml` — no reinstall needed for direct
+dispatch, the default execution path for every adapter:
 
 ```bash
-# Edit .env with new model ids, then:
-set -a
-source .env
-set +a
-bash adapters/opencode/install.sh --global --verify
+opsx-plan models init                     # first time only
+$EDITOR ~/.config/opsx-controller/models.toml
+opsx-plan models show --adapter opencode  # confirm resolution and source
 ```
+
+The one remaining case that *does* need a reinstall is OpenCode's deprecated
+nested-controller `/opsx-drive` path: its subagents are spawned by OpenCode
+itself, so they can only get a model from installed agent frontmatter.
+`bash adapters/opencode/install.sh --global --verify` re-bakes that
+frontmatter from the resolver. Direct dispatch (the default) is unaffected.
 
 ### Comparing two model sets
 
 To compare two model combinations, run the **same plan** twice, restoring a
 clean worktree between runs so each model set starts from an identical repo
 state. Two mutating plan‑stage runs in one worktree is a known failure mode
-(see `orchestrator/README.md`), so re‑installing agents and re‑running is not
-enough — you must reset the repo as well.
+(see `orchestrator/README.md`), so editing `models.toml` alone is not enough
+— you must reset the repo as well.
 
 ```bash
 # Record the baseline commit first
 git rev-parse HEAD > .baseline-commit
 
-# Configure model set A in .env, then install and run
-# .env: OPSX_IMPLEMENTER_MODEL="deepseek/deepseek-v4-pro"
-#       OPSX_REVIEWER_MODEL="anthropic/claude-sonnet-4-20250514"
-set -a
-source .env
-set +a
-bash adapters/opencode/install.sh --global --verify
+# Configure model set A in models.toml, then run
+# [adapters.opencode] implementer = "deepseek/deepseek-v4-pro"
+#                     reviewer    = "anthropic/claude-sonnet-4-20250514"
+opsx-plan models show --adapter opencode  # confirm resolution
 opsx-plan run plan.toml
 
 # Restore a clean baseline before model set B
@@ -151,13 +158,10 @@ git reset --hard $(cat .baseline-commit)
 git clean -fd
 rm -f .opsx-plan/<plan_name>.state.json
 
-# Configure model set B in .env, then re-install and run
-# .env: OPSX_IMPLEMENTER_MODEL="openai/gpt-4o"
-#       OPSX_REVIEWER_MODEL="openai/gpt-4o"
-set -a
-source .env
-set +a
-bash adapters/opencode/install.sh --global --verify
+# Configure model set B in models.toml, then run
+# [adapters.opencode] implementer = "openai/gpt-4o"
+#                     reviewer    = "openai/gpt-4o"
+opsx-plan models show --adapter opencode  # confirm resolution
 opsx-plan run plan.toml
 ```
 
@@ -251,12 +255,9 @@ opsx-plan run plan.toml --dry-run
 # 4. Record the baseline commit (required for clean re-runs)
 git rev-parse HEAD > .baseline-commit
 
-# 5. Install model set A and run
-#    Update .env with model set A values, then:
-set -a
-source .env
-set +a
-bash adapters/opencode/install.sh --global --verify
+# 5. Configure model set A and run
+#    Update models.toml with model set A values, then:
+opsx-plan models show --adapter opencode
 opsx-plan run plan.toml
 
 # 6. Restore a clean baseline for model set B
@@ -267,12 +268,9 @@ git reset --hard $(cat .baseline-commit)
 git clean -fd
 rm -f .opsx-plan/<plan_name>.state.json
 
-# 7. Install model set B and run
-#    Update .env with model set B values, then:
-set -a
-source .env
-set +a
-bash adapters/opencode/install.sh --global --verify
+# 7. Configure model set B and run
+#    Update models.toml with model set B values, then:
+opsx-plan models show --adapter opencode
 opsx-plan run plan.toml
 
 # 8. Compare specific runs

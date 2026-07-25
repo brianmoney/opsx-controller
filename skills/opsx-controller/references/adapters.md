@@ -9,6 +9,13 @@ plan-owned round control, stage logs, and telemetry). Direct dispatch is
 gated purely on configuration — a plan takes it whenever `implement_invoke`,
 `review_invoke`, and `archive_invoke` are all set, regardless of adapter.
 
+The nested-controller `/opsx-drive` path is **deprecated** in favor of direct
+dispatch. For manual single-change control outside a plan run, use
+`opsx-run <change-id>` (equivalently `opsx-plan run-one <change-id>`)
+instead of `/opsx-drive <change-id>` — it drives the same loop with no
+manifest required. `opsx-plan` emits a deprecation warning when a resolved
+plan still takes the nested-controller path.
+
 | Adapter | Nested-controller (`invoke`) | Direct dispatch defaults | Usage/model source |
 |---|---|---|---|
 | `opencode` | Supported | Supported (`ADAPTER_DEFAULTS`) | OpenCode plugin sidecar (`opencode_plugin`), plus worker JSON and log metadata |

@@ -45,7 +45,7 @@ install_agents() {
   local file
   for file in "$src_dir/agents/"*.toml; do
     [[ -e "$file" ]] || continue
-    install -m 0644 "$file" "$dest_dir/$(basename "$file")"
+    install_agent "$file" "$dest_dir/$(basename "$file")"
   done
 }
 
@@ -84,6 +84,8 @@ do_verify() {
 }
 
 install_global() {
+  load_model_env codex-cli
+
   local skills_root="$HOME/.agents"
   local agents_root="$HOME/.codex"
   install_skill "$SCRIPT_DIR" "$skills_root"
@@ -102,6 +104,8 @@ install_project() {
     printf 'Project directory does not exist: %s\n' "$project_dir" >&2
     exit 1
   fi
+
+  load_model_env codex-cli
 
   local skills_root="$project_dir/.agents"
   local agents_root="$project_dir/.codex"

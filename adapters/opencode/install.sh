@@ -76,6 +76,7 @@ install_orchestrator() {
   mkdir -p "$runtime_dir/lib"
   cp -R "$ROOT_DIR/lib/metrics" "$runtime_dir/lib/"
   cp -R "$ROOT_DIR/lib/pricing" "$runtime_dir/lib/"
+  cp -R "$ROOT_DIR/lib/models" "$runtime_dir/lib/"
   install -m 0755 \
     "$ROOT_DIR/orchestrator/opsx-plan.py" \
     "$dest_dir/opsx-plan"
@@ -137,7 +138,7 @@ verify_plugin_deployed() {
 }
 
 install_global() {
-  require_model_envs
+  load_model_env opencode
 
   local config_root="$HOME/.config/opencode"
   install_commands "$config_root/commands"
@@ -164,7 +165,7 @@ install_project() {
     exit 1
   fi
 
-  require_model_envs
+  load_model_env opencode
 
   install_commands "$project_dir/.opencode/commands"
   install_agents "$project_dir/.opencode/agents"

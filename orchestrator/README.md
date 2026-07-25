@@ -223,6 +223,11 @@ nested controller state file.
   reached.
 - Manual `/opsx-drive <change-id>` remains available for single-change control,
   but `opsx-plan` no longer nests `/opsx-drive` for OpenCode execution.
+  `/opsx-drive` is **deprecated**: `opsx-run <change-id>` (equivalently
+  `opsx-plan run-one <change-id>`) is the supported replacement, driving the
+  same loop with no manifest required. `opsx-plan` emits a deprecation
+  warning when a resolved plan still takes the nested-controller path (fewer
+  than all three stage invokes configured).
 - A change that archives successfully but then fails `fast_checks` is marked
   failed without retry (re-archiving an already archived change cannot fix the
   repo).
@@ -238,8 +243,8 @@ Defaults (override with `invoke` / `state_file` / `implement_invoke` /
 
 | adapter | invocation | state file |
 |---|---|---|
-| `opencode` | `opencode run --agent opsx-implementer`, `opencode run --agent opsx-reviewer`, `opencode run --agent opsx-archiver` for plan runs; `opencode run "/opsx-drive {change}"` remains the manual single-change controller entrypoint | `.opencode/opsx-controller/{change}.json` for manual `/opsx-drive`; `.opsx-plan/<plan>.state.json` is authoritative for direct plan execution |
-| `claude-code` | `claude -p "/opsx-drive {change}"` | `.claude/opsx-controller/{change}.json` |
+| `opencode` | `opencode run --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL"`, and similarly for reviewer/archiver, for plan runs; `opencode run "/opsx-drive {change}"` remains the manual single-change controller entrypoint (**deprecated** — use `opsx-run <change-id>`) | `.opencode/opsx-controller/{change}.json` for manual `/opsx-drive`; `.opsx-plan/<plan>.state.json` is authoritative for direct plan execution |
+| `claude-code` | `claude -p --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL" ...` for plan runs; `claude -p "/opsx-drive {change}"` remains the manual single-change controller entrypoint (**deprecated** — use `opsx-run <change-id>`) | `.claude/opsx-controller/{change}.json` |
 | `codex-cli` | `codex exec "$opsx-drive {change}"` | `.opsx-controller/{change}.json` |
 
 Verify your client's headless syntax and permission configuration before an

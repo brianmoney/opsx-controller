@@ -84,37 +84,35 @@ Requirements:
   - `/opsx-verify`
   - `/opsx-archive`
 
+Model configuration, before the first install:
+
+```bash
+python3 orchestrator/opsx-plan.py models init   # seeds ~/.config/opsx-controller/models.toml
+$EDITOR ~/.config/opsx-controller/models.toml    # set [adapters.opencode] roles
+python3 orchestrator/opsx-plan.py models show --adapter opencode
+```
+
+Roles are `controller`, `implementer`, `reviewer`, and `archiver`, resolved
+per adapter and exported as `OPSX_CONTROLLER_MODEL`, `OPSX_IMPLEMENTER_MODEL`,
+`OPSX_REVIEWER_MODEL`, and `OPSX_ARCHIVER_MODEL`. See `models.example.toml`
+at the repo root for the file shape. `opsx-plan models init` needs no prior
+install — run it against the repo checkout directly. Once installed,
+`opsx-plan models ...` works the same way without the `python3
+orchestrator/opsx-plan.py` prefix. If no `models.toml` exists, installers and
+runs fall back to ambient `OPSX_*_MODEL` environment variables (for example
+from `.env`, kept as the legacy path — see `.env.example`).
+
 Install globally:
 
 ```bash
-set -a
-source .env
-set +a
 bash adapters/opencode/install.sh --global
 ```
 
 Install into one project:
 
 ```bash
-set -a
-source .env
-set +a
 bash adapters/opencode/install.sh --project /path/to/project
 ```
-
-Required model environment variables for the OpenCode agents:
-
-```bash
-cp .env.example .env
-set -a
-source .env
-set +a
-```
-
-- `OPSX_CONTROLLER_MODEL`
-- `OPSX_IMPLEMENTER_MODEL`
-- `OPSX_REVIEWER_MODEL`
-- `OPSX_ARCHIVER_MODEL`
 
 Project install behavior:
 
@@ -130,15 +128,23 @@ If the project already has `opencode.json`, `opencode.jsonc`, or
 `.opencode/opencode.json`, merge
 `adapters/opencode/templates/project/opencode.json.snippet.json` manually.
 
-The OpenCode adapter installer resolves the agent `model` values from those env
-vars and writes concrete `provider/model` values into the installed Markdown
-agent files. Re-run the installer after changing any `OPSX_*_MODEL` value.
+The OpenCode adapter installer resolves each agent's `model` value through
+the resolver and writes concrete `provider/model` values into the installed
+Markdown agent files. That baked value is only used by the deprecated
+`/opsx-drive` nested-controller path (see [Deprecation
+Notes](#deprecation-notes)) — direct dispatch, the default execution path,
+reads `models.toml` fresh at every plan load and needs no reinstall. Re-run
+the installer only if you still depend on `/opsx-drive`.
 
 Usage from the host project root:
 
 ```text
 /opsx-drive <change-id>
 ```
+
+`/opsx-drive` is **deprecated**. Use `opsx-run <change-id>` instead — it
+drives the same loop without the nested-controller path. See
+[Deprecation Notes](#deprecation-notes).
 
 If you want the host repo instructions to advertise the controller path, merge
 `adapters/opencode/templates/project/AGENTS.snippet.md` into that project's
@@ -195,11 +201,15 @@ Usage from the host project root:
 /opsx-drive <change-id>
 ```
 
+`/opsx-drive` is **deprecated**. Use `opsx-run <change-id>` instead — see
+[Deprecation Notes](#deprecation-notes).
+
 Compilation note:
 
 - `/opsx-plan` authors the markdown implementation plan in Claude Code.
 - `opsx-plan compile` still requires an OpenCode-configured environment plus
-  `OPSX_CONTROLLER_MODEL`.
+  a `controller` model resolved for the `opencode` adapter (`opsx-plan models
+  show --adapter opencode` to check).
 - A Claude-only installation can author the markdown but cannot claim TOML
   compilation succeeded until that OpenCode-backed compile step runs.
 
@@ -257,6 +267,9 @@ Usage from the host project root:
 $opsx-drive <change-id>
 ```
 
+`/opsx-drive` is **deprecated**. Use `opsx-run <change-id>` instead — see
+[Deprecation Notes](#deprecation-notes).
+
 State path differs from other adapters: durable state files live at
 `.opsx-controller/<change-id>.json` (project root) because Codex sandbox
 protects the `.codex/` directory from agent writes.
@@ -296,6 +309,9 @@ Usage:
 /opsx-controller:opsx-drive <change-id>
 ```
 
+`/opsx-controller:opsx-drive` is **deprecated**. Use
+`opsx-run <change-id>` instead — see [Deprecation Notes](#deprecation-notes).
+
 Why use the plugin package:
 
 - namespaced Claude skill for sharing across projects
@@ -305,9 +321,9 @@ Why use the plugin package:
 Compilation note:
 
 - `/opsx-controller:opsx-plan` authors the markdown plan document.
-- `opsx-plan compile` still depends on OpenCode plus `OPSX_CONTROLLER_MODEL`,
-  so the plugin must report when compilation was unavailable instead of
-  implying success.
+- `opsx-plan compile` still depends on OpenCode plus a `controller` model
+  resolved for the `opencode` adapter, so the plugin must report when
+  compilation was unavailable instead of implying success.
 
 ## Vercel Skill Package
 
@@ -327,6 +343,22 @@ SKILL_BASE_URL="https://github.com/brianmoney/opsx-controller/tree/main" \
 ```
 
 It is a guidance package, not a full cross-client automated installer.
+
+## Deprecation Notes
+
+`/opsx-drive` (the nested-controller single-change path, available per-adapter
+as `/opsx-drive`, `/opsx-controller:opsx-drive`, or `$opsx-drive`) is
+**deprecated**. Direct dispatch has been the default execution path for both
+the `opencode` and `claude-code` adapters since their stage invokes were
+added, and `/opsx-drive` is now the only remaining consumer of install-time
+model baking.
+
+Use `opsx-run <change-id>` (equivalently `opsx-plan run-one <change-id>`)
+instead: it drives the same implement/review/archive loop with the same
+retry, no-progress, and archive-verification gates, and requires no plan
+manifest. `/opsx-drive` continues to work during the deprecation period —
+`opsx-plan` logs a warning when a resolved plan still takes the
+nested-controller path — but it will be removed in a later change.
 
 ## Portability Notes
 

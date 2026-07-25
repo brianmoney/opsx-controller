@@ -94,6 +94,40 @@ activating a new plan with `opsx-plan use`.
 
 ---
 
+## Model Configuration
+
+Model selection is stored per adapter and per role in
+`~/.config/opsx-controller/models.toml`, with an optional machine-local
+`<repo>/.opsx-plan/models.toml` override (gitignored by `write_active_plan`).
+Roles are `controller`, `implementer`, `reviewer`, `archiver`. `opsx-plan`
+resolves all four roles for the active plan's adapter when the plan loads
+and exports them as `OPSX_*_MODEL` for the rest of the process, so the
+active plan's adapter automatically gets the right model set with no manual
+switching.
+
+```bash
+opsx-plan models init                       # seed the file from the current environment
+$EDITOR ~/.config/opsx-controller/models.toml
+opsx-plan models show --adapter opencode     # inspect resolution and source
+opsx-plan models show --adapter claude-code  # same file, different adapter table
+opsx-plan models env --adapter opencode      # emit shell export statements
+```
+
+Precedence, highest first: repo-local `[adapters.<adapter>]`, user-global
+`[adapters.<adapter>]`, repo-local `[defaults]`, user-global `[defaults]`,
+then the ambient `OPSX_<ROLE>_MODEL` environment variable (the sole
+mechanism before this file existed, kept as a fallback so existing `.env`
+setups keep working until you create `models.toml`). See
+`models.example.toml` at the repository root for the full file shape.
+
+A model change in `models.toml` takes effect on the next `opsx-plan run` —
+no installer re-run needed for direct dispatch, the default execution path
+for every adapter. `opsx-plan doctor` reports each resolved model with its
+source and flags an identifier that doesn't match the target adapter's
+syntax (see [Preflight with `doctor`](#preflight-with-doctor) below).
+
+---
+
 ## Preflight with `doctor`
 
 `opsx-plan doctor` runs a suite of preflight checks without dispatching any
@@ -109,7 +143,8 @@ opsx-plan doctor
 | Check | What it validates |
 |---|---|
 | Installed orchestrator matches repo copy | SHA-256 comparison of `~/.local/bin/opsx-plan` against `orchestrator/opsx-plan.py` |
-| Required `OPSX_*_MODEL` env vars | `OPSX_CONTROLLER_MODEL`, `OPSX_IMPLEMENTER_MODEL`, `OPSX_REVIEWER_MODEL`, `OPSX_ARCHIVER_MODEL` |
+| Model roles resolve for the target adapter | All four roles (`controller`, `implementer`, `reviewer`, `archiver`) resolve for the resolved plan's adapter via `models.toml`/ambient environment; reports each resolved model with its source |
+| Resolved model identifiers match adapter syntax | Flags a provider-prefixed identifier under `claude-code` or a bare identifier under `opencode`, before it fails at dispatch |
 | `openspec` on PATH | OpenSpec CLI is installed and reachable |
 | Adapter client on PATH | e.g. `opencode`, `claude`, or `codex` |
 | No tracked bytecode | No `__pycache__/` or `.pyc` files tracked in git |
@@ -228,24 +263,31 @@ defaults.
 
 Before dispatching a stage, `opsx-plan` expands `$VAR`/`${VAR}` references in
 each argument of the resolved invoke string — this is how `OPSX_*_MODEL`
-selects the per-stage model for `claude-code`, whose agent frontmatter has no
-environment interpolation (OpenCode agents interpolate the model directly in
-frontmatter instead). If a referenced variable is unset, the stage fails
-immediately with a message naming the variable — no client subprocess is
-started. The `exec[stage]` log line always shows the already-expanded
-command (with the worker input block elided).
+selects the per-stage model for both `claude-code` and `opencode` direct
+stage invokes (both now pass an explicit `--model "$OPSX_*_MODEL"` argument).
+If a referenced variable is unset, the stage fails immediately with a
+message naming the variable — no client subprocess is started. The
+`exec[stage]` log line always shows the already-expanded command (with the
+worker input block elided).
 
-**`doctor` does not validate model-string format.** The `Required
-OPSX_*_MODEL environment variables` check in `opsx-plan doctor` only confirms
-the four `OPSX_*_MODEL` variables are set to a non-empty value — it does not
-check that the value is a model identifier the configured adapter's client
-can dispatch. OpenCode-style provider-prefixed ids (for example
-`deepseek/deepseek-v4-pro` or `openai/gpt-5.6-luna`) are valid for the
-`opencode` adapter but are not valid `--model` arguments for the Claude Code
-CLI. Under `claude-code`, `doctor` passes with such a value set, and the
-stage then fails at dispatch time when the client rejects the model. Set
-Anthropic model ids (for example `claude-sonnet-5`) for the three
-`OPSX_*_MODEL` variables when running a `claude-code` plan.
+The four `OPSX_*_MODEL` variables are populated once per process, when the
+plan loads, by resolving each role against the plan's adapter through
+`~/.config/opsx-controller/models.toml` (see [Model
+Configuration](#model-configuration) below) — not read directly from ambient
+environment variables the way earlier versions worked, though ambient
+variables remain the fallback while no `models.toml` exists.
+
+**`doctor` validates model-string format.** The `Resolved model identifiers
+match adapter syntax` check in `opsx-plan doctor` catches the
+adapter/identifier mismatch that used to only surface at dispatch time.
+OpenCode-style provider-prefixed ids (for example `deepseek/deepseek-v4-pro`
+or `openai/gpt-5.6-luna`) are valid for the `opencode` adapter but are not
+valid `--model` arguments for the Claude Code CLI; a bare id like
+`claude-sonnet-5` is rejected the other way, since `opencode` requires the
+`provider/model` form. `doctor` fails closed and names the offending role
+before the stage ever dispatches — no need to wait for a client-side
+rejection. Run `opsx-plan models show --adapter <adapter>` to inspect
+resolution and fix the offending role in `models.toml`.
 
 ### Unrecognized manifest keys are silently ignored
 
@@ -282,12 +324,13 @@ catch this whole class of drift at `doctor` time rather than after a run.
 ## Compiling a Plan
 
 `opsx-plan compile` converts a markdown implementation plan into a runnable
-TOML manifest. It invokes OpenCode with the model configured in
-`OPSX_CONTROLLER_MODEL`.
+TOML manifest. It invokes OpenCode with the `controller` role resolved for
+the `opencode` adapter specifically — regardless of which adapter the active
+plan uses, since compile always shells out to the `opencode` binary.
 
 ```bash
-# Required: set the controller model
-export OPSX_CONTROLLER_MODEL="your-model-id"
+# Required: a controller model resolved for the opencode adapter
+opsx-plan models show --adapter opencode   # confirm it resolves
 
 # Compile a markdown plan to TOML
 opsx-plan compile docs/my-plan.md -o plan.toml
@@ -299,7 +342,9 @@ opsx-plan compile docs/my-plan.md -o plan.toml --force
 ### Compile behavior
 
 - Refuses to overwrite an existing output file unless `--force` is passed.
-- Fails before invoking OpenCode if `OPSX_CONTROLLER_MODEL` is unset or empty.
+- Fails before invoking OpenCode if the `controller` role does not resolve
+  for the `opencode` adapter (via `models.toml` or the ambient
+  `OPSX_CONTROLLER_MODEL` fallback).
 - The generated TOML is validated locally: it must parse as valid TOML, pass
   `load_plan()` (unique ids, known deps, no cycles), and is written through a
   temporary file with atomic replacement.
@@ -766,7 +811,8 @@ monitor progress, and complete with a pull request.
 
 ```bash
 # Prerequisites: OpenSpec CLI, OpenCode, gh (for PR), and the opsx-controller
-# adapter installed. The four OPSX_*_MODEL env vars are set in .env.
+# adapter installed. Model roles are resolved from
+# ~/.config/opsx-controller/models.toml (opsx-plan models init to seed it).
 
 cd /path/to/host-project
 git rev-parse HEAD > .baseline-commit   # record baseline for clean re-runs
@@ -775,8 +821,8 @@ git rev-parse HEAD > .baseline-commit   # record baseline for clean re-runs
 ### 1. Compile the plan
 
 ```bash
-# Set the controller model (required for compile)
-export OPSX_CONTROLLER_MODEL="anthropic/claude-sonnet-4-20250514"
+# Confirm the controller model resolves for the opencode adapter (required for compile)
+opsx-plan models show --adapter opencode
 
 # Compile a markdown plan into a runnable TOML manifest
 opsx-plan compile docs/my-hardening-plan.md -o plan.toml
@@ -806,7 +852,12 @@ opsx-plan status
 ```bash
 opsx-plan doctor
 #   ✓ Installed orchestrator matches repo copy
-#   ✓ Required OPSX_*_MODEL environment variables
+#   ✓ Model roles resolve for the target adapter
+#       controller   github-copilot/gpt-5.4      [user-global config (~/.config/opsx-controller/models.toml)]
+#       implementer  deepseek/deepseek-v4-pro     [user-global config (~/.config/opsx-controller/models.toml)]
+#       reviewer     github-copilot/gpt-5.4      [user-global config (~/.config/opsx-controller/models.toml)]
+#       archiver     github-copilot/gpt-5.4      [user-global config (~/.config/opsx-controller/models.toml)]
+#   ✓ Resolved model identifiers match adapter syntax
 #   ✓ openspec on PATH
 #   ✓ opencode on PATH
 #   ✓ No tracked __pycache__ or .pyc files
@@ -953,9 +1004,24 @@ written.
 ```
 opsx-plan compile <source.md> -o <output.toml> [--force]
 ```
-Compile a markdown plan into a runnable TOML manifest. Requires
-`OPSX_CONTROLLER_MODEL`. Refuses to overwrite an existing output unless
-`--force` is passed.
+Compile a markdown plan into a runnable TOML manifest. Requires a
+`controller` model resolved for the `opencode` adapter. Refuses to overwrite
+an existing output unless `--force` is passed.
+
+### `opsx-plan models`
+
+```
+opsx-plan models show [--adapter <name>]
+opsx-plan models env [--adapter <name>]
+opsx-plan models init [--force]
+```
+Inspect and seed per-adapter model configuration. `show` prints each role's
+resolved model and source, plus any identifier-syntax warnings. `env` prints
+shell `export` statements for the four resolved variables and exits non-zero
+if any role is unresolved. `init` seeds
+`~/.config/opsx-controller/models.toml` from the current environment,
+refusing to overwrite an existing file without `--force`. `--adapter`
+defaults to the active plan's adapter when omitted.
 
 ### `opsx-plan run`
 
