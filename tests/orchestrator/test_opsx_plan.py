@@ -1692,6 +1692,135 @@ class OpenCodeAgentModeTests(unittest.TestCase):
             )
 
 
+class ArchiverDeletionStagingTests(unittest.TestCase):
+    REPO_ROOT = Path(__file__).resolve().parents[2]
+    ARCHIVER_FILES = (
+        "adapters/claude-code/agents/opsx-archiver.md",
+        "adapters/opencode/agents/opsx-archiver.md",
+        "adapters/codex-cli/agents/opsx-archiver.toml",
+        "adapters/codex-cli/plugin/agents/opsx-archiver.toml",
+        "plugins/opsx-controller/agents/opsx-archiver.md",
+    )
+    # These four name the change directory in their scope-determination step
+    # with the shared "(the deletion left by the move)" marker; the
+    # claude-code definition names it inline in its staging step instead.
+    SCOPE_STEP_ENUMERATES_CHANGE_DIR_FILES = (
+        "adapters/opencode/agents/opsx-archiver.md",
+        "adapters/codex-cli/agents/opsx-archiver.toml",
+        "adapters/codex-cli/plugin/agents/opsx-archiver.toml",
+        "plugins/opsx-controller/agents/opsx-archiver.md",
+    )
+
+    # The step after the deletion-staging step enumerates what else to stage.
+    # Each definition must reconcile that list with the deletion already
+    # staged, or its "only" reads as an instruction to exclude it. The wording
+    # differs per variant, so pin the exact clause per file. Renumbering the
+    # steps means updating these strings -- a stale cross-reference here is
+    # exactly the drift this assertion exists to catch.
+    STAGING_STEP_RECONCILES_DELETION = {
+        "adapters/claude-code/agents/opsx-archiver.md": (
+            "and the change-directory deletion staged in step 13."
+        ),
+        "adapters/opencode/agents/opsx-archiver.md": (
+            "Leave the change-directory deletion from step 15 staged; "
+            "do not unstage it."
+        ),
+        "adapters/codex-cli/agents/opsx-archiver.toml": (
+            "and the change-directory deletion staged in step 12."
+        ),
+        "adapters/codex-cli/plugin/agents/opsx-archiver.toml": (
+            "and the change-directory deletion staged in step 12."
+        ),
+        "plugins/opsx-controller/agents/opsx-archiver.md": (
+            "Stage only the rest of the explicit archive set."
+        ),
+    }
+
+    def _read(self, rel_path: str) -> str:
+        return (self.REPO_ROOT / rel_path).read_text(encoding="utf-8")
+
+    def _read_unwrapped(self, rel_path: str) -> str:
+        """Read a definition with line wrapping collapsed to single spaces.
+
+        The staging clauses wrap mid-sentence in every definition, so match
+        against normalized text rather than the raw file.
+        """
+        return " ".join(self._read(rel_path).split())
+
+    def test_all_archivers_stage_change_directory_deletion(self) -> None:
+        for rel_path in self.ARCHIVER_FILES:
+            text = self._read(rel_path)
+            self.assertIn(
+                "git add -A -- openspec/changes",
+                text,
+                f"{rel_path} must instruct staging the change-directory deletion "
+                "with a git add -A pathspec so the move commits as one rename",
+            )
+
+    def test_all_archivers_require_deletion_present_before_commit(self) -> None:
+        for rel_path in self.ARCHIVER_FILES:
+            text = self._read(rel_path)
+            self.assertIn(
+                "deletions under",
+                text,
+                f"{rel_path} pre-commit inspection must reference the "
+                "change-directory deletions",
+            )
+            self.assertIn(
+                "absent from the staged",
+                text,
+                f"{rel_path} pre-commit inspection must fail closed when the "
+                "change-directory deletion is missing from the staged set",
+            )
+
+    def test_scope_step_names_change_directory_in_four_definitions(self) -> None:
+        for rel_path in self.SCOPE_STEP_ENUMERATES_CHANGE_DIR_FILES:
+            text = self._read(rel_path)
+            self.assertIn(
+                "(the deletion left by the move)",
+                text,
+                f"{rel_path} must name openspec/changes/<change>/ as in-scope "
+                "in its scope-determination step",
+            )
+
+    def test_staging_step_reconciles_the_deletion_in_every_definition(self) -> None:
+        self.assertEqual(
+            set(self.STAGING_STEP_RECONCILES_DELETION),
+            set(self.ARCHIVER_FILES),
+            "every archiver definition needs a pinned staging-step clause; "
+            "add new adapters to STAGING_STEP_RECONCILES_DELETION",
+        )
+        for rel_path, clause in self.STAGING_STEP_RECONCILES_DELETION.items():
+            self.assertIn(
+                clause,
+                self._read_unwrapped(rel_path),
+                f"{rel_path} must reconcile its explicit-staging step with the "
+                "change-directory deletion staged in the preceding step, so "
+                "that step's 'only' is not read as excluding the deletion",
+            )
+
+    def test_all_archivers_guard_staging_with_git_ls_files(self) -> None:
+        for rel_path in self.ARCHIVER_FILES:
+            text = self._read(rel_path)
+            self.assertIn(
+                "git ls-files -- openspec/changes",
+                text,
+                f"{rel_path} must guard change-directory deletion staging "
+                "with a git ls-files tracked check so git add -A is never "
+                "run on an untracked pathspec",
+            )
+
+    def test_all_archivers_treat_untracked_change_dir_as_non_failure(self) -> None:
+        for rel_path in self.ARCHIVER_FILES:
+            text = self._read(rel_path)
+            self.assertIn(
+                "absent deletions are expected and are not",
+                text,
+                f"{rel_path} must describe an untracked change directory's "
+                "absent deletions as expected, not a pre-commit failure",
+            )
+
+
 class ParseStageJsonPermissionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.opsx_plan = load_opsx_plan()

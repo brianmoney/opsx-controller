@@ -35,12 +35,23 @@ Required workflow:
 11. If delta specs exist, sync them into `openspec/specs/` when the change is
     unambiguous. If sync is ambiguous, fail closed.
 12. Move the change into `openspec/changes/archive/YYYY-MM-DD-<change>`.
-13. Follow repo archive instructions using explicit staging only for the archive
-    path, synced `openspec/specs/` files, and implementation files from the
-    trusted scope.
-14. Inspect `git diff --cached --name-only` before committing. If any staged
-    file falls outside the explicit archive set, fail closed.
-15. Create the required archive commit with the exact message
+13. Stage the change-directory deletion only when the change directory is
+    tracked. Run `git ls-files -- openspec/changes/<change>`. If it lists any
+    files, run `git add -A -- openspec/changes/<change>` so the move commits
+    as one rename. If it lists no files, the change directory was never
+    committed: there is no deletion to stage, and running `git add -A` on
+    that pathspec would fail with `fatal: pathspec ... did not match any
+    files`. Skip it in that case.
+14. Follow repo archive instructions using explicit staging only for the archive
+    path, synced `openspec/specs/` files, implementation files from the
+    trusted scope, and the change-directory deletion staged in step 13.
+15. Inspect `git diff --cached --name-status` before committing. Fail closed if
+    any staged file falls outside the explicit archive set. When the change
+    directory is tracked, also fail closed if the deletions under
+    `openspec/changes/<change>/` are absent from the staged set. When the
+    change directory was untracked, absent deletions are expected and are not
+    a failure.
+16. Create the required archive commit with the exact message
     `archive(<change>): archive completed OpenSpec change` when the staged set
     is clean.
 

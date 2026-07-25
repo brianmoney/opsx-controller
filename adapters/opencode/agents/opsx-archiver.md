@@ -61,6 +61,8 @@ Required workflow:
     - changed files under `openspec/specs/` created or updated by delta sync
     - implementation files from controller-owned archive-scope evidence that
       live outside the change directory
+    - `openspec/changes/<change>/` (the deletion left by the move) when that
+      is tracked
 12. If you cannot name that narrow staged set up front, return blocked JSON with
     reason `ambiguous archive commit scope` before syncing or moving anything,
     and include actionable triage describing the scope basis, trusted in-scope
@@ -69,12 +71,24 @@ Required workflow:
 13. If delta specs exist, sync them into `openspec/specs/` when the change is
     unambiguous. If sync is ambiguous, fail closed.
 14. Move the change into `openspec/changes/archive/YYYY-MM-DD-<change>`.
-15. Follow the repo archive instructions in `AGENTS.md` using explicit staging
-    only for the archive path, synced `openspec/specs/` files, and the
-    implementation files from step 10.
-15. Inspect `git diff --cached --name-only` before committing. If any staged
-    file falls outside the explicit archive set, fail closed.
-16. Create the required archive commit with the exact message
+15. Stage the change-directory deletion only when the change directory is
+    tracked. Run `git ls-files -- openspec/changes/<change>`. If it lists any
+    files, run `git add -A -- openspec/changes/<change>` so the move commits
+    as one rename. If it lists no files, the change directory was never
+    committed: there is no deletion to stage, and running `git add -A` on
+    that pathspec would fail with `fatal: pathspec ... did not match any
+    files`. Skip it in that case.
+16. Follow the repo archive instructions in `AGENTS.md`, staging only the rest
+    of the explicit archive set: the archive path, synced `openspec/specs/`
+    files, and the implementation files from step 6. Leave the
+    change-directory deletion from step 15 staged; do not unstage it.
+17. Inspect `git diff --cached --name-status` before committing. Fail closed if
+    any staged file falls outside the explicit archive set. When the change
+    directory is tracked, also fail closed if the deletions under
+    `openspec/changes/<change>/` are absent from the staged set. When the
+    change directory was untracked, absent deletions are expected and are not
+    a failure.
+18. Create the required archive commit with the exact message
     `archive(<change>): archive completed OpenSpec change` when the staged set
     is clean.
 
