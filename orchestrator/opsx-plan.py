@@ -2196,8 +2196,10 @@ def _clean_log_lines(text: str) -> list[str]:
 
 def _find_last_json_object(lines: list[str]) -> dict | None:
     for candidate in reversed(lines):
-        if candidate.startswith("`") and candidate.endswith("`"):
-            candidate = candidate.strip("`").strip()
+        # Claude occasionally prefixes its required final JSON with a Markdown
+        # inline-code backtick but omits the closing delimiter.
+        if candidate.startswith("`"):
+            candidate = candidate.lstrip("`").strip()
         if not (candidate.startswith("{") and candidate.endswith("}")):
             continue
         try:
@@ -2223,8 +2225,8 @@ def _find_last_envelope(lines: list[str]) -> dict | None:
     """
     last_envelope: dict | None = None
     for candidate in lines:
-        if candidate.startswith("`") and candidate.endswith("`"):
-            candidate = candidate.strip("`").strip()
+        if candidate.startswith("`"):
+            candidate = candidate.lstrip("`").strip()
         if not (candidate.startswith("{") and candidate.endswith("}")):
             continue
         try:

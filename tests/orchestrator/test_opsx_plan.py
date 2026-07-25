@@ -2090,6 +2090,22 @@ class ClaudeCodeResultEnvelopeParsingTests(unittest.TestCase):
         self.assertIsNotNone(envelope)
         self.assertEqual(envelope["type"], "result")
 
+    def test_worker_json_with_unclosed_inline_code_backtick_is_recovered(self) -> None:
+        worker_json = (
+            '{"status":"implemented","change":"ex","round":1,"progress_made":true,'
+            '"completed_tasks":[],"remaining_tasks":[],'
+            '"task_counts":{"complete":0,"total":0},'
+            '"files_touched":[],"known_change_files":[],"summary":"done"}'
+        )
+        envelope_obj = {"type": "result", "result": f"`{worker_json}"}
+        log_path = self._write_log(json.dumps(envelope_obj) + "\n")
+
+        payload, reason, envelope = self.opsx_plan.parse_stage_json(log_path)
+        self.assertIsNotNone(payload, f"expected recovered worker JSON, reason={reason}")
+        self.assertEqual(payload["status"], "implemented")
+        self.assertEqual(reason, "")
+        self.assertIsNotNone(envelope)
+
     def test_envelope_with_no_worker_json_is_invalid_output(self) -> None:
         envelope_obj = {
             "type": "result",
