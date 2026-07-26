@@ -14,9 +14,50 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
+from lib.models import resolver
 from lib.models.types import ResolvedModel
 
 SCRIPT = Path(__file__).resolve().parents[2] / "orchestrator" / "opsx-plan.py"
+
+_MODEL_HOME: tempfile.TemporaryDirectory | None = None
+_MODEL_CONFIG_PATCH = None
+_MODEL_ENV_PATCH = None
+
+
+def setUpModule() -> None:
+    """Pin model resolution so the suite does not read ambient configuration.
+
+    Resolution consults ~/.config/opsx-controller/models.toml and then the
+    OPSX_*_MODEL environment variables. Left unpinned, this suite passes on a
+    machine that happens to have models configured and fails on a clean
+    checkout or a CI runner, where stages cannot resolve a model and report
+    `cannot activate models for adapter ...: unresolved role(s)`.
+    """
+    global _MODEL_HOME, _MODEL_CONFIG_PATCH, _MODEL_ENV_PATCH
+    _MODEL_HOME = tempfile.TemporaryDirectory()
+    _MODEL_CONFIG_PATCH = mock.patch.object(
+        resolver, "USER_CONFIG_PATH", Path(_MODEL_HOME.name) / "models.toml"
+    )
+    _MODEL_CONFIG_PATCH.start()
+    _MODEL_ENV_PATCH = mock.patch.dict(
+        os.environ,
+        {
+            "OPSX_CONTROLLER_MODEL": "test-provider/test-controller",
+            "OPSX_IMPLEMENTER_MODEL": "test-provider/test-implementer",
+            "OPSX_REVIEWER_MODEL": "test-provider/test-reviewer",
+            "OPSX_ARCHIVER_MODEL": "test-provider/test-archiver",
+        },
+    )
+    _MODEL_ENV_PATCH.start()
+
+
+def tearDownModule() -> None:
+    assert _MODEL_ENV_PATCH is not None
+    assert _MODEL_CONFIG_PATCH is not None
+    assert _MODEL_HOME is not None
+    _MODEL_ENV_PATCH.stop()
+    _MODEL_CONFIG_PATCH.stop()
+    _MODEL_HOME.cleanup()
 
 
 def load_opsx_plan():
@@ -10499,12 +10540,18 @@ class DoctorPreflightTests(unittest.TestCase):
         stdout = io.StringIO()
         with mock.patch("sys.stdout", stdout):
             rc = self.opsx_plan.cmd_doctor(args)
-        self.assertIn("opsx-plan doctor", stdout.getvalue())
-        self.assertIn(plan_src, stdout.getvalue())
-        # Should report 0 failures if environment is clean
-        self.assertEqual(rc, 0)
-        # 4.2: each resolved role's source is reported alongside the model
         output = stdout.getvalue()
+        self.assertIn("opsx-plan doctor", output)
+        self.assertIn(plan_src, output)
+        # The plan-dependent checks are what this test is about. The overall
+        # exit code is not asserted: doctor also checks host installation state
+        # (~/.local/bin/opsx-plan, installed worker agents), which is absent on
+        # a clean checkout and on CI, so requiring rc == 0 would only pass on a
+        # machine where the installer had already been run.
+        self.assertIn("✓ Plan loads successfully", output)
+        self.assertIn("✓ Model roles resolve for the target adapter", output)
+        self.assertIsNotNone(rc)
+        # 4.2: each resolved role's source is reported alongside the model
         self.assertIn("controller", output)
         self.assertIn("ambient environment", output)
 
