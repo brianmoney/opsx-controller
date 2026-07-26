@@ -23,7 +23,6 @@ for arg in "$@"; do
   case "$arg" in
     --verify)
       VERIFY=true
-      shift
       ;;
   esac
 done
