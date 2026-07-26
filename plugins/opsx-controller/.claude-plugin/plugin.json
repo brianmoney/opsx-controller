@@ -3,7 +3,8 @@
   "description": "OpenSpec controller workflow for Claude Code with namespaced /opsx-controller:opsx-drive and /opsx-controller:opsx-plan skills plus supporting agents.",
   "version": "1.0.0",
   "author": {
-    "name": "brianmoney"
+    "name": "Brian Money",
+    "url": "https://github.com/brianmoney"
   },
   "homepage": "https://github.com/brianmoney/opsx-controller",
   "repository": "https://github.com/brianmoney/opsx-controller",

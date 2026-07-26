@@ -15,8 +15,41 @@ The goal is to make one accepted OpenSpec change easy to drive through a strict
 implement, review, and archive loop while keeping the workflow flexible enough
 to package for different coding clients.
 
-For a quickstart, start with `adapters/claude-code/` if you're on Claude Code,
-or the adapter matching your coding client.
+## Installation
+
+Requires Python 3.11+ (the orchestrator uses `tomllib`) and git. There is
+nothing to pip install — the orchestrator is stdlib-only.
+
+```bash
+git clone https://github.com/brianmoney/opsx-controller.git
+cd opsx-controller
+bash adapters/claude-code/install.sh --global --verify
+```
+
+Substitute the adapter matching your coding client: `claude-code`, `opencode`,
+or `codex-cli`. Use `--project /path/to/repo` instead of `--global` to install
+into a single project. Each adapter's section below covers what it installs and
+where.
+
+Configure models before your first install: run
+`python3 orchestrator/opsx-plan.py models init` to seed
+`~/.config/opsx-controller/models.toml`, or copy `models.example.toml` and edit
+it. Installers and plan runs fail closed with guidance if no model resolves.
+
+## Running the tests
+
+Two suites, both dependency-free:
+
+```bash
+python3 -m unittest tests.lib.metrics.test_aggregator \
+  tests.lib.models.test_resolver tests.lib.pricing.test_loader \
+  tests.orchestrator.test_opsx_plan
+node tests/opencode/test-opsx-usage-emitter.js
+```
+
+Both run in CI on every push and pull request. See [CONTRIBUTING.md](CONTRIBUTING.md)
+for how changes to this repo are expected to flow, and [SECURITY.md](SECURITY.md)
+for what permissions the workers run with.
 
 ## Layout
 
@@ -385,3 +418,7 @@ same three phases:
 
 Keep the durable state contract, strict review gate, and explicit archive scope
 behavior intact.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
