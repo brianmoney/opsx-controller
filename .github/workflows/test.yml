@@ -12,12 +12,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Run Python tests
-        run: >-
-          python3 -m unittest
-          tests.lib.metrics.test_aggregator
-          tests.lib.models.test_resolver
-          tests.lib.pricing.test_loader
-          tests.orchestrator.test_opsx_plan
+        run: python3 -m unittest discover -t . -s tests
 
       - uses: actions/setup-node@v4
         with:

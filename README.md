@@ -41,9 +41,7 @@ it. Installers and plan runs fail closed with guidance if no model resolves.
 Two suites, both dependency-free:
 
 ```bash
-python3 -m unittest tests.lib.metrics.test_aggregator \
-  tests.lib.models.test_resolver tests.lib.pricing.test_loader \
-  tests.orchestrator.test_opsx_plan
+python3 -m unittest discover -t . -s tests
 node tests/opencode/test-opsx-usage-emitter.js
 ```
 

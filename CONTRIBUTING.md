@@ -8,11 +8,19 @@ Two independent suites, both stdlib/runtime only — no repo `.venv` or
 Python (3.11+, stdlib-only — the orchestrator relies on `tomllib`):
 
 ```bash
-python3 -m unittest \
-  tests.lib.metrics.test_aggregator \
-  tests.lib.models.test_resolver \
-  tests.lib.pricing.test_loader \
-  tests.orchestrator.test_opsx_plan
+python3 -m unittest discover -t . -s tests
+```
+
+Run it from the repository root. Discovery picks up any `test_*.py` under
+`tests/`, so a new test module is included automatically — add an
+`__init__.py` when you create a new test package, or discovery will skip the
+directory without saying so.
+
+To run one module or one test while iterating:
+
+```bash
+python3 -m unittest tests.orchestrator.test_opsx_plan
+python3 -m unittest tests.orchestrator.test_opsx_plan.ArchiveCommitEvidenceGateTests
 ```
 
 JavaScript (Node, no dependencies):

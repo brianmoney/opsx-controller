@@ -13,12 +13,11 @@ core contract (`core/`) plus client-specific adapters (`adapters/opencode/`,
 
 ## Validation
 
-- Tests: `python3 -m unittest tests.lib.metrics.test_aggregator
-  tests.lib.models.test_resolver tests.lib.pricing.test_loader
-  tests.orchestrator.test_opsx_plan` and `node
-  tests/opencode/test-opsx-usage-emitter.js` (run both suites for orchestrator
-  or adapter changes; both suites are stdlib/runtime only, so no repo `.venv`
-  or `node_modules` is required).
+- Tests: `python3 -m unittest discover -t . -s tests` and `node
+  tests/opencode/test-opsx-usage-emitter.js`, both from the repository root
+  (run both suites for orchestrator or adapter changes; both are
+  stdlib/runtime only, so no repo `.venv` or `node_modules` is required). A
+  new test package needs an `__init__.py` or discovery skips it silently.
 - OpenSpec: `openspec validate <change> --strict` for a single change, or
   `openspec validate --all`.
 
