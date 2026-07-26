@@ -1,0 +1,26 @@
+name: Tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Run Python tests
+        run: >-
+          python3 -m unittest
+          tests.lib.metrics.test_aggregator
+          tests.lib.models.test_resolver
+          tests.lib.pricing.test_loader
+          tests.orchestrator.test_opsx_plan
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Run JS tests
+        run: node tests/opencode/test-opsx-usage-emitter.js

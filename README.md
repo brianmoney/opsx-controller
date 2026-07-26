@@ -1,11 +1,22 @@
 # opsx-controller
 
+Driving an OpenSpec change through a coding agent usually means babysitting
+it: prompting implement, then review, then re-prompting implement when review
+finds something, then remembering to archive once it's clean. `opsx-controller`
+turns that into one command — `opsx-plan run` drives a whole plan of changes
+through implement → review → archive, unattended, fails closed on ambiguity,
+and works the same way whether the underlying agent is Claude Code, OpenCode,
+or Codex CLI.
+
 Portable OpenSpec controller workflow with a shared core contract and client-
 specific adapters.
 
 The goal is to make one accepted OpenSpec change easy to drive through a strict
 implement, review, and archive loop while keeping the workflow flexible enough
 to package for different coding clients.
+
+For a quickstart, start with `adapters/claude-code/` if you're on Claude Code,
+or the adapter matching your coding client.
 
 ## Layout
 

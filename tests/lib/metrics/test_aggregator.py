@@ -931,19 +931,24 @@ class ModelLeaderboardTests(unittest.TestCase):
         result = aggregate(str(repo), "test-plan")
 
         # Full combination should have no entries (archiver unknown)
+        # A complete triple is where all three roles are actual models, not "unknown"
         full_entries = [
             e for e in result.model_leaderboard
-            if (e.implementer_model and e.reviewer_model and e.archiver_model)
+            if (e.implementer_model and e.implementer_model != "unknown" and
+                e.reviewer_model and e.reviewer_model != "unknown" and
+                e.archiver_model and e.archiver_model != "unknown")
         ]
         self.assertEqual(len(full_entries), 0)
 
-        # But implementer should be present
+        # But implementer should be present (with "unknown" for reviewer/archiver)
         impl_entries = [
             e for e in result.model_leaderboard
             if e.implementer_model == "openai:gpt-4o"
         ]
         self.assertEqual(len(impl_entries), 1)
         self.assertEqual(impl_entries[0].change_count, 1)
+        self.assertEqual(impl_entries[0].reviewer_model, "unknown")
+        self.assertEqual(impl_entries[0].archiver_model, "unknown")
 
     def test_leaderboard_with_no_records(self):
         """Leaderboard is empty when no records."""
