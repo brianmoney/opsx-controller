@@ -13,6 +13,7 @@ const fs = require("fs");
 const path = require("path");
 const cp = require("child_process");
 const os = require("os");
+const { pathToFileURL } = require("url");
 
 // ---------------------------------------------------------------------------
 // Test harness
@@ -76,13 +77,14 @@ process.on("exit", cleanup);
  * Script: register plugin, feed events, then print the sidecar file contents.
  */
 function makeRunScript(usagePath, eventsJSON) {
-  const code = `
+const code = `
 const fs = require("fs");
 const path = require("path");
-const plugin = require(${JSON.stringify(PLUGIN)});
 
 async function main() {
-  const hooks = await plugin.OpsxUsageEmitter({
+  const pluginModule = await import(${JSON.stringify(pathToFileURL(PLUGIN).href)});
+  const plugin = pluginModule.default;
+  const hooks = await plugin({
     project: {},
     client: {},
     $: {},

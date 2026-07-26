@@ -61,6 +61,10 @@ install_support_readme() {
 install_plugins() {
   local dest_dir="$1"
   mkdir -p "$dest_dir"
+  local module_manifest="$ROOT_DIR/adapters/opencode/plugins/package.json"
+  if [[ -f "$module_manifest" ]]; then
+    install -m 0644 "$module_manifest" "$dest_dir/package.json"
+  fi
   local file
   for file in "$ROOT_DIR"/adapters/opencode/plugins/*.js; do
     [[ -e "$file" ]] || continue
@@ -128,7 +132,7 @@ do_verify() {
 verify_plugin_deployed() {
   local plugins_dir="$1"
   local plugin_name="opsx-usage-emitter.js"
-  if [[ -f "$plugins_dir/$plugin_name" ]]; then
+  if [[ -f "$plugins_dir/$plugin_name" && -f "$plugins_dir/package.json" ]]; then
     printf '%s\n' "Verify: usage emitter plugin deployed at $plugins_dir/$plugin_name"
     return 0
   else
@@ -214,4 +218,3 @@ case "$1" in
 esac
 
 printf '%s\n' 'Restart OpenCode after install so it reloads commands, agents, and plugins.'
-

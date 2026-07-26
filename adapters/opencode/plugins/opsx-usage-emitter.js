@@ -1,5 +1,5 @@
-const fs = require("fs");
-const path = require("path");
+import fs from "node:fs";
+import path from "node:path";
 
 /**
  * opsx-usage-emitter – OpenCode plugin that appends normalized JSONL usage
@@ -122,7 +122,7 @@ function appendRecord(record) {
 // Plugin entry-point
 // ---------------------------------------------------------------------------
 
-module.exports.OpsxUsageEmitter = async function ({ project, client, $, directory, worktree }) {
+export default async function OpsxUsageEmitter({ project, client, $, directory, worktree }) {
   if (!stageIdentityValid()) {
     // Plugin is inert: do not register any hooks (return empty object).
     return {};
