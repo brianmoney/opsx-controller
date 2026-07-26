@@ -34,7 +34,12 @@ Required workflow:
     reason `ambiguous archive commit scope` before syncing or moving anything.
 11. If delta specs exist, sync them into `openspec/specs/` when the change is
     unambiguous. If sync is ambiguous, fail closed.
-12. Move the change into `openspec/changes/archive/YYYY-MM-DD-<change>`.
+12. Move the change into `openspec/changes/archive/YYYY-MM-DD-<change>`. This
+    destination may or may not be tracked: run
+    `git check-ignore --no-index -q openspec/changes/archive/`. If it exits 0
+    the destination is gitignored — never stage or commit any path under it.
+    Otherwise the destination is tracked, and the moved directory belongs in
+    the archive commit so the archive is durably recorded.
 13. Stage the change-directory deletion only when the change directory is
     tracked. Run `git ls-files -- openspec/changes/<change>`. If it lists any
     files, run `git add -A -- openspec/changes/<change>` so the move commits
@@ -42,9 +47,11 @@ Required workflow:
     committed: there is no deletion to stage, and running `git add -A` on
     that pathspec would fail with `fatal: pathspec ... did not match any
     files`. Skip it in that case.
-14. Follow repo archive instructions using explicit staging only for the archive
-    path, synced `openspec/specs/` files, implementation files from the
-    trusted scope, and the change-directory deletion staged in step 13.
+14. Follow repo archive instructions using explicit staging only for synced
+    `openspec/specs/` files, implementation files from the trusted scope, and
+    the change-directory deletion staged in step 13. Never stage
+    `openspec/changes/archive/YYYY-MM-DD-<change>/` when that destination is
+    gitignored.
 15. Inspect `git diff --cached --name-status` before committing. Fail closed if
     any staged file falls outside the explicit archive set. When the change
     directory is tracked, also fail closed if the deletions under
@@ -53,7 +60,10 @@ Required workflow:
     a failure.
 16. Create the required archive commit with the exact message
     `archive(<change>): archive completed OpenSpec change` when the staged set
-    is clean.
+    is clean and non-empty. If nothing ended up staged (the change directory
+    was untracked and no specs or implementation files changed), skip the
+    commit — there is nothing to commit — and report `commit` as an empty
+    string; the move to the archive directory still makes this a success.
 
 Guardrails:
 
@@ -71,7 +81,7 @@ Final response requirements:
 - Use one of these shapes:
 
 Success:
-`{"status":"archived","change":"<change>","archive_path":"openspec/changes/archive/YYYY-MM-DD-<change>","spec_sync_status":"synced|sync-skipped|no-delta|already-synced|synced-anyway","commit":"<commit-sha created by this run>","summary":"one short sentence"}`
+`{"status":"archived","change":"<change>","archive_path":"openspec/changes/archive/YYYY-MM-DD-<change>","spec_sync_status":"synced|sync-skipped|no-delta|already-synced|synced-anyway","commit":"<commit-sha created by this run, or empty when nothing was staged>","summary":"one short sentence"}`
 
 Blocked:
 `{"status":"blocked","change":"<change>","reason":"short reason","archive_path":"empty when restored or not moved","spec_sync_status":"not_started|synced|already-synced|no-delta","commit":"","summary":"one short sentence","triage":{"scope_basis":"short basis","in_scope_files":["path"],"ambiguous_files":["path"],"retry_guidance":"short next step","retry_outlook":"same_failure|may_succeed|unknown"}}`

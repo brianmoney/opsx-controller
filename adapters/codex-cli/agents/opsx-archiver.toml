@@ -30,12 +30,14 @@ Required workflow:
    history, not as automatic failure.
 8. Determine the narrow explicit archive commit scope before mutating files.
    The allowed staged set is:
-   - openspec/changes/archive/YYYY-MM-DD-<change> after the move
    - changed files under openspec/specs/ created or updated by delta sync
    - implementation files from controller-owned archive-scope evidence that
      live outside the change directory
    - openspec/changes/<change>/ (the deletion left by the move) when that is
      tracked
+   openspec/changes/archive/YYYY-MM-DD-<change> (the move destination) is
+   part of this staged set only when it is not gitignored; see the move step
+   for how to decide.
 9. If you cannot name that narrow staged set up front, return blocked JSON with
    reason "ambiguous archive commit scope" before syncing or moving anything,
    and include actionable triage describing the scope basis, trusted in-scope
@@ -43,7 +45,12 @@ Required workflow:
    way.
 10. If delta specs exist, sync them into openspec/specs/ when the change is
     unambiguous. If sync is ambiguous, fail closed.
-11. Move the change into openspec/changes/archive/YYYY-MM-DD-<change>.
+11. Move the change into openspec/changes/archive/YYYY-MM-DD-<change>. This
+    destination may or may not be tracked: run
+    `git check-ignore --no-index -q openspec/changes/archive/`. If it exits 0
+    the destination is gitignored — never stage or commit any path under it.
+    Otherwise the destination is tracked, and the moved directory belongs in
+    the archive commit so the archive is durably recorded.
 12. Stage the change-directory deletion only when the change directory is
     tracked. Run `git ls-files -- openspec/changes/<change>`. If it lists any
     files, run `git add -A -- openspec/changes/<change>` so the move commits
@@ -52,9 +59,10 @@ Required workflow:
     that pathspec would fail with fatal: pathspec ... did not match any
     files. Skip it in that case.
 13. Follow the repo archive instructions in AGENTS.md using explicit staging
-    only for the archive path, synced openspec/specs/ files, the
-    implementation files from step 8, and the change-directory deletion
-    staged in step 12.
+    only for synced openspec/specs/ files, the implementation files from
+    step 8, and the change-directory deletion staged in step 12. Never stage
+    openspec/changes/archive/YYYY-MM-DD-<change>/ when that destination is
+    gitignored.
 14. Inspect `git diff --cached --name-status` before committing. Fail closed if
     any staged file falls outside the explicit archive set. When the change
     directory is tracked, also fail closed if the deletions under
@@ -63,7 +71,10 @@ Required workflow:
     a failure.
 15. Create the required archive commit with the exact message
     `archive(<change>): archive completed OpenSpec change` when the staged set
-    is clean.
+    is clean and non-empty. If nothing ended up staged (the change directory
+    was untracked and no specs or implementation files changed), skip the
+    commit — there is nothing to commit — and report commit as an empty
+    string; the move still makes this a success.
 
 Post-move failure handling:
 - If a failure happens after step 11 but before the archive commit succeeds,
@@ -77,9 +88,10 @@ Guardrails:
 - Never report success if validation, sync, move, or commit work fails.
 - If the archive target already exists or the sync/commit scope is ambiguous,
   return a blocked result.
-- Return status=archived only when this run completed the archive move and the
-  required archive commit. Never reuse an existing archive directory, prior
-  commit at HEAD, or state/history evidence as a success proxy.
+- Return status=archived only when this run completed the archive move, and
+  either created the required archive commit or confirmed nothing needed to
+  be staged. Never reuse an existing archive directory, prior commit at HEAD,
+  or state/history evidence as a success proxy.
 - Untracked files outside the explicit archive set are not a blocker and must
   remain unstaged.
 - If you cannot finish safely, or you are at risk of exhausting your step
@@ -91,7 +103,7 @@ Final response requirements:
 - Use one of these shapes:
 
 Success:
-{"status":"archived","change":"<change>","archive_path":"openspec/changes/archive/YYYY-MM-DD-<change>","spec_sync_status":"synced|sync-skipped|no-delta|already-synced|synced-anyway","commit":"<commit-sha created by this run>","summary":"one short sentence"}
+{"status":"archived","change":"<change>","archive_path":"openspec/changes/archive/YYYY-MM-DD-<change>","spec_sync_status":"synced|sync-skipped|no-delta|already-synced|synced-anyway","commit":"<commit-sha created by this run, or empty when nothing was staged>","summary":"one short sentence"}
 
 Blocked:
 {"status":"blocked","change":"<change>","reason":"short reason","archive_path":"empty when restored or not moved","spec_sync_status":"not_started|synced|already-synced|no-delta","commit":"","summary":"one short sentence","triage":{"scope_basis":"short basis","in_scope_files":["path"],"ambiguous_files":["path"],"retry_guidance":"short next step","retry_outlook":"same_failure|may_succeed|unknown"}}

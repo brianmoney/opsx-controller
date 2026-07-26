@@ -1,20 +1,44 @@
 ## Purpose
 
-Define the commit hygiene requirements for archive operations when moving OpenSpec changes from `openspec/changes/<change>/` to `openspec/changes/archive/YYYY-MM-DD-<change>/`.
+Define the commit hygiene requirements for archive operations when moving OpenSpec changes from `openspec/changes/<change>/` to `openspec/changes/archive/YYYY-MM-DD-<change>/`. Where the dated archive directory is gitignored, the orchestrator still needs it on disk as local evidence, but its contents are not part of the repository's tracked history.
 
 ## Requirements
+
+### Requirement: The archive destination is never staged or committed
+
+Where `openspec/changes/archive/` is gitignored, every `opsx-archiver` worker,
+on every adapter, SHALL perform the physical move to
+`openspec/changes/archive/YYYY-MM-DD-<change>/` but SHALL NOT force-stage or
+commit any path under that destination.
+
+#### Scenario: Archive directory stays untracked
+
+- **WHEN** the archiver has moved a change to a gitignored `openspec/changes/archive/YYYY-MM-DD-<change>` and is preparing the archive commit
+- **THEN** `git diff --cached --name-status` contains no path under `openspec/changes/archive/`, and `git status --short` shows the new directory as ignored, not staged
+
+### Requirement: Archive-commit evidence follows the ignore status of the destination
+
+The orchestrator SHALL decide whether an `archive(<change>):` commit is
+required evidence of completion by asking git whether
+`openspec/changes/archive/` is covered by an ignore rule, independent of
+whether any path under it happens to be tracked.
+
+#### Scenario: Tracked archive destination requires the archive commit
+
+- **WHEN** `openspec/changes/archive/` is not gitignored and a change is archived with no recorded `archive(<change>):` commit, or with one that is unreachable from `HEAD`
+- **THEN** the orchestrator fails the change rather than marking it done, because the archive was not durably recorded
+
+#### Scenario: Ignored archive destination tolerates a missing archive commit
+
+- **WHEN** `openspec/changes/archive/` is gitignored and a change is archived with no recorded `archive(<change>):` commit
+- **THEN** the orchestrator logs a note and still marks the change done, treating the on-disk dated directory and the change directory's removal as the load-bearing evidence
 
 ### Requirement: The archive commit includes the change-directory deletion
 
 Every `opsx-archiver` worker, on every adapter, SHALL stage the removal of
-`openspec/changes/<change>/` as part of the same commit that adds
-`openspec/changes/archive/YYYY-MM-DD-<change>/`, when the change directory is
-tracked at archive time.
-
-The archive move SHALL be committed as a single rename: the deleted paths under
-the original change directory and the added paths under the dated archive
-directory land together. The archiver SHALL NOT leave the change-directory
-deletion as an unstaged worktree modification.
+`openspec/changes/<change>/` as part of the archive commit, when the change
+directory is tracked at archive time. The archiver SHALL NOT leave the
+change-directory deletion as an unstaged worktree modification.
 
 The archiver SHALL determine whether the change directory is tracked by
 running `git ls-files -- openspec/changes/<change>` before staging. When that
@@ -23,15 +47,21 @@ deletion to stage, and the archiver SHALL NOT run `git add -A` on that
 pathspec, since it would fail with `fatal: pathspec ... did not match any
 files`.
 
-#### Scenario: Archive move is committed as one rename
+When the change directory was untracked and no other files (synced specs,
+trusted implementation files) are in scope this round, there is nothing to
+stage. The archiver SHALL skip creating a commit in that case, report
+`commit` as an empty string, and still report `status=archived` — the
+completed move is success on its own.
+
+#### Scenario: Change-directory deletion is committed alone
 
 - **WHEN** the archiver has moved a tracked `openspec/changes/<change>` to `openspec/changes/archive/YYYY-MM-DD-<change>` and is preparing the archive commit
-- **THEN** `git diff --cached --name-status` shows both the deletions under `openspec/changes/<change>/` and the additions under `openspec/changes/archive/YYYY-MM-DD-<change>/`
+- **THEN** `git diff --cached --name-status` shows only the deletions under `openspec/changes/<change>/` plus any synced specs or trusted implementation files, never anything under the dated archive directory
 
-#### Scenario: Untracked change directory does not block the archive
+#### Scenario: Untracked change directory with nothing else in scope produces no commit
 
-- **WHEN** the change directory was never committed and is moved to the dated archive directory
-- **THEN** the archiver stages the archive path, does not attempt to stage a deletion, does not return blocked, and leaves a clean tracked tree after the commit
+- **WHEN** the change directory was never committed, is moved to the dated archive directory, and no specs or implementation files are in scope this round
+- **THEN** the archiver does not attempt to stage a deletion, does not create a commit, reports `commit` as an empty string, does not return blocked, and leaves a clean tracked tree
 
 #### Scenario: Tracked worktree is clean after the archive commit
 
@@ -42,15 +72,18 @@ files`.
 
 Each archiver SHALL include paths under `openspec/changes/<change>/` in the explicit archive commit scope it names before mutating files, alongside the existing members of that scope:
 
-- `openspec/changes/archive/YYYY-MM-DD-<change>/` after the move
 - changed files under `openspec/specs/` created or updated by delta sync
 - implementation files from controller-owned archive-scope evidence that live
   outside the change directory
 
+Where `openspec/changes/archive/` is gitignored, the dated archive directory
+under it is never a member of this scope, and naming it as in-scope is a
+defect.
+
 Widening the scope SHALL NOT relax the narrowness guarantee for any other path.
-Files that are neither under the change directory, the dated archive directory,
-synced `openspec/specs/` paths, nor the trusted implementation set remain out of
-scope, and untracked files outside the archive set SHALL remain unstaged.
+Files that are neither under the change directory, synced `openspec/specs/`
+paths, nor the trusted implementation set remain out of scope, and untracked
+files outside the archive set SHALL remain unstaged.
 
 #### Scenario: Change-directory paths are in scope
 

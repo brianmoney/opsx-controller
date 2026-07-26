@@ -196,15 +196,25 @@ A change is marked `done` only when all of the following agree:
 1. a fresh archive worker run returned machine-readable success for the current
    change
 2. `openspec/changes/<id>` is absent from the worktree
-3. a dated `openspec/changes/archive/YYYY-MM-DD-<id>` directory exists
-4. an `archive(<id>):` commit recorded by the archive worker is reachable from
-   `HEAD`
-5. all `fast_checks` commands exit 0 (e.g. `openspec validate --all`,
+3. a dated `openspec/changes/archive/YYYY-MM-DD-<id>` directory exists on disk
+4. all `fast_checks` commands exit 0 (e.g. `openspec validate --all`,
    your fast test suite)
 
-The worker process exit code is never treated as success. For OpenCode-backed
-plan runs, repository archive evidence without matching plan-owned archive
-worker evidence is reconciled as failed, not as completed.
+Whether an `archive(<id>):` commit is *also* required depends on the repo:
+
+- **`openspec/changes/archive/` is tracked** (the default OpenSpec layout): the
+  commit is required evidence. A missing or unreachable commit fails the change,
+  because it means the archive was never durably recorded.
+- **`openspec/changes/archive/` is gitignored** (as in this repo): the archiver
+  has nothing to stage, so no commit is produced. The commit degrades to a
+  corroborating signal — logged as a note when present, never blocking when
+  absent — and the on-disk dated directory plus the change directory's removal
+  are the load-bearing evidence.
+
+The orchestrator decides which case applies by asking git whether the path is
+covered by an ignore rule, independent of what happens to be tracked today.
+
+The worker process exit code is never treated as success.
 
 On startup the orchestrator reconciles recorded state against the repo:
 recorded-done changes whose evidence has disappeared are downgraded to failed;

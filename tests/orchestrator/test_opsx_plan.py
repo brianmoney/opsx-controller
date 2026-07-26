@@ -99,7 +99,14 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
         self.repo = Path(self.tmp.name)
         git(self.repo, "init")
         (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
-        git(self.repo, "add", "tracked.txt")
+        # Mirror this repo's own layout: openspec/changes/archive/ is
+        # gitignored, so archiving stages nothing and produces no
+        # archive(<id>): commit. Tests that assert the commit is optional
+        # depend on this actually being ignored, not just assumed.
+        (self.repo / ".gitignore").write_text(
+            "openspec/changes/archive/\n", encoding="utf-8"
+        )
+        git(self.repo, "add", "tracked.txt", ".gitignore")
         git(
             self.repo,
             "-c",
@@ -175,7 +182,21 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
         dst = self.repo / archive_rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         src.rename(dst)
-        git(self.repo, "add", "-A", "openspec")
+        # openspec/changes/archive/ is gitignored: only the change-directory
+        # deletion (when tracked) is ever staged, mirroring the real
+        # opsx-archiver's git-ls-files guard.
+        tracked = subprocess.run(
+            ["git", "ls-files", "--", f"openspec/changes/{cid}"],
+            cwd=self.repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        if tracked:
+            git(self.repo, "add", "-A", "--", f"openspec/changes/{cid}")
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            cwd=self.repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        if not staged:
+            return archive_rel, ""
         git(
             self.repo,
             "-c",
@@ -423,6 +444,80 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
         self.assertEqual(record["last_result"], "post_archive_dirty_tracked")
         self.assertIn("post-archive tracked worktree is dirty", record["reason"])
 
+    def test_archive_succeeds_with_no_archive_commit_when_nothing_staged(self) -> None:
+        """openspec/changes/archive/ is gitignored: when the change directory
+        is untracked and nothing else is in scope, the archiver has nothing
+        to commit. The archive commit is corroborating, not required -- the
+        change should still reach DONE from the on-disk move alone."""
+        self.cfg["require_clean_tracked"] = True
+
+        def fake_invoke(repo: Path, cfg: dict, cid: str, stage: str, round_num: int, input_block: str):
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            if stage == "implement":
+                payload = {
+                    "status": "implemented",
+                    "change": cid,
+                    "round": round_num,
+                    "progress_made": True,
+                    "completed_tasks": ["1.1"],
+                    "remaining_tasks": ["1.2"],
+                    "task_counts": {"complete": 1, "total": 2},
+                    "files_touched": [],
+                    "known_change_files": [f"openspec/changes/{cid}/tasks.md"],
+                    "summary": "implemented first round",
+                }
+            elif stage == "review":
+                payload = {
+                    "status": "reviewed",
+                    "change": cid,
+                    "round": round_num,
+                    "verdict": "pass",
+                    "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                    "summary": "review passed",
+                    "fix_prompt": "",
+                    "next_phase": "archive",
+                }
+            else:
+                src = repo / "openspec" / "changes" / cid
+                archive_rel = f"openspec/changes/archive/2026-07-02-{cid}"
+                dst = repo / archive_rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                src.rename(dst)
+                # The change directory was never git-tracked in this test
+                # repo and the archive destination is gitignored, so there
+                # is nothing to stage or commit.
+                payload = {
+                    "status": "archived",
+                    "change": cid,
+                    "archive_path": archive_rel,
+                    "spec_sync_status": "no-delta",
+                    "commit": "",
+                    "summary": "archive succeeded",
+                }
+            log_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            return "exited", log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, self.opsx_plan.DONE)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        self.assertEqual(record["status"], self.opsx_plan.DONE)
+        self.assertEqual(record["archive"]["status"], "passed")
+        self.assertEqual(record["archive"]["commit"], "")
+
+        ok, why = self.opsx_plan.verify_direct_archive_done(self.repo, self.cid, record)
+        self.assertTrue(ok, why)
+
+        # reconcile() must also resolve this from disk alone on a fresh
+        # in-memory state, without relying on the archive commit.
+        fresh_state = {"plan": self.plan_name, "approvals": [], "changes": {}}
+        self.opsx_plan.reconcile(self.repo, self.cfg, fresh_state)
+        fresh_record = self.opsx_plan.rec(fresh_state, self.cid)
+        self.assertEqual(fresh_record["status"], self.opsx_plan.DONE)
+
     def test_reconcile_keeps_done_change_when_newer_archive_prefix_commit_exists(self) -> None:
         self.stage_runner(
             [
@@ -481,7 +576,10 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
             / "tasks.md"
         )
         archived_tasks.write_text("## 1. Tasks\n\n- [x] 1.1 Example task\n", encoding="utf-8")
-        git(self.repo, "add", str(archived_tasks.relative_to(self.repo)))
+        # -f: the archive directory is gitignored in this fixture, and this
+        # test needs a real archive(<id>): commit to exercise the
+        # newer-commit-reachable note path.
+        git(self.repo, "add", "-f", str(archived_tasks.relative_to(self.repo)))
         git(
             self.repo,
             "-c",
@@ -895,7 +993,16 @@ class SingleChangeConfigTests(unittest.TestCase):
         self.assertIn("tracked worktree is dirty", stderr.getvalue())
 
 
-class SingleChangeRunnerTests(unittest.TestCase):
+class ArchiveCommitEvidenceGateTests(unittest.TestCase):
+    """Whether an `archive(<id>):` commit is required evidence depends on
+    whether openspec/changes/archive/ is gitignored.
+
+    When the directory is tracked (the default OpenSpec layout) a missing
+    commit means the archive was never durably recorded and must fail the
+    change. When it is gitignored the archiver has nothing to stage, so the
+    commit legitimately does not exist and must not veto completion.
+    """
+
     def setUp(self) -> None:
         self.opsx_plan = load_opsx_plan()
         self.tmp = tempfile.TemporaryDirectory()
@@ -903,6 +1010,133 @@ class SingleChangeRunnerTests(unittest.TestCase):
         git(self.repo, "init")
         (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
         git(self.repo, "add", "tracked.txt")
+        git(
+            self.repo,
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "user.name=Test User",
+            "commit",
+            "-m",
+            "init",
+        )
+        self.cid = "add-gate-example"
+        self.archive_rel = f"openspec/changes/archive/2026-07-26-{self.cid}"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def ignore_archive_dir(self) -> None:
+        (self.repo / ".gitignore").write_text(
+            "openspec/changes/archive/\n", encoding="utf-8"
+        )
+
+    def archive_on_disk(self) -> None:
+        dst = self.repo / self.archive_rel
+        dst.mkdir(parents=True, exist_ok=True)
+        (dst / "proposal.md").write_text("# archived\n", encoding="utf-8")
+
+    def record_without_commit(self) -> dict:
+        return {
+            "archive": {
+                "status": "passed",
+                "path": self.archive_rel,
+                "commit": "",
+                "reason": "",
+            }
+        }
+
+    def test_archive_dir_ignored_reports_ignore_rules(self) -> None:
+        self.assertFalse(self.opsx_plan.archive_dir_ignored(self.repo))
+        self.ignore_archive_dir()
+        self.assertTrue(self.opsx_plan.archive_dir_ignored(self.repo))
+
+    def test_archive_dir_ignored_ignores_index_state(self) -> None:
+        """A force-added legacy archive must not flip the gate: newly
+        archived files still stage nothing under the same ignore rule."""
+        self.ignore_archive_dir()
+        self.archive_on_disk()
+        git(self.repo, "add", "-f", f"{self.archive_rel}/proposal.md")
+        git(
+            self.repo,
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "user.name=Test User",
+            "commit",
+            "-m",
+            f"archive({self.cid}): force-added legacy archive",
+        )
+        self.assertTrue(self.opsx_plan.archive_dir_ignored(self.repo))
+
+    def test_tracked_archive_dir_requires_archive_commit(self) -> None:
+        self.archive_on_disk()
+        ok, why = self.opsx_plan.verify_direct_archive_done(
+            self.repo, self.cid, self.record_without_commit()
+        )
+        self.assertFalse(ok)
+        self.assertIn("did not record archive commit", why)
+
+    def test_ignored_archive_dir_allows_missing_archive_commit(self) -> None:
+        self.ignore_archive_dir()
+        self.archive_on_disk()
+        ok, why = self.opsx_plan.verify_direct_archive_done(
+            self.repo, self.cid, self.record_without_commit()
+        )
+        self.assertTrue(ok, why)
+
+    def test_tracked_archive_dir_requires_reachable_commit(self) -> None:
+        self.archive_on_disk()
+        record = self.record_without_commit()
+        record["archive"]["commit"] = "0" * 40
+        ok, why = self.opsx_plan.verify_direct_archive_done(
+            self.repo, self.cid, record
+        )
+        self.assertFalse(ok)
+        self.assertIn("not reachable from HEAD", why)
+
+    def test_ignored_archive_dir_tolerates_unreachable_commit(self) -> None:
+        self.ignore_archive_dir()
+        self.archive_on_disk()
+        record = self.record_without_commit()
+        record["archive"]["commit"] = "0" * 40
+        ok, why = self.opsx_plan.verify_direct_archive_done(
+            self.repo, self.cid, record
+        )
+        self.assertTrue(ok, why)
+
+    def test_record_archive_evidence_requires_commit_when_tracked(self) -> None:
+        self.archive_on_disk()
+        record = {"archive": {}}
+        self.assertFalse(
+            self.opsx_plan.record_archive_evidence(self.repo, record, self.cid)
+        )
+
+    def test_record_archive_evidence_accepts_no_commit_when_ignored(self) -> None:
+        self.ignore_archive_dir()
+        self.archive_on_disk()
+        record = {"archive": {}}
+        self.assertTrue(
+            self.opsx_plan.record_archive_evidence(self.repo, record, self.cid)
+        )
+        self.assertEqual(record["archive"]["status"], "passed")
+        self.assertEqual(record["archive"]["commit"], "")
+
+
+class SingleChangeRunnerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        git(self.repo, "init")
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        # openspec/changes/archive/ is gitignored here, mirroring this
+        # repo: archiving stages nothing, so no archive(<id>): commit is
+        # produced and none is required.
+        (self.repo / ".gitignore").write_text(
+            "openspec/changes/archive/\n", encoding="utf-8"
+        )
+        git(self.repo, "add", "tracked.txt", ".gitignore")
         git(
             self.repo,
             "-c",
@@ -938,7 +1172,21 @@ class SingleChangeRunnerTests(unittest.TestCase):
         dst = self.repo / archive_rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         src.rename(dst)
-        git(self.repo, "add", "-A", "openspec")
+        # openspec/changes/archive/ is gitignored: only the change-directory
+        # deletion (when tracked) is ever staged, mirroring the real
+        # opsx-archiver's git-ls-files guard.
+        tracked = subprocess.run(
+            ["git", "ls-files", "--", f"openspec/changes/{cid}"],
+            cwd=self.repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        if tracked:
+            git(self.repo, "add", "-A", "--", f"openspec/changes/{cid}")
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            cwd=self.repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        if not staged:
+            return archive_rel, ""
         git(
             self.repo,
             "-c",
@@ -1959,6 +2207,16 @@ class ArchiverDeletionStagingTests(unittest.TestCase):
                 "absent deletions as expected, not a pre-commit failure",
             )
 
+    def test_all_archivers_never_stage_the_archive_destination(self) -> None:
+        for rel_path in self.ARCHIVER_FILES:
+            text = self._read(rel_path)
+            self.assertIn(
+                "gitignored",
+                text,
+                f"{rel_path} must document that openspec/changes/archive/ is "
+                "gitignored and must never be staged or committed",
+            )
+
 
 class ParseStageJsonPermissionTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -2186,7 +2444,13 @@ class DirectStageTelemetryTests(unittest.TestCase):
         self.repo = Path(self.tmp.name)
         git(self.repo, "init")
         (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
-        git(self.repo, "add", "tracked.txt")
+        # openspec/changes/archive/ is gitignored here, mirroring this
+        # repo: archiving stages nothing, so no archive(<id>): commit is
+        # produced and none is required.
+        (self.repo / ".gitignore").write_text(
+            "openspec/changes/archive/\n", encoding="utf-8"
+        )
+        git(self.repo, "add", "tracked.txt", ".gitignore")
         git(
             self.repo,
             "-c",
@@ -2256,7 +2520,21 @@ class DirectStageTelemetryTests(unittest.TestCase):
         dst = self.repo / archive_rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         src.rename(dst)
-        git(self.repo, "add", "-A", "openspec")
+        # openspec/changes/archive/ is gitignored: only the change-directory
+        # deletion (when tracked) is ever staged, mirroring the real
+        # opsx-archiver's git-ls-files guard.
+        tracked = subprocess.run(
+            ["git", "ls-files", "--", f"openspec/changes/{cid}"],
+            cwd=self.repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        if tracked:
+            git(self.repo, "add", "-A", "--", f"openspec/changes/{cid}")
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            cwd=self.repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        if not staged:
+            return archive_rel, ""
         git(
             self.repo,
             "-c",
@@ -7755,22 +8033,33 @@ class ReportCommandTests(unittest.TestCase):
         self.assertGreater(len(data["model_leaderboard"]), 0,
                            "Leaderboard must not be empty")
 
-        for entry in data["model_leaderboard"]:
-            impl = entry.get("implementer_model")
-            rev = entry.get("reviewer_model")
-            arch = entry.get("archiver_model")
-            self.assertIsNotNone(
-                impl,
-                f"Leaderboard entry missing implementer_model: {entry}",
-            )
-            self.assertIsNotNone(
-                rev,
-                f"Leaderboard entry missing reviewer_model: {entry}",
-            )
-            self.assertIsNotNone(
-                arch,
-                f"Leaderboard entry missing archiver_model: {entry}",
-            )
+        # Verify complete triple entry exists (ch-alpha has all three roles with known models)
+        complete_entries = [
+            e for e in data["model_leaderboard"]
+            if (e.get("implementer_model") and e.get("implementer_model") != "unknown" and
+                e.get("reviewer_model") and e.get("reviewer_model") != "unknown" and
+                e.get("archiver_model") and e.get("archiver_model") != "unknown")
+        ]
+        self.assertEqual(len(complete_entries), 1,
+                         "Should have exactly one complete triple entry (ch-alpha)")
+        complete = complete_entries[0]
+        self.assertEqual(complete["implementer_model"], "openai:gpt-4o")
+        self.assertEqual(complete["reviewer_model"], "openai:gpt-4o-mini")
+        self.assertEqual(complete["archiver_model"], "openai:gpt-4o")
+
+        # Verify partial entry exists for ch-beta (only implementer known, others marked "unknown")
+        partial_entries = [
+            e for e in data["model_leaderboard"]
+            if e.get("implementer_model") == "anthropic:claude-sonnet"
+        ]
+        self.assertEqual(len(partial_entries), 1,
+                         "Should have exactly one entry for ch-beta (partial with unknown roles)")
+        partial = partial_entries[0]
+        self.assertEqual(partial["implementer_model"], "anthropic:claude-sonnet")
+        self.assertEqual(partial.get("reviewer_model"), "unknown",
+                         "Partial entry should have 'unknown' for unknown reviewer_model")
+        self.assertEqual(partial.get("archiver_model"), "unknown",
+                         "Partial entry should have 'unknown' for unknown archiver_model")
 
     # -- regression: avg tokens/change displayed even when cost is unresolved
 
@@ -9437,7 +9726,13 @@ class SpendBudgetTests(unittest.TestCase):
         self.repo = Path(self.tmp.name)
         git(self.repo, "init")
         (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
-        git(self.repo, "add", "tracked.txt")
+        # openspec/changes/archive/ is gitignored here, mirroring this
+        # repo: archiving stages nothing, so no archive(<id>): commit is
+        # produced and none is required.
+        (self.repo / ".gitignore").write_text(
+            "openspec/changes/archive/\n", encoding="utf-8"
+        )
+        git(self.repo, "add", "tracked.txt", ".gitignore")
         git(
             self.repo,
             "-c",
@@ -9726,17 +10021,29 @@ class SpendBudgetTests(unittest.TestCase):
                 dst = self.repo / archive_rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 src.rename(dst)
-                git(self.repo, "add", "-A", "openspec")
-                git(
-                    self.repo,
-                    "-c", "user.email=test@example.invalid",
-                    "-c", "user.name=Test User",
-                    "commit", "-m", f"archive({self.cid}): archive completed OpenSpec change",
-                )
-                commit = subprocess.run(
-                    ["git", "rev-parse", "HEAD"], cwd=self.repo,
-                    check=True, capture_output=True, text=True,
+                tracked = subprocess.run(
+                    ["git", "ls-files", "--", f"openspec/changes/{self.cid}"],
+                    cwd=self.repo, check=True, capture_output=True, text=True,
                 ).stdout.strip()
+                if tracked:
+                    git(self.repo, "add", "-A", "--", f"openspec/changes/{self.cid}")
+                staged = subprocess.run(
+                    ["git", "diff", "--cached", "--name-only"],
+                    cwd=self.repo, check=True, capture_output=True, text=True,
+                ).stdout.strip()
+                if staged:
+                    git(
+                        self.repo,
+                        "-c", "user.email=test@example.invalid",
+                        "-c", "user.name=Test User",
+                        "commit", "-m", f"archive({self.cid}): archive completed OpenSpec change",
+                    )
+                    commit = subprocess.run(
+                        ["git", "rev-parse", "HEAD"], cwd=self.repo,
+                        check=True, capture_output=True, text=True,
+                    ).stdout.strip()
+                else:
+                    commit = ""
                 payload = {
                     "status": "archived",
                     "change": cid,
@@ -12675,7 +12982,13 @@ class RunEventNotificationTests(unittest.TestCase):
         self.repo = Path(self.tmp.name)
         git(self.repo, "init")
         (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
-        git(self.repo, "add", "tracked.txt")
+        # openspec/changes/archive/ is gitignored here, mirroring this
+        # repo: archiving stages nothing, so no archive(<id>): commit is
+        # produced and none is required.
+        (self.repo / ".gitignore").write_text(
+            "openspec/changes/archive/\n", encoding="utf-8"
+        )
+        git(self.repo, "add", "tracked.txt", ".gitignore")
         git(
             self.repo,
             "-c",
@@ -12753,7 +13066,21 @@ class RunEventNotificationTests(unittest.TestCase):
         dst = self.repo / archive_rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         src.rename(dst)
-        git(self.repo, "add", "-A", "openspec")
+        # openspec/changes/archive/ is gitignored: only the change-directory
+        # deletion (when tracked) is ever staged, mirroring the real
+        # opsx-archiver's git-ls-files guard.
+        tracked = subprocess.run(
+            ["git", "ls-files", "--", f"openspec/changes/{cid}"],
+            cwd=self.repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        if tracked:
+            git(self.repo, "add", "-A", "--", f"openspec/changes/{cid}")
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            cwd=self.repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        if not staged:
+            return archive_rel, ""
         git(
             self.repo,
             "-c",

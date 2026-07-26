@@ -2288,8 +2288,10 @@ def parse_stage_json(log_path: Path) -> tuple[dict | None, str, dict | None]:
 
 def record_archive_evidence(repo: Path, record: dict, cid: str) -> bool:
     archive_dir = find_archive_dir(repo, cid)
+    if archive_dir is None:
+        return False
     commit = find_archive_commit(repo, cid)
-    if archive_dir is None or not commit:
+    if not commit and not archive_dir_ignored(repo):
         return False
     record["archive"].update(
         {
@@ -2340,20 +2342,34 @@ def verify_direct_archive_done(repo: Path, cid: str, record: dict) -> tuple[bool
             f"archive directory mismatch: expected {archive_path}, found "
             f"{actual_archive.relative_to(repo)}"
         )
+    # Whether the `archive(<id>):` commit is required evidence depends on the
+    # repo: when openspec/changes/archive/ is gitignored the archive worker has
+    # nothing to stage and legitimately produces no commit, so it degrades to a
+    # corroborating signal. When the directory is tracked it stays load-bearing
+    # — a missing commit there means the archive was never durably recorded.
+    commit_optional = archive_dir_ignored(repo)
     commit = archive.get("commit", "")
     if not commit:
-        return False, "archive worker did not record archive commit"
-    if not reachable_commit(repo, commit):
-        return False, f"archive commit not reachable from HEAD: {commit}"
-    resolved_commit = resolve_commit(repo, commit)
-    if not resolved_commit:
-        return False, f"archive commit could not be resolved: {commit}"
-    latest_commit = find_archive_commit(repo, cid)
-    if latest_commit and latest_commit != resolved_commit:
+        if not commit_optional:
+            return False, "archive worker did not record archive commit"
         log(
-            f"  note: {cid} archive state recorded {resolved_commit[:12]} but newer "
-            f"archive(<change>) commit {latest_commit[:12]} is reachable"
+            f"  note: {cid} archived with no archive(<id>): commit "
+            f"(archive directory is gitignored)"
         )
+    elif not reachable_commit(repo, commit):
+        if not commit_optional:
+            return False, f"archive commit not reachable from HEAD: {commit}"
+        log(f"  note: {cid} archive commit not reachable from HEAD: {commit}")
+    else:
+        resolved_commit = resolve_commit(repo, commit)
+        if not resolved_commit and not commit_optional:
+            return False, f"archive commit could not be resolved: {commit}"
+        latest_commit = find_archive_commit(repo, cid)
+        if latest_commit and resolved_commit and latest_commit != resolved_commit:
+            log(
+                f"  note: {cid} archive state recorded {resolved_commit[:12]} but "
+                f"newer archive(<change>) commit {latest_commit[:12]} is reachable"
+            )
     return True, ""
 
 
@@ -2920,6 +2936,27 @@ def find_archive_commit(repo: Path, cid: str) -> str:
         "--format=%H", "-n", "1",
     )
     return res.stdout.strip() if res.returncode == 0 else ""
+
+
+def archive_dir_ignored(repo: Path) -> bool:
+    """True when `openspec/changes/archive/` is gitignored in this repo.
+
+    Decides whether an `archive(<id>):` commit is required evidence. When the
+    archive directory is ignored, `openspec archive` moves files git will never
+    track, so the archive worker has nothing to stage and legitimately produces
+    no commit — its absence is expected, not a failure. When the directory is
+    tracked (the default OpenSpec layout), a missing commit means the archive
+    was never durably recorded, which must fail the change.
+    """
+    # --no-index answers purely from the ignore rules. Without it git consults
+    # the index and refuses to call a path ignored once anything under it is
+    # tracked (e.g. a force-added legacy archive), which would flip the gate
+    # even though newly archived files still stage nothing.
+    # The trailing slash matters: a directory-only ignore rule
+    # (`openspec/changes/archive/`) does not match the bare path when the
+    # directory does not exist on disk yet.
+    res = git(repo, "check-ignore", "--no-index", "-q", "openspec/changes/archive/")
+    return res.returncode == 0
 
 
 def verify_change_done(repo: Path, cfg: dict, cid: str) -> tuple[bool, str]:
