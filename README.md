@@ -1,23 +1,43 @@
 # opsx-controller
 
-**Drive a whole plan of OpenSpec changes through implement → review → archive,
-unattended.**
+**Write the plan in markdown. Drive it to done — implement, review, re-review
+until clean, archive — unattended.**
 
-Driving an OpenSpec change through a coding agent usually means babysitting it:
-prompt implement, then review, then re-prompt implement when review finds
-something, then remember to archive once it's clean. Repeat per change.
+Driving a change through a coding agent usually means babysitting it: prompt
+implement, then review, then re-prompt implement when review finds something,
+then remember to archive once it's clean. Repeat per change, while holding the
+dependency order in your head.
 
-`opsx-controller` turns that into one command. `opsx-plan run` walks a
-dependency graph of changes and, for each one, loops implement → review until a
-review comes back with zero findings, then archives it — verifying against
-ground truth at every step and failing closed when anything is ambiguous. It
-works the same way whether the underlying agent is Claude Code, OpenCode, or
-Codex CLI.
+`opsx-controller` takes over at that line. You write a plan in markdown — in the
+tool of your choice, or by hand. `opsx-plan` compiles it into a dependency
+graph, authors each change, and loops implement → review until a review comes
+back with zero findings, then archives it — verifying against ground truth at
+every step and failing closed when anything is ambiguous. It works the same way
+whether the underlying agent is Claude Code, OpenCode, or Codex CLI.
 
 ```bash
-opsx-plan run                 # drive the whole plan
-opsx-run add-user-avatars     # or drive one already-authored change
+$EDITOR openspec/plans/my-plan.md                                          # you write this
+opsx-plan compile openspec/plans/my-plan.md -o openspec/plans/my-plan.toml # markdown -> DAG
+opsx-plan run --dry-run                                                    # inspect the order and gates
+opsx-plan run                                                              # drive it
 ```
+
+## What you write, and what the loop does
+
+You keep the vision. The loop takes the tedium.
+
+| Stage | Who | What happens |
+|---|---|---|
+| the plan | **you** | A markdown document: what should exist, why, in what phases, and what "done" means. Authored anywhere — a chat with a model, an editor, a napkin. |
+| `compile` | opsx-plan | Turns that markdown into a TOML dependency graph, and activates it. |
+| `create` | worker | Authors each OpenSpec change — proposal, tasks, spec deltas — then **stops and waits for your `opsx-plan accept`** before anything is driven. |
+| `implement` | worker | Applies one bounded change. |
+| `review` | worker | Any critical, warning, *or* note finding sends the work back to `implement`. |
+| `archive` | worker | Only after a fresh zero-finding review, and only once the change directory has actually moved into `openspec/changes/archive/`. |
+
+**You never hand-author an OpenSpec change.** OpenSpec is the representation the
+loop works inside, not a format you write. It needs to be initialized in the
+repo once (see Quick start); after that you write markdown plans.
 
 The run below drove 10 changes to completion in one session, unattended:
 
@@ -44,8 +64,12 @@ The run below drove 10 changes to completion in one session, unattended:
 
 ```mermaid
 flowchart LR
-    P[Plan TOML<br/>dependency DAG] --> R{Next ready<br/>change}
-    R --> I[implement]
+    M[plan.md<br/>you write this] --> C[compile]
+    C --> P[TOML<br/>dependency DAG]
+    P --> R{Next ready<br/>change}
+    R --> N[create]
+    N --> G{accept}
+    G --> I[implement]
     I --> V[review]
     V -->|findings| I
     V -->|zero findings| A[archive]
@@ -57,6 +81,11 @@ The orchestrator is deliberately a deterministic script, not an agent. All LLM
 judgment stays inside the implement, review, and archive workers. The
 orchestrator only does ordering, dispatch, verification, retry policy, and
 durable bookkeeping.
+
+`create` is verified against the repository the same way every other stage is:
+the change is not considered authored until its artifacts exist on disk. By
+default (`review_created = true`) the run pauses there for you to read what the
+system decided your plan meant, and continues on `opsx-plan accept`.
 
 Underneath, the per-change controller contract is client-neutral. `opsx-plan`
 sequences the DAG; the controller handles exactly one change at a time:
@@ -96,8 +125,16 @@ Workflow](core/model-efficiency-workflow.md) for that benchmarking loop.
 
 ## Quick start
 
-Requires Python 3.11+ (the orchestrator uses `tomllib`) and git. There is
-nothing to pip install — the orchestrator is stdlib-only.
+Requires Python 3.11+ (the orchestrator uses `tomllib`), git, the
+[OpenSpec](https://github.com/Fission-AI/OpenSpec) CLI, and a supported coding
+client. There is nothing to pip install — the orchestrator is stdlib-only.
+
+> **OpenCode is currently required regardless of which client drives the loop.**
+> `opsx-plan compile` always shells out to `opencode`, and the OpenCode
+> installer is the only one that installs the `opsx-plan` / `opsx-run`
+> executables. You can drive the loop itself with Claude Code or Codex CLI, but
+> you need OpenCode installed to compile a plan and to get the CLI on your PATH.
+> See [docs/adapters.md](docs/adapters.md#choosing-an-adapter).
 
 **1. Clone and configure models.**
 
@@ -119,24 +156,36 @@ bash adapters/opencode/install.sh --global      # or claude-code, or codex-cli
 ```
 
 Use `--project /path/to/repo` instead of `--global` to install into a single
-project.
+project. Install the OpenCode adapter as well as your own client's — see the
+note above. If you install only the Claude Code or Codex CLI adapter, invoke
+the orchestrator from this checkout as `python3 orchestrator/opsx-plan.py ...`
+wherever these docs say `opsx-plan ...`.
 
-> **Note:** the OpenCode installer is the one that installs the orchestrator
-> executables (`opsx-plan` and `opsx-run`) to `~/.local/bin`. If you install
-> only the Claude Code or Codex CLI adapter, the loop works the same, but
-> invoke the orchestrator from this checkout as `python3
-> orchestrator/opsx-plan.py ...` wherever these docs say `opsx-plan ...`.
-> Compiling a markdown plan to TOML also requires OpenCode. See
-> [docs/adapters.md](docs/adapters.md#choosing-an-adapter).
-
-**3. Point it at a project that already uses OpenSpec, and run.**
+**3. Initialize OpenSpec in your project, once.**
 
 ```bash
+cd /path/to/your/repo
+openspec init          # only if the repo has no openspec/ directory yet
+```
+
+This is the one time OpenSpec is something you set up. From here you write
+markdown plans; the loop authors the changes.
+
+**4. Write a plan, compile it, and run.**
+
+```bash
+$EDITOR openspec/plans/my-plan.md
+opsx-plan compile openspec/plans/my-plan.md -o openspec/plans/my-plan.toml
 opsx-plan doctor                      # preflight checks
-opsx-plan use openspec/plans/my-plan.toml
 opsx-plan run --dry-run               # review the DAG and gates first
 opsx-plan run
 ```
+
+`compile` activates the plan it just wrote, so there is no separate `opsx-plan
+use` step — that command is for switching between existing manifests. For
+worked examples of what a plan document looks like, see the real ones in
+[`openspec/plans/archived/`](openspec/plans/archived), each paired with the
+TOML it compiled to.
 
 Always review the DAG with `--dry-run` before an unattended run. For a single
 already-authored change, skip the plan manifest entirely with

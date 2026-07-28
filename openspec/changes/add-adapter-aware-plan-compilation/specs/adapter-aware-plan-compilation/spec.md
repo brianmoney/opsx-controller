@@ -1,0 +1,65 @@
+## ADDED Requirements
+
+### Requirement: Operators select a compile adapter explicitly
+The orchestrator SHALL accept `opsx-plan compile --adapter <adapter>` for each
+known adapter key. When `--adapter` is omitted, it SHALL use `opencode`.
+
+The selected adapter SHALL determine the controller-model resolution, client
+invocation, generated manifest defaults, prompt instructions, extraction
+diagnostics, and compile log messages. The compiler SHALL require the generated
+`[plan].adapter` value to match the selected adapter through its existing
+manifest validation path.
+
+#### Scenario: Claude Code compiles a plan
+- **WHEN** an operator runs `opsx-plan compile --adapter claude-code plan.md -o plan.toml` with a resolvable Claude controller model
+- **THEN** the orchestrator invokes Claude Code, validates a manifest whose adapter is `claude-code`, and writes the output atomically
+
+#### Scenario: Existing OpenCode command remains compatible
+- **WHEN** an operator runs `opsx-plan compile plan.md -o plan.toml` without `--adapter`
+- **THEN** the orchestrator selects `opencode` and retains the existing OpenCode compile behavior
+
+### Requirement: Supported compile clients use adapter-specific controller models
+For each supported compile adapter, the orchestrator SHALL resolve the
+`controller` role using that adapter before spawning its client. It SHALL fail
+before spawn when the role is unresolved or violates the selected adapter's
+model-identifier syntax.
+
+OpenCode compilation SHALL invoke `opencode run --model <model> <prompt>`.
+Claude Code compilation SHALL invoke its non-interactive print command with the
+resolved model and compile prompt. Spawn failures, non-zero exits, and timeouts
+SHALL name the selected client and retain the existing 600-second timeout.
+
+#### Scenario: Claude model does not leak from OpenCode configuration
+- **WHEN** OpenCode and Claude Code have different configured controller models and an operator compiles with `--adapter claude-code`
+- **THEN** the Claude client argv receives only the Claude Code controller model
+
+#### Scenario: Missing selected controller model fails closed
+- **WHEN** the controller role is unresolved for the selected compile adapter
+- **THEN** compilation exits before client invocation with remediation naming that adapter
+
+### Requirement: Unsupported compile adapters fail before invocation
+The compiler SHALL recognize `codex-cli` as an adapter selection but SHALL
+reject it before model resolution or client spawn with an error that states
+Codex CLI compilation is unsupported in the current release.
+
+#### Scenario: Codex compile is rejected explicitly
+- **WHEN** an operator runs `opsx-plan compile --adapter codex-cli plan.md -o plan.toml`
+- **THEN** no Codex process is spawned and the command reports that Codex compilation is out of scope
+
+### Requirement: TOML extraction remains fail closed per client
+The compiler SHALL accept bare TOML or exactly one clean TOML fence for
+OpenCode output. Claude Code output SHALL use the same rule unless the
+implementation documents and tests one stable Claude-specific output envelope.
+
+Any accepted Claude-specific envelope handling SHALL produce exactly one TOML
+candidate before applying the normal extraction rule. The compiler SHALL reject
+empty output, multiple fenced blocks, multiple candidate payloads, prose before
+or after the payload, and malformed TOML.
+
+#### Scenario: Claude output with an approved stable envelope is accepted
+- **WHEN** Claude Code returns the one documented and tested envelope containing one TOML payload
+- **THEN** the compiler extracts that payload and continues with normal TOML and manifest validation
+
+#### Scenario: Ambiguous model output is rejected
+- **WHEN** a supported compile client returns prose surrounding a TOML fence or multiple TOML fences
+- **THEN** compilation fails without writing or replacing the output manifest

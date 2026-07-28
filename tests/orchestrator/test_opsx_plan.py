@@ -6915,7 +6915,7 @@ class CostEstimationTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "estimated",
                          f"expected estimated, got {result}")
-        self.assertEqual(result["pricing_catalog_version"], "1.2.0")
+        self.assertEqual(result["pricing_catalog_version"], "1.3.0")
         # input 100k * 2.50/mtok + output 50k * 10.00/mtok
         # = 0.25 + 0.50 = 0.75
         self.assertEqual(result["estimated_cost"], 0.75)

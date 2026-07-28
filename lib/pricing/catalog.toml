@@ -81,8 +81,8 @@
 # ---------------------------------------------------------------------------
 
 [catalog]
-version = "1.2.0"
-updated = "2026-07-25"
+version = "1.3.0"
+updated = "2026-07-28"
 
 # ---------------------------------------------------------------------------
 # OpenAI entries
@@ -334,3 +334,87 @@ subscription_period = "monthly"
 subscription_price = 10.00
 effective_date = "2025-01-01"
 notes = "GitHub Copilot individual monthly subscription"
+
+# ---------------------------------------------------------------------------
+# OpenAI GPT-5.6 entries
+# ---------------------------------------------------------------------------
+
+[[entries]]
+provider = "openai"
+model_id = "gpt-5.6-luna"
+display_name = "GPT-5.6 Luna"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 3.50
+output_price_per_mtok = 20.00
+cached_input_price_per_mtok = 0.35
+effective_date = "2026-07-28"
+notes = "GPT-5.6 Luna — optimized for creative and conversational tasks"
+
+[[entries]]
+provider = "openai"
+model_id = "gpt-5.6-terra"
+display_name = "GPT-5.6 Terra"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 4.00
+output_price_per_mtok = 24.00
+cached_input_price_per_mtok = 0.40
+effective_date = "2026-07-28"
+notes = "GPT-5.6 Terra — balanced reasoning and generation"
+
+[[entries]]
+provider = "openai"
+model_id = "gpt-5.6-sol"
+display_name = "GPT-5.6 Sol"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 6.00
+output_price_per_mtok = 35.00
+cached_input_price_per_mtok = 0.60
+effective_date = "2026-07-28"
+notes = "GPT-5.6 Sol — flagship reasoning model, highest capability tier"
+
+# ---------------------------------------------------------------------------
+# Anthropic Claude Opus 5 / Fable 5 (updated)
+# ---------------------------------------------------------------------------
+
+[[entries]]
+provider = "anthropic"
+model_id = "claude-opus-5"
+display_name = "Claude Opus 5"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 8.00
+output_price_per_mtok = 40.00
+cached_input_price_per_mtok = 0.80
+effective_date = "2026-07-28"
+notes = "Claude Opus 5 — flagship model, successor to Opus 4.8"
+
+[[entries]]
+provider = "anthropic"
+model_id = "claude-fable-5"
+display_name = "Claude Fable 5"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 12.00
+output_price_per_mtok = 60.00
+cached_input_price_per_mtok = 1.20
+effective_date = "2026-07-28"
+notes = "Mythos-class model; sits above Opus with always-on adaptive thinking (updated pricing)"
+
+# ---------------------------------------------------------------------------
+# Lightning AI / NVIDIA entries
+# ---------------------------------------------------------------------------
+
+[[entries]]
+provider = "lightning"
+model_id = "nvidia-nemotron-3-ultra-550b-a55b"
+display_name = "Nemotron 3 Ultra 550B"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 0.41
+output_price_per_mtok = 1.20
+cached_input_price_per_mtok = 0.041
+effective_date = "2026-07-28"
+notes = "NVIDIA Nemotron 3 Ultra 550B via Lightning AI; MoE architecture with 55B active params"
