@@ -28,39 +28,55 @@
 - [ ] 4.2 Confirm the defaulted output is auto-activated on success exactly as an explicit `-o` path is
 - [ ] 4.3 Extend `discover_template_pairs` to list top-level `openspec/plans/` pairs first and `openspec/plans/archived/` pairs second, without recursing further
 
-## 5. Plan archival command
+## 5. Canonical sample plan
 
-- [ ] 5.1 Add the `archive-plan` subparser and `cmd_archive_plan`, taking a manifest path
-- [ ] 5.2 Refuse targets that are missing, already under `openspec/plans/archived/`, or outside `openspec/plans/`, before moving anything
-- [ ] 5.3 Move the `.toml` and the sibling `.md` when present into `openspec/plans/archived/`, using `git mv` for tracked files (determined via `git ls-files`) and a plain rename otherwise
-- [ ] 5.4 Clear the active-plan pointer when it referenced the archived plan, report that it was cleared, and never repoint it at the archived copy
-- [ ] 5.5 Report the moved paths and that the move still needs committing; do not create a commit
+- [ ] 5.1 Author `orchestrator/samples/sample-plan.md` as a realistic phased implementation plan whose structure exercises phases, dependency edges, and a gate
+- [ ] 5.2 Author `orchestrator/samples/sample-plan.toml` as the manifest that plan compiles to, covering the documented `[plan]` and `[[changes]]` field surface with no keys the loader ignores
+- [ ] 5.3 Add `resolve_sample_plan_pair()` probing `~/.local/lib/opsx-controller/samples` then `<checkout>/orchestrator/samples`, mirroring the `_SCRIPT_ROOT` / `_RUNTIME_ROOTS` pattern at the top of the script, returning `None` when neither exists
+- [ ] 5.4 Include the canonical pair in `build_compile_prompt` ahead of repository pairs, and proceed without the section when resolution returns `None`
+- [ ] 5.5 Omit the repository reference section entirely when no repo pairs exist, replacing the current "No `openspec/plans/*.md` template plan pairs were found" fallback text
+- [ ] 5.6 Add `samples/` deployment to `scripts/install-orchestrator.sh`, replacing it on repeated installs like the runtime libraries
+- [ ] 5.7 Delete `orchestrator/plan.example.toml` and repoint its four references in `orchestrator/README.md`, `docs/opsx-plan-operator-workflow.md`, `skills/opsx-plan-manifest/SKILL.md`, and `skills/opsx-plan-manifest/references/worked-example.md`
+- [ ] 5.8 Revise the "Trusting example manifests" failure mode in `skills/opsx-plan-manifest/SKILL.md`, which becomes obsolete for the sample once it is test-verified
 
-## 6. Tests
+## 6. Plan archival command
 
-- [ ] 6.1 Assert `render_single_change_manifest` round-trips through `load_plan` to a config equal to `build_single_change_config`, with an explicit assertion that `review_created` is `False`
-- [ ] 6.2 Assert a divergent serialization fails the write, leaves no manifest, and removes the temp file
-- [ ] 6.3 Assert `cmd_run_one` writes `.opsx-plan/plans/run-<id>.toml` and leaves the active-plan pointer untouched
-- [ ] 6.4 Assert no manifest is written when the dirty-worktree guard rejects the run
-- [ ] 6.5 Assert `report --for-change` resolves via the manifest, and via the state-file fallback when the manifest is absent
-- [ ] 6.6 Assert `report --for-change` on an unknown change id errors, and that combining `--for-change` with a positional plan is a usage error
-- [ ] 6.7 Assert `archive-plan` moves both files, clears a matching pointer, leaves a non-matching pointer intact, and refuses a double archive
-- [ ] 6.8 Assert `compile` with no `-o` writes and activates `openspec/plans/<stem>.toml`
-- [ ] 6.9 Assert `discover_template_pairs` returns archived pairs and orders non-archived pairs first
-- [ ] 6.10 Run `python -m pytest tests/orchestrator/test_opsx_plan.py -q` and confirm the full suite passes
+- [ ] 6.1 Add the `archive-plan` subparser and `cmd_archive_plan`, taking a manifest path
+- [ ] 6.2 Refuse targets that are missing, already under `openspec/plans/archived/`, or outside `openspec/plans/`, before moving anything
+- [ ] 6.3 Move the `.toml` and the sibling `.md` when present into `openspec/plans/archived/`, using `git mv` for tracked files (determined via `git ls-files`) and a plain rename otherwise
+- [ ] 6.4 Clear the active-plan pointer when it referenced the archived plan, report that it was cleared, and never repoint it at the archived copy
+- [ ] 6.5 Report the moved paths and that the move still needs committing; do not create a commit
 
-## 7. Documentation
+## 7. Tests
 
-- [ ] 7.1 Update the `opsx-run` and report/dashboard sections of `docs/opsx-plan-operator-workflow.md` to cover derived manifests and `--for-change`
-- [ ] 7.2 Document `archive-plan` and the `openspec/plans/` + `openspec/plans/archived/` convention in `orchestrator/README.md`
-- [ ] 7.3 Update `README.md` and `orchestrator/README.md` compile examples to the shorter form without `-o`
-- [ ] 7.4 Leave the `docs/plans/` default for authored markdown in `claude-code-plan-authoring` unchanged, as scoped in the proposal
+- [ ] 7.1 Assert `render_single_change_manifest` round-trips through `load_plan` to a config equal to `build_single_change_config`, with an explicit assertion that `review_created` is `False`
+- [ ] 7.2 Assert a divergent serialization fails the write, leaves no manifest, and removes the temp file
+- [ ] 7.3 Assert `cmd_run_one` writes `.opsx-plan/plans/run-<id>.toml` and leaves the active-plan pointer untouched
+- [ ] 7.4 Assert no manifest is written when the dirty-worktree guard rejects the run
+- [ ] 7.5 Assert `report --for-change` resolves via the manifest, and via the state-file fallback when the manifest is absent
+- [ ] 7.6 Assert `report --for-change` on an unknown change id errors, and that combining `--for-change` with a positional plan is a usage error
+- [ ] 7.7 Assert `archive-plan` moves both files, clears a matching pointer, leaves a non-matching pointer intact, and refuses a double archive
+- [ ] 7.8 Assert `compile` with no `-o` writes and activates `openspec/plans/<stem>.toml`
+- [ ] 7.9 Assert `discover_template_pairs` returns archived pairs and orders non-archived pairs first
+- [ ] 7.10 Assert the shipped `sample-plan.toml` loads through `load_plan` and yields the changes, dependency edges, and gates `sample-plan.md` describes
+- [ ] 7.11 Assert the sample exercises the documented `[plan]` and `[[changes]]` field surface and carries no keys the loader ignores, so loader drift fails the suite
+- [ ] 7.12 Assert `build_compile_prompt` includes the canonical pair in a repository with no plans, and emits no "no pairs found" text
+- [ ] 7.13 Assert the canonical pair is ordered ahead of repository pairs, and that an unresolvable sample degrades without raising
+- [ ] 7.14 Run `python -m pytest tests/orchestrator/test_opsx_plan.py -q` and confirm the full suite passes
 
-## 8. Verification
+## 8. Documentation
 
-- [ ] 8.1 Re-run `scripts/install-orchestrator.sh` so `opsx-plan`/`opsx-run` execute the updated source, and confirm no tracked `.pyc` files shadow it
-- [ ] 8.2 Run `opsx-run <change-id>` end to end, then confirm the derived manifest exists, the active-plan pointer is unchanged, and `opsx-plan report` by path and by `--for-change` agree
-- [ ] 8.3 Generate a dashboard with `opsx-plan dashboard --for-change <change-id>` and confirm the HTML renders
-- [ ] 8.4 Exercise the fallback path against an existing pre-change run namespace such as `run-add-adapter-aware-plan-compilation`, whose telemetry is already on disk with no manifest
-- [ ] 8.5 Compile a plan with no `-o`, then archive the pair with `archive-plan` and confirm the pointer is cleared
-- [ ] 8.6 Reset this repository's stale active-plan pointer, which currently references `openspec/plans/plan-fix-claude.toml` after that file moved to `archived/`
+- [ ] 8.1 Update the `opsx-run` and report/dashboard sections of `docs/opsx-plan-operator-workflow.md` to cover derived manifests and `--for-change`
+- [ ] 8.2 Document `archive-plan` and the `openspec/plans/` + `openspec/plans/archived/` convention in `orchestrator/README.md`
+- [ ] 8.3 Update `README.md` and `orchestrator/README.md` compile examples to the shorter form without `-o`
+- [ ] 8.4 Leave the `docs/plans/` default for authored markdown in `claude-code-plan-authoring` unchanged, as scoped in the proposal
+
+## 9. Verification
+
+- [ ] 9.1 Re-run `scripts/install-orchestrator.sh` so `opsx-plan`/`opsx-run` execute the updated source, confirm no tracked `.pyc` files shadow it, and confirm `~/.local/lib/opsx-controller/samples/` now exists
+- [ ] 9.2 Build a compile prompt from an installed run against a repository with no plans and confirm the canonical sample is present and the "no pairs found" text is gone
+- [ ] 9.3 Run `opsx-run <change-id>` end to end, then confirm the derived manifest exists, the active-plan pointer is unchanged, and `opsx-plan report` by path and by `--for-change` agree
+- [ ] 9.4 Generate a dashboard with `opsx-plan dashboard --for-change <change-id>` and confirm the HTML renders
+- [ ] 9.5 Exercise the fallback path against an existing pre-change run namespace such as `run-add-adapter-aware-plan-compilation`, whose telemetry is already on disk with no manifest
+- [ ] 9.6 Compile a plan with no `-o`, then archive the pair with `archive-plan` and confirm the pointer is cleared
+- [ ] 9.7 Reset this repository's stale active-plan pointer, which currently references `openspec/plans/plan-fix-claude.toml` after that file moved to `archived/`

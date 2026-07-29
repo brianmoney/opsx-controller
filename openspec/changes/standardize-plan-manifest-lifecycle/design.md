@@ -17,6 +17,7 @@ Constraints that shape the design:
 - Make `report` and `dashboard` work for single-change runs without the operator hand-constructing anything.
 - Guarantee the emitted manifest describes the configuration that actually ran, permanently — not just at implementation time.
 - Give `.toml` manifests one canonical home and one supported way to retire.
+- Make compile-prompt example quality independent of the target repository's state.
 - Keep runs that predate this change reportable.
 
 **Non-Goals:**
@@ -61,9 +62,27 @@ A separate flag rather than overloading the positional `plan` argument: one argu
 
 The command uses `git mv` for tracked files, guarded by `git ls-files`, and a plain rename for untracked ones; it does not commit.
 
-### Template discovery extends one level into `archived/`
+### The compile prompt gets a shipped canonical example, not just wider discovery
 
-`discover_template_pairs` globs `openspec/plans/*.md` non-recursively. In this repository that returns nothing, because the only pairs live in `archived/` — so the compile prompt falls back to "no template pair was found" while the README points readers at those very pairs as the canonical examples. Listing top-level pairs first and then `archived/` fixes the contradiction while keeping active plans as the primary examples. Deliberately one level, not `rglob`, so an unrelated nested directory can't start feeding the compile prompt.
+The original framing of this problem — "make `discover_template_pairs` also look in `archived/`" — treats a symptom. The underlying defect is that the compile prompt's worked examples come *entirely* from whatever happens to be in the target repository, so prompt quality is a function of incidental repo state. Archiving completed plans, which is good hygiene, silently removes the examples; measured here, the prompt drops from 49,604 to 5,568 characters, and the only signal is a quiet sentence saying no pairs were found.
+
+So the fix is a canonical `sample-plan.md` + `sample-plan.toml` pair that ships with the orchestrator, exercises the full documented manifest surface, and is **always** in the prompt. Repository-local plans stay, but demoted to supplementary real-world context listed after the canonical sample, and now include `archived/`. When a repository has no plans of its own, that section is omitted entirely rather than announcing its own absence — a "none found" note is prompt noise once a guaranteed example exists.
+
+The pair matters more than a lone manifest: the model's actual task is transforming `.md` into `.toml`, which a `.toml` alone cannot demonstrate.
+
+*Alternative considered:* canonical-only, dropping repo discovery. Fully deterministic and much cheaper, but discards repo-specific conventions the model could usefully imitate. Rejected as over-correction — repo pairs are valuable when they exist, just not load-bearing.
+
+### The sample ships as installed files, resolved like the runtime libraries
+
+`opsx-plan` runs from `~/.local/bin` against arbitrary repositories, so a canonical sample cannot be looked up in the target repo. `scripts/install-orchestrator.sh` deploys `orchestrator/samples/` to `~/.local/lib/opsx-controller/samples/`, mirroring how it already deploys `lib/metrics`, `lib/pricing`, and `lib/models`.
+
+Resolution reuses the established probe pattern at the top of the script, which resolves `_SCRIPT_ROOT` from `__file__` and tries the installed root before the checkout root. The sample resolver tries `~/.local/lib/opsx-controller/samples` then `<repo>/orchestrator/samples`, and returns `None` if neither exists — in which case the prompt proceeds without the canonical section rather than failing the compile. A missing sample degrades prompt quality; it must never break a compile.
+
+*Alternative considered:* embedding the sample as string constants in `opsx-plan.py`. Immune to install drift and needs no installer change, but buries a maintained example inside a 7,400-line script where it cannot be read, diffed, or validated as a real plan document. Files keep the example reviewable and let the test suite load the actual artifact operators are pointed at.
+
+### `orchestrator/plan.example.toml` is removed rather than kept alongside
+
+It is a 165-line, 20-change snapshot of an unrelated project's plan (`name = "kf-hardening"`), has no paired markdown, is referenced by no code path, and the project's own manifest skill lists trusting it as a known failure mode because it "contain[s] keys the current loader ignores." Keeping it would mean maintaining two examples with opposite trust levels and no way for a reader to tell which is authoritative. Its four documentation references repoint at the sample pair, and the skill's failure-mode warning is revised, since the replacement is validated by a test that loads it through `load_plan`.
 
 ## Risks / Trade-offs
 
@@ -73,6 +92,9 @@ The command uses `git mv` for tracked files, guarded by `git ls-files`, and a pl
 - **`compile` defaulting its output could surprise scripts that relied on `-o` being mandatory.** → `-o` continues to work unchanged; only omitting it is new, and omitting it previously was an argparse error, so no existing invocation changes meaning.
 - **`archive-plan` moving tracked files leaves the repository dirty.** → The command reports what moved and that it needs committing; it does not commit on the operator's behalf, matching how the rest of the CLI treats git state.
 - **Edits do not take effect until reinstalled.** → `opsx-plan`/`opsx-run` run from installed copies under `~/.local/bin`; verification starts by re-running `scripts/install-orchestrator.sh`.
+- **The canonical sample can drift from the loader, exactly as `plan.example.toml` did.** → A test loads the shipped sample through `load_plan` and asserts it exercises the documented `[plan]` and `[[changes]]` field surface, so drift fails the suite instead of silently teaching the compile model stale keys. This is the single most important guard in this change: without it the new sample becomes the old one.
+- **An operator on an older install gets no canonical sample until they reinstall.** → Resolution returns `None` and the prompt omits the section, which is exactly today's behavior; no compile breaks. `doctor` already flags a stale installed executable.
+- **Always-on sample plus repo pairs makes prompts larger.** → The canonical sample is sized deliberately for coverage rather than realism, and repo pairs were already unbounded before this change; if prompt size becomes a problem the repo section is the part to cap, not the sample.
 
 ## Migration Plan
 

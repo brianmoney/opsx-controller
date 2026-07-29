@@ -35,26 +35,38 @@ The runner SHALL write the derived manifest only after its input guards have pas
 The compile command SHALL provide the selected client with a self-contained
 prompt that includes the source markdown plan, the expected TOML manifest
 shape, dependency and phase interpretation rules, current selected-adapter
-defaults, and representative markdown/TOML template plan references when
-available in the repository.
+defaults, a canonical markdown/TOML sample plan pair, and representative
+repository plan references when available in the repository.
 
-Template plan discovery SHALL consider pairs directly under `openspec/plans/` and pairs under `openspec/plans/archived/`, preferring non-archived pairs, so that retiring every active plan does not leave the prompt without reference material. Discovery SHALL NOT descend into any other nested directory.
+The canonical sample pair SHALL be included in every compile prompt and SHALL be listed before any repository plan references, so that prompt example quality does not depend on the contents of the repository being compiled against.
 
-Derived manifests under `.opsx-plan/plans/` SHALL NOT be offered as template plan references.
+Repository plan discovery SHALL consider pairs directly under `openspec/plans/` and pairs under `openspec/plans/archived/`, preferring non-archived pairs. Discovery SHALL NOT descend into any other nested directory, and derived manifests under `.opsx-plan/plans/` SHALL NOT be offered as references.
+
+When a repository contains no plan pairs of its own, the prompt SHALL omit the repository reference section entirely rather than stating that no pairs were found.
+
+If the canonical sample pair cannot be located, the compile command SHALL proceed without it rather than failing, and SHALL NOT substitute a claim that no examples exist.
 
 The prompt SHALL instruct the model to emit only the compiled TOML manifest and not to include prose outside the TOML payload.
 
-#### Scenario: Prompt contains template plans and schema guidance
+#### Scenario: Prompt contains the canonical sample and schema guidance
 - **WHEN** `opsx-plan compile` builds a prompt for a source markdown plan
-- **THEN** the prompt includes the source plan content, manifest field guidance for `[plan]` and `[[changes]]`, dependency-resolution guidance, and at least one available repository template plan pair or an explicit note that no template pair was found
+- **THEN** the prompt includes the source plan content, manifest field guidance for `[plan]` and `[[changes]]`, dependency-resolution guidance, and the canonical sample plan markdown paired with its compiled TOML
 
-#### Scenario: Archived pairs remain available as references
+#### Scenario: Canonical sample is present regardless of repository contents
+- **WHEN** `opsx-plan compile` builds a prompt in a repository that contains no plan pairs at all
+- **THEN** the canonical sample pair is still included, and the prompt contains no statement that example plans were unavailable
+
+#### Scenario: Repository pairs supplement the canonical sample
+- **WHEN** `opsx-plan compile` builds a prompt in a repository containing pairs under `openspec/plans/` and under `openspec/plans/archived/`
+- **THEN** the canonical sample is listed first, followed by the non-archived repository pairs, followed by the archived pairs
+
+#### Scenario: Archived-only repository still contributes real-world context
 - **WHEN** `opsx-plan compile` builds a prompt in a repository whose only plan pairs live under `openspec/plans/archived/`
-- **THEN** those archived pairs are offered as template plan references rather than reporting that no template pair was found
+- **THEN** those archived pairs are included as repository references after the canonical sample
 
-#### Scenario: Active pairs are preferred over archived pairs
-- **WHEN** `opsx-plan compile` builds a prompt in a repository containing pairs both directly under `openspec/plans/` and under `openspec/plans/archived/`
-- **THEN** the non-archived pairs are listed ahead of the archived pairs
+#### Scenario: Missing canonical sample degrades rather than fails
+- **WHEN** `opsx-plan compile` builds a prompt and the canonical sample pair cannot be resolved from the installed runtime or the repository checkout
+- **THEN** the command builds the prompt without the canonical section and the compile proceeds
 
 #### Scenario: Prompt forbids prose output
 - **WHEN** the prompt is sent to the selected compile client

@@ -58,6 +58,44 @@ The orchestrator SHALL regenerate the derived manifest on every single-change ru
 - **WHEN** an operator runs the same change id a second time after adapter defaults or resolved models have changed
 - **THEN** the derived manifest is rewritten to reflect the configuration of the current run without an overwrite prompt or error
 
+### Requirement: A canonical sample plan pair ships with the orchestrator
+
+The orchestrator SHALL ship a canonical sample plan as a markdown source and its compiled TOML manifest, kept together as a pair, so that the transformation from an authored plan document to a manifest can be demonstrated rather than only described.
+
+The sample SHALL exercise the documented `[plan]` and `[[changes]]` field surface, including phase assignment, dependency edges, and gating, so it serves as a complete reference rather than a minimal one.
+
+The sample SHALL be deployed with the orchestrator runtime and SHALL be resolvable when `opsx-plan` executes from its installed location against an unrelated repository. Resolution SHALL prefer the installed runtime location and SHALL fall back to the repository checkout.
+
+The repository SHALL NOT ship a second, competing example manifest presented as authoritative.
+
+#### Scenario: Sample is resolvable from an installed run
+- **WHEN** `opsx-plan` executes from its installed location with a working directory in an unrelated repository that contains no plans
+- **THEN** the canonical sample pair is resolved from the installed runtime location
+
+#### Scenario: Sample is resolvable from a repository checkout
+- **WHEN** `opsx-plan` executes directly from a repository checkout that has not been installed
+- **THEN** the canonical sample pair is resolved from the checkout
+
+#### Scenario: Missing sample is not fatal
+- **WHEN** neither the installed runtime location nor a repository checkout provides the sample pair
+- **THEN** commands that would include the sample continue without it instead of failing
+
+### Requirement: The canonical sample is verified against the plan loader
+
+The canonical sample manifest SHALL load successfully through the same plan-loading path used by `opsx-plan status` and `opsx-plan run`, and this SHALL be enforced by the test suite.
+
+The test suite SHALL additionally assert that the sample exercises the documented field surface, so that a field added to or changed in the loader cannot leave the shipped sample silently stale.
+
+The sample SHALL NOT contain keys the current loader ignores.
+
+#### Scenario: Shipped sample loads
+- **WHEN** the test suite loads the canonical sample manifest through the plan loader
+- **THEN** it loads without error and yields the changes, dependency edges, and gates the sample markdown describes
+
+#### Scenario: Loader drift fails the suite
+- **WHEN** the plan loader changes such that the canonical sample no longer covers the documented field surface, or the sample carries a key the loader ignores
+- **THEN** the test suite fails rather than shipping a stale example
+
 ### Requirement: Completed plans retire to an archived subdirectory
 
 Completed authored plans SHALL retire to `openspec/plans/archived/`, retaining both the markdown source and the compiled manifest as a pair.

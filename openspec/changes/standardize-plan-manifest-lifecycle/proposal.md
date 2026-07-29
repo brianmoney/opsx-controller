@@ -4,6 +4,8 @@
 
 Separately, compiled `.toml` plans have no enforced home. `compile` requires `-o` with no default, so four different target directories appear across the docs, and completed plans reach `openspec/plans/archived/` only by manual `git mv` — a flow that has already left this repository with an active-plan pointer aimed at a file that was moved out from under it.
 
+Worse, the compile prompt has no guaranteed worked example. `discover_template_pairs` scans only the top level of the *target* repository's `openspec/plans/`, so example quality depends on incidental repo state. In this repository all four plans have been archived into `openspec/plans/archived/`, the scan returns nothing, and every compile prompt now carries the literal text "No `openspec/plans/*.md` template plan pairs were found" — a measured drop from 49,604 to 5,568 characters, about 89% of the prompt. The failure is self-inflicted and silent: tidily archiving completed plans is precisely what removes the examples, and the fallback is a quiet sentence rather than a warning. The repository does ship `orchestrator/plan.example.toml`, but nothing in `opsx-plan.py` references it, it has no paired markdown so it cannot demonstrate the `.md` → `.toml` transformation at all, it is a 20-change snapshot of an unrelated project's plan, and the project's own manifest skill warns that it "contain[s] keys the current loader ignores."
+
 ## What Changes
 
 - `run-one` writes a durable, self-verified single-change manifest to `.opsx-plan/plans/run-<change-id>.toml` before dispatching workers, making `report` and `dashboard` work for single-change runs.
@@ -11,26 +13,32 @@ Separately, compiled `.toml` plans have no enforced home. `compile` requires `-o
 - `run-one` does **not** become the active plan; it prints the `report`/`dashboard` commands instead, so a bare `opsx-plan run`/`status` is never silently repointed at a single-change manifest.
 - `report` and `dashboard` gain `--for-change <id>`, resolving the generated manifest when present and falling back to the `run-<id>` plan name when it is absent (so runs predating this change stay reportable).
 - `compile` gains a default output of `openspec/plans/<source-stem>.toml`, making `-o` optional and establishing one canonical home for authored plan manifests.
-- Repository template-plan discovery also looks in `openspec/plans/archived/`, so the archived pairs the README advertises as the canonical examples actually reach the compile prompt.
+- A canonical `sample-plan.md` + `sample-plan.toml` pair, exercising the full documented manifest surface, ships with the orchestrator and is always included in the compile prompt — so prompt quality no longer depends on what happens to be sitting in the target repository.
+- The canonical sample is installed alongside the runtime libraries and resolved from the installed location with a repository-checkout fallback, because `opsx-plan` runs from `~/.local/bin` against arbitrary repositories.
+- `orchestrator/plan.example.toml` is **removed** and its four documentation references repoint at the new sample pair, replacing an unvalidated snapshot of an unrelated project's plan with a maintained, test-verified example.
+- Repository-local plans remain in the prompt as supplementary real-world context, listed after the canonical sample and now including `openspec/plans/archived/`; when a repository has no plans of its own, that section is omitted rather than announcing its own absence.
 - New `opsx-plan archive-plan <plan.toml>` moves a completed `.md`+`.toml` pair into `openspec/plans/archived/` and clears the active-plan pointer when it referenced the moved plan.
 
-Not breaking: `-o` remains accepted, existing manifests and plan paths keep working, and no existing command changes its default behavior.
+Not breaking: `-o` remains accepted, existing manifests and plan paths keep working, and no existing command changes its default behavior. Removing `orchestrator/plan.example.toml` affects documentation references only; no code path reads it.
 
 ## Capabilities
 
 ### New Capabilities
-- `plan-manifest-lifecycle`: where plan `.toml` manifests come from, where they live, and how they retire — the canonical directory for authored manifests, the derived-manifest location for single-change runs, and the supported archival path for completed plans.
+- `plan-manifest-lifecycle`: where plan `.toml` manifests come from, where they live, and how they retire — the canonical directory for authored manifests, the derived-manifest location for single-change runs, the canonical shipped sample pair, and the supported archival path for completed plans.
 
 ### Modified Capabilities
-- `plan-driven-opencode-execution`: the single-change runner still requires no manifest as *input*, but now emits one as a durable byproduct; template-plan discovery for compile prompts extends to archived pairs.
+- `plan-driven-opencode-execution`: the single-change runner still requires no manifest as *input*, but now emits one as a durable byproduct; the compile prompt always carries a shipped canonical example, with repository-local plans (including archived ones) as supplementary context.
 - `plan-operator-cli`: `compile` accepts an omitted `-o` and activates the defaulted output; new `archive-plan` subcommand; the pointer-clearing behavior is defined as an explicit reported operator action, distinct from the existing prohibition on silently self-healing a stale pointer at resolution time.
 - `plan-run-observability`: `report` and `dashboard` can target a single-change run by change id rather than by manifest path.
+- `shared-orchestrator-installation`: the shared installer additionally deploys the canonical sample pair, so every adapter's install yields the same prompt quality.
 
 ## Impact
 
-- `orchestrator/opsx-plan.py`: `build_single_change_config`, `cmd_run_one`, `cmd_report`, `cmd_dashboard`, `cmd_compile`, `discover_template_pairs`, `write_active_plan`, argparse wiring, plus a new manifest serializer and `cmd_archive_plan`. The `opsx-run` argv[0] dispatch path needs no change.
-- `tests/orchestrator/test_opsx_plan.py`: new coverage for serialization round-trip, manifest emission, `--for-change`, `archive-plan`, default compile output, and archived-pair discovery.
-- Docs: `README.md`, `orchestrator/README.md`, `docs/opsx-plan-operator-workflow.md`.
+- `orchestrator/opsx-plan.py`: `build_single_change_config`, `cmd_run_one`, `cmd_report`, `cmd_dashboard`, `cmd_compile`, `build_compile_prompt`, `discover_template_pairs`, `write_active_plan`, argparse wiring, plus a new manifest serializer, sample resolution, and `cmd_archive_plan`. The `opsx-run` argv[0] dispatch path needs no change.
+- New `orchestrator/samples/sample-plan.md` and `orchestrator/samples/sample-plan.toml`; removal of `orchestrator/plan.example.toml`.
+- `scripts/install-orchestrator.sh`: deploy the sample directory to `~/.local/lib/opsx-controller/samples`.
+- `tests/orchestrator/test_opsx_plan.py`: new coverage for serialization round-trip, manifest emission, `--for-change`, `archive-plan`, default compile output, repo-pair discovery, and a test asserting the shipped sample loads through `load_plan` and covers the documented field surface.
+- Docs: `README.md`, `orchestrator/README.md`, `docs/opsx-plan-operator-workflow.md`, `skills/opsx-plan-manifest/SKILL.md` and its `references/worked-example.md` (the four `plan.example.toml` references, including the failure-mode warning that becomes obsolete once the sample is test-verified).
 - No new dependencies; the manifest writer is hand-rolled because `tomllib` is read-only and the project is stdlib-only.
 - Runtime effect requires re-running `scripts/install-orchestrator.sh`, since `opsx-plan`/`opsx-run` execute from installed copies.
 - Out of scope: the `docs/plans/` default for *authored* markdown in `claude-code-plan-authoring` stays as is; pre-compile `.md` location is unconstrained.
