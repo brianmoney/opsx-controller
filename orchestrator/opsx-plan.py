@@ -2633,7 +2633,14 @@ def apply_review_result(repo: Path, cfg: dict, state: dict, cid: str, payload: d
             "finding_counts": counts,
         },
     )
-    passed = verdict == "pass" and counts == {"critical": 0, "warning": 0, "note": 0}
+    skip_warning = cfg.get("skip_warning", False)
+    skip_suggestion = cfg.get("skip_suggestion", False) or skip_warning
+    if skip_warning:
+        passed = verdict == "pass" and counts.get("critical", 0) == 0
+    elif skip_suggestion:
+        passed = verdict == "pass" and counts.get("critical", 0) == 0 and counts.get("warning", 0) == 0
+    else:
+        passed = verdict == "pass" and counts == {"critical": 0, "warning": 0, "note": 0}
     if passed:
         r["latest_fix_prompt"] = ""
         r["last_result"] = "review_passed"
@@ -4724,6 +4731,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     plan_src = resolve_plan(repo, args.plan)
     plan_abs = _resolve_plan_path(repo, plan_src)
     cfg = load_plan(plan_abs, repo=repo)
+    cfg["skip_warning"] = getattr(args, "skip_warning", False)
+    cfg["skip_suggestion"] = getattr(args, "skip_suggestion", False)
     try:
         apply_model_env(cfg)
     except PlanError as exc:
@@ -5285,6 +5294,8 @@ def cmd_run_one(args: argparse.Namespace) -> int:
         return 2
 
     cfg = build_single_change_config(repo, change_id)
+    cfg["skip_warning"] = getattr(args, "skip_warning", False)
+    cfg["skip_suggestion"] = getattr(args, "skip_suggestion", False)
     state = load_state(repo, cfg["name"])
     signal.signal(signal.SIGINT, handle_sigint)
 
@@ -7196,6 +7207,12 @@ def main() -> int:
     p_run.add_argument("--no-pr", action="store_true",
                        help="skip PR-delivery preflight and completion-time "
                             "PR creation for this invocation only")
+    p_run.add_argument("--skip-warning", action="store_true",
+                       help="treat review warnings and suggestions as non-blocking; "
+                            "only critical findings prevent archive")
+    p_run.add_argument("--skip-suggestion", action="store_true",
+                       help="treat review suggestions as non-blocking; "
+                            "critical and warning findings still prevent archive")
     p_run.set_defaults(fn=cmd_run)
 
     p_status = sub.add_parser("status", help="reconcile and show plan status")
@@ -7311,6 +7328,12 @@ def main() -> int:
     )
     p_run_one.add_argument("change", help="change id")
     p_run_one.add_argument("--budget-usd", type=float, default=0)
+    p_run_one.add_argument("--skip-warning", action="store_true",
+                           help="treat review warnings and suggestions as non-blocking; "
+                                "only critical findings prevent archive")
+    p_run_one.add_argument("--skip-suggestion", action="store_true",
+                           help="treat review suggestions as non-blocking; "
+                                "critical and warning findings still prevent archive")
     p_run_one.set_defaults(fn=cmd_run_one)
 
     p_doctor = sub.add_parser(
