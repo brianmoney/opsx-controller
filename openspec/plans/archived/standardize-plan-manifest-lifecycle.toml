@@ -1,0 +1,7 @@
+[plan]
+name = "standardize-plan-manifest-lifecycle"
+adapter = "opencode"
+
+[[changes]]
+id = "standardize-plan-manifest-lifecycle"
+phase = 1
