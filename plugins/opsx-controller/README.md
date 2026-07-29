@@ -29,8 +29,9 @@ Compilation note:
 
 - `/opsx-controller:opsx-plan` authors the markdown plan document in Claude
   Code.
-- `opsx-plan compile` still depends on an OpenCode-configured environment and
-  `OPSX_CONTROLLER_MODEL`.
+- `opsx-plan compile --adapter claude-code` compiles the markdown into a TOML
+  manifest using Claude Code.  This requires a `controller` model resolved for
+  the `claude-code` adapter.
 - If those prerequisites are unavailable, the skill must report that the
   document was authored but not compiled.
 

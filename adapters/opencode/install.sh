@@ -73,20 +73,7 @@ install_plugins() {
 }
 
 install_orchestrator() {
-  local dest_dir="$HOME/.local/bin"
-  local runtime_dir="$HOME/.local/lib/opsx-controller"
-  mkdir -p "$dest_dir"
-  rm -rf "$runtime_dir/lib"
-  mkdir -p "$runtime_dir/lib"
-  cp -R "$ROOT_DIR/lib/metrics" "$runtime_dir/lib/"
-  cp -R "$ROOT_DIR/lib/pricing" "$runtime_dir/lib/"
-  cp -R "$ROOT_DIR/lib/models" "$runtime_dir/lib/"
-  install -m 0755 \
-    "$ROOT_DIR/orchestrator/opsx-plan.py" \
-    "$dest_dir/opsx-plan"
-  install -m 0755 \
-    "$ROOT_DIR/orchestrator/opsx-plan.py" \
-    "$dest_dir/opsx-run"
+  bash "$ROOT_DIR/scripts/install-orchestrator.sh" "$ROOT_DIR"
 }
 
 ensure_project_gitignore() {

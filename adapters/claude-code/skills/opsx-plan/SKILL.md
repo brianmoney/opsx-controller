@@ -1,5 +1,5 @@
 ---
-description: Author one phased OpenSpec implementation-plan markdown document in Claude Code and only claim compilation when the OpenCode-backed compiler self-check actually runs.
+description: Author one phased OpenSpec implementation-plan markdown document in Claude Code and only claim compilation when the Claude Code-backed compiler self-check actually runs.
 argument-hint: [planning-request]
 disable-model-invocation: true
 ---
@@ -28,9 +28,9 @@ Workflow:
 
 The authoring result must distinguish between:
 
-- markdown authored and OpenCode-backed compile self-check passed
+- markdown authored and Claude Code-backed compile self-check passed
 - markdown authored but compile self-check unavailable because `opsx-plan`
-  and/or `OPSX_CONTROLLER_MODEL` was not configured
+  and/or a Claude Code controller model was not configured
 
 Never present markdown authoring as successful TOML compilation unless the
 compile self-check actually ran and succeeded.

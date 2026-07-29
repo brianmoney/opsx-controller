@@ -15,25 +15,28 @@ model, so the core controller semantics stay identical.
 ## Choosing an adapter
 
 All three adapters drive the same loop. They differ in what gets installed and
-in two capabilities that currently live only in the OpenCode path:
+in the plan compilation and authoring capabilities that vary by adapter:
 
 | | OpenCode | Claude Code | Codex CLI |
 |---|---|---|---|
 | implement / review / archive loop | yes | yes | yes |
-| `opsx-plan` + `opsx-run` on `PATH` | installed to `~/.local/bin` | not installed | not installed |
-| `opsx-plan compile` (markdown plan → TOML) | yes | needs OpenCode | needs OpenCode |
+| `opsx-plan` + `opsx-run` on `PATH` | installed to `~/.local/bin` | installed to `~/.local/bin` | installed to `~/.local/bin` |
+| `opsx-plan compile` (markdown plan → TOML) | yes (OpenCode controller model) | yes (Claude Code controller model) | needs OpenCode or Claude Code |
 | plan authoring skill (`/opsx-plan`) | yes | yes | — |
 
-If you install only the Claude Code or Codex CLI adapter, the orchestrator
-still works — invoke it from the repo checkout as
-`python3 orchestrator/opsx-plan.py ...` instead of `opsx-plan ...`. Installing
-the OpenCode adapter is what puts the `opsx-plan` and `opsx-run` executables
-on your `PATH`.
+All three adapters install `opsx-plan` and `opsx-run` to `~/.local/bin/`
+via the shared installer helper. The Codex CLI adapter does not support
+plan compilation (`opsx-plan compile`) but its global installer still
+deploys the orchestrator executables — use `opsx-plan` or
+`opsx-run` from `PATH` as you would with any other adapter.
 
-`opsx-plan compile` always requires an OpenCode-configured environment plus a
-`controller` model resolved for the `opencode` adapter. A Claude-only or
-Codex-only installation can author a markdown plan but cannot claim TOML
-compilation succeeded until that OpenCode-backed compile step runs.
+`opsx-plan compile` supports OpenCode (the default) and Claude Code (via
+`--adapter claude-code`). Each requires a `controller` model resolved for
+the corresponding adapter — the compiler rejects invalid model syntax
+before writing any output. Plan compilation is not supported through the
+Codex CLI adapter; use `--adapter opencode` or `--adapter claude-code`
+instead. A markdown plan authored under any adapter can be compiled as
+long as an appropriate `controller` model is resolved.
 
 ## Model configuration
 
@@ -167,7 +170,8 @@ Usage from the host project root:
 ```
 
 `/opsx-plan` authors the markdown implementation plan. Compiling it to TOML
-still requires OpenCode — see [Choosing an adapter](#choosing-an-adapter).
+works with `opsx-plan compile --adapter claude-code` (requires a `controller`
+model resolved for `claude-code`). See [Choosing an adapter](#choosing-an-adapter).
 
 To advertise the controller path in the host repo's instructions, merge
 `adapters/claude-code/templates/project/CLAUDE.snippet.md` into its `CLAUDE.md`.
@@ -239,8 +243,9 @@ Why use the plugin package:
 - ready to evolve toward marketplace distribution
 
 As with the Claude Code adapter, `/opsx-controller:opsx-plan` authors the
-markdown plan document; `opsx-plan compile` still depends on OpenCode, so the
-plugin reports when compilation was unavailable rather than implying success.
+markdown plan document; `opsx-plan compile` supports both `--adapter opencode`
+and `--adapter claude-code`. The plugin reports when compilation was
+unavailable rather than implying success.
 
 ### Codex plugin
 

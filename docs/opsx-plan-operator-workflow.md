@@ -14,13 +14,18 @@ that opens a pull request.
 ## Quick Start
 
 ```bash
-# 1. Author a plan document (markdown), then compile to TOML
+# 1. Author a plan document (markdown), then compile to TOML.
+#    Defaults to OpenCode; use --adapter to select another client.
 opsx-plan compile docs/my-plan.md -o plan.toml
+
+# For Claude Code users:
+opsx-plan compile --adapter claude-code docs/my-plan.md -o plan.toml
 
 # 2. Activate the plan (subsequent commands resolve it automatically)
 opsx-plan use plan.toml
 
-# 3. Run preflight checks
+# 3. Run preflight checks (or opsx-plan doctor --adapter claude-code for
+#    plan-less preflight against a specific adapter)
 opsx-plan doctor
 
 # 4. Dry-run to review the DAG and gate config
@@ -136,6 +141,9 @@ an unattended run to catch configuration problems early.
 
 ```bash
 opsx-plan doctor
+
+# For plan-less preflight, specify the adapter explicitly:
+opsx-plan doctor --adapter claude-code
 ```
 
 ### Checks performed
@@ -143,10 +151,10 @@ opsx-plan doctor
 | Check | What it validates |
 |---|---|
 | Installed orchestrator matches repo copy | SHA-256 comparison of `~/.local/bin/opsx-plan` against `orchestrator/opsx-plan.py` |
-| Model roles resolve for the target adapter | All four roles (`controller`, `implementer`, `reviewer`, `archiver`) resolve for the resolved plan's adapter via `models.toml`/ambient environment; reports each resolved model with its source |
+| Model roles resolve for the target adapter | All four roles (`controller`, `implementer`, `reviewer`, `archiver`) resolve for the resolved plan's adapter via `models.toml`/ambient environment; reports each resolved model with its source. When no plan is active, `--adapter` selects the adapter to resolve against (defaults to `opencode`). |
 | Resolved model identifiers match adapter syntax | Flags a provider-prefixed identifier under `claude-code` or a bare identifier under `opencode`, before it fails at dispatch |
 | `openspec` on PATH | OpenSpec CLI is installed and reachable |
-| Adapter client on PATH | e.g. `opencode`, `claude`, or `codex` |
+| Adapter client on PATH | e.g. `opencode`, `claude`, or `codex`. When `--adapter` is set without a plan, validates the specified adapter's client. |
 | No tracked bytecode | No `__pycache__/` or `.pyc` files tracked in git |
 | Tracked tree is clean | No uncommitted modifications to tracked files |
 | Plan loads successfully | The resolved plan TOML is valid and parses without errors |
@@ -324,9 +332,9 @@ catch this whole class of drift at `doctor` time rather than after a run.
 ## Compiling a Plan
 
 `opsx-plan compile` converts a markdown implementation plan into a runnable
-TOML manifest. It invokes OpenCode with the `controller` role resolved for
-the `opencode` adapter specifically — regardless of which adapter the active
-plan uses, since compile always shells out to the `opencode` binary.
+TOML manifest. It invokes the selected compile client (default `opencode`,
+also supports `--adapter claude-code`) with the `controller` role resolved
+for that adapter. The `codex-cli` adapter is not supported for compilation.
 
 ```bash
 # Required: a controller model resolved for the opencode adapter
@@ -342,9 +350,10 @@ opsx-plan compile docs/my-plan.md -o plan.toml --force
 ### Compile behavior
 
 - Refuses to overwrite an existing output file unless `--force` is passed.
-- Fails before invoking OpenCode if the `controller` role does not resolve
-  for the `opencode` adapter (via `models.toml` or the ambient
-  `OPSX_CONTROLLER_MODEL` fallback).
+- Fails before invoking the compile client if the `controller` role does not
+  resolve for the selected adapter (via `models.toml` or the ambient
+  `OPSX_CONTROLLER_MODEL` fallback), or if the resolved model identifier
+  violates the adapter's model syntax rules.
 - The generated TOML is validated locally: it must parse as valid TOML, pass
   `load_plan()` (unique ids, known deps, no cycles), and is written through a
   temporary file with atomic replacement.
@@ -1002,10 +1011,11 @@ written.
 ### `opsx-plan compile`
 
 ```
-opsx-plan compile <source.md> -o <output.toml> [--force]
+opsx-plan compile <source.md> -o <output.toml> [--force] [--adapter <name>]
 ```
 Compile a markdown plan into a runnable TOML manifest. Requires a
-`controller` model resolved for the `opencode` adapter. Refuses to overwrite
+`controller` model resolved for the selected adapter (default `opencode`,
+`--adapter claude-code` for Claude Code). Refuses to overwrite
 an existing output unless `--force` is passed.
 
 ### `opsx-plan models`
@@ -1043,10 +1053,13 @@ Reconcile state against the repository and print per-change status.
 ### `opsx-plan doctor`
 
 ```
-opsx-plan doctor [plan.toml]
+opsx-plan doctor [plan.toml] [--adapter <name>]
 ```
 Run preflight checks without dispatching stages. Exits with status 1 on any
-failed check, 0 if all pass.
+failed check, 0 if all pass. When a plan is resolved, its declared adapter is
+authoritative and `--adapter` is ignored. When no plan is active, `--adapter`
+selects the adapter to check model resolution and client PATH against (defaults
+to `opencode`).
 
 ### `opsx-plan approve`
 
@@ -1144,6 +1157,7 @@ Equivalent to `opsx-plan run-one`.
 |---|---|---|---|
 | `-o`, `--output` | string | **required** | Output TOML path |
 | `--force` | flag | `false` | Overwrite existing output |
+| `--adapter` | string | `"opencode"` | Compile client adapter (`opencode` or `claude-code`) |
 
 ### `opsx-plan approve` / `accept` / `reset` flags
 

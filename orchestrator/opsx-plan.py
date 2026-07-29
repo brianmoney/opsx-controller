@@ -114,6 +114,29 @@ ADAPTER_CLIENTS = {
     "codex-cli": "codex",
 }
 
+# Compile-client registry (separate from stage invocation defaults).
+# Maps adapter keys to their compile invocation details.  Entries that lack
+# ``supported`` or set it to ``False`` are recognised by the flag parser but
+# rejected before model resolution or process spawn.
+COMPILE_CLIENTS: dict[str, dict] = {
+    "opencode": {
+        "executable": "opencode",
+        "supported": True,
+        "argv_template": ["{executable}", "run", "--model", "{model}", "{prompt}"],
+    },
+    "claude-code": {
+        "executable": "claude",
+        "supported": True,
+        "argv_template": [
+            "{executable}", "-p", "--model", "{model}", "{prompt}",
+        ],
+    },
+    "codex-cli": {
+        "executable": "codex",
+        "supported": False,
+    },
+}
+
 DONE = "done"
 PENDING = "pending"
 RUNNING = "running"
@@ -4100,29 +4123,40 @@ def resolve_compile_output(repo: Path, output: str, force: bool) -> Path:
     return p
 
 
-def check_controller_model(repo: Path | None = None) -> str:
-    """Return the controller model resolved for the ``opencode`` adapter.
-
-    ``compile`` always shells out to the ``opencode`` binary regardless of
-    the active plan's adapter, so this resolves against ``opencode``
-    specifically rather than against the active plan's adapter — handing a
-    Claude Code or Codex identifier to OpenCode would fail at dispatch.
+def check_controller_model(repo: Path | None = None, adapter: str = "opencode") -> str:
+    """Return the controller model resolved for *adapter*.
 
     Raises ``PlanError`` when the ``controller`` role cannot be resolved
-    for ``opencode``.
+    for *adapter*, or when the resolved identifier violates the adapter's
+    model syntax rules (e.g. a provider-prefixed identifier for Claude).
     """
     try:
-        resolved = resolve_models("opencode", repo=repo)
+        resolved = resolve_models(adapter, repo=repo)
     except ModelConfigError as exc:
         raise PlanError(str(exc)) from exc
     model = resolved["controller"].model
     if not model:
         raise PlanError(
-            "controller model is not configured for the opencode adapter; "
-            "compile requires a controller model to invoke OpenCode "
-            "(run `opsx-plan models show --adapter opencode` to inspect, "
-            "or `opsx-plan models init` to seed a configuration file)"
+            f"controller model is not configured for the {adapter} adapter; "
+            f"compile requires a controller model to invoke the selected client "
+            f"(run `opsx-plan models show --adapter {adapter}` to inspect, "
+            f"or `opsx-plan models init` to seed a configuration file)"
         )
+
+    # Reject an identifier whose syntax is invalid for the selected adapter
+    # before any process spawn (the opencode adapter expects provider/model,
+    # claude-code rejects provider prefixes, etc.).
+    warnings = validate_models(adapter, resolved)
+    controller_warnings = [w for w in warnings if w.startswith("controller:")]
+    if controller_warnings:
+        raise PlanError(
+            f"controller model '{model}' is not valid for the {adapter} adapter: "
+            f"{controller_warnings[0]}\n"
+            f"Run `opsx-plan models show --adapter {adapter}` to inspect "
+            f"resolved models, or `opsx-plan models init` to seed a "
+            f"configuration file."
+        )
+
     return model
 
 
@@ -4142,31 +4176,49 @@ def discover_template_pairs(repo: Path) -> list[tuple[Path, Path | None]]:
     return pairs
 
 
-def build_schema_guidance() -> str:
+def _escape_toml_value(value: str) -> str:
+    """Escape *value* for safe inclusion inside a TOML basic (double-quoted) string.
+
+    Only backslash and double-quote require escaping in the TOML basic-string
+    grammar; other characters (``$``, ``{``, ``}``, etc.) are literal.
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def build_schema_guidance(adapter: str = "opencode") -> str:
     """Build manifest schema guidance derived from ``load_plan()`` behavior.
 
     Covers ``[plan]`` fields, ``[[changes]]`` entries, dependency edges,
     gate defaults, adapter defaults, and fields consumed by the parser.
+
+    *adapter* selects the compile client and determines the ``[plan]``
+    defaults rendered in the prompt — every field shown reflects the
+    selected adapter's own defaults, not a generic template.
     """
-    default_adapter = "opencode"
+    default_adapter = adapter
     defaults = ADAPTER_DEFAULTS[default_adapter]
+    invoke = defaults.get("invoke", "")
+    state_file = defaults.get("state_file", "")
+    impl_invoke = defaults.get("implement_invoke", "")
+    review_invoke = defaults.get("review_invoke", "")
+    archive_invoke = defaults.get("archive_invoke", "")
     return (
         "## Expected TOML manifest shape\n"
         "\n"
         "The manifest is a TOML document with a ``[plan]`` table and\n"
         "one or more ``[[changes]]`` entries.\n"
         "\n"
-        "### ``[plan]`` table fields (all optional with defaults shown)\n"
+        f"### ``[plan]`` table fields (all optional; the {adapter} defaults shown)\n"
         "\n"
         "| Field | Type | Default | Description |\n"
         "|-------|------|---------|-------------|\n"
         "| name | string | stems from filename | plan display name |\n"
-        "| adapter | string | ``\"opencode\"`` | adapter key (``ADAPTER_DEFAULTS``) |\n"
-        "| invoke | string | ``opencode run \\\"/opsx-drive {change}\\\"`` | legacy drive command |\n"
-        "| state_file | string | ``.opencode/opsx-controller/{change}.json`` | controller state path |\n"
-        "| implement_invoke | string | ``opencode run --agent opsx-implementer`` | direct implement command |\n"
-        "| review_invoke | string | ``opencode run --agent opsx-reviewer`` | direct review command |\n"
-        "| archive_invoke | string | ``opencode run --agent opsx-archiver`` | direct archive command |\n"
+        f"| adapter | string | ``\"{default_adapter}\"`` | adapter key (``ADAPTER_DEFAULTS``) |\n"
+        f"| invoke | string | ``{invoke}`` | legacy drive command |\n"
+        f"| state_file | string | ``{state_file}`` | controller state path |\n"
+        f"| implement_invoke | string | ``{impl_invoke}`` | direct implement command |\n"
+        f"| review_invoke | string | ``{review_invoke}`` | direct review command |\n"
+        f"| archive_invoke | string | ``{archive_invoke}`` | direct archive command |\n"
         "| timeout_minutes | float | ``90`` | per-change stage timeout |\n"
         "| max_attempts | int | ``2`` | legacy drive retry ceiling |\n"
         "| max_rounds | int | ``5`` | implement-review loop ceiling |\n"
@@ -4217,26 +4269,26 @@ def build_schema_guidance() -> str:
         "- Manual phase-exit gates (``pause_before = true``) are added by the\n"
         "  operator; the compiler records but does not invent them.\n"
         "\n"
-        "### Adapter defaults (opencode)\n"
+        f"### Adapter defaults ({adapter})\n"
         "\n"
         "```toml\n"
         f"[plan]\n"
         f"adapter = \"{default_adapter}\"\n"
-        f"invoke = \"{defaults['invoke']}\"\n"
-        f"state_file = \"{defaults['state_file']}\"\n"
-        f"implement_invoke = \"{defaults['implement_invoke']}\"\n"
-        f"review_invoke = \"{defaults['review_invoke']}\"\n"
-        f"archive_invoke = \"{defaults['archive_invoke']}\"\n"
+        f"invoke = \"{_escape_toml_value(defaults['invoke'])}\"\n"
+        f"state_file = \"{_escape_toml_value(defaults['state_file'])}\"\n"
+        f"implement_invoke = \"{_escape_toml_value(defaults['implement_invoke'])}\"\n"
+        f"review_invoke = \"{_escape_toml_value(defaults['review_invoke'])}\"\n"
+        f"archive_invoke = \"{_escape_toml_value(defaults['archive_invoke'])}\"\n"
         "```\n"
     )
 
 
 def build_compile_prompt(source_content: str, source_path: Path,
-                         repo: Path) -> str:
-    """Build the complete compile prompt for OpenCode.
+                         repo: Path, adapter: str = "opencode") -> str:
+    """Build the complete compile prompt for the selected adapter.
 
-    Includes: source markdown, manifest schema guidance, template plan
-    pairs from the repository, and model instructions.
+    Includes: source markdown, manifest schema guidance (adapter-aware),
+    template plan pairs from the repository, and model instructions.
     """
     try:
         rel_source = str(source_path.resolve().relative_to(repo.resolve()))
@@ -4248,7 +4300,7 @@ def build_compile_prompt(source_content: str, source_path: Path,
     parts.append("## Source plan markdown\n")
     parts.append(source_content)
 
-    parts.append(build_schema_guidance())
+    parts.append(build_schema_guidance(adapter))
 
     template_pairs = discover_template_pairs(repo)
     if template_pairs:
@@ -4285,41 +4337,74 @@ def build_compile_prompt(source_content: str, source_path: Path,
         "markdown headers, or commentary outside the TOML payload. "
         "Output raw TOML or a single fenced ```toml block.\n"
         "2. **Emit a `[plan]` table** with at least `name`, `adapter` "
-        "(\"opencode\"), and `plan_doc` set to exactly "
+        f"(\"{adapter}\"), and `plan_doc` set to exactly "
         f"\"{rel_source}\".\n"
-        "3. **Emit one `[[changes]]` entry per change** described in the "
+        "3. **The `adapter` field MUST equal exactly** "
+        f"\"{adapter}\".\n"
+        "4. **Emit one `[[changes]]` entry per change** described in the "
         "source plan, in phase order.\n"
-        "4. **Preserve dependency semantics:** backticked known change ids "
+        "5. **Preserve dependency semantics:** backticked known change ids "
         "in the source doc become `depends_on` entries. Independence wording "
         "(\"independent\", \"in parallel\", \"may proceed\") means no "
         "dependency edge. Deferred wording means `enabled = false`.\n"
-        "5. **Preserve manual gates:** `pause_before = true` for any change "
+        "6. **Preserve manual gates:** `pause_before = true` for any change "
         "that introduces a proposed capability (marked with `(proposed` "
         "in the source) or has an explicit gate note.\n"
-        "6. **Preserve phase numbers** as `phase` fields on each change.\n"
-        "7. **Every change id must be unique** and every `depends_on` id "
+        "7. **Preserve phase numbers** as `phase` fields on each change.\n"
+        "8. **Every change id must be unique** and every `depends_on` id "
         "must reference another change in the manifest.\n"
-        "8. **The DAG must have no cycles.**\n"
+        "9. **The DAG must have no cycles.**\n"
     )
 
     return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
-# OpenCode invocation for compile
+# Compile client invocation
 # ---------------------------------------------------------------------------
 
-def run_opencode_for_compile(repo: Path, model: str,
-                              prompt: str) -> tuple[str, str]:
-    """Invoke OpenCode non-interactively for plan compilation.
+def _build_compile_argv(adapter: str, model: str, prompt: str) -> list[str]:
+    """Build the compile client argv for *adapter*.
+
+    Raises ``PlanError`` when the adapter is unsupported for compilation.
+    """
+    entry = COMPILE_CLIENTS.get(adapter)
+    if entry is None:
+        raise PlanError(f"unknown adapter '{adapter}'; "
+                        f"known adapters: {', '.join(sorted(COMPILE_CLIENTS))}")
+    if not entry.get("supported", False):
+        raise PlanError(
+            f"compilation through the {adapter} adapter is not supported "
+            f"in this release; select a supported adapter "
+            f"({'opencode'} or {'claude-code'})"
+        )
+    # Use a template-style argv construction so we compose the full command
+    # from the registry without relying on a shared argv template format.
+    executable = entry["executable"]
+    tmpl = entry["argv_template"]
+    # Replace {executable} first so later replacements do not interfere.
+    argv: list[str] = []
+    for part in tmpl:
+        argv.append(
+            part.replace("{executable}", executable)
+                .replace("{model}", model)
+                .replace("{prompt}", prompt)
+        )
+    return argv
+
+
+def run_compile_client(repo: Path, adapter: str, model: str,
+                        prompt: str) -> tuple[str, str]:
+    """Invoke the selected compile client non-interactively.
 
     Returns ``(stdout, stderr)`` as a tuple.  Raises ``PlanError`` on
-    spawn failure.  A non-zero exit is surfaced in the return value — the
-    caller decides how to interpret it.
+    spawn failure, timeout, or unsupported adapter.
     """
+    argv = _build_compile_argv(adapter, model, prompt)
+    executable = COMPILE_CLIENTS[adapter]["executable"]
     try:
         proc = subprocess.run(
-            ["opencode", "run", "--model", model, prompt],
+            argv,
             cwd=repo,
             capture_output=True,
             text=True,
@@ -4327,29 +4412,65 @@ def run_opencode_for_compile(repo: Path, model: str,
         )
     except FileNotFoundError:
         raise PlanError(
-            "could not spawn opencode; is it installed and on PATH?"
+            f"could not spawn {executable}; is it installed and on PATH?"
         )
     except subprocess.TimeoutExpired:
-        raise PlanError("opencode compile invocation timed out after 600s")
+        raise PlanError(
+            f"{executable} compile invocation timed out after 600s"
+        )
     if proc.returncode != 0:
         raise PlanError(
-            f"opencode exited with code {proc.returncode}\n"
+            f"{executable} exited with code {proc.returncode}\n"
             f"stderr: {proc.stderr[:500]}"
         )
     return proc.stdout, proc.stderr
 
 
-def extract_toml(output: str) -> str:
+def _strip_claude_envelope(output: str) -> str:
+    """Strip one known Claude CLI result envelope, if present.
+
+    Claude ``-p`` output may wrap the actual response in one of a small set
+    of stable formats.  This function removes exactly one recognised envelope
+    so the remaining payload can be passed to the standard TOML extractor.
+
+    Returns the input unchanged when no known envelope is detected.
+    """
+    stripped = output.strip()
+
+    # JSON result envelope: {"result": "...", ...}
+    # Claude may return a JSON object with a "result" key containing the
+    # actual model output.  Remove exactly one such outer wrapper.
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            data = json.loads(stripped)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        else:
+            if isinstance(data, dict) and "result" in data:
+                inner = data["result"]
+                if isinstance(inner, str) and inner.strip():
+                    return inner
+    return output
+
+
+def extract_toml(output: str, adapter: str = "opencode") -> str:
     """Extract a TOML payload from raw model output.
 
     Accepts a single clean fenced ``toml` block or a bare TOML
     payload.  Raises ``PlanError`` for ambiguous output: multiple
     fenced blocks, extra prose or non-whitespace content surrounding a
     fenced block, or no TOML content at all.
+
+    *adapter* is used in error messages and may trigger client-specific
+    envelope handling.
     """
+    if adapter == "claude-code":
+        output = _strip_claude_envelope(output)
+
     stripped = output.strip()
     if not stripped:
-        raise PlanError("opencode returned empty output; no TOML to compile")
+        client = COMPILE_CLIENTS.get(adapter, {}).get("executable", adapter)
+        raise PlanError(f"{client} returned empty output; no TOML to compile")
 
     fenced_matches = list(re.finditer(r"```(?:toml)?\s*\n(.*?)```", stripped, re.DOTALL))
     if len(fenced_matches) > 1:
@@ -4371,8 +4492,9 @@ def extract_toml(output: str) -> str:
     if "[" in stripped:
         return stripped
 
+    client = COMPILE_CLIENTS.get(adapter, {}).get("executable", adapter)
     raise PlanError(
-        "could not extract TOML from opencode output; "
+        f"could not extract TOML from {client} output; "
         "output does not contain a fenced toml block or bare TOML"
     )
 
@@ -5212,25 +5334,42 @@ def cmd_run_one(args: argparse.Namespace) -> int:
 
 
 def cmd_compile(args: argparse.Namespace) -> int:
-    """opsx-plan compile <source.md> -o <output.toml> [--force]"""
+    """opsx-plan compile <source.md> -o <output.toml> [--force] [--adapter <adapter>]"""
     repo = Path(args.repo).resolve()
+    adapter = getattr(args, "adapter", "opencode") or "opencode"
+
+    # Reject unsupported adapters before model resolution.
+    entry = COMPILE_CLIENTS.get(adapter)
+    if entry is None:
+        print(f"error: unknown adapter '{adapter}'; "
+              f"known adapters: {', '.join(sorted(COMPILE_CLIENTS))}",
+              file=sys.stderr)
+        return 2
+    if not entry.get("supported", False):
+        print(f"error: compilation through the {adapter} adapter is not supported "
+              f"in this release; select a supported adapter "
+              f"({'opencode'} or {'claude-code'})",
+              file=sys.stderr)
+        return 2
 
     source_path = resolve_compile_source(repo, args.source)
     output_path = resolve_compile_output(repo, args.output, args.force)
-    model = check_controller_model(repo)
+    model = check_controller_model(repo, adapter=adapter)
 
-    log(f"compile: {source_path} -> {output_path}  (model: {model})")
+    client_name = entry["executable"]
+    log(f"compile: {source_path} -> {output_path}  "
+        f"(adapter: {adapter}, client: {client_name}, model: {model})")
 
     source_content = source_path.read_text(encoding="utf-8")
-    prompt = build_compile_prompt(source_content, source_path, repo)
+    prompt = build_compile_prompt(source_content, source_path, repo, adapter=adapter)
     log(f"  prompt size: {len(prompt)} chars")
 
-    log("  invoking opencode ...")
-    stdout, stderr = run_opencode_for_compile(repo, model, prompt)
+    log(f"  invoking {client_name} ...")
+    stdout, stderr = run_compile_client(repo, adapter, model, prompt)
     if stderr.strip():
-        log(f"  opencode stderr: {stderr.strip()[:500]}")
+        log(f"  {client_name} stderr: {stderr.strip()[:500]}")
 
-    toml_text = extract_toml(stdout)
+    toml_text = extract_toml(stdout, adapter=adapter)
     if not toml_text:
         raise PlanError("extracted TOML payload is empty")
 
@@ -5240,16 +5379,46 @@ def cmd_compile(args: argparse.Namespace) -> int:
     except Exception as exc:
         raise PlanError(f"generated TOML is not valid TOML: {exc}")
 
+    if not isinstance(parsed, dict):
+        raise PlanError("generated manifest must be a TOML table")
+
+    plan_table = parsed.get("plan", {})
+    if not isinstance(plan_table, dict):
+        raise PlanError("generated manifest [plan] must be a TOML table")
+
+    changes = parsed.get("changes", [])
+    if not isinstance(changes, list):
+        raise PlanError("generated manifest [[changes]] must be an array of TOML tables")
+    for index, change in enumerate(changes, 1):
+        if not isinstance(change, dict):
+            raise PlanError(
+                f"generated manifest [[changes]] entry {index} must be a TOML table"
+            )
+
+    # Require the generated adapter field to match the selected adapter.
+    generated_adapter = plan_table.get("adapter", "")
+    if generated_adapter != adapter:
+        raise PlanError(
+            f"generated manifest adapter is '{generated_adapter}' but "
+            f"compilation selected '{adapter}'; "
+            f"the {client_name} output must use adapter = \"{adapter}\""
+        )
+
     tmp_path = output_path.with_suffix(output_path.suffix + ".compile-tmp")
     try:
         tmp_path.write_text(toml_text, encoding="utf-8")
-        cfg = load_plan(tmp_path, repo=repo)
+        try:
+            cfg = load_plan(tmp_path, repo=repo)
+        except PlanError:
+            raise
+        except Exception as exc:
+            raise PlanError(f"generated manifest failed validation: {exc}") from exc
     except PlanError:
         tmp_path.unlink(missing_ok=True)
         raise
-    except Exception:
+    except OSError as exc:
         tmp_path.unlink(missing_ok=True)
-        raise
+        raise PlanError(f"could not stage generated manifest: {exc}") from exc
 
     os.replace(tmp_path, output_path)
     log(f"  validated: {len(cfg['order'])} changes, {cfg['changes'].get(cfg['order'][0], {}).get('phase', 'no-phase') or 'no phase'}")
@@ -6829,12 +6998,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                     return 2
             # No active plan; run plan-independent checks only.
 
-    # Determine adapter from resolved plan.
-    adapter = "opencode"
+    # Determine adapter from resolved plan or explicit --adapter flag.
+    adapter = getattr(args, "adapter", None) or "opencode"
     cfg: dict | None = None
     if plan_src:
         try:
             cfg = load_plan(_resolve_plan_path(repo, plan_src), repo=repo)
+            # A resolved plan's adapter is authoritative; --adapter is ignored.
             adapter = cfg["adapter"]
         except PlanError:
             print(f"error: cannot load plan: {plan_src}", file=sys.stderr)
@@ -7073,6 +7243,11 @@ def main() -> int:
     p_compile.add_argument(
         "--force", action="store_true", help="overwrite existing output"
     )
+    p_compile.add_argument(
+        "--adapter", default="opencode",
+        choices=list(COMPILE_CLIENTS),
+        help="adapter to compile against (default: opencode)",
+    )
     p_compile.set_defaults(fn=cmd_compile)
 
     p_report = sub.add_parser(
@@ -7142,6 +7317,11 @@ def main() -> int:
         "doctor", help="run preflight checks before a run"
     )
     p_doctor.add_argument("plan", nargs="?", default=None, help="path to plan TOML")
+    p_doctor.add_argument(
+        "--adapter", default=None,
+        choices=list(COMPILE_CLIENTS) if COMPILE_CLIENTS else None,
+        help="adapter to preflight (default: plan's adapter, or opencode when no plan)",
+    )
     p_doctor.set_defaults(fn=cmd_doctor)
 
     p_models = sub.add_parser(

@@ -6,9 +6,10 @@ implementation-plan markdown document.
 - `/opsx-plan` writes a source markdown plan document, usually at
   `docs/plans/<kebab-case-topic>-plan.md` unless you request another path.
 - The authored markdown must be compiled before plan execution.
-- `opsx-plan compile` currently depends on an OpenCode-configured environment
-  and `OPSX_CONTROLLER_MODEL`; Claude-only installs may author the markdown but
-  cannot honestly claim TOML compilation succeeded.
+- `opsx-plan compile --adapter claude-code` compiles the markdown into a TOML
+  manifest using Claude Code.  This requires a `controller` model resolved for
+  the `claude-code` adapter.  Run `opsx-plan models show --adapter claude-code`
+  to inspect, or `opsx-plan models init` to seed a configuration file.
 
 Use `/opsx-drive <change-id>` as the default controller entrypoint when you
 want the iterative implement-review-archive loop for one accepted OpenSpec

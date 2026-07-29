@@ -35,14 +35,19 @@ they re-install. A merged change can look "done" in git while stale code
 keeps running locally.
 
 **After merging any change that touches `adapters/`, `orchestrator/`,
-`plugins/`, or `skills/`, the maintainer re-runs the installer(s) to deploy
-it:**
+`plugins/`, `skills/`, or `scripts/`, the maintainer re-runs the
+installer(s) to deploy it:**
 
 ```bash
 bash adapters/opencode/install.sh --global --verify
 bash adapters/claude-code/install.sh --global --verify   # if Claude Code adapter changed
 bash adapters/codex-cli/install.sh --global --verify      # if Codex CLI adapter changed
 ```
+
+Any global installer now deploys the shared `opsx-plan` and `opsx-run`
+executables (via `scripts/install-orchestrator.sh`), so a maintainer only
+needs to rerun one installer — the installed runtime location is the same
+regardless of which adapter deployed it.
 
 ## Sandbox / filesystem discipline
 

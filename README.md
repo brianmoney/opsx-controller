@@ -129,11 +129,10 @@ Requires Python 3.11+ (the orchestrator uses `tomllib`), git, the
 [OpenSpec](https://github.com/Fission-AI/OpenSpec) CLI, and a supported coding
 client. There is nothing to pip install — the orchestrator is stdlib-only.
 
-> **OpenCode is currently required regardless of which client drives the loop.**
-> `opsx-plan compile` always shells out to `opencode`, and the OpenCode
-> installer is the only one that installs the `opsx-plan` / `opsx-run`
-> executables. You can drive the loop itself with Claude Code or Codex CLI, but
-> you need OpenCode installed to compile a plan and to get the CLI on your PATH.
+> **OpenCode and Claude Code can compile plans; all three adapters install the
+> orchestrator to `~/.local/bin/`.**  `opsx-plan compile` supports `--adapter
+> opencode` (the default) and `--adapter claude-code`.  Every adapter installs
+> `opsx-plan` / `opsx-run` to `~/.local/bin/` via a shared installer helper.
 > See [docs/adapters.md](docs/adapters.md#choosing-an-adapter).
 
 **1. Clone and configure models.**
@@ -156,10 +155,9 @@ bash adapters/opencode/install.sh --global      # or claude-code, or codex-cli
 ```
 
 Use `--project /path/to/repo` instead of `--global` to install into a single
-project. Install the OpenCode adapter as well as your own client's — see the
-note above. If you install only the Claude Code or Codex CLI adapter, invoke
-the orchestrator from this checkout as `python3 orchestrator/opsx-plan.py ...`
-wherever these docs say `opsx-plan ...`.
+project. Install the adapter for whichever coding client you plan to use (or
+more than one — they coexist). Every adapter's global installer deploys
+`opsx-plan` and `opsx-run` to `~/.local/bin/`.
 
 **3. Initialize OpenSpec in your project, once.**
 

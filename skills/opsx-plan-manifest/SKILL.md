@@ -38,7 +38,8 @@ wrong and the orchestrator will happily spend an afternoon reimplementing
 something that shipped last month.
 
 `opsx-plan compile <plan.md> -o <plan.toml>` exists and does a mechanical
-first pass by invoking OpenCode. It reads only the markdown, so it cannot know
+first pass by invoking the selected adapter (`--adapter opencode` or
+`--adapter claude-code`). It reads only the markdown, so it cannot know
 what already shipped or what is blocked. Hand-authoring is usually faster for
 plans under roughly a dozen changes. If you do compile, treat its output as a
 draft and run every step below against it.

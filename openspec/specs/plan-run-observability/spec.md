@@ -1288,6 +1288,16 @@ Token count, request count, and latency fields SHALL be non-negative integers wh
 - **WHEN** the OpenCode plugin observes final usage for a stage invocation
 - **THEN** it appends a JSONL record with `event_type = "final"`, matching stage identity fields, normalized model identity fields, and any available normalized token fields
 
+#### Scenario: Empty session idle finalizes the latest usage snapshot
+
+- **WHEN** the OpenCode plugin observes one or more valid token-bearing assistant updates followed by a `session.idle` event without usable usage metadata
+- **THEN** it appends exactly one `event_type = "final"` record using the latest valid normalized snapshot
+
+#### Scenario: Idle without observed usage remains unavailable
+
+- **WHEN** the OpenCode plugin observes `session.idle` before any valid token-bearing assistant update and without usable idle metadata
+- **THEN** it does not append a final record
+
 #### Scenario: Malformed numeric fields are unavailable
 
 - **WHEN** a sidecar record contains a negative, floating-point, non-numeric, or ambiguous value for a token count, request count, or latency field

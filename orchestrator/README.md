@@ -36,39 +36,38 @@ and durable bookkeeping.
 
 ## The compile stage
 
-The OpenCode adapter ships an `/opsx-plan` command
-(`adapters/opencode/commands/opsx-plan.md`) that instructs your frontier
-model to author plan docs in this convention and self-check them against
-the compiler, so generated docs compile cleanly on the first try.
-
 `compile` converts a markdown implementation plan into a runnable TOML
-manifest by invoking OpenCode with the controller model configured in
-`OPSX_CONTROLLER_MODEL`. The compiler builds a self-contained prompt that
-includes the source markdown, the expected TOML schema (derived from the
-plan loader), dependency-resolution rules, adapter defaults, and repository
-template plan pairs from `openspec/plans/` when available.
+manifest by invoking your selected compile adapter client with its
+configured controller model. OpenCode is the default; use `--adapter
+claude-code` to compile through Claude Code instead.
+
+The compiler builds a self-contained prompt that includes the source
+markdown, adapter-aware TOML schema (derived from the plan loader),
+dependency-resolution rules, adapter defaults, and repository template
+plan pairs from `openspec/plans/` when available.
 
 The generated TOML is validated locally before writing: it must parse as
 valid TOML, pass the existing `load_plan()` path (unique ids, known deps,
-no cycles), and is written through a temporary file with atomic replacement
-so invalid output never replaces an existing manifest.
+no cycles), and its `adapter` field must match the selected compile
+adapter. Output is written through a temporary file with atomic
+replacement so invalid output never replaces an existing manifest.
 
 Usage:
 
 ```bash
-# Set the controller model (required)
-export OPSX_CONTROLLER_MODEL="your-model-id"
+# Compile through OpenCode (the default)
+opsx-plan compile docs/my-plan.md -o plan.toml
 
-# Compile a markdown plan to TOML
-python3 .../opsx-plan.py compile docs/my-plan.md -o plan.toml
+# Compile through Claude Code
+opsx-plan compile --adapter claude-code docs/my-plan.md -o plan.toml
 
 # Overwrite an existing manifest
-python3 .../opsx-plan.py compile docs/my-plan.md -o plan.toml --force
+opsx-plan compile docs/my-plan.md -o plan.toml --force
 ```
 
 The compile command refuses to overwrite an existing output file unless
-`--force` is passed. It fails before invoking OpenCode if
-`OPSX_CONTROLLER_MODEL` is unset or empty.
+`--force` is passed. It fails before client invocation if the controller
+model is unconfigured for the selected adapter.
 
 Two things the compiler cannot do, by design: detect a dependency the doc
 forgot to state, and place judgment gates such as phase exit reviews — add

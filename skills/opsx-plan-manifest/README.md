@@ -43,8 +43,9 @@ dropped, and whether each change id actually corresponds to unarchived work in
 
 ## Relationship to `opsx-plan compile`
 
-`opsx-plan compile` converts markdown to TOML by invoking OpenCode with
-`$OPSX_CONTROLLER_MODEL`. It reads only the markdown, so it cannot know what has
+`opsx-plan compile` converts markdown to TOML by invoking a supported adapter
+(OpenCode or Claude Code, selected with `--adapter`) using its resolved
+controller model. It reads only the markdown, so it cannot know what has
 already shipped or what is blocked on an outside decision. This skill covers
 that reconciliation, and works either from scratch or on top of compile's
 output.

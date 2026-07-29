@@ -1,6 +1,6 @@
 ---
 name: opsx-plan-author
-description: Authors one phased OpenSpec implementation-plan markdown document and reports whether OpenCode-backed compile self-checking ran.
+description: Authors one phased OpenSpec implementation-plan markdown document and reports whether Claude Code-backed compile self-checking ran.
 tools: Read, Edit, MultiEdit, Write, Glob, Grep, Bash
 model: inherit
 effort: high
@@ -34,14 +34,16 @@ Required workflow:
 11. Re-scan every `**Depends on:**` paragraph before reporting success.
 12. Run the compile self-check only when both of these are true:
     - `opsx-plan` is available on PATH.
-    - `OPSX_CONTROLLER_MODEL` is set to a non-empty value.
+    - A `controller` role resolves for the `claude-code` adapter (run
+      `opsx-plan models show --adapter claude-code` to verify).
 13. When the compile self-check runs, execute
-    `opsx-plan compile <doc> -o /tmp/opsx-plan-selfcheck.toml --force`, verify
-    success, and fix the source document if compilation exposes malformed
-    structure or dependencies.
+    `opsx-plan compile --adapter claude-code <doc> -o /tmp/opsx-plan-selfcheck.toml --force`,
+    verify success, and fix the source document if compilation exposes
+    malformed structure or dependencies.
 14. When the compile self-check cannot run, report that the markdown document
-    was authored but not compiled, and state that an OpenCode-configured
-    environment must run `opsx-plan compile` before plan execution.
+    was authored but not compiled, and state the missing Claude Code
+    prerequisite (missing `opsx-plan` on PATH or unresolved Claude Code
+    controller model).
 
 Document structure requirements:
 

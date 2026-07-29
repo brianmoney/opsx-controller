@@ -202,7 +202,9 @@ When a stage log contains no parseable final JSON object and includes permission
 
 The orchestrator SHALL provide an `opsx-plan compile <source.md> -o <output.toml>` command that converts a markdown implementation-plan document into a TOML manifest accepted by the existing `opsx-plan` plan loader.
 
-The compile command SHALL refuse to overwrite an existing output path unless the operator passes `--force`.
+The compile command SHALL accept `--adapter <adapter>` and SHALL default to
+`opencode` when the flag is omitted. It SHALL refuse to overwrite an existing
+output path unless the operator passes `--force`.
 
 #### Scenario: Operator compiles a markdown plan
 - **WHEN** an operator runs `opsx-plan compile openspec/plans/example-plan.md -o openspec/plans/example-plan.toml`
@@ -212,38 +214,45 @@ The compile command SHALL refuse to overwrite an existing output path unless the
 - **WHEN** the requested output file already exists and the operator does not pass `--force`
 - **THEN** `opsx-plan compile` exits with a clear error and leaves the existing output file unchanged
 
-### Requirement: Plan compilation invokes OpenCode with the controller model
+### Requirement: Plan compilation invokes the selected adapter with its controller model
 
-`opsx-plan compile` SHALL invoke OpenCode to perform the markdown-to-TOML transformation and SHALL select the model by resolving the `controller` role against the `opencode` adapter.
+When the selected compile adapter is `opencode`, `opsx-plan compile` SHALL
+invoke OpenCode and resolve the `controller` role against the `opencode`
+adapter. If the selected adapter is `claude-code`, it SHALL invoke Claude Code
+and resolve the role against the `claude-code` adapter.
 
-Because the compile command shells out to the OpenCode CLI regardless of the active plan's adapter, it SHALL resolve against the `opencode` adapter specifically and SHALL NOT use the active plan's adapter for this resolution.
-
-If the `controller` role cannot be resolved for the `opencode` adapter, the command SHALL fail before invoking OpenCode and explain that the controller model must be configured.
+If the `controller` role cannot be resolved for the selected adapter, the
+command SHALL fail before invoking the client and explain that the selected
+adapter's controller model must be configured.
 
 #### Scenario: Controller model is passed to OpenCode
-- **WHEN** the `controller` role resolves for the `opencode` adapter and an operator runs `opsx-plan compile`
+- **WHEN** the `controller` role resolves for the `opencode` adapter and an operator runs `opsx-plan compile` without `--adapter`
 - **THEN** the spawned OpenCode command includes the resolved controller model for the transformation request
 
-#### Scenario: Compile ignores a non-OpenCode active plan adapter
-- **WHEN** the active plan's adapter is `claude-code` and an operator runs `opsx-plan compile`
-- **THEN** the spawned OpenCode command uses the controller model resolved for the `opencode` adapter, not the one resolved for `claude-code`
+#### Scenario: Claude compilation uses the Claude controller model
+- **WHEN** an operator runs `opsx-plan compile --adapter claude-code` and Claude and OpenCode have different controller models
+- **THEN** the spawned Claude Code command uses only the controller model resolved for `claude-code`
 
 #### Scenario: Missing controller model fails closed
-- **WHEN** the `controller` role cannot be resolved for the `opencode` adapter
-- **THEN** `opsx-plan compile` exits with a configuration error before spawning OpenCode
+- **WHEN** the `controller` role cannot be resolved for the selected adapter
+- **THEN** `opsx-plan compile` exits with a configuration error before spawning that adapter's client
 
-### Requirement: Compile prompts include source and reference context
+### Requirement: Compile prompts include source and adapter reference context
 
-The compile command SHALL provide the OpenCode invocation with a self-contained prompt that includes the source markdown plan, the expected TOML manifest shape, dependency and phase interpretation rules, current adapter defaults, and representative markdown/TOML template plan references when available in the repository.
+The compile command SHALL provide the selected client with a self-contained
+prompt that includes the source markdown plan, the expected TOML manifest
+shape, dependency and phase interpretation rules, current selected-adapter
+defaults, and representative markdown/TOML template plan references when
+available in the repository.
 
 The prompt SHALL instruct the model to emit only the compiled TOML manifest and not to include prose outside the TOML payload.
 
 #### Scenario: Prompt contains template plans and schema guidance
-- **WHEN** `opsx-plan compile` builds the OpenCode prompt for a source markdown plan
+- **WHEN** `opsx-plan compile` builds a prompt for a source markdown plan
 - **THEN** the prompt includes the source plan content, manifest field guidance for `[plan]` and `[[changes]]`, dependency-resolution guidance, and at least one available repository template plan pair or an explicit note that no template pair was found
 
 #### Scenario: Prompt forbids prose output
-- **WHEN** the prompt is sent to OpenCode
+- **WHEN** the prompt is sent to the selected compile client
 - **THEN** it instructs the model to return TOML only so the result can be validated and written without manual cleanup
 
 ### Requirement: Compiled manifests are validated before write success
@@ -253,9 +262,9 @@ The prompt SHALL instruct the model to emit only the compiled TOML manifest and 
 If validation fails, the command SHALL exit with a clear error and SHALL NOT replace an existing output file.
 
 #### Scenario: Valid generated TOML is written atomically
-- **WHEN** OpenCode returns TOML that parses successfully and passes the existing plan loader validation
+- **WHEN** the selected client returns TOML that parses successfully and passes the existing plan loader validation
 - **THEN** `opsx-plan compile` writes the output manifest atomically and reports the output path
 
 #### Scenario: Invalid generated TOML is rejected
-- **WHEN** OpenCode returns malformed TOML or a manifest with invalid dependency references
+- **WHEN** the selected client returns malformed TOML or a manifest with invalid dependency references
 - **THEN** `opsx-plan compile` exits with a validation error and does not report the manifest as compiled

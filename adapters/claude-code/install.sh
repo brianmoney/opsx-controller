@@ -90,6 +90,7 @@ install_global() {
   install_skills "$config_root/skills"
   install_agents "$config_root/agents"
   install_support_readme "$config_root/opsx-controller"
+  bash "$ROOT_DIR/scripts/install-orchestrator.sh" "$ROOT_DIR"
   printf '%s\n' \
     "Installed skills to $config_root/skills" \
     "Installed agents to $config_root/agents" \

@@ -217,6 +217,42 @@ console.log("\n🧪 Testing opsx-usage-emitter plugin\n");
     assert(noRecords, "3.2a session.idle without tokens emits no final record", "Lines: " + JSON.stringify(lines));
   }
 
+  // 3.2f – empty session.idle finalizes the latest message snapshot
+  {
+    const usagePath = path.join(TMP, "fin-3.2f.jsonl");
+    const env = {
+      OPSX_USAGE_PATH: usagePath,
+      OPSX_PLAN_NAME: "plan-3.2f",
+      OPSX_RUN_ID: "run-3.2f",
+      OPSX_CHANGE_ID: "change-3.2f",
+      OPSX_STAGE: "review",
+      OPSX_ROUND: "2",
+    };
+
+    const events = JSON.stringify([
+      makeUpdateEvent(
+        { input: 50, output: 30, reasoning: 0, cache: { read: 0, write: 0 }, total: 80 },
+        "prov-f",
+        "model-f",
+      ),
+      makeIdleEvent(null),
+      makeIdleEvent(null),
+    ]);
+    const script = makeRunScript(usagePath, events);
+    const { lines } = spawn(script, env);
+
+    const records = (lines || []).map(line => {
+      try { return JSON.parse(line); } catch (_) { return null; }
+    }).filter(Boolean);
+    const finals = records.filter(record => record.event_type === "final");
+    assert(finals.length === 1, "3.2f empty session.idle emits one final record", "Records: " + JSON.stringify(records));
+    if (finals.length === 1) {
+      assert(finals[0].total_tokens === 80, "3.2f final preserves latest total_tokens");
+      assert(finals[0].provider === "prov-f", "3.2f final preserves latest provider");
+      assert(finals[0].model_id === "model-f", "3.2f final preserves latest model_id");
+    }
+  }
+
   // 3.2b – session.idle WITH info.tokens → final record (future-proof)
   {
     const usagePath = path.join(TMP, "fin-3.2b.jsonl");
@@ -350,7 +386,9 @@ console.log("\n🧪 Testing opsx-usage-emitter plugin\n");
 // -- 3.3: Plugin inert when OPSX_USAGE_PATH is absent ---------------------
 {
   const env = {
-    // no OPSX_USAGE_PATH
+    // Make absent variables explicit so the spawned child does not inherit
+    // them from the test harness process environment.
+    OPSX_USAGE_PATH: "",
     OPSX_PLAN_NAME: "plan-3.3",
     OPSX_RUN_ID: "run-3.3",
     OPSX_CHANGE_ID: "change-3.3",
@@ -467,7 +505,9 @@ console.log("\n🧪 Testing opsx-usage-emitter plugin\n");
       OPSX_RUN_ID: "run-3.5d",
       OPSX_CHANGE_ID: "change-3.5d",
       OPSX_STAGE: "implement",
-      // OPSX_ROUND intentionally omitted
+      // OPSX_ROUND intentionally omitted — explicitly unset so the spawned
+      // child does not inherit it from the test harness process environment.
+      OPSX_ROUND: "",
     };
     const events = JSON.stringify([makeUpdateEvent({ input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 }, total: 2 }, "p", "m")]);
     const script = makeRunScript(usagePath, events);

@@ -103,6 +103,41 @@ function buildRecord(eventType, tokens, providerID, modelID) {
   };
 }
 
+function hasTokenField(record) {
+  return (
+    record.input_tokens !== null ||
+    record.output_tokens !== null ||
+    record.cached_input_tokens !== null ||
+    record.reasoning_tokens !== null ||
+    record.total_tokens !== null
+  );
+}
+
+function hasUsableField(record) {
+  return (
+    hasTokenField(record) ||
+    record.provider !== null ||
+    record.model_id !== null
+  );
+}
+
+function mergeRecord(primary, fallback) {
+  const merged = { ...fallback, ...primary };
+  for (const field of [
+    "provider",
+    "model_id",
+    "model_alias",
+    "input_tokens",
+    "output_tokens",
+    "cached_input_tokens",
+    "reasoning_tokens",
+    "total_tokens",
+  ]) {
+    if (merged[field] === null && fallback) merged[field] = fallback[field];
+  }
+  return merged;
+}
+
 // ---------------------------------------------------------------------------
 // Sidecar append (best-effort, never throws)
 // ---------------------------------------------------------------------------
@@ -127,6 +162,11 @@ export default async function OpsxUsageEmitter({ project, client, $, directory, 
     // Plugin is inert: do not register any hooks (return empty object).
     return {};
   }
+
+  // OpenCode's session.idle event does not reliably include the final message
+  // usage. Keep the latest normalized snapshot so idle can close the stage.
+  let latestSnapshot = null;
+  let finalEmitted = false;
 
   return {
     /**
@@ -153,43 +193,38 @@ export default async function OpsxUsageEmitter({ project, client, $, directory, 
             // Only assistant messages carry token usage.
             if (!info || info.role !== "assistant" || !info.tokens) return;
 
-            appendRecord(
-              buildRecord("incremental", info.tokens, info.providerID, info.modelID)
+            const record = buildRecord(
+              "incremental", info.tokens, info.providerID, info.modelID
             );
+            if (hasUsableField(record)) latestSnapshot = record;
+            appendRecord(record);
             break;
           }
 
           // -- Final session event → final ------------------------------
           case "session.idle": {
-            // session.idle itself does not carry usage or model metadata;
-            // only emit a final record when the normalized record has at
-            // least one usable field (non-null numeric or model metadata).
-            // Build the record first so the gate checks normalized values,
-            // not the raw (possibly malformed) info object.
+            if (finalEmitted) return;
+
+            // Prefer usage attached to idle when available, then supplement
+            // it with the latest message snapshot. Real idle events commonly
+            // have no info at all, so the snapshot is the normal fallback.
             const info = props.info;
-            if (!info) return;
+            const idleRecord = info
+              ? buildRecord("final", info.tokens, info.providerID, info.modelID)
+              : null;
+            const baseRecord = idleRecord && hasUsableField(idleRecord)
+              ? idleRecord
+              : latestSnapshot;
+            if (!baseRecord || !hasUsableField(baseRecord)) return;
 
-            const record = buildRecord(
-              "final",
-              info.tokens,
-              info.providerID,
-              info.modelID
+            const record = mergeRecord(
+              idleRecord && hasTokenField(idleRecord) ? idleRecord : baseRecord,
+              idleRecord && !hasTokenField(idleRecord) ? latestSnapshot : null,
             );
-
-            // Check whether the normalized record carries anything the
-            // sidecar contract can represent.
-            const hasUsableField =
-              record.input_tokens !== null ||
-              record.output_tokens !== null ||
-              record.cached_input_tokens !== null ||
-              record.reasoning_tokens !== null ||
-              record.total_tokens !== null ||
-              record.provider !== null ||
-              record.model_id !== null;
-
-            if (!hasUsableField) return;
-
+            record.event_type = "final";
+            record.emitted_at = isoNow();
             appendRecord(record);
+            finalEmitted = true;
             break;
           }
 

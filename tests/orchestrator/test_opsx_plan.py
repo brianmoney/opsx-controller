@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -18,6 +19,10 @@ from lib.models import resolver
 from lib.models.types import ResolvedModel
 
 SCRIPT = Path(__file__).resolve().parents[2] / "orchestrator" / "opsx-plan.py"
+
+# Pre-compiled regex for extracting the fenced TOML block emitted by
+# build_schema_guidance.
+_TOM_BLOCK = re.compile(r"```toml\s*\n(.*?)```", re.DOTALL)
 
 _MODEL_HOME: tempfile.TemporaryDirectory | None = None
 _MODEL_CONFIG_PATCH = None
@@ -4161,7 +4166,7 @@ class CompileTests(unittest.TestCase):
 
     def _set_model(self) -> None:
         import os as _os
-        _os.environ["OPSX_CONTROLLER_MODEL"] = "test-model"
+        _os.environ["OPSX_CONTROLLER_MODEL"] = "test-provider/test-model"
 
     def _clear_model(self) -> None:
         import os as _os
@@ -4204,7 +4209,7 @@ class CompileTests(unittest.TestCase):
     def test_check_controller_model_succeeds_when_set(self) -> None:
         self._set_model()
         model = self.opsx_plan.check_controller_model()
-        self.assertEqual(model, "test-model")
+        self.assertEqual(model, "test-provider/test-model")
 
     # -- prompt construction --
 
@@ -4320,22 +4325,22 @@ class CompileTests(unittest.TestCase):
             "[[changes]]\nid = \"c1\"\nphase = 1\n"
         )
 
-        def fake_run(repo, model, prompt):
+        def fake_run(repo, adapter, model, prompt):
             return valid_toml, ""
 
-        original = self.opsx_plan.run_opencode_for_compile
+        original = self.opsx_plan.run_compile_client
         try:
-            self.opsx_plan.run_opencode_for_compile = fake_run
+            self.opsx_plan.run_compile_client = fake_run
             out = self.repo / "out.toml"
             args = argparse.Namespace(repo=str(self.repo), source="plan.md",
-                                      output=str(out), force=False)
+                                      output=str(out), force=False, adapter="opencode")
             rc = self.opsx_plan.cmd_compile(args)
             self.assertEqual(rc, 0)
             self.assertTrue(out.is_file())
             content = out.read_text(encoding="utf-8")
             self.assertIn("c1", content)
         finally:
-            self.opsx_plan.run_opencode_for_compile = original
+            self.opsx_plan.run_compile_client = original
 
     def test_cmd_compile_success_with_fenced_toml(self) -> None:
         self._set_model()
@@ -4348,12 +4353,12 @@ class CompileTests(unittest.TestCase):
             '```\n'
         )
 
-        def fake_run(repo, model, prompt):
+        def fake_run(repo, adapter, model, prompt):
             return fenced_toml, ""
 
-        original = self.opsx_plan.run_opencode_for_compile
+        original = self.opsx_plan.run_compile_client
         try:
-            self.opsx_plan.run_opencode_for_compile = fake_run
+            self.opsx_plan.run_compile_client = fake_run
             out = self.repo / "out.toml"
             args = argparse.Namespace(repo=str(self.repo), source="plan.md",
                                       output=str(out), force=False)
@@ -4363,7 +4368,7 @@ class CompileTests(unittest.TestCase):
             content = out.read_text(encoding="utf-8")
             self.assertIn("c1", content)
         finally:
-            self.opsx_plan.run_opencode_for_compile = original
+            self.opsx_plan.run_compile_client = original
 
     # -- invalid TOML rejection --
 
@@ -4371,12 +4376,12 @@ class CompileTests(unittest.TestCase):
         self._set_model()
         source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
 
-        def fake_run(repo, model, prompt):
+        def fake_run(repo, adapter, model, prompt):
             return "not valid toml {{{", ""
 
-        original = self.opsx_plan.run_opencode_for_compile
+        original = self.opsx_plan.run_compile_client
         try:
-            self.opsx_plan.run_opencode_for_compile = fake_run
+            self.opsx_plan.run_compile_client = fake_run
             out = self.repo / "out.toml"
             args = argparse.Namespace(repo=str(self.repo), source="plan.md",
                                       output=str(out), force=False)
@@ -4384,18 +4389,18 @@ class CompileTests(unittest.TestCase):
                 self.opsx_plan.cmd_compile(args)
             self.assertFalse(out.is_file())
         finally:
-            self.opsx_plan.run_opencode_for_compile = original
+            self.opsx_plan.run_compile_client = original
 
     def test_cmd_compile_rejects_empty_output(self) -> None:
         self._set_model()
         source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
 
-        def fake_run(repo, model, prompt):
+        def fake_run(repo, adapter, model, prompt):
             return "   ", ""
 
-        original = self.opsx_plan.run_opencode_for_compile
+        original = self.opsx_plan.run_compile_client
         try:
-            self.opsx_plan.run_opencode_for_compile = fake_run
+            self.opsx_plan.run_compile_client = fake_run
             out = self.repo / "out.toml"
             args = argparse.Namespace(repo=str(self.repo), source="plan.md",
                                       output=str(out), force=False)
@@ -4403,7 +4408,7 @@ class CompileTests(unittest.TestCase):
                 self.opsx_plan.cmd_compile(args)
             self.assertFalse(out.is_file())
         finally:
-            self.opsx_plan.run_opencode_for_compile = original
+            self.opsx_plan.run_compile_client = original
 
     def test_cmd_compile_rejects_toml_with_no_changes(self) -> None:
         self._set_model()
@@ -4411,12 +4416,12 @@ class CompileTests(unittest.TestCase):
 
         no_changes_toml = '[plan]\nname = "test"\n'
 
-        def fake_run(repo, model, prompt):
+        def fake_run(repo, adapter, model, prompt):
             return no_changes_toml, ""
 
-        original = self.opsx_plan.run_opencode_for_compile
+        original = self.opsx_plan.run_compile_client
         try:
-            self.opsx_plan.run_opencode_for_compile = fake_run
+            self.opsx_plan.run_compile_client = fake_run
             out = self.repo / "out.toml"
             args = argparse.Namespace(repo=str(self.repo), source="plan.md",
                                       output=str(out), force=False)
@@ -4424,7 +4429,7 @@ class CompileTests(unittest.TestCase):
                 self.opsx_plan.cmd_compile(args)
             self.assertFalse(out.is_file())
         finally:
-            self.opsx_plan.run_opencode_for_compile = original
+            self.opsx_plan.run_compile_client = original
 
     def test_cmd_compile_rejects_unknown_dependency(self) -> None:
         self._set_model()
@@ -4436,12 +4441,12 @@ class CompileTests(unittest.TestCase):
             "depends_on = [\"nonexistent\"]\n"
         )
 
-        def fake_run(repo, model, prompt):
+        def fake_run(repo, adapter, model, prompt):
             return unknown_dep_toml, ""
 
-        original = self.opsx_plan.run_opencode_for_compile
+        original = self.opsx_plan.run_compile_client
         try:
-            self.opsx_plan.run_opencode_for_compile = fake_run
+            self.opsx_plan.run_compile_client = fake_run
             out = self.repo / "out.toml"
             args = argparse.Namespace(repo=str(self.repo), source="plan.md",
                                       output=str(out), force=False)
@@ -4449,7 +4454,7 @@ class CompileTests(unittest.TestCase):
                 self.opsx_plan.cmd_compile(args)
             self.assertFalse(out.is_file())
         finally:
-            self.opsx_plan.run_opencode_for_compile = original
+            self.opsx_plan.run_compile_client = original
 
     def test_cmd_compile_rejects_duplicate_change_id(self) -> None:
         self._set_model()
@@ -4461,12 +4466,12 @@ class CompileTests(unittest.TestCase):
             "[[changes]]\nid = \"c1\"\nphase = 2\n"
         )
 
-        def fake_run(repo, model, prompt):
+        def fake_run(repo, adapter, model, prompt):
             return dup_id_toml, ""
 
-        original = self.opsx_plan.run_opencode_for_compile
+        original = self.opsx_plan.run_compile_client
         try:
-            self.opsx_plan.run_opencode_for_compile = fake_run
+            self.opsx_plan.run_compile_client = fake_run
             out = self.repo / "out.toml"
             args = argparse.Namespace(repo=str(self.repo), source="plan.md",
                                       output=str(out), force=False)
@@ -4474,7 +4479,7 @@ class CompileTests(unittest.TestCase):
                 self.opsx_plan.cmd_compile(args)
             self.assertFalse(out.is_file())
         finally:
-            self.opsx_plan.run_opencode_for_compile = original
+            self.opsx_plan.run_compile_client = original
 
     def test_cmd_compile_does_not_overwrite_on_failure(self) -> None:
         """Even when --force is passed, an invalid model output must not
@@ -4484,19 +4489,77 @@ class CompileTests(unittest.TestCase):
         out = self.repo / "out.toml"
         out.write_text("original content", encoding="utf-8")
 
-        def fake_run(repo, model, prompt):
+        def fake_run(repo, adapter, model, prompt):
             return "bad toml {{{", ""
 
-        original = self.opsx_plan.run_opencode_for_compile
+        original = self.opsx_plan.run_compile_client
         try:
-            self.opsx_plan.run_opencode_for_compile = fake_run
+            self.opsx_plan.run_compile_client = fake_run
             args = argparse.Namespace(repo=str(self.repo), source="plan.md",
                                       output=str(out), force=True)
             with self.assertRaises(self.opsx_plan.PlanError):
                 self.opsx_plan.cmd_compile(args)
             self.assertEqual(out.read_text(encoding="utf-8"), "original content")
         finally:
-            self.opsx_plan.run_opencode_for_compile = original
+            self.opsx_plan.run_compile_client = original
+
+    def test_cmd_compile_rejects_scalar_plan_without_overwriting(self) -> None:
+        """A scalar replacement for [plan] must be a validation error."""
+        self._set_model()
+        self._write_plan_md("plan.md", "# Plan\n")
+        out = self.repo / "out.toml"
+        out.write_text("original content", encoding="utf-8")
+
+        malformed_toml = (
+            'plan = "invalid"\n\n'
+            '[[changes]]\nid = "c1"\n'
+        )
+
+        original = self.opsx_plan.run_compile_client
+        try:
+            self.opsx_plan.run_compile_client = lambda repo, adapter, model, prompt: (
+                malformed_toml, ""
+            )
+            args = argparse.Namespace(
+                repo=str(self.repo), source="plan.md",
+                output=str(out), force=True, adapter="opencode",
+            )
+            with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+                self.opsx_plan.cmd_compile(args)
+            self.assertIn("[plan]", str(ctx.exception))
+            self.assertIn("table", str(ctx.exception))
+            self.assertEqual(out.read_text(encoding="utf-8"), "original content")
+        finally:
+            self.opsx_plan.run_compile_client = original
+
+    def test_cmd_compile_rejects_malformed_changes_without_overwriting(self) -> None:
+        """Every [[changes]] entry must be a TOML table."""
+        self._set_model()
+        self._write_plan_md("plan.md", "# Plan\n")
+        out = self.repo / "out.toml"
+        out.write_text("original content", encoding="utf-8")
+
+        malformed_toml = (
+            'changes = ["invalid"]\n\n'
+            '[plan]\nadapter = "opencode"\n'
+        )
+
+        original = self.opsx_plan.run_compile_client
+        try:
+            self.opsx_plan.run_compile_client = lambda repo, adapter, model, prompt: (
+                malformed_toml, ""
+            )
+            args = argparse.Namespace(
+                repo=str(self.repo), source="plan.md",
+                output=str(out), force=True, adapter="opencode",
+            )
+            with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+                self.opsx_plan.cmd_compile(args)
+            self.assertIn("[[changes]]", str(ctx.exception))
+            self.assertIn("table", str(ctx.exception))
+            self.assertEqual(out.read_text(encoding="utf-8"), "original content")
+        finally:
+            self.opsx_plan.run_compile_client = original
 
     # -- extract_toml --
 
@@ -4576,12 +4639,12 @@ class CompileTests(unittest.TestCase):
             "[[changes]]\nid = \"c1\"\nphase = 1\n"
         )
 
-        def fake_run(repo, model, prompt):
+        def fake_run(repo, adapter, model, prompt):
             return valid_toml, ""
 
-        original = self.opsx_plan.run_opencode_for_compile
+        original = self.opsx_plan.run_compile_client
         try:
-            self.opsx_plan.run_opencode_for_compile = fake_run
+            self.opsx_plan.run_compile_client = fake_run
             with mock.patch.object(
                 self.opsx_plan.sys,
                 "argv",
@@ -4592,19 +4655,19 @@ class CompileTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertTrue(out.is_file())
         finally:
-            self.opsx_plan.run_opencode_for_compile = original
+            self.opsx_plan.run_compile_client = original
 
-    def test_run_opencode_for_compile_raises_on_spawn_failure(self) -> None:
+    def test_run_compile_client_raises_on_spawn_failure(self) -> None:
         def fake_run(*args, **kwargs):
             raise FileNotFoundError("no opencode")
 
         with mock.patch("subprocess.run", side_effect=fake_run):
             with self.assertRaises(self.opsx_plan.PlanError) as ctx:
-                self.opsx_plan.run_opencode_for_compile(self.repo, "m", "prompt")
-            self.assertIn("could not spawn opencode", str(ctx.exception))
+                self.opsx_plan.run_compile_client(self.repo, "opencode", "m", "prompt")
+            self.assertIn("could not spawn", str(ctx.exception))
 
-    def test_run_opencode_for_compile_passes_model_in_argv(self) -> None:
-        """Verify ``run_opencode_for_compile`` spawns opencode with the
+    def test_run_compile_client_passes_model_in_argv(self) -> None:
+        """Verify ``run_compile_client`` spawns opencode with the
         configured model."""
         model = "configured-model-v1"
         prompt = "compile this plan"
@@ -4624,11 +4687,11 @@ class CompileTests(unittest.TestCase):
             return result
 
         with mock.patch("subprocess.run", side_effect=fake_run):
-            stdout, stderr = self.opsx_plan.run_opencode_for_compile(
-                self.repo, model, prompt
+            stdout, stderr = self.opsx_plan.run_compile_client(
+                self.repo, "opencode", model, prompt
             )
 
-    def test_run_opencode_for_compile_raises_on_nonzero_exit(self) -> None:
+    def test_run_compile_client_raises_on_nonzero_exit(self) -> None:
         fake_result = mock.Mock()
         fake_result.returncode = 1
         fake_result.stdout = ""
@@ -4636,7 +4699,7 @@ class CompileTests(unittest.TestCase):
 
         with mock.patch("subprocess.run", return_value=fake_result):
             with self.assertRaises(self.opsx_plan.PlanError) as ctx:
-                self.opsx_plan.run_opencode_for_compile(self.repo, "m", "prompt")
+                self.opsx_plan.run_compile_client(self.repo, "opencode", "m", "prompt")
             self.assertIn("exited with code 1", str(ctx.exception))
 
     def test_build_schema_guidance_includes_load_plan_fields(self) -> None:
@@ -4648,6 +4711,406 @@ class CompileTests(unittest.TestCase):
                        "enabled", "phase", "id", "max_attempts", "review_created"):
             self.assertIn(field, guidance,
                           f"schema guidance must mention field '{field}' consumed by load_plan()")
+
+    def test_build_schema_guidance_toml_block_parses_for_each_adapter(self) -> None:
+        """The TOML fenced block rendered by schema guidance must be valid TOML."""
+        import tomllib
+
+        for adapter in ("opencode", "claude-code"):
+            guidance = self.opsx_plan.build_schema_guidance(adapter)
+            m = _TOM_BLOCK.search(guidance)
+            self.assertIsNotNone(m, f"{adapter}: no fenced toml block found")
+            try:
+                parsed = tomllib.loads(m.group(1))
+            except Exception as exc:
+                self.fail(f"{adapter}: generated TOML block must parse: {exc}")
+            plan = parsed.get("plan", {})
+            self.assertEqual(plan.get("adapter"), adapter,
+                             f"{adapter}: adapter field must match")
+            for key in ("invoke", "state_file", "implement_invoke",
+                         "review_invoke", "archive_invoke"):
+                self.assertIn(key, plan,
+                              f"{adapter}: [plan] must include '{key}'")
+
+    # -- adapter-aware compile tests --
+
+    def test_cmd_compile_codex_rejected_before_spawn(self) -> None:
+        """Codex CLI compile exits non-zero before model resolution."""
+        self._set_model()
+        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
+        out = self.repo / "out.toml"
+        args = argparse.Namespace(repo=str(self.repo), source="plan.md",
+                                  output=str(out), force=False, adapter="codex-cli")
+        # Must not call subprocess.run at all — reject in cmd_compile itself.
+        with mock.patch("subprocess.run") as m_run:
+            rc = self.opsx_plan.cmd_compile(args)
+        m_run.assert_not_called()
+        self.assertNotEqual(rc, 0)
+
+    def test_cmd_compile_claude_adapter_propagates_to_prompt(self) -> None:
+        """Claude adapter appears in the compile prompt."""
+        # _set_model() provides a provider-prefixed model valid for opencode
+        # but rejected by claude-code. Override with a claude-valid model.
+        os.environ["OPSX_CONTROLLER_MODEL"] = "claude-sonnet-5"
+        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
+
+        def fake_run(repo, adapter, model, prompt):
+            self.assertEqual(adapter, "claude-code")
+            self.assertIn("adapter defaults (claude-code)", prompt.lower())
+            return (
+                '[plan]\nname = "test"\nadapter = "claude-code"\n\n'
+                "[[changes]]\nid = \"c1\"\nphase = 1\n",
+                "",
+            )
+
+        original = self.opsx_plan.run_compile_client
+        try:
+            self.opsx_plan.run_compile_client = fake_run
+            out = self.repo / "out.toml"
+            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
+                                      output=str(out), force=False,
+                                      adapter="claude-code")
+            rc = self.opsx_plan.cmd_compile(args)
+            self.assertEqual(rc, 0)
+        finally:
+            self.opsx_plan.run_compile_client = original
+
+    def test_cmd_compile_rejects_mismatched_adapter_in_manifest(self) -> None:
+        """Generated manifest must have adapter matching the selected one."""
+        os.environ["OPSX_CONTROLLER_MODEL"] = "claude-sonnet-5"
+        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
+
+        # Model returns opencode adapter despite claude-code selection.
+        wrong_toml = (
+            '[plan]\nname = "test"\nadapter = "opencode"\n\n'
+            "[[changes]]\nid = \"c1\"\nphase = 1\n"
+        )
+
+        invoked = False
+
+        def fake_run(repo, adapter, model, prompt):
+            nonlocal invoked
+            invoked = True
+            return wrong_toml, ""
+
+        original = self.opsx_plan.run_compile_client
+        try:
+            self.opsx_plan.run_compile_client = fake_run
+            out = self.repo / "out.toml"
+            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
+                                      output=str(out), force=False,
+                                      adapter="claude-code")
+            with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+                self.opsx_plan.cmd_compile(args)
+            self.assertIn("adapter", str(ctx.exception).lower())
+            self.assertTrue(invoked)
+            self.assertFalse(out.exists())
+        finally:
+            self.opsx_plan.run_compile_client = original
+
+    def test_cmd_compile_unknown_adapter_exits_nonzero(self) -> None:
+        """Unknown adapter name exits 2 before model resolution."""
+        self._set_model()
+        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
+        out = self.repo / "out.toml"
+        args = argparse.Namespace(repo=str(self.repo), source="plan.md",
+                                  output=str(out), force=False,
+                                  adapter="nonexistent")
+        rc = self.opsx_plan.cmd_compile(args)
+        self.assertEqual(rc, 2)
+
+    # -- _build_compile_argv tests --
+
+    def test_build_argv_for_opencode(self) -> None:
+        argv = self.opsx_plan._build_compile_argv(
+            "opencode", "m1", "prompt text"
+        )
+        self.assertIn("opencode", argv[0])
+        self.assertIn("run", argv)
+        self.assertIn("m1", argv)
+        self.assertIn("prompt text", argv)
+
+    def test_build_argv_for_claude_code(self) -> None:
+        argv = self.opsx_plan._build_compile_argv(
+            "claude-code", "m2", "compile this"
+        )
+        self.assertIn("claude", argv[0])
+        self.assertIn("-p", argv)
+        self.assertIn("m2", argv)
+        self.assertIn("compile this", argv)
+
+    def test_build_argv_rejects_unsupported_codex(self) -> None:
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan._build_compile_argv("codex-cli", "m", "prompt")
+        self.assertIn("not supported", str(ctx.exception))
+
+    # -- controller model syntax validation (reject before spawn) -----------
+
+    def test_check_controller_model_rejects_provider_prefix_for_claude(self) -> None:
+        """A provider-prefixed model (e.g. 'anthropic/claude-sonnet-5') is
+        rejected for the claude-code adapter before any process spawn."""
+        os.environ["OPSX_CONTROLLER_MODEL"] = "anthropic/claude-sonnet-5"
+        try:
+            with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+                self.opsx_plan.check_controller_model(adapter="claude-code")
+            self.assertIn("not valid", str(ctx.exception))
+            self.assertIn("claude-code", str(ctx.exception))
+            self.assertIn("controller", str(ctx.exception))
+        finally:
+            os.environ.pop("OPSX_CONTROLLER_MODEL", None)
+
+    def test_check_controller_model_rejects_missing_provider_prefix_for_opencode(self) -> None:
+        """A model identifier without a 'provider/' prefix is rejected for
+        the opencode adapter."""
+        os.environ["OPSX_CONTROLLER_MODEL"] = "sonnet-direct"
+        try:
+            with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+                self.opsx_plan.check_controller_model(adapter="opencode")
+            self.assertIn("not valid", str(ctx.exception))
+            self.assertIn("opencode", str(ctx.exception))
+            self.assertIn("controller", str(ctx.exception))
+        finally:
+            os.environ.pop("OPSX_CONTROLLER_MODEL", None)
+
+    def test_check_controller_model_accepts_valid_opencode_model(self) -> None:
+        """A valid provider/model identifier is accepted for opencode."""
+        self._set_model()  # sets OPSX_CONTROLLER_MODEL = "test-provider/test-model"
+        model = self.opsx_plan.check_controller_model(adapter="opencode")
+        self.assertEqual(model, "test-provider/test-model")
+
+    def test_check_controller_model_accepts_valid_claude_model(self) -> None:
+        """A non-prefixed model identifier is accepted for claude-code."""
+        os.environ["OPSX_CONTROLLER_MODEL"] = "claude-sonnet-5"
+        try:
+            model = self.opsx_plan.check_controller_model(adapter="claude-code")
+            self.assertEqual(model, "claude-sonnet-5")
+        finally:
+            os.environ.pop("OPSX_CONTROLLER_MODEL", None)
+
+    # -- compile client timeout ----------------------------------------------
+
+    def test_run_compile_client_raises_on_timeout(self) -> None:
+        """A compile client invocation that exceeds the timeout is reported
+        as a PlanError."""
+        def fake_run(args, **kwargs):
+            raise subprocess.TimeoutExpired(args, kwargs.get("timeout", 60))
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+                self.opsx_plan.run_compile_client(self.repo, "claude-code",
+                                                   "m", "prompt")
+            self.assertIn("timed out", str(ctx.exception).lower())
+
+    # -- _strip_claude_envelope / extract_toml tests --
+
+    def test_strip_claude_json_result_envelope(self) -> None:
+        output = '{"result": "[plan]\\nname = \\\"p\\\"\\nadapter = \\\"claude-code\\\"\\n\\n"}'
+        stripped = self.opsx_plan._strip_claude_envelope(output)
+        self.assertIn("[plan]", stripped)
+        self.assertNotIn('{"result"', stripped)
+
+    def test_strip_claude_envelope_preserves_non_json(self) -> None:
+        output = '[plan]\nname = "p"\n'
+        result = self.opsx_plan._strip_claude_envelope(output)
+        self.assertEqual(result, output)
+
+    def test_extract_toml_claude_jason_envelope(self) -> None:
+        inner = '[plan]\nname = "p"\nadapter = "claude-code"\n\n[[changes]]\nid = "c1"\n'
+        output = '{"result": "' + inner.replace('\n', '\\n').replace('"', '\\"') + '"}'
+        result = self.opsx_plan.extract_toml(output, adapter="claude-code")
+        self.assertIn("[plan]", result)
+
+    def test_extract_toml_claude_plain_rejected_without_envelope(self) -> None:
+        """Claude plain text without TOML content is rejected with named client."""
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan.extract_toml("here is some prose", adapter="claude-code")
+        self.assertIn("claude", str(ctx.exception).lower())
+
+    def test_extract_toml_empty_opencode_mentions_opencode(self) -> None:
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan.extract_toml("", adapter="opencode")
+        self.assertIn("opencode", str(ctx.exception).lower())
+
+    # -- Claude extraction edge cases ----------------------------------------
+
+    def test_extract_toml_claude_strips_envelope_with_leading_whitespace(self) -> None:
+        """Claude JSON envelope with leading/trailing whitespace is stripped."""
+        inner = '[plan]\nname = "p"\nadapter = "claude-code"\n\n[[changes]]\nid = "c1"\n'
+        escaped = inner.replace('\n', '\\n').replace('"', '\\"')
+        output = ' \n {"result": "' + escaped + '"} \n'
+        result = self.opsx_plan.extract_toml(output, adapter="claude-code")
+        self.assertIn("[plan]", result)
+
+    def test_extract_toml_claude_envelope_with_fenced_toml_inside_result(self) -> None:
+        """When the envelope result string contains a fenced TOML block,
+        the envelope is stripped before the fenced-block extraction."""
+        inner = '```toml\n[plan]\nname = "p"\nadapter = "claude-code"\n\n[[changes]]\nid = "c1"\n```\n'
+        escaped = json.dumps(inner)
+        output = '{"result": ' + escaped + '}'
+        result = self.opsx_plan.extract_toml(output, adapter="claude-code")
+        self.assertIn("[plan]", result)
+        self.assertNotIn("```", result)
+
+    def test_extract_toml_claude_handles_result_not_a_string(self) -> None:
+        """Claude envelope whose result is not a string falls through to
+        standard extraction (e.g. result is a dict)."""
+        output = '{"result": {"status": "ok"}}'
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan.extract_toml(output, adapter="claude-code")
+        self.assertIn("claude", str(ctx.exception).lower())
+
+    def test_extract_toml_claude_handles_broken_json_gracefully(self) -> None:
+        """Claude output that looks like JSON but is broken falls through
+        without crashing the extractor."""
+        # Malformed JSON that starts with `{` but is not parseable.
+        output = '{"result": unfinished'
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan.extract_toml(output, adapter="claude-code")
+        self.assertIn("claude", str(ctx.exception).lower())
+
+    def test_extract_toml_claude_envelope_result_empty_string(self) -> None:
+        """Claude envelope with empty result string is treated as no TOML."""
+        output = '{"result": ""}'
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan.extract_toml(output, adapter="claude-code")
+        self.assertIn("claude", str(ctx.exception).lower())
+
+    # -- Claude compile client-level error and rejection tests ---------------
+
+    def test_run_compile_client_claude_spawn_failure(self) -> None:
+        """Claude compile client raises PlanError when the 'claude' binary
+        is not on PATH (FileNotFoundError), reporting the missing executable
+        by name."""
+        def fake_run(*args, **kwargs):
+            raise FileNotFoundError("no claude")
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+                self.opsx_plan.run_compile_client(
+                    self.repo, "claude-code", "m", "prompt"
+                )
+            self.assertIn("could not spawn", str(ctx.exception))
+            self.assertIn("claude", str(ctx.exception))
+
+    def test_run_compile_client_claude_nonzero_exit(self) -> None:
+        """Claude compile client raises PlanError with exit code and stderr
+        when the Claude process exits non-zero."""
+        fake_result = mock.Mock()
+        fake_result.returncode = 1
+        fake_result.stdout = ""
+        fake_result.stderr = "Claude error: model not configured"
+
+        with mock.patch("subprocess.run", return_value=fake_result):
+            with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+                self.opsx_plan.run_compile_client(
+                    self.repo, "claude-code", "m", "prompt"
+                )
+            self.assertIn("exited with code 1", str(ctx.exception))
+            self.assertIn("Claude error", str(ctx.exception))
+
+    def test_cmd_compile_claude_raw_toml_no_envelope(self) -> None:
+        """Claude compile succeeds when output is plain TOML (no JSON
+        envelope, no fenced block)."""
+        self._set_model()
+        os.environ["OPSX_CONTROLLER_MODEL"] = "claude-sonnet-5"
+        source = self._write_plan_md(
+            "plan.md",
+            "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n",
+        )
+
+        raw_toml = (
+            '[plan]\nname = "test"\nadapter = "claude-code"\n\n'
+            "[[changes]]\nid = \"c1\"\nphase = 1\n"
+        )
+
+        def fake_run(repo, adapter, model, prompt):
+            return raw_toml, ""
+
+        original = self.opsx_plan.run_compile_client
+        try:
+            self.opsx_plan.run_compile_client = fake_run
+            out = self.repo / "out.toml"
+            args = argparse.Namespace(
+                repo=str(self.repo), source="plan.md",
+                output=str(out), force=False, adapter="claude-code",
+            )
+            rc = self.opsx_plan.cmd_compile(args)
+            self.assertEqual(rc, 0)
+            self.assertTrue(out.is_file())
+            content = out.read_text(encoding="utf-8")
+            self.assertIn("c1", content)
+            self.assertIn("claude-code", content)
+        finally:
+            self.opsx_plan.run_compile_client = original
+            os.environ.pop("OPSX_CONTROLLER_MODEL", None)
+
+    def test_cmd_compile_claude_fenced_toml_no_envelope(self) -> None:
+        """Claude compile succeeds when output is a fenced TOML block with
+        no JSON envelope — the generic fenced-block extraction applies."""
+        self._set_model()
+        os.environ["OPSX_CONTROLLER_MODEL"] = "claude-sonnet-5"
+        source = self._write_plan_md(
+            "plan.md",
+            "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n",
+        )
+
+        fenced_toml = (
+            '```toml\n'
+            '[plan]\nname = "test"\nadapter = "claude-code"\n\n'
+            "[[changes]]\nid = \"c1\"\nphase = 1\n"
+            '```\n'
+        )
+
+        def fake_run(repo, adapter, model, prompt):
+            return fenced_toml, ""
+
+        original = self.opsx_plan.run_compile_client
+        try:
+            self.opsx_plan.run_compile_client = fake_run
+            out = self.repo / "out.toml"
+            args = argparse.Namespace(
+                repo=str(self.repo), source="plan.md",
+                output=str(out), force=False, adapter="claude-code",
+            )
+            rc = self.opsx_plan.cmd_compile(args)
+            self.assertEqual(rc, 0)
+            self.assertTrue(out.is_file())
+            content = out.read_text(encoding="utf-8")
+            self.assertIn("c1", content)
+            self.assertIn("claude-code", content)
+        finally:
+            self.opsx_plan.run_compile_client = original
+            os.environ.pop("OPSX_CONTROLLER_MODEL", None)
+
+    def test_cmd_compile_claude_rejects_prose_output(self) -> None:
+        """Claude compile raises PlanError when output is plain prose with
+        no TOML content — the extraction fails with a client-named message."""
+        self._set_model()
+        os.environ["OPSX_CONTROLLER_MODEL"] = "claude-sonnet-5"
+        source = self._write_plan_md(
+            "plan.md",
+            "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n",
+        )
+
+        def fake_run(repo, adapter, model, prompt):
+            return "I cannot compile this plan because it lacks change entries.", ""
+
+        original = self.opsx_plan.run_compile_client
+        try:
+            self.opsx_plan.run_compile_client = fake_run
+            out = self.repo / "out.toml"
+            args = argparse.Namespace(
+                repo=str(self.repo), source="plan.md",
+                output=str(out), force=False, adapter="claude-code",
+            )
+            with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+                self.opsx_plan.cmd_compile(args)
+            self.assertIn("claude", str(ctx.exception).lower())
+            self.assertIn("TOML", str(ctx.exception))
+            self.assertFalse(out.is_file())
+        finally:
+            self.opsx_plan.run_compile_client = original
+            os.environ.pop("OPSX_CONTROLLER_MODEL", None)
 
 
 class DirectStageUsageExtractionTests(unittest.TestCase):
@@ -9284,15 +9747,15 @@ class ActivePlanResolutionTests(unittest.TestCase):
     def test_compile_auto_activates_output_plan(self) -> None:
         source = self._write_plan_md("plan.md")
         out = self.repo / "out.toml"
-        os.environ["OPSX_CONTROLLER_MODEL"] = "test-model"
+        os.environ["OPSX_CONTROLLER_MODEL"] = "test-provider/test-model"
 
         valid_toml = (
             '[plan]\nname = "test"\nadapter = "opencode"\n\n'
             "[[changes]]\nid = \"c1\"\nphase = 1\n"
         )
-        original = self.opsx_plan.run_opencode_for_compile
+        original = self.opsx_plan.run_compile_client
         try:
-            self.opsx_plan.run_opencode_for_compile = lambda repo, model, prompt: (valid_toml, "")
+            self.opsx_plan.run_compile_client = lambda repo, adapter, model, prompt: (valid_toml, "")
             args = argparse.Namespace(repo=str(self.repo), source="plan.md",
                                       output=str(out), force=False)
             rc = self.opsx_plan.cmd_compile(args)
@@ -9301,7 +9764,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
             self.assertIsNotNone(pointer)
             self.assertEqual(Path(pointer), Path("out.toml"))
         finally:
-            self.opsx_plan.run_opencode_for_compile = original
+            self.opsx_plan.run_compile_client = original
 
     def test_run_explicit_auto_activates_after_successful_load(self) -> None:
         plan = self._write_plan_toml("my-plan.toml")
@@ -10645,6 +11108,54 @@ class DoctorPreflightTests(unittest.TestCase):
             )
             rc = self.opsx_plan.cmd_run(args)
         self.assertTrue(preflight_called, "run_preflight_warnings was not called")
+
+    # -- doctor --adapter tests --
+
+    def test_doctor_planless_claude_selection(self) -> None:
+        """Doctor without a plan uses explicit --adapter."""
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            plan=None,
+            adapter="claude-code",
+        )
+        with mock.patch.object(self.opsx_plan, "run_doctor_checks") as m_run:
+            m_run.return_value = 0
+            rc = self.opsx_plan.cmd_doctor(args)
+        self.assertEqual(rc, 0)
+        m_run.assert_called_once()
+        _, _, passed_adapter, _ = m_run.call_args[0]
+        self.assertEqual(passed_adapter, "claude-code",
+                         "plan-less doctor should propagate --adapter")
+
+    def test_doctor_plan_adapter_overrides_flag(self) -> None:
+        """A resolved plan's adapter is authoritative even when --adapter is given."""
+        plan_path = self._write_plan_toml(name="override-test")
+        plan_src = str(plan_path.relative_to(self.repo))
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            plan=plan_src,
+            adapter="claude-code",
+        )
+        with mock.patch.object(self.opsx_plan, "run_doctor_checks") as m_run:
+            m_run.return_value = 0
+            rc = self.opsx_plan.cmd_doctor(args)
+        self.assertEqual(rc, 0)
+        _, _, passed_adapter, _ = m_run.call_args[0]
+        self.assertEqual(passed_adapter, "opencode",
+                         "plan's adapter must override --adapter flag")
+
+    def test_doctor_defaults_to_opencode_without_flag_or_plan(self) -> None:
+        """Doctor without --adapter and without plan defaults to opencode."""
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            plan=None,
+        )
+        with mock.patch.object(self.opsx_plan, "run_doctor_checks") as m_run:
+            m_run.return_value = 0
+            rc = self.opsx_plan.cmd_doctor(args)
+        self.assertEqual(rc, 0)
+        _, _, passed_adapter, _ = m_run.call_args[0]
+        self.assertEqual(passed_adapter, "opencode")
 
 
 class DirectWorkerAgentDoctorCheckTests(unittest.TestCase):

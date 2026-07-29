@@ -54,32 +54,32 @@ SHALL re-scan every dependency paragraph before reporting success.
 - **THEN** it re-scans each `**Depends on:**` paragraph so only intended
   backticked change IDs and phase references create compiler DAG edges
 
-### Requirement: Claude authoring reports OpenCode compilation truthfully
+### Requirement: Claude authoring reports compilation truthfully
 
-The authoring agent SHALL run an `opsx-plan compile` self-check only when
-`opsx-plan` is available on PATH and `OPSX_CONTROLLER_MODEL` is non-empty.
+The authoring agent SHALL run an `opsx-plan compile --adapter claude-code`
+self-check only when `opsx-plan` is available on PATH and a `controller` model
+resolves for the `claude-code` adapter.
 
 When those prerequisites are available, the agent SHALL compile the authored
 document, correct plan structure or dependency defects exposed by compilation,
 and report the successful self-check. When either prerequisite is unavailable,
 it SHALL report that the Markdown document was authored but not compiled and
-state that an OpenCode-configured environment must run `opsx-plan compile`
-before plan execution.
+state the missing Claude Code prerequisite.
 
 The adapter SHALL NOT imply that successful Markdown authoring is successful
 TOML compilation.
 
 #### Scenario: Claude-only authoring is not represented as compilation
 
-- **WHEN** a Claude-only environment lacks `opsx-plan` or
-  `OPSX_CONTROLLER_MODEL`
+- **WHEN** a Claude-only environment lacks `opsx-plan` or a Claude Code
+  controller model
 - **THEN** the agent reports the authored Markdown path and that compilation was
-  not performed, including the OpenCode-backed prerequisite
+  not performed, including the missing Claude-selected prerequisite
 
 #### Scenario: Available compiler self-check passes
 
-- **WHEN** `opsx-plan` is on PATH and `OPSX_CONTROLLER_MODEL` is configured
-- **THEN** the agent runs `opsx-plan compile` for the authored document and
+- **WHEN** `opsx-plan` is on PATH and a Claude Code controller model is configured
+- **THEN** the agent runs `opsx-plan compile --adapter claude-code` for the authored document and
   reports compilation only after that command succeeds
 
 ### Requirement: Claude authoring is packaged for adapter and plugin use
@@ -90,10 +90,12 @@ artifacts and expose `/opsx-controller:opsx-plan <planning request>` with
 namespaced agent delegation.
 
 The existing generic Claude installer SHALL install the new skill through its
-directory-copy behavior without feature-specific installer logic. Host-project,
-repository, and plugin documentation SHALL state the authoring command, retain
-`/opsx-drive <change-id>` for accepted single-change control, and document that
-compilation currently requires OpenCode and `OPSX_CONTROLLER_MODEL`.
+directory-copy behavior without feature-specific installer logic. The Claude
+global installer SHALL install the common `opsx-plan` and `opsx-run`
+executables in addition to its adapter artifacts. Host-project, repository, and
+plugin documentation SHALL state the authoring command, retain `/opsx-drive
+<change-id>` for accepted single-change control, and document Claude-selected
+compilation.
 
 #### Scenario: Global and project installs include plan authoring
 
@@ -107,3 +109,7 @@ compilation currently requires OpenCode and `OPSX_CONTROLLER_MODEL`.
 - **THEN** the plugin exposes `/opsx-controller:opsx-plan` and delegates its
   authoring request to the plugin-scoped `opsx-plan-author` agent
 
+#### Scenario: Global Claude install includes orchestrator commands
+
+- **WHEN** an operator installs the Claude adapter globally
+- **THEN** `opsx-plan` and `opsx-run` are available from the shared user-level executable location

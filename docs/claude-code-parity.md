@@ -1,100 +1,21 @@
 # Claude Code Parity for `compile` and the Orchestrator Executables
 
-**Status:** proposed, targeted at the public launch
+**Status:** resolved (add-adapter-aware-plan-compilation)
 **Scope:** `opsx-plan compile` and installation of the `opsx-plan` / `opsx-run`
 executables
 
 ## Summary
 
 The controller loop is client-neutral. The two surfaces a *new user* touches
-first are not. Both are hard-wired to OpenCode:
+first are now client-neutral as well:
 
-1. `opsx-plan compile` always shells out to the `opencode` binary, regardless of
-   which adapter the plan targets.
-2. Only `adapters/opencode/install.sh` installs the `opsx-plan` and `opsx-run`
-   executables, even though those executables are client-agnostic.
-
-The result is that a Claude Code user cannot complete the documented quick start
-without installing a second, competing coding agent. This document explains why
-that matters for launch and what the fix involves.
-
-## Why this blocks launch
-
-### The failure is first-run, not edge-case
-
-Follow the README as a Claude Code user today:
-
-```bash
-bash adapters/claude-code/install.sh --global     # step 2, as documented
-opsx-plan compile openspec/plans/my-plan.md -o openspec/plans/my-plan.toml
-```
-
-Two failures, in order:
-
-1. `opsx-plan: command not found` — the Claude Code installer installs skills,
-   agents, and a support README, but never runs the equivalent of the OpenCode
-   installer's `install_orchestrator()`.
-2. Once worked around by invoking `python3 orchestrator/opsx-plan.py` from a
-   checkout, `compile` fails at `check_controller_model()` or at
-   `run_opencode_for_compile()` — it needs an `opencode` binary and a
-   controller model resolved *for the opencode adapter*.
-
-Neither failure is recoverable by reading the error. The first is a missing
-command; the second names a tool the user deliberately chose not to install.
-
-### It contradicts the product's central claim
-
-"Client-portable" is one of six bullets in the README's *Why it exists*, and it
-is a real property of the loop — `ADAPTER_DEFAULTS` carries complete
-`implement` / `review` / `archive` invocations for `claude-code`, direct
-dispatch works, and result parsing already handles Claude's output conventions.
-
-The portability claim is undermined at exactly the two points where a new user
-forms their first impression. The README currently has to carry a prerequisite
-callout stating that OpenCode is required no matter which client drives the
-loop. That callout is honest, and it is the first thing a Claude Code user
-reads.
-
-### The launch audience skews Claude Code
-
-The public launch is driven by developer content aimed at people already
-running coding agents. Claude Code is the largest single segment of that
-audience. The current state routes the most likely arrival into the worst
-first-run experience, and it does so after they have already agreed with the
-premise — the most expensive possible place to lose someone.
-
-### The fix is small relative to the cost
-
-Neither problem is architectural. The loop already abstracts the client; these
-two surfaces simply predate that abstraction and were never generalized. This
-is not "port the controller to Claude Code" — it is two seams.
-
-## What is actually wired to OpenCode
-
-### 1. `compile` (`orchestrator/opsx-plan.py`)
-
-| Location | Coupling |
-|---|---|
-| `check_controller_model()` (~`:4103`) | Resolves the `controller` role against the `opencode` adapter explicitly, with a docstring stating that compile always shells out to `opencode`. |
-| `run_opencode_for_compile()` (~`:4312`) | Hard-codes `["opencode", "run", "--model", model, prompt]`. |
-| `build_compile_prompt()` / `build_schema_guidance()` | Emits OpenCode adapter defaults into the generated manifest guidance. |
-| `extract_toml()` (~`:4341`) | Error strings name `opencode`; ambiguity rules assume OpenCode's output shape. |
-| `cmd_compile()` (~`:5214`) | Calls the above directly with no adapter branch. |
-
-### 2. Executable installation
-
-`install_orchestrator()` in `adapters/opencode/install.sh` (~`:74-89`) does work
-that has nothing to do with OpenCode:
-
-- copies `lib/metrics`, `lib/pricing`, `lib/models` to
-  `~/.local/lib/opsx-controller/lib`
-- installs `orchestrator/opsx-plan.py` to `~/.local/bin/opsx-plan`
-- installs the same script to `~/.local/bin/opsx-run`
-
-`adapters/claude-code/install.sh` and `adapters/codex-cli/install.sh` have no
-equivalent. The orchestrator's own `sys.path` bootstrap (`_RUNTIME_ROOTS`,
-`:41-51`) already supports the installed layout, so nothing about the runtime
-resolution needs to change — only which installers perform the install.
+1. `opsx-plan compile` supports `--adapter opencode` (default) and
+   `--adapter claude-code`, shelling out to the corresponding binary with
+   adapter-specific model validation before spawn.
+2. All three global installers (`adapters/opencode/install.sh`,
+   `adapters/claude-code/install.sh`, `adapters/codex-cli/install.sh`) deploy
+   `opsx-plan` and `opsx-run` to `~/.local/bin/` via the shared
+   `scripts/install-orchestrator.sh` helper.
 
 ## What is *not* broken
 
