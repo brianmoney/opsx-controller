@@ -178,7 +178,7 @@ run; treat them as actionable, not informational.
 ## Plan Manifest
 
 The plan manifest is a TOML file with a `[plan]` table and one or more
-`[[changes]]` entries. An example is at `orchestrator/plan.example.toml`.
+`[[changes]]` entries. A canonical example is at `orchestrator/samples/sample-plan.toml`.
 
 ### `[plan]` table: key config keys and defaults
 
@@ -585,6 +585,9 @@ opsx-plan report plan.toml --change add-feature-a
 opsx-plan report plan.toml --run-id <run-id>
 opsx-plan report plan.toml --stage implement
 opsx-plan report plan.toml --model gpt-4o
+
+# Target a single-change run's derived manifest
+opsx-plan report --for-change add-feature-a
 ```
 
 The report includes:
@@ -620,6 +623,9 @@ opsx-plan dashboard plan.toml --output .opsx-plan/dashboards/my-plan.html
 # Filter by change or run
 opsx-plan dashboard plan.toml --change add-feature-a
 opsx-plan dashboard plan.toml --run-id <run-id>
+
+# Target a single-change run's derived manifest
+opsx-plan dashboard --for-change add-feature-a
 ```
 
 The dashboard is a self-contained HTML file with no external dependencies. It
@@ -771,6 +777,41 @@ re-invoking the same `opsx-run <change-id>` command.
 
 This is equivalent to `opsx-plan run-one <change-id>`.
 
+### Derived Manifest
+
+Every `opsx-run` invocation produces a **derived manifest** at
+`.opsx-plan/plans/run-<change-id>.toml`. This manifest is a fully round-tripped
+TOML document that mirrors the one-change configuration the orchestrator uses
+internally — every plan-level field and the single `[[changes]]` entry are
+serialized, written to a temp file, loaded back through the standard
+`load_plan` parser, and compared field-by-field before it replaces any
+existing copy. If the round-trip comparison detects divergence, the stale
+manifest and the temp file are both removed and a `PlanError` is raised to
+prevent an incorrect manifest from persisting.
+
+The derived manifest enables the same reporting and dashboard tooling that
+multi-change plan manifests support:
+
+```bash
+# Report targeting a derived manifest (manifest-driven lookup):
+opsx-plan report --for-change add-gardening-suggestions
+
+# Dashboard targeting the same derived manifest:
+opsx-plan dashboard --for-change add-gardening-suggestions
+
+# When the manifest is absent but state exists (e.g. from a pre-change
+# run namespace that predates manifest serialization), --for-change still
+# resolves via the plan name fallback:
+opsx-plan report --for-change run-add-adapter-aware-plan-compilation
+```
+
+The derived manifest path follows the convention
+`.opsx-plan/plans/run-<change-id>.toml`. It is re-created (not appended to) on
+every `opsx-run` invocation, so the manifest always reflects the configuration
+that the most recent run used. The active-plan pointer (`.opsx-plan/active-plan`)
+is **not** updated by `opsx-run` — it remains unchanged regardless of how many
+single-change runs are dispatched.
+
 ---
 
 ## State and Recovery
@@ -781,6 +822,8 @@ All orchestrator state lives at `.opsx-plan/` in the host project root:
 - `<name>.state.json` — plan-level state: approvals, per-change records, git
   delivery state, notified events
 - `active-plan` — the active-plan pointer file
+- `plans/` — derived single-change manifests (`run-<change-id>.toml`) and
+  other .opsx-plan artifacts
 - `logs/` — per-stage log files
 - `workers/<plan>/<change>.json` — worker-compatible state snapshots used as
   phase inputs
@@ -1011,12 +1054,13 @@ written.
 ### `opsx-plan compile`
 
 ```
-opsx-plan compile <source.md> -o <output.toml> [--force] [--adapter <name>]
+opsx-plan compile <source.md> [-o <output.toml>] [--force] [--adapter <name>]
 ```
 Compile a markdown plan into a runnable TOML manifest. Requires a
 `controller` model resolved for the selected adapter (default `opencode`,
 `--adapter claude-code` for Claude Code). Refuses to overwrite
-an existing output unless `--force` is passed.
+an existing output unless `--force` is passed. When `-o` is omitted,
+defaults to `openspec/plans/<source-stem>.toml`.
 
 ### `opsx-plan models`
 
@@ -1100,16 +1144,20 @@ relevant log by default.
 ```
 opsx-plan report [plan.toml] [--json] [--change <id>]
                  [--run-id <id>] [--stage <stage>] [--model <substr>]
+                 [--for-change <id>]
 ```
-Emit plan-run efficiency metrics from telemetry and state.
+Emit plan-run efficiency metrics from telemetry and state. `--for-change`
+targets a derived single-change run manifest instead of a plan path.
 
 ### `opsx-plan dashboard`
 
 ```
 opsx-plan dashboard [plan.toml] [--output <path>]
                     [--run-id <id>] [--change <id>]
+                    [--for-change <id>]
 ```
-Generate a static HTML efficiency dashboard from telemetry.
+Generate a static HTML efficiency dashboard from telemetry. `--for-change`
+targets a derived single-change run manifest instead of a plan path.
 
 ### `opsx-plan run-one`
 
@@ -1126,6 +1174,16 @@ through the `claude-code` (or `codex-cli`) loop via `run-one` — use a
 plan manifest with `adapter = "claude-code"` and `opsx-plan run` instead.
 Adding an `--adapter` flag to `run-one` is tracked as follow-up work, not
 implemented here.
+
+### `opsx-plan archive-plan`
+
+```
+opsx-plan archive-plan <plan.toml>
+```
+Archive a plan manifest pair (`.toml` and sibling `.md`) into
+`openspec/plans/archived/`. Uses `git mv` for tracked files; clears the
+active-plan pointer when it referenced the archived plan. Does not create
+a commit — you commit the move yourself after reviewing.
 
 ### `opsx-run` (executable-name alias)
 
@@ -1155,7 +1213,7 @@ Equivalent to `opsx-plan run-one`.
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
-| `-o`, `--output` | string | **required** | Output TOML path |
+| `-o`, `--output` | string | `openspec/plans/<source-stem>.toml` | Output TOML path |
 | `--force` | flag | `false` | Overwrite existing output |
 | `--adapter` | string | `"opencode"` | Compile client adapter (`opencode` or `claude-code`) |
 

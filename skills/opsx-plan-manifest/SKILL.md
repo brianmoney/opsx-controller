@@ -182,9 +182,10 @@ those failures otherwise surface several minutes into a run.
 **Transcribing the plan verbatim.** The most common and most expensive mistake.
 Produces a manifest that re-drives finished work. Step 3 exists to catch it.
 
-**Trusting example manifests.** `orchestrator/plan.example.toml` and archived
-compiled plans contain keys the current loader ignores. Derive from
-`load_plan()`.
+**Trusting example manifests.** The canonical sample at
+`orchestrator/samples/sample-plan.toml` is test-verified against the current
+loader and exercises every surface key — derive from `load_plan()` for
+anything not covered.
 
 **Bare command names in `fast_checks`.** Works when you test it interactively,
 fails or silently runs the wrong binary under the orchestrator.

@@ -426,6 +426,201 @@ def build_single_change_config(repo: Path, change_id: str) -> dict:
     return cfg
 
 
+# ---------------------------------------------------------------------------
+# Single-change manifest serialization
+# ---------------------------------------------------------------------------
+
+def render_single_change_manifest(cfg: dict) -> str:
+    """Serialize a single-change config to a TOML manifest string.
+
+    Emits one ``[plan]`` table and one ``[[changes]]`` table.  Reuses the
+    existing ``_escape_toml_value`` helper.
+    """
+    lines: list[str] = []
+    lines.append("[plan]")
+
+    # Plan-level string fields.
+    plan_str_fields = {
+        "name": cfg.get("name", ""),
+        "adapter": cfg.get("adapter", "opencode"),
+        "invoke": cfg.get("invoke", ""),
+        "state_file": cfg.get("state_file", ""),
+        "implement_invoke": cfg.get("implement_invoke", ""),
+        "review_invoke": cfg.get("review_invoke", ""),
+        "archive_invoke": cfg.get("archive_invoke", ""),
+        "notify_cmd": cfg.get("notify_cmd", ""),
+        "plan_doc": cfg.get("plan_doc", ""),
+        "create_invoke": cfg.get("create_invoke", ""),
+        "created_check": cfg.get("created_check", ""),
+    }
+    for key, val in plan_str_fields.items():
+        lines.append(f'{key} = "{_escape_toml_value(val)}"')
+
+    # Numeric plan-level fields — use float/int to match load_plan coercion.
+    lines.append(f"timeout_minutes = {float(cfg.get('timeout_minutes', 90))}")
+    lines.append(f"max_attempts = {int(cfg.get('max_attempts', 2))}")
+    lines.append(f"max_rounds = {int(cfg.get('max_rounds', 5))}")
+    lines.append(f"no_progress_limit = {int(cfg.get('no_progress_limit', 2))}")
+    lines.append(f"check_timeout_minutes = {float(cfg.get('check_timeout_minutes', 15))}")
+    lines.append(f"create_timeout_minutes = {float(cfg.get('create_timeout_minutes', 30))}")
+    lines.append(f"create_max_attempts = {int(cfg.get('create_max_attempts', 2))}")
+
+    # Boolean plan-level fields.
+    lines.append(f"require_clean_tracked = {_toml_bool(cfg.get('require_clean_tracked', True))}")
+    lines.append(f"review_created = {_toml_bool(cfg.get('review_created', False))}")
+
+    # fast_checks.
+    fast_checks = cfg.get("fast_checks", [])
+    if fast_checks:
+        items = ", ".join(f'"{_escape_toml_value(c)}"' for c in fast_checks)
+        lines.append(f"fast_checks = [{items}]")
+    else:
+        lines.append("fast_checks = []")
+
+    # git_delivery inline table.
+    gd = cfg.get("git_delivery", {})
+    lines.append(
+        f"git_delivery = {{ enabled = {_toml_bool(gd.get('enabled', False))}, "
+        f'branch = "{_escape_toml_value(gd.get("branch", ""))}", '
+        f'base_ref = "{_escape_toml_value(gd.get("base_ref", ""))}", '
+        f"create_pull_request = {_toml_bool(gd.get('create_pull_request', False))} }}"
+    )
+
+    # One [[changes]] entry.
+    lines.append("")
+    changes = cfg.get("changes", {})
+    for cid, c in changes.items():
+        lines.append("[[changes]]")
+        lines.append(f'id = "{_escape_toml_value(cid)}"')
+        phase = c.get("phase")
+        if phase is not None:
+            lines.append(f"phase = {int(phase)}")
+        depends_on = c.get("depends_on", [])
+        if depends_on:
+            items = ", ".join(f'"{_escape_toml_value(d)}"' for d in depends_on)
+            lines.append(f"depends_on = [{items}]")
+        else:
+            lines.append("depends_on = []")
+        lines.append(f"pause_before = {_toml_bool(c.get('pause_before', False))}")
+        lines.append(f"enabled = {_toml_bool(c.get('enabled', True))}")
+        lines.append(f"timeout_minutes = {float(c.get('timeout_minutes', cfg.get('timeout_minutes', 90)))}")
+        lines.append(f"max_attempts = {int(c.get('max_attempts', cfg.get('max_attempts', 2)))}")
+        lines.append(f'create_invoke = "{_escape_toml_value(c.get("create_invoke", ""))}"')
+        lines.append(f"create_max_attempts = {int(c.get('create_max_attempts', cfg.get('create_max_attempts', 2)))}")
+        break  # single change only
+
+    return "\n".join(lines) + "\n"
+
+
+def _toml_bool(value) -> str:
+    """Return ``"true"`` or ``"false"`` for a Python truthy/falsy."""
+    return "true" if value else "false"
+
+
+def write_single_change_manifest(repo: Path, change_id: str, cfg: dict) -> None:
+    """Write the derived single-change manifest, verified by round-trip.
+
+    Writes to a temp sibling, loads it through ``load_plan``, compares the
+    reloaded config against *cfg*, and only then ``os.replace``\\s it into
+    position.  Raises ``PlanError`` on divergence.
+    """
+    ensure_opsx_plan_dir(repo)
+    manifest_path = single_change_manifest_path(repo, change_id)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    toml_text = render_single_change_manifest(cfg)
+    tmp_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+
+    try:
+        tmp_path.write_text(toml_text, encoding="utf-8")
+    except OSError as exc:
+        raise PlanError(f"could not stage derived manifest: {exc}") from exc
+
+    # Round-trip: load it back through load_plan.
+    try:
+        loaded = load_plan(tmp_path, repo=repo)
+    except PlanError:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        tmp_path.unlink(missing_ok=True)
+        raise PlanError(
+            f"derived manifest failed to load: {exc}"
+        ) from exc
+
+    # Compare serialized fields between synthesized and reloaded configs.
+    _compare_configs(cfg, loaded, tmp_path, manifest_path)
+
+
+def _compare_configs(
+    original: dict, loaded: dict, tmp_path: Path, manifest_path: Path,
+) -> None:
+    """Compare serialized fields; os.replace on success, PlanError + unlink on divergence."""
+    diverging: list[str] = []
+
+    _SERIALIZED_PLAN_KEYS = [
+        "name", "adapter", "invoke", "state_file",
+        "implement_invoke", "review_invoke", "archive_invoke",
+        "timeout_minutes", "max_attempts", "max_rounds", "no_progress_limit",
+        "fast_checks", "check_timeout_minutes", "require_clean_tracked",
+        "notify_cmd", "plan_doc", "create_invoke",
+        "create_timeout_minutes", "create_max_attempts",
+        "review_created", "created_check", "git_delivery",
+    ]
+
+    for key in _SERIALIZED_PLAN_KEYS:
+        orig_val = original.get(key)
+        loaded_val = loaded.get(key)
+        if not _values_equal(orig_val, loaded_val):
+            diverging.append(key)
+
+    _SERIALIZED_CHANGE_KEYS = [
+        "id", "phase", "depends_on", "pause_before", "enabled",
+        "timeout_minutes", "max_attempts", "create_invoke", "create_max_attempts",
+    ]
+
+    orig_changes = original.get("changes", {})
+    loaded_changes = loaded.get("changes", {})
+    for cid in orig_changes:
+        if cid not in loaded_changes:
+            diverging.append(f"changes.{cid} (missing from loaded)")
+            continue
+        for field in _SERIALIZED_CHANGE_KEYS:
+            orig_val = orig_changes[cid].get(field)
+            loaded_val = loaded_changes[cid].get(field)
+            if not _values_equal(orig_val, loaded_val):
+                diverging.append(f"changes.{cid}.{field}")
+
+    for cid in loaded_changes:
+        if cid not in orig_changes:
+            diverging.append(f"changes.{cid} (unexpected in loaded)")
+
+    if diverging:
+        tmp_path.unlink(missing_ok=True)
+        manifest_path.unlink(missing_ok=True)
+        raise PlanError(
+            f"round-trip divergence in derived manifest: "
+            f"{', '.join(diverging)}"
+        )
+
+    os.replace(tmp_path, manifest_path)
+
+
+def _values_equal(a, b) -> bool:
+    """Compare two values, treating equal numeric values as matching."""
+    if a == b:
+        return True
+    # Handle numeric coercion: int 90 vs float 90.0
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return float(a) == float(b)
+    # Handle list comparison / dict comparison
+    if isinstance(a, list) and isinstance(b, list):
+        return a == b
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a == b
+    return False
+
+
 def apply_model_env(cfg: dict) -> None:
     """Export ``cfg["models"]`` into ``os.environ`` for the process lifetime.
 
@@ -505,6 +700,11 @@ def topo_sort(by_id: dict[str, dict]) -> list[str]:
 
 def state_path(repo: Path, plan_name: str) -> Path:
     return repo / ".opsx-plan" / f"{plan_name}.state.json"
+
+
+def single_change_manifest_path(repo: Path, change_id: str) -> Path:
+    """Path to the derived single-change manifest under .opsx-plan/plans/."""
+    return repo / ".opsx-plan" / "plans" / f"run-{change_id}.toml"
 
 
 def default_context_cache() -> dict:
@@ -706,6 +906,19 @@ def change_context_paths(repo: Path, cid: str) -> list[str]:
 ACTIVE_PLAN_FILENAME = "active-plan"
 
 
+def ensure_opsx_plan_dir(repo: Path) -> Path:
+    """Ensure ``.opsx-plan/`` exists with a self-ignoring ``.gitignore``.
+
+    Returns the resolved ``Path`` to the ``.opsx-plan/`` directory.
+    """
+    dot_dir = repo / ".opsx-plan"
+    dot_dir.mkdir(parents=True, exist_ok=True)
+    gi = dot_dir / ".gitignore"
+    if not gi.exists():
+        gi.write_text("*\n", encoding="utf-8")
+    return dot_dir
+
+
 def active_plan_pointer_path(repo: Path) -> Path:
     """Path to the active-plan pointer file under .opsx-plan/."""
     return repo / ".opsx-plan" / ACTIVE_PLAN_FILENAME
@@ -733,11 +946,8 @@ def write_active_plan(repo: Path, plan_rel: str) -> None:
     plan TOML.  The .opsx-plan/ directory (and its .gitignore) is created
     when missing.
     """
+    ensure_opsx_plan_dir(repo)
     p = active_plan_pointer_path(repo)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    gi = p.parent / ".gitignore"
-    if not gi.exists():
-        gi.write_text("*\n", encoding="utf-8")
     tmp = p.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as fh:
         fh.write(plan_rel.strip() + "\n")
@@ -4170,17 +4380,51 @@ def check_controller_model(repo: Path | None = None, adapter: str = "opencode") 
 def discover_template_pairs(repo: Path) -> list[tuple[Path, Path | None]]:
     """Find repository template plan pairs (md + matching toml).
 
-    Returns a list of ``(md_path, toml_path_or_None)`` tuples for each
-    ``.md`` file under ``openspec/plans/`` in ``repo``.
+    Lists top-level ``openspec/plans/`` pairs first and
+    ``openspec/plans/archived/`` pairs second, without recursing further.
+    Returns a list of ``(md_path, toml_path_or_None)`` tuples.
     """
     plans_dir = repo / "openspec" / "plans"
-    if not plans_dir.is_dir():
-        return []
     pairs: list[tuple[Path, Path | None]] = []
-    for md_path in sorted(plans_dir.glob("*.md")):
-        toml_path = md_path.with_suffix(".toml")
-        pairs.append((md_path, toml_path if toml_path.is_file() else None))
+    if plans_dir.is_dir():
+        for md_path in sorted(plans_dir.glob("*.md")):
+            toml_path = md_path.with_suffix(".toml")
+            pairs.append((md_path, toml_path if toml_path.is_file() else None))
+    archived_dir = repo / "openspec" / "plans" / "archived"
+    if archived_dir.is_dir():
+        for md_path in sorted(archived_dir.glob("*.md")):
+            toml_path = md_path.with_suffix(".toml")
+            pairs.append((md_path, toml_path if toml_path.is_file() else None))
     return pairs
+
+
+def resolve_sample_plan_pair() -> tuple[Path, Path | None] | None:
+    """Resolve the canonical sample plan pair.
+
+    Probes ``~/.local/lib/opsx-controller/samples`` (installed) first, then
+    falls back to ``<checkout>/orchestrator/samples``.  The installed copy
+    takes precedence because it represents the version that was actually
+    deployed — the checkout copy is only a fallback for development.
+
+    Returns ``(md_path, toml_path)`` or ``None`` when neither location
+    exists.
+    """
+    # 1. Installed samples (authoritative copy).
+    installed = Path.home() / ".local" / "lib" / "opsx-controller" / "samples"
+    md_path = installed / "sample-plan.md"
+    toml_path = installed / "sample-plan.toml"
+    if md_path.is_file() and toml_path.is_file():
+        return md_path, toml_path
+
+    # 2. Checkout fallback (mirrors _SCRIPT_ROOT / _RUNTIME_ROOTS).
+    for root in _RUNTIME_ROOTS:
+        samples_dir = root / "orchestrator" / "samples"
+        md_path = samples_dir / "sample-plan.md"
+        toml_path = samples_dir / "sample-plan.toml"
+        if md_path.is_file() and toml_path.is_file():
+            return md_path, toml_path
+
+    return None
 
 
 def _escape_toml_value(value: str) -> str:
@@ -4309,6 +4553,22 @@ def build_compile_prompt(source_content: str, source_path: Path,
 
     parts.append(build_schema_guidance(adapter))
 
+    # Canonical sample plans (installed or from repo checkout) always appear
+    # ahead of repository pairs.
+    sample_pair = resolve_sample_plan_pair()
+    if sample_pair is not None:
+        sample_md, sample_toml = sample_pair
+        parts.append("## Sample plan (canonical)\n")
+        try:
+            parts.append(sample_md.read_text(encoding="utf-8"))
+        except OSError:
+            pass
+        parts.append(f"### Sample manifest (canonical)\n")
+        try:
+            parts.append(sample_toml.read_text(encoding="utf-8"))
+        except OSError:
+            pass
+
     template_pairs = discover_template_pairs(repo)
     if template_pairs:
         parts.append("## Repository template plans\n")
@@ -4326,12 +4586,6 @@ def build_compile_prompt(source_content: str, source_path: Path,
                     parts.append(toml.read_text(encoding="utf-8"))
                 except OSError:
                     pass
-    else:
-        parts.append(
-            "## Repository template plans\n\n"
-            "No `openspec/plans/*.md` template plan pairs were found "
-            "in this repository.\n"
-        )
 
     parts.append(
         "## Compile instructions\n"
@@ -5294,8 +5548,6 @@ def cmd_run_one(args: argparse.Namespace) -> int:
         return 2
 
     cfg = build_single_change_config(repo, change_id)
-    cfg["skip_warning"] = getattr(args, "skip_warning", False)
-    cfg["skip_suggestion"] = getattr(args, "skip_suggestion", False)
     state = load_state(repo, cfg["name"])
     signal.signal(signal.SIGINT, handle_sigint)
 
@@ -5305,6 +5557,10 @@ def cmd_run_one(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+
+    write_single_change_manifest(repo, change_id, cfg)
+    cfg["skip_warning"] = getattr(args, "skip_warning", False)
+    cfg["skip_suggestion"] = getattr(args, "skip_suggestion", False)
 
     reconcile(repo, cfg, state)
     save_state(repo, cfg["name"], state)
@@ -5337,6 +5593,12 @@ def cmd_run_one(args: argparse.Namespace) -> int:
         )
         return 2
 
+    manifest_rel = single_change_manifest_path(repo, change_id).relative_to(repo)
+    print(f"  Report:  opsx-plan report {manifest_rel}")
+    print(f"           opsx-plan report --for-change {change_id}")
+    print(f"  Dashboard: opsx-plan dashboard {manifest_rel}")
+    print(f"             opsx-plan dashboard --for-change {change_id}")
+
     display = r["status"]
     if r.get("reason"):
         display += f" ({r['reason']})"
@@ -5345,7 +5607,7 @@ def cmd_run_one(args: argparse.Namespace) -> int:
 
 
 def cmd_compile(args: argparse.Namespace) -> int:
-    """opsx-plan compile <source.md> -o <output.toml> [--force] [--adapter <adapter>]"""
+    """opsx-plan compile <source.md> [-o <output.toml>] [--force] [--adapter <adapter>]"""
     repo = Path(args.repo).resolve()
     adapter = getattr(args, "adapter", "opencode") or "opencode"
 
@@ -5364,7 +5626,18 @@ def cmd_compile(args: argparse.Namespace) -> int:
         return 2
 
     source_path = resolve_compile_source(repo, args.source)
-    output_path = resolve_compile_output(repo, args.output, args.force)
+
+    # Default output: openspec/plans/<source-stem>.toml
+    if args.output is None:
+        output_rel = f"openspec/plans/{source_path.stem}.toml"
+        output_path = (repo / output_rel).resolve()
+        if output_path.exists() and not args.force:
+            raise PlanError(
+                f"output exists: {output_path}  (use --force to overwrite)"
+            )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        output_path = resolve_compile_output(repo, args.output, args.force)
     model = check_controller_model(repo, adapter=adapter)
 
     client_name = entry["executable"]
@@ -5458,6 +5731,87 @@ def cmd_compile(args: argparse.Namespace) -> int:
         log(f"  warning: compiled plan {output_path} is outside the repo; cannot auto-activate")
 
     return 0
+
+
+def cmd_archive_plan(args: argparse.Namespace) -> int:
+    """opsx-plan archive-plan <manifest> — archive a plan manifest pair."""
+    repo = Path(args.repo).resolve()
+    plan_arg = args.plan
+
+    # Resolve to absolute path relative to repo
+    plan_path = (repo / plan_arg).resolve()
+    if not plan_path.is_file():
+        print(f"error: manifest not found: {plan_arg}", file=sys.stderr)
+        return 2
+
+    # Refuse targets already under archived/
+    try:
+        plan_rel = str(plan_path.relative_to(repo))
+    except ValueError:
+        print(f"error: manifest must be inside the repository: {plan_path}", file=sys.stderr)
+        return 2
+
+    if "openspec/plans/archived/" in plan_rel:
+        print(f"error: manifest is already under openspec/plans/archived/: {plan_rel}", file=sys.stderr)
+        return 2
+
+    if not plan_rel.startswith("openspec/plans/"):
+        print(f"error: manifest must be under openspec/plans/: {plan_rel}", file=sys.stderr)
+        return 2
+
+    # Determine the sibling .md path
+    md_path = plan_path.with_suffix(".md")
+    has_md = md_path.is_file()
+
+    archived_dir = repo / "openspec" / "plans" / "archived"
+    archived_dir.mkdir(parents=True, exist_ok=True)
+
+    moved: list[str] = []
+
+    # Move the .toml
+    toml_dst = archived_dir / plan_path.name
+    moved.append(str(plan_path.relative_to(repo)))
+    _git_mv_or_rename(repo, plan_path, toml_dst)
+
+    # Move the sibling .md when present
+    if has_md:
+        md_dst = archived_dir / md_path.name
+        moved.append(str(md_path.relative_to(repo)))
+        _git_mv_or_rename(repo, md_path, md_dst)
+
+    # Clear the active-plan pointer when it referenced the archived plan
+    active = read_active_plan(repo)
+    if active == plan_rel:
+        pointer = active_plan_pointer_path(repo)
+        if pointer.is_file():
+            pointer.unlink()
+
+    print(f"Archived:")
+    for path in moved:
+        print(f"  {path} -> openspec/plans/archived/{Path(path).name}")
+    if active == plan_rel:
+        print(f"  Cleared active-plan pointer (was: {plan_rel})")
+    print(f"  Move still needs committing; archive-plan does not create a commit.")
+    return 0
+
+
+def _git_mv_or_rename(repo: Path, src: Path, dst: Path) -> None:
+    """Move *src* to *dst* using ``git mv`` for tracked files, plain rename otherwise."""
+    try:
+        rel_src = str(src.relative_to(repo))
+    except ValueError:
+        rel_src = str(src)
+    res = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", rel_src],
+        cwd=repo, capture_output=True, text=True,
+    )
+    if res.returncode == 0:
+        subprocess.run(
+            ["git", "mv", rel_src, str(dst.relative_to(repo))],
+            cwd=repo, check=True, capture_output=True,
+        )
+    else:
+        os.rename(src, dst)
 
 
 # ---------------------------------------------------------------------------
@@ -5797,11 +6151,51 @@ def _print_report_json(result, plan_name: str, run_id: str,
 
 # -- cmd_report ---------------------------------------------------------------
 
+def _resolve_for_change_plan(
+    repo: Path, for_change: str | None, plan_arg: str | None
+) -> str | None:
+    """Resolve ``--for-change <id>`` to either a derived manifest path or a
+    fallback plan name, without loading the plan.
+
+    Returns the plan source string to use with ``resolve_plan``, or ``None``
+    when *for_change* is ``None`` (caller should follow its normal plan
+    resolution path).  Raises ``PlanError`` when *for_change* is given but
+    neither the derived manifest nor the state file exists.
+    """
+    if not for_change:
+        return None
+
+    if plan_arg is not None:
+        raise PlanError(
+            "--for-change and a positional plan argument are mutually "
+            "exclusive; pick one"
+        )
+
+    manifest = single_change_manifest_path(repo, for_change)
+    if manifest.is_file():
+        return str(manifest.relative_to(repo))
+
+    state = repo / ".opsx-plan" / f"run-{for_change}.state.json"
+    if state.is_file():
+        return f"run-{for_change}"
+
+    raise PlanError(
+        f"--for-change {for_change}: no derived manifest "
+        f"(.opsx-plan/plans/run-{for_change}.toml) or state file "
+        f"(.opsx-plan/run-{for_change}.state.json) found; "
+        f"has `opsx-run {for_change}` been invoked yet?"
+    )
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     """opsx-plan report <plan> [--json] [--change <id>] [--run-id <id>]
-       [--stage <stage>] [--model <substr>]"""
+       [--stage <stage>] [--model <substr>] [--for-change <id>]"""
     repo = Path(args.repo).resolve()
-    plan_src = resolve_plan(repo, args.plan)
+    for_change_plan = _resolve_for_change_plan(
+        repo, getattr(args, "for_change", None), args.plan,
+    )
+    plan_src = for_change_plan     if for_change_plan is not None else resolve_plan(repo, args.plan)
+
     from lib.metrics.aggregator import (
         AggregationError,
         _build_leaderboard,
@@ -5812,8 +6206,17 @@ def cmd_report(args: argparse.Namespace) -> int:
         aggregate,
     )
 
-    cfg = load_plan(_resolve_plan_path(repo, plan_src), repo=repo)
-    plan_name = cfg["name"]
+    # When --for-change resolves through the state-file fallback (no manifest
+    # on disk), the plan source string is a bare name (e.g. "run-<id>") that
+    # does not correspond to a loadable TOML file.  In that case we skip
+    # load_plan and use the name directly so report still works.
+    for_change = getattr(args, "for_change", None)
+    if for_change and for_change_plan == f"run-{for_change}":
+        plan_name = for_change_plan
+        cfg = {"name": plan_name, "adapter": "opencode", "changes": {}}
+    else:
+        cfg = load_plan(_resolve_plan_path(repo, plan_src), repo=repo)
+        plan_name = cfg["name"]
     run_id = args.run_id if args.run_id else None
 
     # Validate --stage early
@@ -6763,9 +7166,12 @@ def _render_dashboard_html(
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
     """opsx-plan dashboard <plan> [--output <path>] [--run-id <id>]
-       [--change <id>]"""
+       [--change <id>] [--for-change <id>]"""
     repo = Path(args.repo).resolve()
-    plan_src = resolve_plan(repo, args.plan)
+    for_change_plan = _resolve_for_change_plan(
+        repo, getattr(args, "for_change", None), args.plan,
+    )
+    plan_src = for_change_plan if for_change_plan is not None else resolve_plan(repo, args.plan)
     from lib.metrics.aggregator import (
         AggregationError,
         _build_leaderboard,
@@ -6776,8 +7182,13 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         aggregate,
     )
 
-    cfg = load_plan(_resolve_plan_path(repo, plan_src), repo=repo)
-    plan_name = cfg["name"]
+    for_change = getattr(args, "for_change", None)
+    if for_change and for_change_plan == f"run-{for_change}":
+        plan_name = for_change_plan
+        cfg = {"name": plan_name, "adapter": "opencode", "changes": {}}
+    else:
+        cfg = load_plan(_resolve_plan_path(repo, plan_src), repo=repo)
+        plan_name = cfg["name"]
     run_id = args.run_id if args.run_id else None
 
     try:
@@ -7255,7 +7666,7 @@ def main() -> int:
         "source", help="path to source markdown plan (.md)"
     )
     p_compile.add_argument(
-        "-o", "--output", required=True, help="output TOML path"
+        "-o", "--output", default=None, help="output TOML path (default: openspec/plans/<source-stem>.toml)"
     )
     p_compile.add_argument(
         "--force", action="store_true", help="overwrite existing output"
@@ -7266,6 +7677,12 @@ def main() -> int:
         help="adapter to compile against (default: opencode)",
     )
     p_compile.set_defaults(fn=cmd_compile)
+
+    p_archive_plan = sub.add_parser(
+        "archive-plan", help="archive a plan manifest pair to openspec/plans/archived/"
+    )
+    p_archive_plan.add_argument("plan", help="path to plan manifest TOML")
+    p_archive_plan.set_defaults(fn=cmd_archive_plan)
 
     p_report = sub.add_parser(
         "report",
@@ -7298,6 +7715,11 @@ def main() -> int:
         help="filter leaderboard to entries with model IDs containing this "
              "substring (case-insensitive)",
     )
+    p_report.add_argument(
+        "--for-change", default=None,
+        help="target the derived single-change manifest instead of a plan "
+             "path (mutually exclusive with positional plan)",
+    )
     p_report.set_defaults(fn=cmd_report)
 
     p_dashboard = sub.add_parser(
@@ -7320,6 +7742,11 @@ def main() -> int:
     p_dashboard.add_argument(
         "--change", default=None,
         help="filter per-change output and timeline to this change id",
+    )
+    p_dashboard.add_argument(
+        "--for-change", default=None,
+        help="target the derived single-change manifest instead of a plan "
+             "path (mutually exclusive with positional plan)",
     )
     p_dashboard.set_defaults(fn=cmd_dashboard)
 

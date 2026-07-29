@@ -1,0 +1,69 @@
+# Sample opsx-plan manifest — the runnable TOML this plan compiles to.
+# Covers the documented [plan] and [[changes]] field surface with no keys
+# the loader ignores.
+
+[plan]
+name = "sample-implementation-plan"
+adapter = "opencode"
+invoke = 'opencode run "/opsx-drive {change}"'
+state_file = ".opencode/opsx-controller/{change}.json"
+implement_invoke = 'opencode run --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL"'
+review_invoke = 'opencode run --agent opsx-reviewer --model "$OPSX_REVIEWER_MODEL"'
+archive_invoke = 'opencode run --agent opsx-archiver --model "$OPSX_ARCHIVER_MODEL"'
+notify_cmd = ""
+plan_doc = "openspec/plans/sample-plan.md"
+create_invoke = 'opencode run "/opsx-ff Please review @{plan_doc} and create a change for {change}"'
+create_timeout_minutes = 30
+create_max_attempts = 2
+review_created = true
+created_check = "openspec validate {change} --strict"
+timeout_minutes = 90
+max_attempts = 2
+max_rounds = 5
+no_progress_limit = 2
+require_clean_tracked = true
+fast_checks = [
+  "openspec validate --all",
+]
+check_timeout_minutes = 15
+
+[plan.git_delivery]
+enabled = false
+branch = ""
+base_ref = ""
+create_pull_request = false
+
+[[changes]]
+id = "add-input-validation"
+phase = 1
+pause_before = true  # first change in proposed shared-validation capability
+enabled = true
+timeout_minutes = 90
+max_attempts = 2
+create_invoke = ""
+create_max_attempts = 2
+
+[[changes]]
+id = "add-unit-tests"
+phase = 1
+enabled = true
+
+[[changes]]
+id = "fix-tax-calculation"
+phase = 2
+depends_on = ["add-unit-tests"]
+
+[[changes]]
+id = "add-discount-code-verification"
+phase = 2
+enabled = true
+
+[[changes]]
+id = "integrate-payment-gateway-v2"
+phase = 3
+depends_on = ["add-input-validation", "add-discount-code-verification"]
+pause_before = true  # talks to a real payment processor — human review gate
+enabled = true
+timeout_minutes = 120
+max_attempts = 3
+create_max_attempts = 2

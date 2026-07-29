@@ -17,7 +17,7 @@ whether the underlying agent is Claude Code, OpenCode, or Codex CLI.
 
 ```bash
 $EDITOR openspec/plans/my-plan.md                                          # you write this
-opsx-plan compile openspec/plans/my-plan.md -o openspec/plans/my-plan.toml # markdown -> DAG
+opsx-plan compile openspec/plans/my-plan.md                                # markdown -> DAG (default output: openspec/plans/my-plan.toml)
 opsx-plan run --dry-run                                                    # inspect the order and gates
 opsx-plan run                                                              # drive it
 ```
@@ -173,7 +173,7 @@ markdown plans; the loop authors the changes.
 
 ```bash
 $EDITOR openspec/plans/my-plan.md
-opsx-plan compile openspec/plans/my-plan.md -o openspec/plans/my-plan.toml
+opsx-plan compile openspec/plans/my-plan.md
 opsx-plan doctor                      # preflight checks
 opsx-plan run --dry-run               # review the DAG and gates first
 opsx-plan run

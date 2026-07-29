@@ -100,8 +100,9 @@ enabled = false       # blocked: see openspec/changes/add-kf-mcp-server
 
 Notes on the `[plan]` choices:
 
-- `/opsx:ff`, not `/opsx-ff`. The controller's own `plan.example.toml` uses the
-  hyphenated form; this repo registers the skill as `opsx:ff`. Checked the
+- `/opsx:ff`, not `/opsx-ff`. The controller's own canonical sample
+  (`orchestrator/samples/sample-plan.toml`) uses the hyphenated form;
+  this repo registers the skill as `opsx:ff`. Checked the
   registration rather than copying the example.
 - `fast_checks` is one command. `AGENTS.md` names `kf devcheck` as the canonical
   gate, and it already runs OpenSpec structural validation, semantic duplicate

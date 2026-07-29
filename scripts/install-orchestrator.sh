@@ -15,12 +15,16 @@ install_orchestrator() {
   local runtime_dir="$HOME/.local/lib/opsx-controller"
 
   mkdir -p "$dest_dir"
-  rm -rf "$runtime_dir/lib"
-  mkdir -p "$runtime_dir/lib"
+  rm -rf "$runtime_dir/lib" "$runtime_dir/samples"
+  mkdir -p "$runtime_dir/lib" "$runtime_dir/samples"
 
   cp -R "$repo_root/lib/metrics"   "$runtime_dir/lib/"
   cp -R "$repo_root/lib/pricing"   "$runtime_dir/lib/"
   cp -R "$repo_root/lib/models"    "$runtime_dir/lib/"
+  install -m 0644 \
+    "$repo_root/orchestrator/samples/sample-plan.md" \
+    "$repo_root/orchestrator/samples/sample-plan.toml" \
+    "$runtime_dir/samples/"
 
   install -m 0755 \
     "$repo_root/orchestrator/opsx-plan.py" \
@@ -31,6 +35,7 @@ install_orchestrator() {
 
   printf '%s\n' \
     "Installed opsx-plan runtime libraries to $runtime_dir" \
+    "Installed opsx-plan samples to $runtime_dir/samples" \
     "Installed opsx-plan to $dest_dir/opsx-plan" \
     "Installed opsx-run to $dest_dir/opsx-run"
 }

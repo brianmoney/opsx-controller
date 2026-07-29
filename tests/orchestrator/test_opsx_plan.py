@@ -4249,9 +4249,10 @@ class CompileTests(unittest.TestCase):
         self.assertIn('"openspec/plans/my-plan.md"', prompt)
         self.assertIn("plan_doc", prompt)
 
-    def test_build_compile_prompt_notes_no_templates_when_none_found(self) -> None:
+    def test_build_compile_prompt_includes_canonical_sample_when_no_repo_pairs(self) -> None:
         prompt = self.opsx_plan.build_compile_prompt("content", Path("/tmp/fake.md"), self.repo)
-        self.assertIn("No `openspec/plans/*.md` template plan pairs were found", prompt)
+        self.assertIn("Sample plan (canonical)", prompt)
+        self.assertIn("Sample manifest (canonical)", prompt)
 
     def test_build_compile_prompt_injects_template_pairs(self) -> None:
         plans_dir = self.repo / "openspec" / "plans"
@@ -5111,6 +5112,48 @@ class CompileTests(unittest.TestCase):
         finally:
             self.opsx_plan.run_compile_client = original
             os.environ.pop("OPSX_CONTROLLER_MODEL", None)
+
+    # -- default compile output and auto-activation (7.8) -------------------
+
+    def test_compile_no_output_flag_defaults_and_activates(self) -> None:
+        """7.8 — compile with no -o writes to openspec/plans/<stem>.toml
+        and auto-activates the active-plan pointer."""
+        self._set_model()
+        source = self._write_plan_md(
+            "openspec/plans/my-plan.md",
+            "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n",
+        )
+
+        valid_toml = (
+            '[plan]\nname = "test"\nadapter = "opencode"\n\n'
+            "[[changes]]\nid = \"c1\"\nphase = 1\n"
+        )
+
+        def fake_run(repo, adapter, model, prompt):
+            return valid_toml, ""
+
+        original = self.opsx_plan.run_compile_client
+        try:
+            self.opsx_plan.run_compile_client = fake_run
+            args = argparse.Namespace(
+                repo=str(self.repo), source="openspec/plans/my-plan.md",
+                output=None, force=False, adapter="opencode",
+            )
+            rc = self.opsx_plan.cmd_compile(args)
+            self.assertEqual(rc, 0)
+            default_out = self.repo / "openspec" / "plans" / "my-plan.toml"
+            self.assertTrue(default_out.is_file(),
+                            f"expected default output at {default_out}")
+            content = default_out.read_text(encoding="utf-8")
+            self.assertIn("c1", content)
+            # Auto-activation: active-plan pointer must reference the compiled plan
+            active = self.opsx_plan.read_active_plan(self.repo)
+            self.assertEqual(
+                active, "openspec/plans/my-plan.toml",
+                "compile without -o must auto-activate the output plan",
+            )
+        finally:
+            self.opsx_plan.run_compile_client = original
 
 
 class DirectStageUsageExtractionTests(unittest.TestCase):
@@ -14574,6 +14617,617 @@ class RunEventNotificationTests(unittest.TestCase):
         pr_events = [c for c in calls if c[0] == "pull_request_opened"]
         self.assertEqual(len(pr_events), 0,
                          f"pull_request_opened was re-emitted on rerun: {calls}")
+
+
+class SingleChangeManifestTests(unittest.TestCase):
+    """7.1–7.4: Manifest serialization round-trip and dirty-tree guard."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        git(self.repo, "init")
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        git(self.repo, "add", "tracked.txt")
+        git(
+            self.repo,
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "user.name=Test User",
+            "commit",
+            "-m",
+            "init",
+        )
+        self.cid = "add-manifest-test"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def write_authored_change(self, cid: str) -> None:
+        cdir = self.repo / "openspec" / "changes" / cid
+        cdir.mkdir(parents=True)
+        (cdir / "proposal.md").write_text("## Why\n", encoding="utf-8")
+        (cdir / "tasks.md").write_text(
+            "## 1. Tasks\n\n- [ ] 1.1 Example task\n", encoding="utf-8"
+        )
+
+    def test_render_round_trips_through_load_plan(self):
+        """7.1"""
+        self.write_authored_change(self.cid)
+        cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
+        self.opsx_plan.write_single_change_manifest(self.repo, self.cid, cfg)
+
+        manifest_path = self.opsx_plan.single_change_manifest_path(
+            self.repo, self.cid
+        )
+        self.assertTrue(manifest_path.is_file())
+
+        loaded = self.opsx_plan.load_plan(manifest_path, repo=self.repo)
+        self.assertEqual(loaded["name"], cfg["name"])
+        self.assertEqual(loaded["adapter"], "opencode")
+        self.assertFalse(loaded["review_created"],
+                         "review_created must be False in the loaded config")
+        self.assertIn(self.cid, loaded["changes"])
+        self.assertEqual(
+            loaded["changes"][self.cid]["id"], self.cid,
+        )
+
+    def test_write_rejects_dirty_tracked_guard(self):
+        """7.4"""
+        self.write_authored_change(self.cid)
+        (self.repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+        args = argparse.Namespace(repo=str(self.repo), change=self.cid)
+
+        # patch run_direct_change so we don't actually spawn
+        with mock.patch.object(self.opsx_plan, "run_direct_change") as run_dc:
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                rc = self.opsx_plan.cmd_run_one(args)
+            self.assertEqual(rc, 2)
+            run_dc.assert_not_called()
+            self.assertIn("tracked worktree is dirty", stderr.getvalue())
+
+        # Manifest must NOT have been written
+        manifest_path = self.opsx_plan.single_change_manifest_path(
+            self.repo, self.cid
+        )
+        self.assertFalse(
+            manifest_path.is_file(),
+            "manifest must not be written when dirty-tree guard rejects run",
+        )
+
+    def test_manifest_written_on_clean_tree(self):
+        """7.3"""
+        self.write_authored_change(self.cid)
+        args = argparse.Namespace(repo=str(self.repo), change=self.cid)
+
+        def fake_run_dc(repo, cfg, state, cid, budget_usd=0.0):
+            self.assertEqual(cid, self.cid)
+            r = self.opsx_plan.rec(state, cid)
+            r["phase"] = "done"
+            self.opsx_plan.set_status(state, cid, self.opsx_plan.DONE, "done")
+            return self.opsx_plan.DONE
+
+        with mock.patch.object(
+            self.opsx_plan, "run_direct_change", side_effect=fake_run_dc
+        ):
+            rc = self.opsx_plan.cmd_run_one(args)
+
+        self.assertEqual(rc, 0)
+        manifest_path = self.opsx_plan.single_change_manifest_path(
+            self.repo, self.cid
+        )
+        self.assertTrue(
+            manifest_path.is_file(),
+            "manifest must be written when run succeeds",
+        )
+
+    def test_divergent_serialization_rejects_write_cleans_up(self):
+        """7.2 — divergent serialization fails write, removes manifest + temp."""
+        self.write_authored_change(self.cid)
+        cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
+
+        # Write a first valid manifest (to create a file on disk).
+        self.opsx_plan.write_single_change_manifest(self.repo, self.cid, cfg)
+        manifest_path = self.opsx_plan.single_change_manifest_path(
+            self.repo, self.cid
+        )
+        self.assertTrue(manifest_path.is_file(), "initial manifest must exist")
+
+        # Now inject divergence: modify cfg so the round-trip mismatch triggers
+        # _compare_configs's unlink path for both tmp and the existing manifest.
+        divergent_cfg = dict(cfg)
+        divergent_cfg["name"] = "deliberately-different"
+        tmp_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+        tmp_path.write_text("", encoding="utf-8")
+
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan._compare_configs(
+                divergent_cfg, cfg, tmp_path, manifest_path,
+            )
+        self.assertIn("round-trip divergence", str(ctx.exception))
+        self.assertIn("name", str(ctx.exception))
+        # Both the temp file and the existing manifest must be removed.
+        self.assertFalse(tmp_path.is_file(), "temp file must be removed on divergence")
+        self.assertFalse(
+            manifest_path.is_file(),
+            "stale manifest must be removed on divergence",
+        )
+
+
+
+class ForChangeReportTests(unittest.TestCase):
+    """7.5–7.6: report --for-change resolution."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        git(self.repo, "init")
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        git(self.repo, "add", "tracked.txt")
+        git(
+            self.repo,
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "user.name=Test User",
+            "commit",
+            "-m",
+            "init",
+        )
+        self.cid = "add-for-change-test"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def write_authored_change(self, cid: str) -> None:
+        cdir = self.repo / "openspec" / "changes" / cid
+        cdir.mkdir(parents=True)
+        (cdir / "proposal.md").write_text("## Why\n", encoding="utf-8")
+        (cdir / "tasks.md").write_text(
+            "## 1. Tasks\n\n- [ ] 1.1 Example task\n", encoding="utf-8"
+        )
+
+    def test_for_change_resolves_via_manifest(self):
+        """7.5 — manifest exists"""
+        self.write_authored_change(self.cid)
+        cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
+        self.opsx_plan.write_single_change_manifest(self.repo, self.cid, cfg)
+
+        plan = self.opsx_plan._resolve_for_change_plan(
+            self.repo, self.cid, None,
+        )
+        self.assertIsNotNone(plan)
+        self.assertIn(f"run-{self.cid}", plan)
+        self.assertIn(".toml", plan)
+
+    def test_for_change_errors_unknown_id(self):
+        """7.6"""
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan._resolve_for_change_plan(
+                self.repo, "no-such-change", None,
+            )
+        self.assertIn("no-such-change", str(ctx.exception))
+
+    def test_for_change_mutually_exclusive_with_plan(self):
+        """7.6"""
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan._resolve_for_change_plan(
+                self.repo, self.cid, "some-plan.toml",
+            )
+        self.assertIn("mutually exclusive", str(ctx.exception))
+
+    def test_for_change_way_through_state_file(self):
+        """7.5 — manifest absent, state file exists"""
+        self.write_authored_change(self.cid)
+        state_dir = self.repo / ".opsx-plan"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        state_file = state_dir / f"run-{self.cid}.state.json"
+        state_file.write_text('{"plan": "run-' + self.cid + '"}', encoding="utf-8")
+
+        plan = self.opsx_plan._resolve_for_change_plan(
+            self.repo, self.cid, None,
+        )
+        self.assertEqual(plan, f"run-{self.cid}")
+
+
+class ArchivePlanCommandTests(unittest.TestCase):
+    """7.7: archive-plan moves files and handles pointer."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        git(self.repo, "init")
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        git(self.repo, "add", "tracked.txt")
+        git(
+            self.repo,
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "user.name=Test User",
+            "commit",
+            "-m",
+            "init",
+        )
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _write_plan_pair(self, name: str, content: str = "") -> tuple[Path, Path]:
+        plans_dir = self.repo / "openspec" / "plans"
+        plans_dir.mkdir(parents=True, exist_ok=True)
+        toml_path = plans_dir / f"{name}.toml"
+        md_path = plans_dir / f"{name}.md"
+        toml_path.write_text(
+            '[plan]\nname = "test"\nadapter = "opencode"\n\n'
+            '[[changes]]\nid = "c1"\n',
+            encoding="utf-8",
+        )
+        md_path.write_text(content or "# Test Plan\n", encoding="utf-8")
+        return toml_path, md_path
+
+    def test_archive_moves_both_files(self):
+        toml_path, md_path = self._write_plan_pair("my-plan")
+        git(self.repo, "add", str(toml_path.relative_to(self.repo)))
+        git(self.repo, "add", str(md_path.relative_to(self.repo)))
+
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            plan=str(toml_path.relative_to(self.repo)),
+        )
+        rc = self.opsx_plan.cmd_archive_plan(args)
+        self.assertEqual(rc, 0)
+
+        archived_dir = self.repo / "openspec" / "plans" / "archived"
+        self.assertTrue((archived_dir / "my-plan.toml").is_file())
+        self.assertTrue((archived_dir / "my-plan.md").is_file())
+        self.assertFalse(toml_path.exists())
+        self.assertFalse(md_path.exists())
+
+    def test_archive_clears_matching_pointer(self):
+        toml_path, md_path = self._write_plan_pair("my-plan")
+        rel = str(toml_path.relative_to(self.repo))
+        self.opsx_plan.write_active_plan(self.repo, rel)
+
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            plan=rel,
+        )
+        rc = self.opsx_plan.cmd_archive_plan(args)
+        self.assertEqual(rc, 0)
+
+        self.assertIsNone(self.opsx_plan.read_active_plan(self.repo),
+                          "active-plan pointer must be cleared")
+
+    def test_archive_refuses_already_archived(self):
+        archived_dir = self.repo / "openspec" / "plans" / "archived"
+        archived_dir.mkdir(parents=True)
+        toml_path = archived_dir / "my-plan.toml"
+        toml_path.write_text(
+            '[plan]\nname = "test"\nadapter = "opencode"\n\n'
+            '[[changes]]\nid = "c1"\n',
+            encoding="utf-8",
+        )
+
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            plan=str(toml_path.relative_to(self.repo)),
+        )
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr):
+            rc = self.opsx_plan.cmd_archive_plan(args)
+        self.assertEqual(rc, 2)
+        self.assertIn("already under", stderr.getvalue())
+
+    def test_archive_refuses_outside_plans_dir(self):
+        toml_path = self.repo / "plan.toml"
+        toml_path.write_text(
+            '[plan]\nname = "test"\nadapter = "opencode"\n\n'
+            '[[changes]]\nid = "c1"\n',
+            encoding="utf-8",
+        )
+
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            plan="plan.toml",
+        )
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr):
+            rc = self.opsx_plan.cmd_archive_plan(args)
+        self.assertEqual(rc, 2)
+        self.assertIn("must be under openspec/plans/", stderr.getvalue())
+
+    def test_archive_leaves_nonmatching_pointer_intact(self):
+        """7.7 — archiving a non-active plan must preserve the active-plan
+        pointer that references a different plan."""
+        # Create plan-a (the one we'll archive)
+        toml_a, md_a = self._write_plan_pair("plan-a")
+        rel_a = str(toml_a.relative_to(self.repo))
+        # Create plan-b (the active plan we must preserve)
+        toml_b, md_b = self._write_plan_pair("plan-b")
+        rel_b = str(toml_b.relative_to(self.repo))
+        # Point active to plan-b
+        self.opsx_plan.write_active_plan(self.repo, rel_b)
+
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            plan=rel_a,
+        )
+        rc = self.opsx_plan.cmd_archive_plan(args)
+        self.assertEqual(rc, 0)
+
+        # plan-a should be moved to archived/
+        archived_dir = self.repo / "openspec" / "plans" / "archived"
+        self.assertTrue((archived_dir / "plan-a.toml").is_file())
+        self.assertFalse(toml_a.exists())
+
+        # plan-b's active pointer must still be intact
+        self.assertEqual(
+            self.opsx_plan.read_active_plan(self.repo), rel_b,
+            "active-plan pointer referencing a different plan must be preserved",
+        )
+
+
+class CompileOptionalOutputTests(unittest.TestCase):
+    """7.8–7.9: compile default output and discover_template_pairs ordering."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        git(self.repo, "init")
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        git(self.repo, "add", "tracked.txt")
+        git(
+            self.repo,
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "user.name=Test User",
+            "commit",
+            "-m",
+            "init",
+        )
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_discover_template_pairs_includes_archived(self):
+        """7.9"""
+        plans_dir = self.repo / "openspec" / "plans"
+        plans_dir.mkdir(parents=True)
+        archived_dir = plans_dir / "archived"
+        archived_dir.mkdir(parents=True)
+
+        (plans_dir / "active.md").write_text("# active\n", encoding="utf-8")
+        (plans_dir / "active.toml").write_text("", encoding="utf-8")
+        (archived_dir / "done.md").write_text("# done\n", encoding="utf-8")
+        (archived_dir / "done.toml").write_text("", encoding="utf-8")
+
+        pairs = self.opsx_plan.discover_template_pairs(self.repo)
+        self.assertEqual(len(pairs), 2)
+        # The active pair must come first
+        first_md = pairs[0][0]
+        self.assertIn("active.md", str(first_md))
+        second_md = pairs[1][0]
+        self.assertIn("done.md", str(second_md))
+
+
+class SamplePlanTests(unittest.TestCase):
+    """7.10–7.13: Canonical sample plan pair."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_sample_toml_loads(self):
+        """7.10"""
+        sample_dir = (
+            Path(__file__).resolve().parents[2] / "orchestrator" / "samples"
+        )
+        toml_path = sample_dir / "sample-plan.toml"
+        md_path = sample_dir / "sample-plan.md"
+        self.assertTrue(toml_path.is_file(), f"sample not found: {toml_path}")
+        self.assertTrue(md_path.is_file())
+
+        cfg = self.opsx_plan.load_plan(toml_path)
+        self.assertEqual(cfg["name"], "sample-implementation-plan")
+        self.assertEqual(cfg["adapter"], "opencode")
+
+        changes = cfg["changes"]
+        expected_ids = {
+            "add-input-validation", "add-unit-tests",
+            "fix-tax-calculation", "add-discount-code-verification",
+            "integrate-payment-gateway-v2",
+        }
+        self.assertEqual(set(changes.keys()), expected_ids)
+
+        # Dependency edges
+        self.assertEqual(
+            set(changes["fix-tax-calculation"]["depends_on"]),
+            {"add-unit-tests"},
+        )
+        gated = cfg["order"][0]
+        self.assertEqual(gated, "add-input-validation")
+
+    def test_sample_exercises_full_surface(self):
+        """7.11"""
+        import tomllib
+        sample_dir = (
+            Path(__file__).resolve().parents[2] / "orchestrator" / "samples"
+        )
+        toml_path = sample_dir / "sample-plan.toml"
+        raw = tomllib.loads(toml_path.read_text(encoding="utf-8"))
+
+        plan = raw["plan"]
+        # Every plan key the loader reads (except adapter defaults) must be present
+        plan_keys = set(plan.keys())
+        # The loader silently drops unknown keys — we assert the sample carries
+        # no keys the loader ignores
+        known_plan_keys = {
+            "name", "adapter", "invoke", "state_file",
+            "implement_invoke", "review_invoke", "archive_invoke",
+            "timeout_minutes", "max_attempts", "max_rounds", "no_progress_limit",
+            "fast_checks", "check_timeout_minutes", "require_clean_tracked",
+            "notify_cmd", "plan_doc", "create_invoke",
+            "create_timeout_minutes", "create_max_attempts",
+            "review_created", "created_check", "git_delivery",
+        }
+        unknown = plan_keys - known_plan_keys
+        self.assertEqual(
+            unknown, set(),
+            f"sample carries keys the loader ignores: {unknown}",
+        )
+        # Assert every known plan key is present in the sample
+        missing_plan = known_plan_keys - plan_keys
+        self.assertEqual(
+            missing_plan, set(),
+            f"sample is missing plan keys the loader reads: {missing_plan}",
+        )
+
+        known_change_keys = {
+            "id", "phase", "depends_on", "pause_before", "enabled",
+            "timeout_minutes", "max_attempts", "create_invoke", "create_max_attempts",
+        }
+        all_change_keys: set[str] = set()
+        for change in raw["changes"]:
+            unknown = set(change.keys()) - known_change_keys
+            self.assertEqual(
+                unknown, set(),
+                f"change {change.get('id')} carries keys the loader ignores: {unknown}",
+            )
+            all_change_keys |= set(change.keys())
+        # Assert all known change keys appear in at least one change entry
+        missing_change = known_change_keys - all_change_keys
+        self.assertEqual(
+            missing_change, set(),
+            f"sample is missing change keys the loader reads: {missing_change}",
+        )
+
+    def test_sample_files_resolve_via_helper(self):
+        """7.13"""
+        pair = self.opsx_plan.resolve_sample_plan_pair()
+        self.assertIsNotNone(pair, "resolve_sample_plan_pair must find the canonical pair")
+        md, toml = pair
+        self.assertTrue(toml.is_file())
+        self.assertTrue(md.is_file())
+
+    def test_build_compile_prompt_includes_sample(self):
+        """7.12 — with no repo plans, sample appears and no 'no pairs' text"""
+        prompt = self.opsx_plan.build_compile_prompt(
+            "# Source\n", Path("docs/test.md"), self.repo, adapter="opencode",
+        )
+        self.assertIn("Sample plan (canonical)", prompt)
+        self.assertIn("Sample manifest (canonical)", prompt)
+        self.assertNotIn("No `openspec/plans/*.md` template plan pairs were found", prompt)
+
+    def test_sample_pair_ordered_before_repo_pairs(self):
+        """7.13"""
+        plans_dir = self.repo / "openspec" / "plans"
+        plans_dir.mkdir(parents=True)
+        (plans_dir / "repo-plan.md").write_text("# repo\n", encoding="utf-8")
+        (plans_dir / "repo-plan.toml").write_text("", encoding="utf-8")
+
+        prompt = self.opsx_plan.build_compile_prompt(
+            "# Source\n", Path("docs/test.md"), self.repo, adapter="opencode",
+        )
+        sample_idx = prompt.find("Sample plan (canonical)")
+        repo_idx = prompt.find("Repository template plans")
+        self.assertNotEqual(sample_idx, -1)
+        self.assertNotEqual(repo_idx, -1)
+        self.assertLess(sample_idx, repo_idx,
+                        "canonical sample must appear before repo pairs")
+
+    def test_installed_samples_preferred_over_checkout(self):
+        """Lifecycle/drift: installed samples take precedence over checkout
+        when both exist.  The installed copy is the one the operator actually
+        deployed, so it must be authoritative."""
+        import pathlib
+        import unittest.mock as um
+
+        # Create an installed samples directory with distinct content.
+        fake_home = self.repo / ".fake-home"
+        installed_samples = (
+            fake_home / ".local" / "lib" / "opsx-controller" / "samples"
+        )
+        installed_samples.mkdir(parents=True)
+        installed_md = installed_samples / "sample-plan.md"
+        installed_toml = installed_samples / "sample-plan.toml"
+        installed_md.write_text("# installed sample precedence\n", encoding="utf-8")
+        installed_toml.write_text(
+            '[plan]\nname = "installed-precedence"\nadapter = "opencode"\n\n'
+            '[[changes]]\nid = "precedence-ch"\n',
+            encoding="utf-8",
+        )
+
+        # Patch Path.home() so the installed probe returns our fake home.
+        # The function checks installed first, so it should return the
+        # installed pair even when checkout samples also exist.
+        with um.patch.object(pathlib.Path, "home", return_value=fake_home):
+            pair = self.opsx_plan.resolve_sample_plan_pair()
+            self.assertIsNotNone(
+                pair, "resolve_sample_plan_pair must find installed sample"
+            )
+            md, toml = pair
+            self.assertIn(
+                "installed sample precedence",
+                md.read_text(encoding="utf-8"),
+                "must prefer installed sample content",
+            )
+
+    def test_checkout_fallback_when_installed_absent(self):
+        """Lifecycle/drift: when installed samples are absent, fall back to
+        the checkout copy."""
+        import pathlib
+        import unittest.mock as um
+
+        temp_home = self.repo / ".empty-home"
+        temp_home.mkdir(parents=True)
+        # Ensure the installed samples path exists but is empty.
+        (temp_home / ".local" / "lib" / "opsx-controller" / "samples").mkdir(
+            parents=True
+        )
+
+        with um.patch.object(pathlib.Path, "home", return_value=temp_home):
+            pair = self.opsx_plan.resolve_sample_plan_pair()
+            self.assertIsNotNone(
+                pair, "must fall back to checkout sample when installed is absent"
+            )
+
+    def test_resolve_sample_plan_pair_none_when_both_missing(self):
+        """Lifecycle: resolve_sample_plan_pair returns None when neither
+        installed nor checkout locations hold samples."""
+        import pathlib
+        import unittest.mock as um
+
+        temp_home = self.repo / ".no-samples-home"
+        temp_home.mkdir(parents=True)
+        (temp_home / ".local" / "lib" / "opsx-controller" / "samples").mkdir(
+            parents=True
+        )
+
+        # Patch _RUNTIME_ROOTS to point at a directory without samples.
+        fake_root = self.repo / ".fake-orchestrator-root"
+        fake_root.mkdir(parents=True)
+        (fake_root / "orchestrator").mkdir(parents=True)
+        # No samples/ dir under orchestrator/.
+
+        with um.patch.object(pathlib.Path, "home", return_value=temp_home):
+            with um.patch.object(
+                self.opsx_plan, "_RUNTIME_ROOTS", (fake_root,),
+            ):
+                pair = self.opsx_plan.resolve_sample_plan_pair()
+                self.assertIsNone(
+                    pair, "must return None when no sample pair exists"
+                )
 
 
 if __name__ == "__main__":

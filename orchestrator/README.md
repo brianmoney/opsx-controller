@@ -56,10 +56,13 @@ Usage:
 
 ```bash
 # Compile through OpenCode (the default)
+opsx-plan compile docs/my-plan.md
+
+# Compile to an explicit path
 opsx-plan compile docs/my-plan.md -o plan.toml
 
 # Compile through Claude Code
-opsx-plan compile --adapter claude-code docs/my-plan.md -o plan.toml
+opsx-plan compile --adapter claude-code docs/my-plan.md
 
 # Overwrite an existing manifest
 opsx-plan compile docs/my-plan.md -o plan.toml --force
@@ -77,6 +80,23 @@ those `pause_before = true` entries yourself. Always review the DAG
 If you author plan docs with a frontier model, telling it to follow this
 convention (backticked slugs in `Depends on:`, explicit `(proposed` capability
 markers) makes its output directly compilable.
+
+## Plan placement and archival
+
+Active plan manifests live under `openspec/plans/`. Archived (completed or
+superseded) plans move into `openspec/plans/archived/`. The `opsx-plan
+archive-plan` command moves a manifest pair:
+
+```bash
+# Archive a completed plan
+opsx-plan archive-plan openspec/plans/my-plan.toml
+```
+
+`archive-plan` moves the `.toml` and its sibling `.md` (when present) into
+`openspec/plans/archived/`, using `git mv` for tracked files. When the
+active-plan pointer references the archived plan, it is cleared. The command
+reports the moved paths and reminds you that the move still needs committing —
+it never creates a commit.
 
 ## The create stage
 
@@ -129,7 +149,9 @@ The change must already exist at `openspec/changes/<change-id>/` with
 
 Durable state is persisted to `.opsx-plan/run-<change-id>.state.json`, and stage
 logs go to `.opsx-plan/logs/`. Interrupted runs can be resumed by re-invoking
-the same `opsx-run <change-id>` command.
+the same `opsx-run <change-id>` command. Each run also writes a derived
+manifest at `.opsx-plan/plans/run-<change-id>.toml`, so `opsx-plan report` and
+`opsx-plan dashboard` can target the run by id with `--for-change <id>`.
 
 ### Plan-level execution (activate-then-run)
 
@@ -143,9 +165,11 @@ From the host project root:
 
 ```bash
 # 0. generate plan.toml from your phased plan doc, then REVIEW the DAG
-opsx-plan compile docs/phased-implementation-plan.md -o plan.toml
+opsx-plan compile docs/phased-implementation-plan.md
 # Compile auto-activates the output plan when inside the repository.
 # Plans outside the repository receive a warning and are not activated.
+# Use -o to pick an explicit path, e.g.:
+# opsx-plan compile docs/phased-implementation-plan.md -o plan.toml
 
 # preview order, gates, and current status without running anything
 opsx-plan run --dry-run
@@ -178,7 +202,7 @@ compatibility worker-state snapshots used as phase inputs live under
 
 ## Plan manifest
 
-See `plan.example.toml`. Per-change fields: `id` (required), `depends_on`,
+See `orchestrator/samples/sample-plan.toml` for a canonical example. Per-change fields: `id` (required), `depends_on`,
 `phase` (informational), `pause_before` (requires explicit `approve` before
 dispatch — use for human gates like new-capability approvals or phase exit
 reviews), `enabled` (set `false` for deferred changes), and per-change
