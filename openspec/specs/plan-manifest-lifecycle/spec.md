@@ -1,4 +1,9 @@
-## ADDED Requirements
+# plan-manifest-lifecycle Specification
+
+## Purpose
+TBD - created by archiving change standardize-plan-manifest-lifecycle. Update Purpose after archive.
+
+## Requirements
 
 ### Requirement: Authored plan manifests have a canonical repository location
 

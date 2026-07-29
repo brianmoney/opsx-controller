@@ -14755,10 +14755,45 @@ class SingleChangeManifestTests(unittest.TestCase):
             "stale manifest must be removed on divergence",
         )
 
+    def test_cmd_run_one_preserves_active_pointer(self):
+        """cmd_run_one must leave a pre-existing active-plan pointer intact."""
+        self.write_authored_change(self.cid)
+        # Set up an active plan pointer referencing an unrelated plan.
+        plans_dir = self.repo / "openspec" / "plans"
+        plans_dir.mkdir(parents=True)
+        (plans_dir / "existing.toml").write_text(
+            '[plan]\nname = "existing"\nadapter = "opencode"\n\n'
+            '[[changes]]\nid = "x"\n',
+            encoding="utf-8",
+        )
+        self.opsx_plan.write_active_plan(self.repo, "openspec/plans/existing.toml")
+        before = self.opsx_plan.read_active_plan(self.repo)
+        self.assertEqual(before, "openspec/plans/existing.toml")
+
+        args = argparse.Namespace(repo=str(self.repo), change=self.cid)
+
+        def fake_run_dc(repo, cfg, state, cid, budget_usd=0.0):
+            r = self.opsx_plan.rec(state, cid)
+            r["phase"] = "done"
+            self.opsx_plan.set_status(state, cid, self.opsx_plan.DONE, "done")
+            return self.opsx_plan.DONE
+
+        with mock.patch.object(
+            self.opsx_plan, "run_direct_change", side_effect=fake_run_dc
+        ):
+            rc = self.opsx_plan.cmd_run_one(args)
+
+        self.assertEqual(rc, 0)
+        # Active pointer must be preserved — unchanged from before the run.
+        after = self.opsx_plan.read_active_plan(self.repo)
+        self.assertEqual(after, before,
+                         "cmd_run_one must preserve the active-plan pointer")
+
 
 
 class ForChangeReportTests(unittest.TestCase):
-    """7.5–7.6: report --for-change resolution."""
+    """7.5–7.6: report --for-change resolution, exercised through
+    cmd_report / cmd_dashboard command paths and state-file fallback."""
 
     def setUp(self) -> None:
         self.opsx_plan = load_opsx_plan()
@@ -14778,6 +14813,7 @@ class ForChangeReportTests(unittest.TestCase):
             "init",
         )
         self.cid = "add-for-change-test"
+        self.plan_name = f"run-{self.cid}"
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -14788,6 +14824,62 @@ class ForChangeReportTests(unittest.TestCase):
         (cdir / "proposal.md").write_text("## Why\n", encoding="utf-8")
         (cdir / "tasks.md").write_text(
             "## 1. Tasks\n\n- [ ] 1.1 Example task\n", encoding="utf-8"
+        )
+
+    def _write_telemetry_and_state(self) -> None:
+        """Create minimal telemetry and state so report/dashboard can render."""
+        tele_dir = self.repo / ".opsx-plan" / "telemetry"
+        tele_dir.mkdir(parents=True, exist_ok=True)
+        record = {
+            "schema_version": 1,
+            "uid": "uid-001",
+            "plan_name": self.plan_name,
+            "run_id": "run-001",
+            "change_id": self.cid,
+            "stage": "implement",
+            "round": 1,
+            "status": "completed",
+            "started_at": "2026-07-01T10:00:00",
+            "ended_at": "2026-07-01T10:02:00",
+            "duration_ms": 120000,
+            "usage": {
+                "usage_available": True,
+                "input_tokens": 10000,
+                "output_tokens": 2000,
+                "cached_input_tokens": None,
+                "reasoning_tokens": None,
+                "total_tokens": 12000,
+                "usage_source": "worker_json",
+            },
+            "cost": {
+                "status": "estimated",
+                "estimated_cost": 0.05,
+                "pricing_catalog_version": None,
+                "price_snapshot": None,
+                "unresolved_reason": None,
+            },
+            "model": {
+                "provider": "openai",
+                "model_id": "gpt-4o",
+                "model_alias": None,
+            },
+            "result": {
+                "stage_status": "completed",
+                "verdict": None,
+                "critical_count": 0,
+                "warning_count": 0,
+                "note_count": 0,
+            },
+        }
+        (tele_dir / f"{self.plan_name}.jsonl").write_text(
+            json.dumps(record) + "\n", encoding="utf-8",
+        )
+        state_dir = self.repo / ".opsx-plan"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / f"{self.plan_name}.state.json").write_text(
+            json.dumps({"plan": self.plan_name, "approvals": [], "changes": {
+                self.cid: {"status": "done", "round": 1, "phase": "done"},
+            }}), encoding="utf-8",
         )
 
     def test_for_change_resolves_via_manifest(self):
@@ -14831,6 +14923,84 @@ class ForChangeReportTests(unittest.TestCase):
             self.repo, self.cid, None,
         )
         self.assertEqual(plan, f"run-{self.cid}")
+
+    def test_cmd_report_for_change_via_manifest(self):
+        """Exercise ``cmd_report --for-change`` through the manifest path."""
+        self.write_authored_change(self.cid)
+        cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
+        self.opsx_plan.write_single_change_manifest(self.repo, self.cid, cfg)
+        self._write_telemetry_and_state()
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        args = argparse.Namespace(
+            repo=str(self.repo), plan=None, json=False,
+            change=None, run_id=None, stage=None, model=None,
+            for_change=self.cid,
+        )
+        with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+            rc = self.opsx_plan.cmd_report(args)
+        self.assertEqual(rc, 0, f"report failed: {stderr.getvalue()}")
+        self.assertIn(self.plan_name, stdout.getvalue())
+
+    def test_cmd_report_for_change_via_state_file_fallback(self):
+        """Exercise ``cmd_report --for-change`` through the state-file
+        fallback when no manifest exists."""
+        self.write_authored_change(self.cid)
+        self._write_telemetry_and_state()
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        args = argparse.Namespace(
+            repo=str(self.repo), plan=None, json=False,
+            change=None, run_id=None, stage=None, model=None,
+            for_change=self.cid,
+        )
+        with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+            rc = self.opsx_plan.cmd_report(args)
+        self.assertEqual(rc, 0, f"report fallback failed: {stderr.getvalue()}")
+        self.assertIn(self.plan_name, stdout.getvalue())
+
+    def test_cmd_dashboard_for_change_via_manifest(self):
+        """Exercise ``cmd_dashboard --for-change`` through the manifest path."""
+        self.write_authored_change(self.cid)
+        cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
+        self.opsx_plan.write_single_change_manifest(self.repo, self.cid, cfg)
+        self._write_telemetry_and_state()
+
+        output = self.repo / "out.html"
+        stderr = io.StringIO()
+        args = argparse.Namespace(
+            repo=str(self.repo), plan=None, output=str(output),
+            change=None, run_id=None,
+            for_change=self.cid,
+        )
+        with mock.patch("sys.stderr", stderr):
+            rc = self.opsx_plan.cmd_dashboard(args)
+        self.assertEqual(rc, 0, f"dashboard failed: {stderr.getvalue()}")
+        self.assertTrue(output.is_file(), "dashboard HTML must be written")
+        content = output.read_text(encoding="utf-8")
+        self.assertIn("<html", content)
+
+    def test_cmd_dashboard_for_change_via_state_file_fallback(self):
+        """Exercise ``cmd_dashboard --for-change`` through the state-file
+        fallback when no manifest exists."""
+        self.write_authored_change(self.cid)
+        self._write_telemetry_and_state()
+
+        output = self.repo / "out.html"
+        stderr = io.StringIO()
+        args = argparse.Namespace(
+            repo=str(self.repo), plan=None, output=str(output),
+            change=None, run_id=None,
+            for_change=self.cid,
+        )
+        with mock.patch("sys.stderr", stderr):
+            rc = self.opsx_plan.cmd_dashboard(args)
+        self.assertEqual(rc, 0, f"dashboard fallback failed: {stderr.getvalue()}")
+        self.assertTrue(output.is_file(), "dashboard HTML must be written")
+        content = output.read_text(encoding="utf-8")
+        self.assertIn("<html", content)
 
 
 class ArchivePlanCommandTests(unittest.TestCase):
@@ -14941,6 +15111,39 @@ class ArchivePlanCommandTests(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("must be under openspec/plans/", stderr.getvalue())
 
+    def test_archive_refuses_missing_target(self):
+        """7.7 — archive-plan refuses a path that does not exist."""
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            plan="openspec/plans/nonexistent.toml",
+        )
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr):
+            rc = self.opsx_plan.cmd_archive_plan(args)
+        self.assertEqual(rc, 2)
+        self.assertIn("not found", stderr.getvalue())
+
+    def test_archive_without_md_sibling(self):
+        """7.7 — archive-plan moves the .toml when no .md sibling exists."""
+        plans_dir = self.repo / "openspec" / "plans"
+        plans_dir.mkdir(parents=True, exist_ok=True)
+        toml_path = plans_dir / "solo-plan.toml"
+        toml_path.write_text(
+            '[plan]\nname = "solo"\nadapter = "opencode"\n\n'
+            '[[changes]]\nid = "c1"\n',
+            encoding="utf-8",
+        )
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            plan="openspec/plans/solo-plan.toml",
+        )
+        rc = self.opsx_plan.cmd_archive_plan(args)
+        self.assertEqual(rc, 0)
+        archived_dir = self.repo / "openspec" / "plans" / "archived"
+        self.assertTrue((archived_dir / "solo-plan.toml").is_file())
+        self.assertFalse((archived_dir / "solo-plan.md").is_file())
+        self.assertFalse(toml_path.exists())
+
     def test_archive_leaves_nonmatching_pointer_intact(self):
         """7.7 — archiving a non-active plan must preserve the active-plan
         pointer that references a different plan."""
@@ -15029,7 +15232,7 @@ class SamplePlanTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_sample_toml_loads(self):
-        """7.10"""
+        """7.10 — load_plan preserves pause_before gates and dependency edges"""
         sample_dir = (
             Path(__file__).resolve().parents[2] / "orchestrator" / "samples"
         )
@@ -15054,6 +15257,27 @@ class SamplePlanTests(unittest.TestCase):
         self.assertEqual(
             set(changes["fix-tax-calculation"]["depends_on"]),
             {"add-unit-tests"},
+        )
+        self.assertEqual(
+            set(changes["integrate-payment-gateway-v2"]["depends_on"]),
+            {"add-input-validation", "add-discount-code-verification"},
+        )
+        self.assertEqual(
+            changes["add-unit-tests"]["depends_on"], [],
+        )
+
+        # pause_before gates
+        self.assertTrue(
+            changes["add-input-validation"]["pause_before"],
+            "add-input-validation must have pause_before = true",
+        )
+        self.assertTrue(
+            changes["integrate-payment-gateway-v2"]["pause_before"],
+            "integrate-payment-gateway-v2 must have pause_before = true",
+        )
+        self.assertFalse(
+            changes["add-unit-tests"]["pause_before"],
+            "add-unit-tests must have pause_before = false",
         )
         gated = cfg["order"][0]
         self.assertEqual(gated, "add-input-validation")
@@ -15228,6 +15452,163 @@ class SamplePlanTests(unittest.TestCase):
                 self.assertIsNone(
                     pair, "must return None when no sample pair exists"
                 )
+
+    def test_both_sample_gates_load_and_exercise_full_surface(self):
+        """Assert the canonical sample pair passes load_plan + field surface
+        checks from both the installed and checkout resolution gates."""
+        import pathlib
+        import tomllib
+        import unittest.mock as um
+
+        checkout_dir = (
+            Path(__file__).resolve().parents[2] / "orchestrator" / "samples"
+        )
+        checkout_toml = checkout_dir / "sample-plan.toml"
+        checkout_md = checkout_dir / "sample-plan.md"
+
+        known_plan_keys = {
+            "name", "adapter", "invoke", "state_file",
+            "implement_invoke", "review_invoke", "archive_invoke",
+            "timeout_minutes", "max_attempts", "max_rounds",
+            "no_progress_limit", "fast_checks", "check_timeout_minutes",
+            "require_clean_tracked", "notify_cmd", "plan_doc",
+            "create_invoke", "create_timeout_minutes", "create_max_attempts",
+            "review_created", "created_check", "git_delivery",
+        }
+
+        def _assert_sample_surface(toml_path, label):
+            """Gate: load_plan succeeds and no loader-ignored keys exist."""
+            cfg = self.opsx_plan.load_plan(toml_path)
+            self.assertEqual(cfg["name"], "sample-implementation-plan",
+                             f"{label}: plan name mismatch")
+            raw = tomllib.loads(toml_path.read_text(encoding="utf-8"))
+            unknown = set(raw["plan"].keys()) - known_plan_keys
+            self.assertEqual(unknown, set(),
+                             f"{label}: carries unknown plan keys: {unknown}")
+
+        # --- Gate 1: checkout fallback (always available) ---
+        empty_home = self.repo / ".empty-home-for-gate1"
+        empty_home.mkdir(parents=True)
+        (empty_home / ".local" / "lib" / "opsx-controller" / "samples").mkdir(
+            parents=True
+        )
+        with um.patch.object(pathlib.Path, "home", return_value=empty_home):
+            pair = self.opsx_plan.resolve_sample_plan_pair()
+            self.assertIsNotNone(pair, "checkout fallback must resolve")
+            md, toml = pair
+            _assert_sample_surface(toml, "checkout gate")
+
+        # --- Gate 2: installed samples (deterministic) ---
+        fake_home = self.repo / ".fake-home-for-gate2"
+        fake_home.mkdir(parents=True)
+        installed_samples = (
+            fake_home / ".local" / "lib" / "opsx-controller" / "samples"
+        )
+        installed_samples.mkdir(parents=True)
+        # Copy the real sample files into the fake installed location so
+        # the gate exercises identical content.
+        import shutil
+        shutil.copy2(checkout_toml, installed_samples / "sample-plan.toml")
+        shutil.copy2(checkout_md, installed_samples / "sample-plan.md")
+
+        with um.patch.object(pathlib.Path, "home", return_value=fake_home):
+            pair = self.opsx_plan.resolve_sample_plan_pair()
+            self.assertIsNotNone(pair, "installed gate must resolve")
+            md, toml = pair
+            self.assertIn(
+                str(fake_home), str(toml),
+                "installed gate must return the installed path, not checkout",
+            )
+            _assert_sample_surface(toml, "installed gate")
+
+    def test_installer_deploys_samples(self):
+        """Verify the installer deploys sample files to the runtime
+        samples directory."""
+        import pathlib
+        import shutil
+        from unittest import mock as um
+
+        fake_home = self.repo / ".fake-home-install"
+        fake_home.mkdir()
+
+        installer = (
+            Path(__file__).resolve().parents[2]
+            / "scripts" / "install-orchestrator.sh"
+        )
+        checkout = Path(__file__).resolve().parents[2]
+
+        env = {**os.environ, "HOME": str(fake_home)}
+        result = subprocess.run(
+            ["bash", str(installer), str(checkout)],
+            cwd=str(self.repo),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            f"installer failed: {result.stderr}",
+        )
+
+        samples_dir = (
+            fake_home / ".local" / "lib" / "opsx-controller" / "samples"
+        )
+        self.assertTrue(
+            (samples_dir / "sample-plan.md").is_file(),
+            "installer must deploy sample-plan.md",
+        )
+        self.assertTrue(
+            (samples_dir / "sample-plan.toml").is_file(),
+            "installer must deploy sample-plan.toml",
+        )
+
+    def test_installer_refreshes_samples(self):
+        """Verify re-running the installer replaces previously installed
+        sample files (refresh, not append)."""
+        fake_home = self.repo / ".fake-home-refresh"
+        fake_home.mkdir()
+
+        installer = (
+            Path(__file__).resolve().parents[2]
+            / "scripts" / "install-orchestrator.sh"
+        )
+        checkout = Path(__file__).resolve().parents[2]
+        env = {**os.environ, "HOME": str(fake_home)}
+
+        # First install.
+        result1 = subprocess.run(
+            ["bash", str(installer), str(checkout)],
+            cwd=str(self.repo),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(result1.returncode, 0)
+
+        samples_dir = (
+            fake_home / ".local" / "lib" / "opsx-controller" / "samples"
+        )
+        toml_path = samples_dir / "sample-plan.toml"
+        original = toml_path.read_text(encoding="utf-8")
+
+        # Corrupt the installed sample.
+        toml_path.write_text("# corrupted\n", encoding="utf-8")
+
+        # Re-install (refresh).
+        result2 = subprocess.run(
+            ["bash", str(installer), str(checkout)],
+            cwd=str(self.repo),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(result2.returncode, 0)
+
+        restored = toml_path.read_text(encoding="utf-8")
+        self.assertEqual(
+            restored, original,
+            "re-running the installer must restore the original sample content",
+        )
 
 
 if __name__ == "__main__":

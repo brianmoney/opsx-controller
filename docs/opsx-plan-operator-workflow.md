@@ -780,17 +780,20 @@ This is equivalent to `opsx-plan run-one <change-id>`.
 ### Derived Manifest
 
 Every `opsx-run` invocation produces a **derived manifest** at
-`.opsx-plan/plans/run-<change-id>.toml`. This manifest is a fully round-tripped
-TOML document that mirrors the one-change configuration the orchestrator uses
-internally — every plan-level field and the single `[[changes]]` entry are
-serialized, written to a temp file, loaded back through the standard
-`load_plan` parser, and compared field-by-field before it replaces any
-existing copy. If the round-trip comparison detects divergence, the stale
+`.opsx-plan/plans/run-<change-id>.toml`. The manifest is written only after the
+`require_clean_tracked` guard (and any other run-time refusal check) passes —
+a rejected run leaves no manifest behind. The manifest is a fully
+round-tripped TOML document that mirrors the one-change configuration the
+orchestrator uses internally: every plan-level field and the single
+`[[changes]]` entry are serialized, written to a temp file, loaded back through
+the standard `load_plan` parser, and compared field-by-field before it replaces
+any existing copy. If the round-trip comparison detects divergence, the stale
 manifest and the temp file are both removed and a `PlanError` is raised to
 prevent an incorrect manifest from persisting.
 
 The derived manifest enables the same reporting and dashboard tooling that
-multi-change plan manifests support:
+multi-change plan manifests support. Use the bare change id (no `run-` prefix)
+with `--for-change`:
 
 ```bash
 # Report targeting a derived manifest (manifest-driven lookup):
@@ -802,7 +805,7 @@ opsx-plan dashboard --for-change add-gardening-suggestions
 # When the manifest is absent but state exists (e.g. from a pre-change
 # run namespace that predates manifest serialization), --for-change still
 # resolves via the plan name fallback:
-opsx-plan report --for-change run-add-adapter-aware-plan-compilation
+opsx-plan report --for-change add-adapter-aware-plan-compilation
 ```
 
 The derived manifest path follows the convention
