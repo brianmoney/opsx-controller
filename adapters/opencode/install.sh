@@ -144,7 +144,8 @@ install_global() {
     "Installed support files to $config_root/opsx-controller" \
     "Installed opsx-plan runtime libraries to $HOME/.local/lib/opsx-controller" \
     "Installed opsx-plan to $HOME/.local/bin/opsx-plan" \
-    "Installed opsx-run to $HOME/.local/bin/opsx-run"
+    "Installed opsx-run to $HOME/.local/bin/opsx-run" \
+    "Installed opsx-watch-plan to $HOME/.local/bin/opsx-watch-plan"
   do_verify
   verify_plugin_deployed "$config_root/plugins"
 }

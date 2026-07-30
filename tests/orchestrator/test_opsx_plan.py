@@ -952,6 +952,155 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
         self.assertEqual(record["last_result"], "post_archive_check_failed")
         self.assertIn("post-archive", record["reason"])
 
+    def test_corrective_handoff_persists_across_review_failure_and_retry(self) -> None:
+        """Prove a multi-finding corrective handoff survives state persistence,
+        is supplied to the next implementer, and clears after a clean review."""
+        multi_finding_handoff = (
+            "CHANGE: test-cf\n"
+            "FINDINGS:\n"
+            "- [critical] orchestrator/opsx-plan.py: missing input metadata block\n"
+            "  → must write OPSX WORKER INPUT header\n"
+            "- [warning] tests/regression/: no handoff coverage\n"
+            "  → add persistence regression\n"
+            "CORRECTIVE GUIDANCE: Add the comment-prefixed metadata block to\n"
+            "run_logged_command before spawning the worker.\n"
+            "VERIFY: python3 -m pytest tests/orchestrator/test_opsx_plan.py -k handoff"
+        )
+        calls, inputs = self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": ["orchestrator/opsx-plan.py"],
+                        "known_change_files": [],
+                        "summary": "round 1 done",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 1,
+                        "verdict": "fail",
+                        "finding_counts": {"critical": 1, "warning": 1, "note": 0},
+                        "summary": "needs corrections",
+                        "fix_prompt": multi_finding_handoff,
+                        "next_phase": "implement",
+                    },
+                },
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 2,
+                        "progress_made": True,
+                        "completed_tasks": ["1.2"],
+                        "remaining_tasks": [],
+                        "task_counts": {"complete": 2, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "round 2 done",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 2,
+                        "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "all clean",
+                        "fix_prompt": "",
+                        "next_phase": "archive",
+                    },
+                },
+                {
+                    "stage": "archive",
+                    "archive_repo": True,
+                    "result": {
+                        "status": "archived",
+                        "change": self.cid,
+                        "archive_path": "",
+                        "spec_sync_status": "no-delta",
+                        "commit": "",
+                        "summary": "archived",
+                    },
+                },
+            ]
+        )
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, self.opsx_plan.DONE)
+        # The retry implementer (round 2) must receive the handoff.
+        retry_input = inputs[2]  # third stage dispatch (round-2 implement)
+        self.assertIn("LATEST_FIX_PROMPT:", retry_input)
+        self.assertIn("CHANGE:", retry_input)
+        self.assertIn(multi_finding_handoff.splitlines()[0], retry_input)
+        # After the clean review, latest_fix_prompt must be cleared.
+        self.assertEqual(
+            self.opsx_plan.rec(self.state, self.cid)["latest_fix_prompt"], ""
+        )
+        # The passing review's last_review carries an empty fix_prompt,
+        # confirming the handoff was cleared (not carried forward).
+        self.assertEqual(
+            self.opsx_plan.rec(self.state, self.cid)["last_review"]["verdict"], "pass"
+        )
+        self.assertEqual(
+            self.opsx_plan.rec(self.state, self.cid)["last_review"]["fix_prompt"], ""
+        )
+
+    def test_log_metadata_exposes_handoff_without_breaking_parsing(self) -> None:
+        """Prove the OPSX WORKER INPUT metadata block appears in the stage log
+        and that comment-prefixed metadata does not break JSON parsing or
+        trigger false failure-marker detection."""
+        handoff_text = (
+            "CHANGE: test-log-handoff\n"
+            "FINDINGS:\n"
+            "- [critical] core/phase-protocol.md: missing handoff contract\n"
+            "CORRECTIVE GUIDANCE: Document the labeled sections\n"
+            "VERIFY: run openspec validate\n"
+        )
+
+        # Build a log with the metadata block followed by valid JSON and a
+        # failure-like phrase in the handoff that must NOT trigger detection.
+        log_path = self.repo / ".opsx-plan" / "logs" / "test-metadata.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "w", encoding="utf-8") as lf:
+            lf.write("# 2026-07-30T00:00:00+00:00 implement attempt 1: ...\n")
+            lf.write("# --- OPSX WORKER INPUT ---\n")
+            for line in handoff_text.splitlines():
+                lf.write(f"# {line}\n")
+            lf.write("# --- END OPSX WORKER INPUT ---\n")
+            lf.write(
+                '{"status":"implemented","change":"test-cf","round":1,'
+                '"progress_made":true,"completed_tasks":[],'
+                '"remaining_tasks":["1.1"],"task_counts":{"complete":0,"total":1},'
+                '"files_touched":[],"known_change_files":[],"summary":"ok"}\n'
+            )
+
+        payload, reason, envelope = self.opsx_plan.parse_stage_json(log_path)
+        self.assertIsNotNone(payload, f"should parse JSON despite metadata: {reason}")
+        self.assertEqual(payload["status"], "implemented")
+        self.assertIsNone(envelope)
+
+        # The metadata should NOT trigger provider failure markers even though
+        # the handoff contains words that might match failure patterns.
+        # (The _clean_log_lines function strips all # -prefixed lines.)
+        lines = self.opsx_plan._clean_log_lines(log_path.read_text(encoding="utf-8"))
+        failure_reason = self.opsx_plan._scan_for_failure_marker(lines)
+        self.assertEqual(failure_reason, "")
+
 
 class SingleChangeConfigTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -1979,8 +2128,16 @@ class InvokeDirectStageEnvExpansionTests(unittest.TestCase):
         header_line = content.splitlines()[0]
         self.assertIn("<input>", header_line)
         self.assertIn("attempt 1", header_line)
-        self.assertNotIn("THE INPUT BLOCK", content)
-        self.assertNotIn("multiple lines", content)
+        # The multi-line input block is written as comment-prefixed metadata
+        # (OPSX WORKER INPUT block) so operators can inspect it. It must NOT
+        # appear as ordinary log lines that could break JSON parsing.
+        self.assertIn("# --- OPSX WORKER INPUT ---", content)
+        self.assertIn("# THE INPUT BLOCK", content)
+        self.assertIn("# --- END OPSX WORKER INPUT ---", content)
+        # _clean_log_lines strips #-prefixed lines, so the metadata does not
+        # interfere with worker result parsing.
+        clean = self.opsx_plan._clean_log_lines(content)
+        self.assertNotIn("THE INPUT BLOCK", "\n".join(clean))
 
     def test_apply_model_env_populates_variable_invoke_expands(self) -> None:
         """7.5: after apply_model_env, invoke_direct_stage expands

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Shared orchestrator runtime installer for opsx-controller adapters.
 #
-# Copies the client-neutral `opsx-plan` and `opsx-run` executables to
-# ~/.local/bin and the required runtime packages to
+# Copies the client-neutral `opsx-plan`, `opsx-run`, and `opsx-watch-plan`
+# executables to ~/.local/bin and the required runtime packages to
 # ~/.local/lib/opsx-controller/lib.  The installed layout is identical
 # regardless of which adapter installed it.
 #
@@ -32,12 +32,16 @@ install_orchestrator() {
   install -m 0755 \
     "$repo_root/orchestrator/opsx-plan.py" \
     "$dest_dir/opsx-run"
+  install -m 0755 \
+    "$repo_root/scripts/opsx-watch-plan" \
+    "$dest_dir/opsx-watch-plan"
 
   printf '%s\n' \
     "Installed opsx-plan runtime libraries to $runtime_dir" \
     "Installed opsx-plan samples to $runtime_dir/samples" \
     "Installed opsx-plan to $dest_dir/opsx-plan" \
-    "Installed opsx-run to $dest_dir/opsx-run"
+    "Installed opsx-run to $dest_dir/opsx-run" \
+    "Installed opsx-watch-plan to $dest_dir/opsx-watch-plan"
 }
 
 if [[ $# -ne 1 ]]; then

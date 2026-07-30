@@ -17,6 +17,19 @@ Current adapters:
 - `plugins/opsx-controller/`: Claude Code plugin package for namespaced distribution
 - `skills/opsx-controller/`: Vercel `npx skill` package for discovery and guided use
 
+## Operator Workflow
+
+- `opsx-watch-plan`: live stage-log follower installed alongside `opsx-plan` and
+  `opsx-run`. Run it from a repository root to follow the newest direct-stage
+  log under `.opsx-plan/logs/`. Each log begins with a comment-prefixed
+  `OPSX WORKER INPUT` block showing the exact dispatched fields including
+  corrective handoffs (`LATEST_FIX_PROMPT`). The watcher automatically
+  switches to a newer log when a new stage begins.
+- Direct-stage logs are written under `.opsx-plan/logs/<change>.<stage>.r<round>.<n>.log`.
+  The comment-prefixed metadata (lines starting with `# `) is excluded from
+  JSON result parsing and failure-marker detection so it never interferes with
+  controller state transitions.
+
 ## Model Efficiency Workflow
 
 - `model-efficiency-workflow.md`: end-to-end operator workflow for benchmarking

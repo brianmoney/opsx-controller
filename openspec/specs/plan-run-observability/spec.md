@@ -1512,3 +1512,31 @@ When the plugin cannot emit a valid record for an event, it SHALL skip that even
 
 - **WHEN** OpenCode emits an event shape that the plugin does not recognize as usage-bearing
 - **THEN** the plugin skips the event without writing a malformed sidecar record
+
+### Requirement: Direct-stage logs expose the dispatched worker input
+`opsx-plan` SHALL write the exact input block passed to each direct implement,
+review, or archive worker into its stage log before launching that worker. The
+input block SHALL be comment-prefixed metadata with clear start and end markers
+and SHALL include `CHANGE`, `ROUND`, `LATEST_FIX_PROMPT`, task counts, and
+context-cache fields.
+
+The log parser SHALL ignore the metadata block when selecting a worker JSON
+result or detecting worker/provider failure markers.
+
+#### Scenario: Retry implement log shows reviewer handoff
+- **WHEN** a failed review dispatches a retry implementation round with a
+  non-empty corrective handoff
+- **THEN** the retry implementation stage log displays the exact
+  `LATEST_FIX_PROMPT` in its comment-prefixed worker-input metadata before
+  worker output begins
+
+#### Scenario: Input metadata does not invalidate worker JSON
+- **WHEN** a direct-stage log contains comment-prefixed worker-input metadata
+  followed by a valid worker JSON result
+- **THEN** `opsx-plan` parses and applies the worker result normally
+
+#### Scenario: Metadata failure-like text is ignored
+- **WHEN** a corrective handoff contains text matching a provider failure
+  marker and the worker returns valid JSON
+- **THEN** the controller does not treat the metadata text as a provider
+  failure

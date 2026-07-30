@@ -2680,7 +2680,7 @@ def invoke_direct_stage(
         f"  exec[{stage}]: {' '.join(cmd[:-1])} <input> "
         f"(timeout {timeout_s / 60:g}m, log {log_path})"
     )
-    return run_logged_command(repo, cmd, log_path, timeout_s, stage, round_num)
+    return run_logged_command(repo, cmd, log_path, timeout_s, stage, round_num, input_text=input_block)
 
 
 def run_logged_command(
@@ -2690,6 +2690,7 @@ def run_logged_command(
     timeout_s: float,
     stage: str,
     attempt: int,
+    input_text: str = "",
 ) -> tuple[str, Path]:
     global _current_proc
     header_cmd = cmd
@@ -2702,6 +2703,17 @@ def run_logged_command(
     try:
         with open(log_path, "w", encoding="utf-8") as lf:
             lf.write(f"# {utcnow()} {stage} attempt {attempt}: {' '.join(header_cmd)}\n")
+            # Write the worker input block as comment-prefixed metadata so
+            # operators can inspect the exact dispatched fields (including
+            # corrective handoffs) while the existing JSON/failure-marker
+            # parser in _clean_log_lines ignores `# `-prefixed lines.
+            if input_text:
+                lf.write("# --- OPSX WORKER INPUT ---\n")
+                for line in input_text.splitlines():
+                    stripped = line.strip()
+                    if stripped:
+                        lf.write(f"# {stripped}\n")
+                lf.write("# --- END OPSX WORKER INPUT ---\n")
             lf.flush()
             proc = subprocess.Popen(
                 cmd,

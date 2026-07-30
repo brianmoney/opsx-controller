@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# opsx-watch-plan --- live stage-log follower for OpenSpec plan runs.
+#
+# USAGE: opsx-watch-plan            from inside a repository root
+#        opsx-watch-plan <repo>     explicit repository path
+#
+# Follows the newest stage log under <repo>/.opsx-plan/logs/ and
+# automatically switches to a newer log when one appears.  The
+# comment-prefixed OPSX WORKER INPUT block in each direct-stage log
+# (including corrective handoffs) is visible as the stage begins.
+set -euo pipefail
+
+REPO="${1:-${PWD}}"
+LOG_DIR="$REPO/.opsx-plan/logs"
+
+if [[ ! -d "$LOG_DIR" ]]; then
+  printf 'opsx-watch-plan: log directory does not exist: %s\n' "$LOG_DIR" >&2
+  printf 'Start an opsx-plan run to create it.\n' >&2
+  exit 1
+fi
+
+# Collect existing logs up front so the head start for a pre-existing
+# log is never more than one poll cycle.
+declare -A seen=()
+for f in "$LOG_DIR"/*.log; do
+  [[ -e "$f" ]] || continue
+  seen["$f"]=1
+done
+
+# Find the newest log.  The primary ordering key is the writer-guaranteed
+# stage ordering derived from the log filename, which encodes round,
+# stage, and sequence and is entirely under the orchestrator's control.
+# When two logs share the same key the function falls back to mtime.
+#
+# Pattern: {change}.{stage}.r{round}.{seq}.log
+#   - round (higher = newer)
+#   - stage within a round: implement (0) < review (1) < archive (2)
+#   - seq (higher = newer within the same stage+round)
+# This avoids non-deterministic tiebreakers like inode or filename sort.
+newest_log() {
+  local best=""
+  local best_round=-1
+  local best_stage_prio=-1
+  local best_seq=-1
+  local best_mtime=0
+
+  for f in "$LOG_DIR"/*.log; do
+    [[ -e "$f" ]] || continue
+
+    local mtime
+    mtime=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)
+
+    # Parse the writer-guaranteed stage ordering key from the filename.
+    local round=-1 stage_prio=-1 seq=-1
+    if [[ "$f" =~ \.(implement|review|archive)\.r([0-9]+)\.([0-9]+)\.log$ ]]; then
+      local parsed_stage="${BASH_REMATCH[1]}"
+      round="${BASH_REMATCH[2]}"
+      seq="${BASH_REMATCH[3]}"
+      if [[ "$parsed_stage" == "implement" ]]; then
+        stage_prio=0
+      elif [[ "$parsed_stage" == "review" ]]; then
+        stage_prio=1
+      else
+        stage_prio=2
+      fi
+    fi
+
+    # Compare: higher round wins; within a round higher stage priority
+    # (archive > review > implement) wins; within the same stage higher seq wins;
+    # mtime is the final fallback for any remaining tie.
+    local better=false
+    if [[ -z "$best" ]]; then
+      better=true
+    elif (( round > best_round )); then
+      better=true
+    elif (( round == best_round )); then
+      if (( stage_prio > best_stage_prio )); then
+        better=true
+      elif (( stage_prio == best_stage_prio )); then
+        if (( seq > best_seq )); then
+          better=true
+        elif (( seq == best_seq )); then
+          if (( mtime > best_mtime )); then
+            better=true
+          fi
+        fi
+      fi
+    fi
+
+    if $better; then
+      best="$f"
+      best_round=$round
+      best_stage_prio=$stage_prio
+      best_seq=$seq
+      best_mtime=$mtime
+    fi
+  done
+  printf '%s' "$best"
+}
+
+current=""
+while true; do
+  candidate=$(newest_log)
+  if [[ -n "$candidate" && "$candidate" != "$current" ]]; then
+    # Switch to a newer log: stop the current tail and start fresh.
+    if [[ -n "$current" ]]; then
+      kill %1 2>/dev/null || true  # stop background tail
+      wait 2>/dev/null || true
+    fi
+    if [[ -z "${seen["$candidate"]:-}" ]]; then
+      # New log: print the full log (including the worker-input header)
+      # then follow.
+      printf '\n--- opsx-watch-plan: %s ---\n' "$(basename "$candidate")"
+      cat -- "$candidate"
+    else
+      printf '\n--- opsx-watch-plan: switching to %s ---\n' "$(basename "$candidate")"
+    fi
+    seen["$candidate"]=1
+    current="$candidate"
+    tail -f -n +1 -- "$current" &
+  fi
+  sleep 2
+done

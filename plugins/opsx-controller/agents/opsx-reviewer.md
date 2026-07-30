@@ -37,6 +37,19 @@ Classification rules:
 - Count minor notes and suggestions together as `note`.
 - Any non-zero `critical`, `warning`, or `note` count is a failure.
 
+Fix prompt rules:
+- When the verdict is `fail`, the `fix_prompt` must be a self-contained
+  corrective handoff with labeled `CHANGE`, `FINDINGS`, `CORRECTIVE GUIDANCE`,
+  and `VERIFY` sections.
+- `CHANGE` identifies the active change by name.
+- `FINDINGS` lists every blocking finding with its severity, relevant file or
+  symbol, observed behavior, and required behavior.
+- `CORRECTIVE GUIDANCE` prescribes the implementation approach or invariants
+  necessary to correct the findings.
+- `VERIFY` names the focused regressions and validation commands required to
+  demonstrate the correction.
+- When the verdict is `pass`, return an empty `fix_prompt`.
+
 Final response requirements:
 
 - Respond with exactly one line of JSON.

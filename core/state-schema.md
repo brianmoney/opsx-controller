@@ -61,3 +61,10 @@ Resume requirements:
 - trust a completed state only when archive metadata still matches the working
   tree
 - resume blocked implement or archive runs without losing the latest fix prompt
+- persist a failed review's complete corrective handoff in both
+  `last_review.fix_prompt` and `latest_fix_prompt` so the full labeled
+  `CHANGE`, `FINDINGS`, `CORRECTIVE GUIDANCE`, and `VERIFY` sections survive
+  state persistence and retry dispatch
+- clear `latest_fix_prompt` only after a clean passing review records its
+  result; subsequent state must not present a prior corrective handoff as
+  active retry scope

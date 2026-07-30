@@ -53,7 +53,10 @@ Required workflow:
    default in that case.
 8. Always reread the tasks file for the active change, plus the current fix or
    implementation scope files needed for this round. If `LATEST_FIX_PROMPT` is
-   non-empty, treat it as the highest-priority fix scope for this round.
+   non-empty, treat every finding, corrective guideline, and verification
+   requirement in that handoff as the highest-priority retry scope for this
+   round. If the handoff conflicts with live artifacts or repository evidence,
+   return a blocked result instead of inventing an alternative correction.
 9. Only fall back to rereading all `contextFiles` when the cache is missing,
    stale, inconsistent with the state file, or the current round reveals a
    design question that cannot be resolved from the cached background summary.

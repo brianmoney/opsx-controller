@@ -78,7 +78,11 @@ This command should thoroughly inspect the change artifacts and implementation, 
 
    **Recommend archive** only if the change intent is satisfied, strict OpenSpec validation passes, and there are no CRITICAL, WARNING, or NOTE findings.
 
-   **Generate a concise implementation prompt** if there are any findings. The prompt should tell the implementing agent exactly what remains, cite the most relevant files, and state what must be true before archive.
+   **Generate a corrective handoff** if there are any findings. The handoff must be a self-contained report with labeled sections:
+   - `CHANGE:` the active change name
+   - `FINDINGS:` every blocking finding with severity, relevant file/symbol, observed behavior, and required behavior
+   - `CORRECTIVE GUIDANCE:` the implementation approach or invariants needed to correct the findings
+   - `VERIFY:` focused regressions and validation commands to demonstrate the correction
 
 8. **Output format**
 
@@ -112,8 +116,12 @@ This command should thoroughly inspect the change artifacts and implementation, 
    ### Decision
    - **Archive Recommendation:** Not ready
 
-   ### Prompt For Implementing Agent
-   Implement the remaining work for OpenSpec change `<change-name>`. Finish: (1) <gap>, (2) <gap>, (3) <gap>. Check `<file>:<line>` and `<file>:<line>`. The change is ready only when the implementation matches the artifacts and key scenarios are covered.
+   ### Corrective Handoff For Implementing Agent
+   CHANGE: <change-name>
+   FINDINGS:
+   - [<severity>] <file-or-symbol>: <observed behavior> → <required behavior>
+   CORRECTIVE GUIDANCE: <implementation approach>
+   VERIFY: <regressions and validation commands>
    ```
 
 **Guardrails**

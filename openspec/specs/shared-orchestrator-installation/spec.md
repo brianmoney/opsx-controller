@@ -9,11 +9,15 @@ installer.
 
 ### Requirement: Every global adapter install deploys the shared orchestrator
 
-Each global adapter installer SHALL deploy the client-neutral `opsx-plan` and
-`opsx-run` executables to `~/.local/bin` and the required `metrics`, `pricing`,
-and `models` runtime packages to `~/.local/lib/opsx-controller/lib`.
+Each global adapter installer SHALL deploy the client-neutral `opsx-plan`,
+`opsx-run`, and `opsx-watch-plan` executables to `~/.local/bin` and the
+required `metrics`, `pricing`, and `models` runtime packages to
+`~/.local/lib/opsx-controller/lib`.
 
-Each global adapter installer SHALL additionally deploy the canonical sample plan pair to `~/.local/lib/opsx-controller/samples`, so that compile prompts carry a worked example regardless of which repository the orchestrator is invoked against.
+Each global adapter installer SHALL additionally deploy the canonical sample
+plan pair to `~/.local/lib/opsx-controller/samples`, so that compile prompts
+carry a worked example regardless of which repository the orchestrator is
+invoked against.
 
 The installed executable paths and runtime layout SHALL be identical regardless
 of whether OpenCode, Claude Code, or Codex CLI performed the installation.
@@ -21,17 +25,27 @@ of whether OpenCode, Claude Code, or Codex CLI performed the installation.
 #### Scenario: Claude global install provides the executables
 
 - **WHEN** an operator runs `bash adapters/claude-code/install.sh --global`
-- **THEN** `~/.local/bin/opsx-plan`, `~/.local/bin/opsx-run`, and their runtime libraries are installed
+- **THEN** `~/.local/bin/opsx-plan`, `~/.local/bin/opsx-run`,
+  `~/.local/bin/opsx-watch-plan`, and their runtime libraries are installed
 
 #### Scenario: Codex global install provides the executables
 
 - **WHEN** an operator runs `bash adapters/codex-cli/install.sh --global`
-- **THEN** `~/.local/bin/opsx-plan`, `~/.local/bin/opsx-run`, and their runtime libraries are installed
+- **THEN** `~/.local/bin/opsx-plan`, `~/.local/bin/opsx-run`,
+  `~/.local/bin/opsx-watch-plan`, and their runtime libraries are installed
 
 #### Scenario: Global install provides the canonical sample pair
 
 - **WHEN** an operator runs any adapter's global installer
-- **THEN** the canonical sample plan markdown and its compiled TOML are installed under `~/.local/lib/opsx-controller/samples`
+- **THEN** the canonical sample plan markdown and its compiled TOML are
+  installed under `~/.local/lib/opsx-controller/samples`
+
+#### Scenario: Installed watcher follows stage logs
+
+- **WHEN** an operator runs the installed `opsx-watch-plan` from a repository
+  with `.opsx-plan/logs/`
+- **THEN** it follows the newest stage log and switches to a newer stage log
+  when one is created
 
 ### Requirement: Shared installation remains idempotent and diagnosable
 

@@ -26,7 +26,12 @@ Input arrives from `/opsx-controller:opsx-drive` as plain text fields such as:
    `openspec instructions apply --change "<change>" --json`.
 5. Read `STATE_FILE` when it exists.
 6. Use any valid cached background summary, but always reread the active tasks
-   file and current implementation scope files for this round.
+   file and current implementation scope files for this round. If
+   `LATEST_FIX_PROMPT` is non-empty, treat every finding, corrective
+   guideline, and verification requirement in that handoff as the
+   highest-priority retry scope for this round. If the handoff conflicts
+   with live artifacts or repository evidence, return a blocked result
+   instead of inventing an alternative correction.
 7. Implement the next required work for this change.
 8. Keep edits minimal and scoped to the change.
 9. Mark completed tasks in the change task file immediately after finishing
