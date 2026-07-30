@@ -32,6 +32,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -4636,7 +4637,8 @@ def build_compile_prompt(source_content: str, source_path: Path,
 # Compile client invocation
 # ---------------------------------------------------------------------------
 
-def _build_compile_argv(adapter: str, model: str, prompt: str) -> list[str]:
+def _build_compile_argv(adapter: str, model: str, prompt: str,
+                        prompt_file: Path | None = None) -> list[str]:
     """Build the compile client argv for *adapter*.
 
     Raises ``PlanError`` when the adapter is unsupported for compilation.
@@ -4651,9 +4653,16 @@ def _build_compile_argv(adapter: str, model: str, prompt: str) -> list[str]:
             f"in this release; select a supported adapter "
             f"({'opencode'} or {'claude-code'})"
         )
+    executable = entry["executable"]
+    if adapter == "opencode" and prompt_file is not None:
+        return [
+            executable, "run", "--model", model,
+            "Follow the complete compile instructions in the attached file. Output only TOML.",
+            "--file", str(prompt_file),
+        ]
+
     # Use a template-style argv construction so we compose the full command
     # from the registry without relying on a shared argv template format.
-    executable = entry["executable"]
     tmpl = entry["argv_template"]
     # Replace {executable} first so later replacements do not interfere.
     argv: list[str] = []
@@ -4673,8 +4682,19 @@ def run_compile_client(repo: Path, adapter: str, model: str,
     Returns ``(stdout, stderr)`` as a tuple.  Raises ``PlanError`` on
     spawn failure, timeout, or unsupported adapter.
     """
-    argv = _build_compile_argv(adapter, model, prompt)
     executable = COMPILE_CLIENTS[adapter]["executable"]
+    prompt_file: Path | None = None
+    if adapter == "opencode":
+        # OpenCode receives attached files as prompt parts. Keeping the full
+        # prompt out of argv avoids the OS argument-size limit for large plans.
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", prefix="opsx-compile-", suffix=".md",
+            delete=False,
+        ) as handle:
+            handle.write(prompt)
+            prompt_file = Path(handle.name)
+
+    argv = _build_compile_argv(adapter, model, prompt, prompt_file)
     try:
         proc = subprocess.run(
             argv,
@@ -4687,10 +4707,15 @@ def run_compile_client(repo: Path, adapter: str, model: str,
         raise PlanError(
             f"could not spawn {executable}; is it installed and on PATH?"
         )
+    except OSError as exc:
+        raise PlanError(f"could not spawn {executable}: {exc}") from exc
     except subprocess.TimeoutExpired:
         raise PlanError(
             f"{executable} compile invocation timed out after 600s"
         )
+    finally:
+        if prompt_file is not None:
+            prompt_file.unlink(missing_ok=True)
     if proc.returncode != 0:
         raise PlanError(
             f"{executable} exited with code {proc.returncode}\n"

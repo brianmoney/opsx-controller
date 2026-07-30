@@ -4837,7 +4837,12 @@ class CompileTests(unittest.TestCase):
             self.assertEqual(args[1], "run")
             self.assertEqual(args[2], "--model")
             self.assertEqual(args[3], model)
-            self.assertEqual(args[4], prompt)
+            self.assertEqual(
+                args[4],
+                "Follow the complete compile instructions in the attached file. Output only TOML.",
+            )
+            self.assertEqual(args[5], "--file")
+            self.assertEqual(Path(args[6]).read_text(encoding="utf-8"), prompt)
             result = mock.Mock()
             result.returncode = 0
             result.stdout = '[plan]\nname = "x"\n\n[[changes]]\nid = "c1"\n'
@@ -4980,13 +4985,19 @@ class CompileTests(unittest.TestCase):
     # -- _build_compile_argv tests --
 
     def test_build_argv_for_opencode(self) -> None:
+        prompt_file = self.repo / "compile-prompt.md"
         argv = self.opsx_plan._build_compile_argv(
-            "opencode", "m1", "prompt text"
+            "opencode", "m1", "prompt text", prompt_file
         )
         self.assertIn("opencode", argv[0])
         self.assertIn("run", argv)
         self.assertIn("m1", argv)
-        self.assertIn("prompt text", argv)
+        self.assertIn("--file", argv)
+        self.assertIn(str(prompt_file), argv)
+        self.assertLess(argv.index(
+            "Follow the complete compile instructions in the attached file. Output only TOML."
+        ), argv.index("--file"))
+        self.assertNotIn("prompt text", argv)
 
     def test_build_argv_for_claude_code(self) -> None:
         argv = self.opsx_plan._build_compile_argv(
@@ -5058,6 +5069,31 @@ class CompileTests(unittest.TestCase):
                 self.opsx_plan.run_compile_client(self.repo, "claude-code",
                                                    "m", "prompt")
             self.assertIn("timed out", str(ctx.exception).lower())
+
+    def test_run_compile_client_opencode_attaches_and_removes_prompt_file(self) -> None:
+        prompt = "large compile prompt"
+        observed: dict[str, object] = {}
+        result = mock.Mock(returncode=0, stdout="[plan]\n", stderr="")
+
+        def fake_run(argv, **kwargs):
+            prompt_file = Path(argv[argv.index("--file") + 1])
+            observed["argv"] = argv
+            observed["content"] = prompt_file.read_text(encoding="utf-8")
+            observed["path"] = prompt_file
+            return result
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            stdout, stderr = self.opsx_plan.run_compile_client(
+                self.repo, "opencode", "test-provider/test-model", prompt
+            )
+
+        self.assertEqual((stdout, stderr), ("[plan]\n", ""))
+        self.assertEqual(observed["content"], prompt)
+        self.assertLess(observed["argv"].index(
+            "Follow the complete compile instructions in the attached file. Output only TOML."
+        ), observed["argv"].index("--file"))
+        self.assertNotIn(prompt, observed["argv"])
+        self.assertFalse(observed["path"].exists())
 
     # -- _strip_claude_envelope / extract_toml tests --
 
