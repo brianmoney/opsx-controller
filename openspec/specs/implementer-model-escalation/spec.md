@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Define plan-controlled promotion of implement dispatches to a dedicated escalation model after repeated review failures.
+
+## Requirements
 
 ### Requirement: A plan key sets the review-failure threshold for implementer escalation
 
