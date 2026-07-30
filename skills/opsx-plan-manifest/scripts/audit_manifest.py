@@ -7,8 +7,7 @@ get wrong when authoring a manifest by hand:
 1. **Unknown keys.** ``load_plan()`` reads an explicit allowlist of keys and
    drops everything else with no warning and no error. A manifest can therefore
    configure behavior the controller does not implement, load clean, and read
-   as "configured and working" in review. ``escalate_after_review_fails`` is the
-   known instance of this.
+   as "configured and working" in review.
 
 2. **Change-id reality.** The manifest drives *unarchived* OpenSpec changes. An
    id that is already archived is finished work and does not belong in the

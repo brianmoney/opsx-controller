@@ -64,7 +64,7 @@ try:
     from lib.models.resolver import USER_CONFIG_PATH, ModelConfigError
     from lib.models.resolver import resolve as resolve_models
     from lib.models.resolver import validate as validate_models
-    from lib.models.types import ROLE_ENV, ROLES
+    from lib.models.types import ROLE_ENV, ROLES, ALL_ROLES
 except ModuleNotFoundError as exc:  # pragma: no cover
     sys.exit(f"opsx-plan requires the lib.models runtime package: {exc}")
 
@@ -293,6 +293,9 @@ def load_plan(path: Path, repo: Path | None = None) -> dict:
         "fast_checks": list(plan.get("fast_checks", [])),
         "check_timeout_minutes": float(plan.get("check_timeout_minutes", 15)),
         "require_clean_tracked": bool(plan.get("require_clean_tracked", True)),
+        "escalate_after_review_fails": _parse_escalation_threshold(
+            plan.get("escalate_after_review_fails", 0)
+        ),
         # --- run-event notifications ---
         "notify_cmd": plan.get("notify_cmd", "").strip() if plan.get("notify_cmd") else "",
         # --- create stage (the /opsx-ff automation) ---
@@ -391,6 +394,7 @@ def build_single_change_config(repo: Path, change_id: str) -> dict:
         "fast_checks": [],
         "check_timeout_minutes": 15,
         "require_clean_tracked": True,
+        "escalate_after_review_fails": 0,
         "notify_cmd": "",
         "plan_doc": "",
         "create_invoke": "",
@@ -462,6 +466,7 @@ def render_single_change_manifest(cfg: dict) -> str:
     lines.append(f"max_attempts = {int(cfg.get('max_attempts', 2))}")
     lines.append(f"max_rounds = {int(cfg.get('max_rounds', 5))}")
     lines.append(f"no_progress_limit = {int(cfg.get('no_progress_limit', 2))}")
+    lines.append(f"escalate_after_review_fails = {int(cfg.get('escalate_after_review_fails', 0))}")
     lines.append(f"check_timeout_minutes = {float(cfg.get('check_timeout_minutes', 15))}")
     lines.append(f"create_timeout_minutes = {float(cfg.get('create_timeout_minutes', 30))}")
     lines.append(f"create_max_attempts = {int(cfg.get('create_max_attempts', 2))}")
@@ -563,6 +568,7 @@ def _compare_configs(
         "name", "adapter", "invoke", "state_file",
         "implement_invoke", "review_invoke", "archive_invoke",
         "timeout_minutes", "max_attempts", "max_rounds", "no_progress_limit",
+        "escalate_after_review_fails",
         "fast_checks", "check_timeout_minutes", "require_clean_tracked",
         "notify_cmd", "plan_doc", "create_invoke",
         "create_timeout_minutes", "create_max_attempts",
@@ -632,8 +638,10 @@ def apply_model_env(cfg: dict) -> None:
     re-expands the stage invoke string after a stage completes — reads the
     same ``os.environ`` values for the rest of the process.
 
-    Raises ``PlanError`` naming every unresolved role rather than letting a
-    worker dispatch with an empty or defaulted model.
+    Raises ``PlanError`` naming every unresolved required role rather than
+    letting a worker dispatch with an empty or defaulted model.  Optional
+    roles are exported only when resolved; an unresolved optional role does
+    not block activation on its own.
     """
     models: dict = cfg.get("models") or {}
     unresolved = [role for role in ROLES if not (models.get(role) and models[role].model)]
@@ -645,8 +653,46 @@ def apply_model_env(cfg: dict) -> None:
             f"inspect resolution, or `opsx-plan models init` to seed a "
             f"configuration file."
         )
+
+    # Fail-closed gate: when escalation is enabled, the role must resolve.
+    escalation_role = "implementer_escalation"
+    escalate_threshold = cfg.get("escalate_after_review_fails", 0)
+    escalation_entry = models.get(escalation_role)
+    if escalate_threshold > 0 and not (escalation_entry and escalation_entry.model):
+        raise PlanError(
+            f"escalate_after_review_fails is {escalate_threshold} but "
+            f"the '{escalation_role}' role is unresolved for adapter "
+            f"'{cfg.get('adapter', '?')}'.\n"
+            f"Run `opsx-plan models show --adapter {cfg.get('adapter', '?')}` to "
+            f"inspect resolution, or `opsx-plan models init` to seed a "
+            f"configuration file."
+        )
+
     for role in ROLES:
         os.environ[ROLE_ENV[role]] = models[role].model
+
+    # Export the optional escalation role only when resolved.
+    # When unresolved, explicitly unset the variable so a previously-set
+    # value from an earlier apply_model_env call does not leak into a
+    # non-escalation dispatch.
+    if escalation_entry and escalation_entry.model:
+        os.environ[ROLE_ENV[escalation_role]] = escalation_entry.model
+    else:
+        os.environ.pop(ROLE_ENV[escalation_role], None)
+
+
+def _parse_escalation_threshold(value: object) -> int:
+    """Parse ``escalate_after_review_fails`` into a non-negative integer.
+
+    Raises ``PlanError`` naming the key on a negative value.
+    """
+    threshold = int(value)
+    if threshold < 0:
+        raise PlanError(
+            "escalate_after_review_fails must be >= 0, "
+            f"got {threshold}"
+        )
+    return threshold
 
 
 def _parse_git_delivery_config(raw: dict) -> dict:
@@ -782,6 +828,7 @@ def new_change_record() -> dict:
         "last_stage": default_last_stage(),
         "last_log": "",
         "telemetry": {"latest_telemetry": ""},
+        "escalation": {"active": False, "activated_round": 0, "model": ""},
     }
 
 
@@ -2981,6 +3028,19 @@ def apply_archive_result(repo: Path, cfg: dict, state: dict, cid: str, payload: 
     return "done"
 
 
+def _escalation_active_for_dispatch(cfg: dict, r: dict) -> bool:
+    """Return True when escalation should be active for the next implement dispatch.
+
+    Escalation is active when the threshold is > 0 and
+    (round - 1) >= threshold, i.e. the number of failed reviews has
+    reached the threshold.
+    """
+    threshold = cfg.get("escalate_after_review_fails", 0)
+    if threshold <= 0:
+        return False
+    return (r["round"] - 1) >= threshold
+
+
 def run_direct_change(
     repo: Path,
     cfg: dict,
@@ -3060,6 +3120,37 @@ def run_direct_change(
                 )
             except Exception as exc:
                 log(f"warning: failed to write telemetry for {cid}/{stage} r{round_num}: {exc}")
+
+        # ---- escalation: swap OPSX_IMPLEMENTER_MODEL before each implement dispatch ----
+        if stage == "implement":
+            impl_env_key = ROLE_ENV["implementer"]
+            # Prefer the cfg-resolved base model (the immutable source of truth
+            # set by apply_model_env) so a prior change's escalation cannot leak
+            # into an un-escalated dispatch.  Fall back to the current env value
+            # for callers that pass a cfg dict without a resolved models entry.
+            models = cfg.get("models", {})
+            impl_entry = models.get("implementer")
+            if impl_entry and impl_entry.model:
+                base_model = impl_entry.model
+            else:
+                base_model = os.environ.get(impl_env_key, "")
+            active = _escalation_active_for_dispatch(cfg, r)
+            esc_model = os.environ.get(ROLE_ENV["implementer_escalation"], "")
+            if active and esc_model:
+                os.environ[impl_env_key] = esc_model
+                r["escalation"] = {
+                    "active": True,
+                    "activated_round": r["escalation"]["activated_round"] or round_num,
+                    "model": esc_model,
+                }
+            else:
+                os.environ[impl_env_key] = base_model
+                if not r["escalation"]["active"]:
+                    r["escalation"] = {
+                        "active": False,
+                        "activated_round": 0,
+                        "model": "",
+                    }
 
         outcome, log_path = invoke_direct_stage(repo, cfg, cid, stage, round_num, input_block)
 
@@ -4487,6 +4578,7 @@ def build_schema_guidance(adapter: str = "opencode") -> str:
         "| max_attempts | int | ``2`` | legacy drive retry ceiling |\n"
         "| max_rounds | int | ``5`` | implement-review loop ceiling |\n"
         "| no_progress_limit | int | ``2`` | consecutive no-progress rounds before failing |\n"
+        "| escalate_after_review_fails | int | ``0`` | promote implement to escalation model after N failed reviews; round=(N+1) first escalates; 0 disables |\n"
         "| fast_checks | list[str] | ``[]`` | post-archive CLI checks |\n"
         "| check_timeout_minutes | float | ``15`` | fast-check timeout |\n"
         "| require_clean_tracked | bool | ``true`` | refuse to run when tracked tree is dirty |\n"
@@ -7339,7 +7431,7 @@ def cmd_models_show(args: argparse.Namespace) -> int:
         return 2
 
     print(f"adapter: {adapter}")
-    for role in ROLES:
+    for role in ALL_ROLES:
         entry = resolved[role]
         value = entry.model if entry.model else "(unresolved)"
         print(f"  {role:<12} {value}  [{entry.source}]")
@@ -7378,6 +7470,10 @@ def cmd_models_env(args: argparse.Namespace) -> int:
 
     for role in ROLES:
         print(f"export {ROLE_ENV[role]}={shlex.quote(resolved[role].model)}")
+    # Emit the escalation export only when resolved.
+    esc_entry = resolved.get("implementer_escalation")
+    if esc_entry and esc_entry.model:
+        print(f"export {ROLE_ENV['implementer_escalation']}={shlex.quote(esc_entry.model)}")
     return 0
 
 
@@ -7399,7 +7495,7 @@ def cmd_models_init(args: argparse.Namespace) -> int:
         "[defaults]",
     ]
     seeded = 0
-    for role in ROLES:
+    for role in ALL_ROLES:
         value = os.environ.get(ROLE_ENV[role], "").strip()
         if value:
             lines.append(f"{role} = {json.dumps(value)}")

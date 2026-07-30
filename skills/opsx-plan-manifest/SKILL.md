@@ -54,10 +54,9 @@ The authoritative key list is `load_plan()` in
 
 This matters because the loader reads an explicit allowlist and **silently drops
 every other key**. Example manifests and previously compiled plans in the wild
-carry keys that do nothing — `escalate_after_review_fails` and
-`depends_on_phase` are both real instances found in circulating manifests. Copy
-a key from an example and you may be writing a config line that reads as
-configured-and-working in review while having no effect at all.
+may carry keys that do nothing — `depends_on_phase` is one real instance found in
+circulating manifests. Copy a key from an example and you may be writing a config
+line that reads as configured-and-working in review while having no effect at all.
 
 Locate the controller via `$KF_OPSX_CONTROLLER`, `$OPSX_CONTROLLER`, or
 `~/opsx-controller`. `references/schema.md` has the current key tables and the

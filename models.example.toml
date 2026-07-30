@@ -12,7 +12,8 @@
 #   4. the ambient OPSX_<ROLE>_MODEL environment variable
 #   5. unresolved (the run fails closed)
 #
-# Roles: controller, implementer, reviewer, archiver.
+# Roles: controller, implementer, reviewer, archiver (all required).
+#        implementer_escalation (optional, used by escalate_after_review_fails).
 #
 # Identifier syntax is adapter-specific:
 #   - opencode requires "provider/model" (e.g. "deepseek/deepseek-v4-pro")
@@ -24,21 +25,25 @@
 [defaults]
 controller = "github-copilot/gpt-5.4"
 implementer = "deepseek/deepseek-v4-pro"
+# implementer_escalation = "deepseek/deepseek-v4-ultra"  # optional, uncomment to enable escalation
 reviewer = "github-copilot/gpt-5.4"
 archiver = "github-copilot/gpt-5.4"
 
 [adapters.opencode]
 controller = "github-copilot/gpt-5.4"
 implementer = "deepseek/deepseek-v4-pro"
+# implementer_escalation = "deepseek/deepseek-v4-ultra"  # optional, for escalate_after_review_fails
 reviewer = "github-copilot/gpt-5.4"
 archiver = "github-copilot/gpt-5.4"
 
 [adapters.claude-code]
 implementer = "claude-sonnet-5"
+# implementer_escalation = "claude-opus-5"  # optional
 reviewer = "claude-opus-5"
 archiver = "claude-sonnet-5"
 
 [adapters.codex-cli]
 implementer = "gpt-5.4"
+# implementer_escalation = "gpt-5.4-pro"  # optional
 reviewer = "gpt-5.4"
 archiver = "gpt-5.4"

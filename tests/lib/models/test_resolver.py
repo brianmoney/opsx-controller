@@ -10,7 +10,7 @@ from unittest import mock
 
 from lib.models import resolver
 from lib.models.resolver import ModelConfigError, config_paths, resolve, validate
-from lib.models.types import ROLES, ResolvedModel
+from lib.models.types import ROLES, ALL_ROLES, ResolvedModel
 
 
 def _write(path: Path, content: str) -> None:
@@ -184,10 +184,81 @@ class PrecedenceLadderTests(TempDirCase):
 
     def test_all_roles_present_in_result(self) -> None:
         resolved = resolve("opencode", repo=self.repo, environ={})
-        self.assertEqual(set(resolved.keys()), set(ROLES))
+        self.assertEqual(set(resolved.keys()), set(ALL_ROLES))
         for role, entry in resolved.items():
             self.assertIsInstance(entry, ResolvedModel)
             self.assertEqual(entry.role, role)
+
+    def test_escalation_resolves_from_repo_local_adapter_table(self) -> None:
+        _write(
+            self.repo_config_path(),
+            """\
+            [adapters.opencode]
+            implementer_escalation = "repo-local-escalation"
+            """,
+        )
+        resolved = resolve("opencode", repo=self.repo, environ={})
+        entry = resolved["implementer_escalation"]
+        self.assertEqual(entry.model, "repo-local-escalation")
+        self.assertIn(str(self.repo_config_path()), entry.source)
+
+    def test_escalation_resolves_from_user_global_adapter_table(self) -> None:
+        _write(
+            self.user_config,
+            """\
+            [adapters.opencode]
+            implementer_escalation = "user-global-escalation"
+            """,
+        )
+        resolved = resolve("opencode", repo=self.repo, environ={})
+        entry = resolved["implementer_escalation"]
+        self.assertEqual(entry.model, "user-global-escalation")
+        self.assertIn(str(self.user_config), entry.source)
+
+    def test_escalation_resolves_from_defaults_table(self) -> None:
+        _write(
+            self.user_config,
+            """\
+            [defaults]
+            implementer_escalation = "default-escalation"
+            """,
+        )
+        resolved = resolve("opencode", repo=self.repo, environ={})
+        entry = resolved["implementer_escalation"]
+        self.assertEqual(entry.model, "default-escalation")
+        self.assertIn(str(self.user_config), entry.source)
+        self.assertIn("defaults", entry.source)
+
+    def test_escalation_resolves_from_ambient_environment(self) -> None:
+        resolved = resolve("opencode", repo=self.repo,
+                           environ={"OPSX_IMPLEMENTER_ESCALATION_MODEL": "ambient-escalation"})
+        entry = resolved["implementer_escalation"]
+        self.assertEqual(entry.model, "ambient-escalation")
+        self.assertEqual(entry.source, "ambient environment")
+
+    def test_escalation_unresolved_everywhere_is_not_an_error(self) -> None:
+        resolved = resolve("opencode", repo=self.repo, environ={})
+        entry = resolved["implementer_escalation"]
+        self.assertIsNone(entry.model)
+        self.assertEqual(entry.source, "unresolved")
+
+    def test_validate_reports_escalation_syntax_violation_for_opencode(self) -> None:
+        resolved = {
+            "implementer_escalation": ResolvedModel(
+                role="implementer_escalation", model="bare-name", source="x"),
+        }
+        warnings = validate("opencode", resolved)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("implementer_escalation", warnings[0])
+
+    def test_validate_reports_escalation_syntax_violation_for_claude_code(self) -> None:
+        resolved = {
+            "implementer_escalation": ResolvedModel(
+                role="implementer_escalation", model="provider/model", source="x"),
+        }
+        warnings = validate("claude-code", resolved)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("implementer_escalation", warnings[0])
 
 
 class DegradedInputTests(TempDirCase):

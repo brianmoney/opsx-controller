@@ -42,6 +42,7 @@ All optional; defaults shown.
 | `max_attempts` | int | `2` | Legacy drive retry ceiling |
 | `max_rounds` | int | `5` | Implement–review loop ceiling |
 | `no_progress_limit` | int | `2` | Consecutive no-progress rounds before failing |
+| `escalate_after_review_fails` | int | `0` | Promote implement to escalation model after N failed reviews (round N+1) |
 | `fast_checks` | list[str] | `[]` | Post-archive commands; all must pass |
 | `check_timeout_minutes` | float | `15` | Timeout per fast check |
 | `require_clean_tracked` | bool | `true` | Refuse to start on a dirty tracked tree |
@@ -163,7 +164,6 @@ read as working configuration:
 
 | Key | Seen in | Reality |
 |---|---|---|
-| `escalate_after_review_fails` | archived KF hardening plan | No escalation exists; `escalat` has zero hits in the controller repo |
 | `depends_on_phase` | archived KF hardening plan | Phase-level dependencies are not implemented; use `depends_on` |
 | `deferred_reason` | archived KF hardening plan | Not read; use a TOML comment |
 

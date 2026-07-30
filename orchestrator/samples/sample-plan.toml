@@ -21,6 +21,7 @@ timeout_minutes = 90
 max_attempts = 2
 max_rounds = 5
 no_progress_limit = 2
+escalate_after_review_fails = 0
 require_clean_tracked = true
 fast_checks = [
   "openspec validate --all",

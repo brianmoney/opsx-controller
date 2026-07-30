@@ -13,7 +13,7 @@ import tomllib
 from pathlib import Path
 from typing import Mapping, Optional
 
-from lib.models.types import ROLE_ENV, ROLES, ResolvedModel
+from lib.models.types import ROLE_ENV, ROLES, ALL_ROLES, ResolvedModel
 
 USER_CONFIG_PATH = Path.home() / ".config" / "opsx-controller" / "models.toml"
 REPO_CONFIG_RELATIVE = Path(".opsx-plan") / "models.toml"
@@ -98,7 +98,7 @@ def resolve(
     user_global = configs[-1]
 
     resolved: dict[str, ResolvedModel] = {}
-    for role in ROLES:
+    for role in ALL_ROLES:
         model: Optional[str] = None
         source = "unresolved"
 
@@ -145,7 +145,7 @@ def validate(adapter: str, resolved: Mapping[str, ResolvedModel]) -> list[str]:
     role is reported, not just the first.
     """
     warnings: list[str] = []
-    for role in ROLES:
+    for role in ALL_ROLES:
         entry = resolved.get(role)
         if entry is None or not entry.model:
             continue

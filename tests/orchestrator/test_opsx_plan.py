@@ -1323,6 +1323,15 @@ class SingleChangeRunnerTests(unittest.TestCase):
         self.opsx_plan = load_opsx_plan()
         self.tmp = tempfile.TemporaryDirectory()
         self.repo = Path(self.tmp.name)
+        # Isolate model resolution from the real machine's home directory
+        # so escalation tests control models via env vars exclusively.
+        from lib.models import resolver as _resolver
+        self._models_patch = mock.patch.object(
+            _resolver, "USER_CONFIG_PATH",
+            Path(self.tmp.name) / "unused-home" / "models.toml"
+        )
+        self._models_patch.start()
+        self.addCleanup(self._models_patch.stop)
         git(self.repo, "init")
         (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
         # openspec/changes/archive/ is gitignored here, mirroring this
@@ -1649,6 +1658,589 @@ class SingleChangeRunnerTests(unittest.TestCase):
         worker_state = self.opsx_plan.worker_state_path(self.repo, self.plan_name, self.cid)
         self.assertTrue(worker_state.is_file())
 
+    # ── 4.4 escalation dispatch tests ────────────────────────────────────
+
+    def _escalation_stage_runner(self, payloads: list[dict]) -> tuple[list[tuple[str, int, str, str]], list[str], list[tuple[str, str, str, str]]]:
+        """Like stage_runner but also captures the implement, reviewer, and
+        archiver models from os.environ at each dispatch."""
+        calls: list[tuple[str, int, str, str]] = []
+        input_blocks: list[str] = []
+        stage_models: list[tuple[str, str, str, str]] = []  # (stage, impl_model, rev_model, arch_model)
+
+        def fake_invoke(repo: Path, cfg: dict, cid: str, stage: str, round_num: int, input_block: str):
+            self.assertTrue(payloads, f"unexpected stage call: {stage}")
+            payload = payloads.pop(0)
+            self.assertEqual(stage, payload["stage"])
+            impl_model = os.environ.get("OPSX_IMPLEMENTER_MODEL", "")
+            rev_model = os.environ.get("OPSX_REVIEWER_MODEL", "")
+            arch_model = os.environ.get("OPSX_ARCHIVER_MODEL", "")
+            calls.append((stage, round_num, cid, impl_model))
+            stage_models.append((stage, impl_model, rev_model, arch_model))
+            input_blocks.append(input_block)
+            if stage == "archive" and payload.get("archive_repo"):
+                archive_path, commit = self.archive_change_in_repo(cid)
+                payload = {
+                    **payload,
+                    "result": {
+                        **payload["result"],
+                        "archive_path": archive_path,
+                        "commit": commit,
+                    },
+                    "archive_path": archive_path,
+                    "commit": commit,
+                }
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            lines = payload.get("lines")
+            if lines is None:
+                body = json.dumps(payload["result"]) + "\n"
+            else:
+                body = lines
+            log_path.write_text(body, encoding="utf-8")
+            return payload.get("outcome", "exited"), log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+        return calls, input_blocks, stage_models
+
+    def test_escalation_threshold_two_promotes_at_round_three(self) -> None:
+        """4.4: threshold 2 → rounds 1-2 use base model, round 3+ uses escalation"""
+        self.write_authored_change(self.cid)
+        impl_model = "deepseek/deepseek-v4-basic"
+        esc_model = "deepseek/deepseek-v4-ultra"
+        os.environ["OPSX_IMPLEMENTER_MODEL"] = impl_model
+        os.environ["OPSX_REVIEWER_MODEL"] = "github-copilot/gpt-5.4"
+        os.environ["OPSX_ARCHIVER_MODEL"] = "github-copilot/gpt-5.4"
+        os.environ["OPSX_CONTROLLER_MODEL"] = "github-copilot/gpt-5.4"
+        os.environ["OPSX_IMPLEMENTER_ESCALATION_MODEL"] = esc_model
+
+        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
+        cfg["escalate_after_review_fails"] = 2
+
+        # Round 1: implement succeeds, review fails → round 2
+        # Round 2: implement succeeds, review fails → round 3 (escalation!)
+        # Round 3: implement succeeds, review passes → archive
+        calls, _, stage_models = self._escalation_stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented", "change": self.cid, "round": 1,
+                        "progress_made": True, "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"], "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [], "known_change_files": [],
+                        "summary": "r1",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed", "change": self.cid, "round": 1,
+                        "verdict": "fail", "finding_counts": {"critical": 1, "warning": 0, "note": 0},
+                        "summary": "review failed r1", "fix_prompt": "fix it",
+                    },
+                },
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented", "change": self.cid, "round": 2,
+                        "progress_made": True, "completed_tasks": ["1.2"],
+                        "remaining_tasks": [], "task_counts": {"complete": 2, "total": 2},
+                        "files_touched": [], "known_change_files": [],
+                        "summary": "r2",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed", "change": self.cid, "round": 2,
+                        "verdict": "fail", "finding_counts": {"critical": 1, "warning": 0, "note": 0},
+                        "summary": "review failed r2", "fix_prompt": "fix more",
+                    },
+                },
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented", "change": self.cid, "round": 3,
+                        "progress_made": True, "completed_tasks": [],
+                        "remaining_tasks": [], "task_counts": {"complete": 2, "total": 2},
+                        "files_touched": [], "known_change_files": [],
+                        "summary": "r3 escalated",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed", "change": self.cid, "round": 3,
+                        "verdict": "pass", "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "review passed r3", "fix_prompt": "",
+                    },
+                },
+                {
+                    "stage": "archive",
+                    "archive_repo": True,
+                    "result": {
+                        "status": "archived", "change": self.cid,
+                        "round": 3, "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "archived", "fix_prompt": "",
+                    },
+                },
+            ]
+        )
+
+        self.opsx_plan.run_direct_change(self.repo, cfg, state, self.cid)
+
+        # Verify dispatch models: rounds 1-2 should use base, round 3 escalation.
+        impl_calls = [(s, rn, m) for (s, rn, cid, m) in calls if s == "implement"]
+        self.assertEqual(len(impl_calls), 3)
+        self.assertEqual(impl_calls[0][2], impl_model, "round 1 must use base model")
+        self.assertEqual(impl_calls[1][2], impl_model, "round 2 must use base model")
+        self.assertEqual(impl_calls[2][2], esc_model, "round 3 must use escalation model")
+        # Reviewer and archiver models must stay unchanged across all dispatches.
+        rev_model = "github-copilot/gpt-5.4"
+        arch_model = "github-copilot/gpt-5.4"
+        for _stg, _impl_m, _rev_m, _arch_m in stage_models:
+            self.assertEqual(_rev_m, rev_model, f"{_stg} dispatch must keep reviewer model unchanged")
+            self.assertEqual(_arch_m, arch_model, f"{_stg} dispatch must keep archiver model unchanged")
+
+    def test_threshold_zero_never_escalates(self) -> None:
+        """4.4: threshold 0 → never escalates"""
+        self.write_authored_change(self.cid)
+        impl_model = "deepseek/deepseek-v4-basic"
+        esc_model = "deepseek/deepseek-v4-ultra"
+        rev_model = "github-copilot/gpt-5.4"
+        arch_model = "github-copilot/gpt-5.4"
+        os.environ["OPSX_IMPLEMENTER_MODEL"] = impl_model
+        os.environ["OPSX_REVIEWER_MODEL"] = rev_model
+        os.environ["OPSX_ARCHIVER_MODEL"] = arch_model
+        os.environ["OPSX_CONTROLLER_MODEL"] = "github-copilot/gpt-5.4"
+        os.environ["OPSX_IMPLEMENTER_ESCALATION_MODEL"] = esc_model
+
+        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
+        cfg["escalate_after_review_fails"] = 0
+
+        calls, _, stage_models = self._escalation_stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented", "change": self.cid, "round": 1,
+                        "progress_made": True, "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"], "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [], "known_change_files": [],
+                        "summary": "r1",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed", "change": self.cid, "round": 1,
+                        "verdict": "fail", "finding_counts": {"critical": 1, "warning": 0, "note": 0},
+                        "summary": "fail", "fix_prompt": "fix",
+                    },
+                },
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented", "change": self.cid, "round": 2,
+                        "progress_made": True, "completed_tasks": ["1.2"],
+                        "remaining_tasks": [], "task_counts": {"complete": 2, "total": 2},
+                        "files_touched": [], "known_change_files": [],
+                        "summary": "r2",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed", "change": self.cid, "round": 2,
+                        "verdict": "pass", "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "pass", "fix_prompt": "",
+                    },
+                },
+                {
+                    "stage": "archive",
+                    "archive_repo": True,
+                    "result": {
+                        "status": "archived", "change": self.cid,
+                        "round": 2, "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "archived", "fix_prompt": "",
+                    },
+                },
+            ]
+        )
+
+        self.opsx_plan.run_direct_change(self.repo, cfg, state, self.cid)
+
+        # All implement dispatches must use base model.
+        for s, rn, cid, m in calls:
+            if s == "implement":
+                self.assertEqual(m, impl_model,
+                                 f"round {rn} must use base model when threshold is 0")
+        # Reviewer and archiver models must stay unchanged.
+        for _stg, _impl_m, _rev_m, _arch_m in stage_models:
+            self.assertEqual(_rev_m, rev_model, f"{_stg} dispatch must keep reviewer model unchanged")
+            self.assertEqual(_arch_m, arch_model, f"{_stg} dispatch must keep archiver model unchanged")
+
+    def test_escalation_stays_active_in_later_rounds(self) -> None:
+        """4.4: escalation active — stays active in later rounds"""
+        self.write_authored_change(self.cid)
+        impl_model = "deepseek/deepseek-v4-basic"
+        esc_model = "deepseek/deepseek-v4-ultra"
+        rev_model = "github-copilot/gpt-5.4"
+        arch_model = "github-copilot/gpt-5.4"
+        os.environ["OPSX_IMPLEMENTER_MODEL"] = impl_model
+        os.environ["OPSX_REVIEWER_MODEL"] = rev_model
+        os.environ["OPSX_ARCHIVER_MODEL"] = arch_model
+        os.environ["OPSX_CONTROLLER_MODEL"] = "github-copilot/gpt-5.4"
+        os.environ["OPSX_IMPLEMENTER_ESCALATION_MODEL"] = esc_model
+
+        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
+        cfg["escalate_after_review_fails"] = 1
+        cfg["max_rounds"] = 4
+
+        # Round 1: implement succeeds, review fails → escalates from round 2
+        # Round 2: implement succeeds (escalated), review fails → still escalated
+        # Round 3: implement succeeds (escalated), review passes → archive
+        calls, _, stage_models = self._escalation_stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented", "change": self.cid, "round": 1,
+                        "progress_made": True, "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"], "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [], "known_change_files": [],
+                        "summary": "r1",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed", "change": self.cid, "round": 1,
+                        "verdict": "fail", "finding_counts": {"critical": 1, "warning": 0, "note": 0},
+                        "summary": "fail r1", "fix_prompt": "fix",
+                    },
+                },
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented", "change": self.cid, "round": 2,
+                        "progress_made": True, "completed_tasks": ["1.2"],
+                        "remaining_tasks": [], "task_counts": {"complete": 2, "total": 2},
+                        "files_touched": [], "known_change_files": [],
+                        "summary": "r2 escalated",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed", "change": self.cid, "round": 2,
+                        "verdict": "fail", "finding_counts": {"critical": 1, "warning": 0, "note": 0},
+                        "summary": "fail r2", "fix_prompt": "fix more",
+                    },
+                },
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented", "change": self.cid, "round": 3,
+                        "progress_made": True, "completed_tasks": [],
+                        "remaining_tasks": [], "task_counts": {"complete": 2, "total": 2},
+                        "files_touched": [], "known_change_files": [],
+                        "summary": "r3 still escalated",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed", "change": self.cid, "round": 3,
+                        "verdict": "pass", "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "pass r3", "fix_prompt": "",
+                    },
+                },
+                {
+                    "stage": "archive",
+                    "archive_repo": True,
+                    "result": {
+                        "status": "archived", "change": self.cid,
+                        "round": 3, "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "archived", "fix_prompt": "",
+                    },
+                },
+            ]
+        )
+
+        self.opsx_plan.run_direct_change(self.repo, cfg, state, self.cid)
+
+        impl_calls = [(s, rn, m) for (s, rn, cid, m) in calls if s == "implement"]
+        self.assertEqual(impl_calls[0][2], impl_model, "round 1 must use base model")
+        self.assertEqual(impl_calls[1][2], esc_model, "round 2 must use escalation")
+        self.assertEqual(impl_calls[2][2], esc_model, "round 3 must stay escalated")
+        # Reviewer and archiver models must stay unchanged.
+        for _stg, _impl_m, _rev_m, _arch_m in stage_models:
+            self.assertEqual(_rev_m, rev_model, f"{_stg} dispatch must keep reviewer model unchanged")
+            self.assertEqual(_arch_m, arch_model, f"{_stg} dispatch must keep archiver model unchanged")
+
+    def test_no_progress_round_does_not_trigger_escalation(self) -> None:
+        """4.5: no-progress round does not count toward threshold"""
+        self.write_authored_change(self.cid)
+        impl_model = "deepseek/deepseek-v4-basic"
+        esc_model = "deepseek/deepseek-v4-ultra"
+        rev_model = "github-copilot/gpt-5.4"
+        arch_model = "github-copilot/gpt-5.4"
+        os.environ["OPSX_IMPLEMENTER_MODEL"] = impl_model
+        os.environ["OPSX_REVIEWER_MODEL"] = rev_model
+        os.environ["OPSX_ARCHIVER_MODEL"] = arch_model
+        os.environ["OPSX_CONTROLLER_MODEL"] = "github-copilot/gpt-5.4"
+        os.environ["OPSX_IMPLEMENTER_ESCALATION_MODEL"] = esc_model
+
+        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
+        cfg["escalate_after_review_fails"] = 1
+
+        # Round 1: implement with no progress → review passes → archive
+        # (no review failure, so round does not advance, escalation does not trigger)
+        calls, _, stage_models = self._escalation_stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented", "change": self.cid, "round": 1,
+                        "progress_made": False, "completed_tasks": [],
+                        "remaining_tasks": ["1.1", "1.2"],
+                        "task_counts": {"complete": 0, "total": 2},
+                        "files_touched": [], "known_change_files": [],
+                        "summary": "no progress",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed", "change": self.cid, "round": 1,
+                        "verdict": "pass", "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "pass", "fix_prompt": "",
+                    },
+                },
+                {
+                    "stage": "archive",
+                    "archive_repo": True,
+                    "result": {
+                        "status": "archived", "change": self.cid,
+                        "round": 1, "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "archived", "fix_prompt": "",
+                    },
+                },
+            ]
+        )
+
+        self.opsx_plan.run_direct_change(self.repo, cfg, state, self.cid)
+
+        # Implement dispatch must use base model (escalation never triggered).
+        impl_calls = [(s, rn, m) for (s, rn, cid, m) in calls if s == "implement"]
+        self.assertEqual(len(impl_calls), 1)
+        self.assertEqual(impl_calls[0][2], impl_model,
+                         "no-progress round must not trigger escalation")
+        # Reviewer and archiver models must stay unchanged.
+        for _stg, _impl_m, _rev_m, _arch_m in stage_models:
+            self.assertEqual(_rev_m, rev_model, f"{_stg} dispatch must keep reviewer model unchanged")
+            self.assertEqual(_arch_m, arch_model, f"{_stg} dispatch must keep archiver model unchanged")
+
+    def test_custom_implement_invoke_still_escalates(self) -> None:
+        """4.5: custom implement_invoke still gets escalation model"""
+        self.write_authored_change(self.cid)
+        impl_model = "deepseek/deepseek-v4-basic"
+        esc_model = "deepseek/deepseek-v4-ultra"
+        rev_model = "github-copilot/gpt-5.4"
+        arch_model = "github-copilot/gpt-5.4"
+        os.environ["OPSX_IMPLEMENTER_MODEL"] = impl_model
+        os.environ["OPSX_REVIEWER_MODEL"] = rev_model
+        os.environ["OPSX_ARCHIVER_MODEL"] = arch_model
+        os.environ["OPSX_CONTROLLER_MODEL"] = "github-copilot/gpt-5.4"
+        os.environ["OPSX_IMPLEMENTER_ESCALATION_MODEL"] = esc_model
+
+        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
+        cfg["escalate_after_review_fails"] = 1
+        cfg["implement_invoke"] = "my-tool $OPSX_IMPLEMENTER_MODEL {change}"
+
+        # Round 1: implement succeeds, review fails → round 2 escalates
+        calls, _, stage_models = self._escalation_stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented", "change": self.cid, "round": 1,
+                        "progress_made": True, "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"], "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [], "known_change_files": [],
+                        "summary": "r1",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed", "change": self.cid, "round": 1,
+                        "verdict": "fail", "finding_counts": {"critical": 1, "warning": 0, "note": 0},
+                        "summary": "fail", "fix_prompt": "fix",
+                    },
+                },
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented", "change": self.cid, "round": 2,
+                        "progress_made": True, "completed_tasks": ["1.2"],
+                        "remaining_tasks": [], "task_counts": {"complete": 2, "total": 2},
+                        "files_touched": [], "known_change_files": [],
+                        "summary": "r2 escalated",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed", "change": self.cid, "round": 2,
+                        "verdict": "pass", "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "pass", "fix_prompt": "",
+                    },
+                },
+                {
+                    "stage": "archive",
+                    "archive_repo": True,
+                    "result": {
+                        "status": "archived", "change": self.cid,
+                        "round": 2, "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "archived", "fix_prompt": "",
+                    },
+                },
+            ]
+        )
+
+        self.opsx_plan.run_direct_change(self.repo, cfg, state, self.cid)
+
+        impl_calls = [(s, rn, m) for (s, rn, cid, m) in calls if s == "implement"]
+        self.assertEqual(impl_calls[0][2], impl_model, "round 1 must use base model")
+        self.assertEqual(impl_calls[1][2], esc_model,
+                         "round 2 must use escalation with custom invoke")
+        # Reviewer and archiver models must stay unchanged.
+        for _stg, _impl_m, _rev_m, _arch_m in stage_models:
+            self.assertEqual(_rev_m, rev_model, f"{_stg} dispatch must keep reviewer model unchanged")
+            self.assertEqual(_arch_m, arch_model, f"{_stg} dispatch must keep archiver model unchanged")
+
+    def test_non_escalated_dispatch_restores_cfg_model_after_escalation(self) -> None:
+        """Regression: after a prior change escalates and leaves
+        OPSX_IMPLEMENTER_MODEL in the env set to the escalation model, an
+        un-escalated change must restore the cfg-resolved base model."""
+        cid_a = "change-escalates"
+        cid_b = "change-normal"
+        self.write_authored_change(cid_a)
+        self.write_authored_change(cid_b)
+
+        impl_model = "deepseek/deepseek-v4-basic"
+        esc_model = "deepseek/deepseek-v4-ultra"
+        os.environ["OPSX_IMPLEMENTER_MODEL"] = impl_model
+        os.environ["OPSX_REVIEWER_MODEL"] = "github-copilot/gpt-5.4"
+        os.environ["OPSX_ARCHIVER_MODEL"] = "github-copilot/gpt-5.4"
+        os.environ["OPSX_CONTROLLER_MODEL"] = "github-copilot/gpt-5.4"
+        os.environ["OPSX_IMPLEMENTER_ESCALATION_MODEL"] = esc_model
+
+        # ── Run change A that escalates ──
+        plan_name_a = f"run-{cid_a}"
+        state_a = self.opsx_plan.load_state(self.repo, plan_name_a)
+        cfg_a = self.opsx_plan.build_single_change_config(self.repo, cid_a)
+        cfg_a["name"] = plan_name_a
+        cfg_a["escalate_after_review_fails"] = 1
+
+        impl_calls: list[tuple[str, int, str]] = []
+
+        # Track reviews per change so we fail round 1 only for change A.
+        review_counts: dict[str, int] = {}
+
+        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+            impl_m = os.environ.get("OPSX_IMPLEMENTER_MODEL", "")
+            if stage == "implement":
+                impl_calls.append((cid, round_num, impl_m))
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            if stage == "implement":
+                body = json.dumps({
+                    "status": "implemented", "change": cid, "round": round_num,
+                    "progress_made": True, "completed_tasks": ["1.1"],
+                    "remaining_tasks": [], "task_counts": {"complete": 1, "total": 1},
+                    "files_touched": [], "known_change_files": [],
+                    "summary": f"impl r{round_num}",
+                }) + "\n"
+            elif stage == "review":
+                review_counts.setdefault(cid, 0)
+                review_counts[cid] += 1
+                # Fail only change A's first review (so escalation activates).
+                if cid == cid_a and review_counts[cid] == 1:
+                    body = json.dumps({
+                        "status": "reviewed", "change": cid, "round": round_num,
+                        "verdict": "fail",
+                        "finding_counts": {"critical": 1, "warning": 0, "note": 0},
+                        "summary": "fail", "fix_prompt": "fix",
+                    }) + "\n"
+                else:
+                    body = json.dumps({
+                        "status": "reviewed", "change": cid, "round": round_num,
+                        "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "pass", "fix_prompt": "",
+                    }) + "\n"
+            else:  # archive
+                archive_path, commit = self.archive_change_in_repo(cid)
+                body = json.dumps({
+                    "status": "archived", "change": cid, "round": round_num,
+                    "verdict": "pass",
+                    "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                    "summary": "ok", "fix_prompt": "",
+                }) + "\n"
+            log_path.write_text(body, encoding="utf-8")
+            return "exited", log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+        self.opsx_plan.run_fast_checks = lambda _repo, _cfg: (True, "")
+        self.opsx_plan.run_direct_change(self.repo, cfg_a, state_a, cid_a)
+
+        # Verify change A escalated on its second implement dispatch.
+        impl_a = [c for c in impl_calls if c[0] == cid_a]
+        self.assertEqual(impl_a[0][2], impl_model,
+                         "round 1 must use base model")
+        self.assertEqual(impl_a[1][2], esc_model,
+                         "round 2 must use escalation model")
+        # os.environ now holds the escalation model (leaked state).
+        self.assertEqual(os.environ["OPSX_IMPLEMENTER_MODEL"], esc_model)
+
+        # ── Run change B (un-escalated); cfg['models']['implementer'].model is
+        #    the immutable base.  Simulate the cmd_run flow where apply_model_env
+        #    was called once at startup (with the base model) and then escalation
+        #    overwrote the env.  Build cfg_b independently with the base model
+        #    so its resolved models entry is the non-escalated value. ──
+        plan_name_b = f"run-{cid_b}"
+        state_b = self.opsx_plan.load_state(self.repo, plan_name_b)
+        # Reset env to base so resolve_models picks up the correct base model,
+        # then apply_model_env encodes it in cfg_b.
+        os.environ["OPSX_IMPLEMENTER_MODEL"] = impl_model
+        cfg_b = self.opsx_plan.build_single_change_config(self.repo, cid_b)
+        cfg_b["name"] = plan_name_b
+        # Now corrupt the env with the escalation model to simulate leaked state.
+        os.environ["OPSX_IMPLEMENTER_MODEL"] = esc_model
+
+        self.opsx_plan.run_direct_change(self.repo, cfg_b, state_b, cid_b)
+
+        impl_b = [c for c in impl_calls if c[0] == cid_b]
+        self.assertEqual(len(impl_b), 1)
+        self.assertEqual(
+            impl_b[0][2], impl_model,
+            "un-escalated change must restore cfg-resolved base model, "
+            "not the leaked env escalation model",
+        )
+
 
 class MainDispatchTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -1943,6 +2535,12 @@ class ModelResolutionWiringTests(unittest.TestCase):
         self.opsx_plan = load_opsx_plan()
         self.tmp = tempfile.TemporaryDirectory()
         self.repo = Path(self.tmp.name)
+        # Save env vars so apply_model_env side effects don't leak.
+        self._saved_env = {}
+        for key in ("OPSX_IMPLEMENTER_MODEL", "OPSX_IMPLEMENTER_ESCALATION_MODEL",
+                     "OPSX_REVIEWER_MODEL", "OPSX_ARCHIVER_MODEL",
+                     "OPSX_CONTROLLER_MODEL"):
+            self._saved_env[key] = os.environ.get(key)
         # Isolate model resolution from the real machine's home directory.
         from lib.models import resolver as _resolver
         self._models_patch = mock.patch.object(
@@ -1952,6 +2550,12 @@ class ModelResolutionWiringTests(unittest.TestCase):
         self.addCleanup(self._models_patch.stop)
 
     def tearDown(self) -> None:
+        # Restore env vars that apply_model_env may have modified.
+        for key, val in self._saved_env.items():
+            if val is not None:
+                os.environ[key] = val
+            else:
+                os.environ.pop(key, None)
         self.tmp.cleanup()
 
     def _write_config(self, content: str) -> None:
@@ -2028,6 +2632,120 @@ class ModelResolutionWiringTests(unittest.TestCase):
 
         deprecation_logs = [m for m in logs if "deprecated" in m.lower()]
         self.assertEqual(deprecation_logs, [])
+
+    def test_escalate_after_review_fails_defaults_to_zero(self) -> None:
+        """2.6: absent key → 0"""
+        plan = self._write_plan("plan.toml", "opencode")
+        cfg = self.opsx_plan.load_plan(plan, repo=self.repo)
+        self.assertEqual(cfg["escalate_after_review_fails"], 0)
+
+    def test_escalate_after_review_fails_negative_value_raises(self) -> None:
+        """2.6: negative value raises PlanError naming the key"""
+        plan = self.repo / "neg.toml"
+        plan.write_text(
+            '[plan]\nname = "neg"\nadapter = "opencode"\n'
+            'escalate_after_review_fails = -1\n\n'
+            '[[changes]]\nid = "c1"\n',
+            encoding="utf-8",
+        )
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan.load_plan(plan, repo=self.repo)
+        self.assertIn("escalate_after_review_fails", str(ctx.exception))
+
+    def test_apply_model_env_succeeds_with_unresolved_escalation_and_threshold_zero(self) -> None:
+        """3.3: escalation unresolved + threshold 0 → no error"""
+        os.environ.pop("OPSX_IMPLEMENTER_ESCALATION_MODEL", None)
+        self._write_config(
+            """\
+            [adapters.opencode]
+            controller = "github-copilot/gpt-5.4"
+            implementer = "deepseek/deepseek-v4-pro"
+            reviewer = "github-copilot/gpt-5.4"
+            archiver = "github-copilot/gpt-5.4"
+            """
+        )
+        plan = self._write_plan("plan.toml", "opencode")
+        cfg = self.opsx_plan.load_plan(plan, repo=self.repo)
+        # Threshold 0, escalation unresolved — must not raise.
+        models = cfg.get("models", {})
+        self.assertIsNone(models["implementer_escalation"].model,
+                          "escalation must be unresolved for this test")
+        self.opsx_plan.apply_model_env(cfg)
+
+    def test_apply_model_env_raises_when_threshold_positive_and_escalation_unresolved(self) -> None:
+        """3.3: threshold > 0 + unresolved escalation → PlanError"""
+        os.environ.pop("OPSX_IMPLEMENTER_ESCALATION_MODEL", None)
+        self._write_config(
+            """\
+            [adapters.opencode]
+            controller = "github-copilot/gpt-5.4"
+            implementer = "deepseek/deepseek-v4-pro"
+            reviewer = "github-copilot/gpt-5.4"
+            archiver = "github-copilot/gpt-5.4"
+            """
+        )
+        plan_path = self.repo / "esc.toml"
+        plan_path.write_text(
+            '[plan]\nname = "esc"\nadapter = "opencode"\n'
+            'escalate_after_review_fails = 2\n\n'
+            '[[changes]]\nid = "c1"\n',
+            encoding="utf-8",
+        )
+        cfg = self.opsx_plan.load_plan(plan_path, repo=self.repo)
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan.apply_model_env(cfg)
+        self.assertIn("implementer_escalation", str(ctx.exception))
+        self.assertIn("unresolved", str(ctx.exception).lower())
+
+    def test_apply_model_env_exports_escalation_variable_when_resolved(self) -> None:
+        """3.3: resolved escalation role → OPSX_IMPLEMENTER_ESCALATION_MODEL exported"""
+        self._write_config(
+            """\
+            [adapters.opencode]
+            controller = "github-copilot/gpt-5.4"
+            implementer = "deepseek/deepseek-v4-pro"
+            implementer_escalation = "deepseek/deepseek-v4-ultra"
+            reviewer = "github-copilot/gpt-5.4"
+            archiver = "github-copilot/gpt-5.4"
+            """
+        )
+        plan = self._write_plan("plan.toml", "opencode")
+        cfg = self.opsx_plan.load_plan(plan, repo=self.repo)
+        self.assertEqual(cfg["escalate_after_review_fails"], 0)
+        self.opsx_plan.apply_model_env(cfg)
+        self.assertEqual(
+            os.environ.get("OPSX_IMPLEMENTER_ESCALATION_MODEL"),
+            "deepseek/deepseek-v4-ultra",
+        )
+
+    def test_apply_model_env_unsets_stale_escalation_when_unresolved(self) -> None:
+        """3.3: stale OPSX_IMPLEMENTER_ESCALATION_MODEL is unset when
+        the escalation role is unresolved (regression: a prior
+        apply_model_env call must not leak into a subsequent
+        non-escalation dispatch)."""
+        self._write_config(
+            """\
+            [adapters.opencode]
+            controller = "github-copilot/gpt-5.4"
+            implementer = "deepseek/deepseek-v4-pro"
+            reviewer = "github-copilot/gpt-5.4"
+            archiver = "github-copilot/gpt-5.4"
+            """
+        )
+        plan = self._write_plan("plan.toml", "opencode")
+        # Resolve models while escalation env is absent so the role
+        # lands as unresolved in cfg["models"].
+        os.environ.pop("OPSX_IMPLEMENTER_ESCALATION_MODEL", None)
+        cfg = self.opsx_plan.load_plan(plan, repo=self.repo)
+        # Now simulate a stale leftover from a prior apply_model_env call
+        # on a different config that *did* have an escalation model.
+        os.environ["OPSX_IMPLEMENTER_ESCALATION_MODEL"] = "stale/leftover-model"
+        self.opsx_plan.apply_model_env(cfg)
+        self.assertNotIn(
+            "OPSX_IMPLEMENTER_ESCALATION_MODEL",
+            os.environ,
+            "stale escalation env var must be unset when escalation is unresolved",
+        )
 
 
 class InvokeDirectStageEnvExpansionTests(unittest.TestCase):
@@ -2645,6 +3363,13 @@ class DirectStageTelemetryTests(unittest.TestCase):
         self.opsx_plan = load_opsx_plan()
         self.tmp = tempfile.TemporaryDirectory()
         self.repo = Path(self.tmp.name)
+        # Save and clear env vars so tests start from a known state.
+        self._saved_env = {}
+        for key in ("OPSX_IMPLEMENTER_MODEL", "OPSX_IMPLEMENTER_ESCALATION_MODEL",
+                     "OPSX_REVIEWER_MODEL", "OPSX_ARCHIVER_MODEL",
+                     "OPSX_CONTROLLER_MODEL"):
+            self._saved_env[key] = os.environ.get(key)
+            os.environ.pop(key, None)
         git(self.repo, "init")
         (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
         # openspec/changes/archive/ is gitignored here, mirroring this
@@ -2706,6 +3431,12 @@ class DirectStageTelemetryTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.opsx_plan.invoke_direct_stage = self._saved_invoke
         self.opsx_plan.run_fast_checks = self._saved_checks
+        # Restore env vars that tests may have modified.
+        for key, val in self._saved_env.items():
+            if val is not None:
+                os.environ[key] = val
+            else:
+                os.environ.pop(key, None)
         self.tmp.cleanup()
 
     def write_authored_change(self, cid: str) -> None:
@@ -4271,6 +5002,116 @@ class DirectStageTelemetryTests(unittest.TestCase):
         result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
         self.assertEqual(result, "stop")
         self._assert_worker_state_has_latest_telemetry_uid()
+
+    def test_escalated_implement_writes_escalation_model_in_telemetry(self) -> None:
+        """4.6: escalated implement round writes escalation model in telemetry"""
+        self.write_authored_change(self.cid)
+        impl_model = "deepseek/deepseek-v4-basic"
+        esc_model = "deepseek/deepseek-v4-ultra"
+        os.environ["OPSX_IMPLEMENTER_MODEL"] = impl_model
+        os.environ["OPSX_IMPLEMENTER_ESCALATION_MODEL"] = esc_model
+        os.environ["OPSX_REVIEWER_MODEL"] = "github-copilot/gpt-5.4"
+        os.environ["OPSX_ARCHIVER_MODEL"] = "github-copilot/gpt-5.4"
+
+        self.cfg["escalate_after_review_fails"] = 1
+        self.cfg["implement_invoke"] = (
+            'opencode run --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL"'
+        )
+        self.cfg["max_rounds"] = 2
+
+        record = self.opsx_plan.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": ["orchestrator/opsx-plan.py"],
+                        "known_change_files": [],
+                        "summary": "r1",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 1,
+                        "verdict": "fail",
+                        "finding_counts": {"critical": 1, "warning": 0, "note": 0},
+                        "summary": "review failed",
+                        "fix_prompt": "fix",
+                    },
+                },
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 2,
+                        "progress_made": True,
+                        "completed_tasks": ["1.2"],
+                        "remaining_tasks": [],
+                        "task_counts": {"complete": 2, "total": 2},
+                        "files_touched": ["orchestrator/opsx-plan.py"],
+                        "known_change_files": [],
+                        "summary": "r2 escalated",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 2,
+                        "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "pass",
+                        "fix_prompt": "",
+                    },
+                },
+                {
+                    "stage": "archive",
+                    "archive_repo": True,
+                    "result": {
+                        "status": "archived",
+                        "change": self.cid,
+                        "round": 2,
+                        "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "archived",
+                        "fix_prompt": "",
+                    },
+                },
+            ]
+        )
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+        self.assertEqual(result, "done")
+
+        records = self._read_telemetry()
+        implement_records = [r for r in records if r["stage"] == "implement"]
+        self.assertEqual(len(implement_records), 2)
+
+        # Round 1: base model (provider prefix stripped by extraction)
+        r1_model = implement_records[0].get("model", {})
+        self.assertEqual(r1_model.get("model_id"), "deepseek-v4-basic",
+                         "round 1 telemetry must show base model")
+
+        # Round 2: escalated model (provider prefix stripped by extraction)
+        r2_model = implement_records[1].get("model", {})
+        self.assertEqual(r2_model.get("model_id"), "deepseek-v4-ultra",
+                         "round 2 telemetry must show escalation model")
 
 
 class CompileTests(unittest.TestCase):
@@ -14980,7 +15821,15 @@ class SingleChangeManifestTests(unittest.TestCase):
         # Active pointer must be preserved — unchanged from before the run.
         after = self.opsx_plan.read_active_plan(self.repo)
         self.assertEqual(after, before,
-                         "cmd_run_one must preserve the active-plan pointer")
+                          "cmd_run_one must preserve the active-plan pointer")
+
+    def test_round_trip_with_nonzero_escalation_threshold(self):
+        """2.5: non-zero escalate_after_review_fails survives round-trip"""
+        self.write_authored_change(self.cid)
+        cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
+        cfg["escalate_after_review_fails"] = 2
+        # Round-trip through render → load → compare — must not raise.
+        self.opsx_plan.write_single_change_manifest(self.repo, self.cid, cfg)
 
 
 
@@ -15493,6 +16342,7 @@ class SamplePlanTests(unittest.TestCase):
             "name", "adapter", "invoke", "state_file",
             "implement_invoke", "review_invoke", "archive_invoke",
             "timeout_minutes", "max_attempts", "max_rounds", "no_progress_limit",
+            "escalate_after_review_fails",
             "fast_checks", "check_timeout_minutes", "require_clean_tracked",
             "notify_cmd", "plan_doc", "create_invoke",
             "create_timeout_minutes", "create_max_attempts",
@@ -15663,7 +16513,8 @@ class SamplePlanTests(unittest.TestCase):
             "name", "adapter", "invoke", "state_file",
             "implement_invoke", "review_invoke", "archive_invoke",
             "timeout_minutes", "max_attempts", "max_rounds",
-            "no_progress_limit", "fast_checks", "check_timeout_minutes",
+            "no_progress_limit", "escalate_after_review_fails",
+            "fast_checks", "check_timeout_minutes",
             "require_clean_tracked", "notify_cmd", "plan_doc",
             "create_invoke", "create_timeout_minutes", "create_max_attempts",
             "review_created", "created_check", "git_delivery",
@@ -15802,6 +16653,273 @@ class SamplePlanTests(unittest.TestCase):
             restored, original,
             "re-running the installer must restore the original sample content",
         )
+
+
+class EscalationStateMigrationTests(unittest.TestCase):
+    """Verify that pre-escalation state files are migrated with defaults."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_load_state_adds_default_escalation_fields(self) -> None:
+        """Load a state file that lacks the escalation key; verify defaults."""
+        state_path = self.opsx_plan.state_path(self.repo, "test-plan")
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = {
+            "plan": "test-plan",
+            "approvals": [],
+            "changes": {
+                "c1": {
+                    "status": self.opsx_plan.DONE,
+                    "phase": "done",
+                    "round": 2,
+                    "max_rounds": 3,
+                    "no_progress_streak": 0,
+                    "latest_fix_prompt": "",
+                    "last_result": "review_passed",
+                    "task_counts": {"complete": 2, "total": 2},
+                    "tracked_change_files": [],
+                    "context_cache": self.opsx_plan.default_context_cache(),
+                    "last_review": self.opsx_plan.default_last_review(),
+                    "archive": self.opsx_plan.default_archive_state(),
+                    "history": [],
+                    "telemetry": {"latest_telemetry": ""},
+                    "change": "c1",
+                    "attempts": 0,
+                    "reason": "",
+                    "updated_at": "",
+                    "create_attempts": 0,
+                    "created_by_orchestrator": False,
+                    "accepted": False,
+                    "last_stage": self.opsx_plan.default_last_stage(),
+                    "last_log": "",
+                    # NOTE: no "escalation" key — pre-escalation state
+                }
+            },
+        }
+        state_path.write_text(json.dumps(existing), encoding="utf-8")
+        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        rec = state["changes"]["c1"]
+        self.assertIn("escalation", rec,
+                      "merge_defaults must add escalation key")
+        esc = rec["escalation"]
+        self.assertIsInstance(esc, dict)
+        self.assertFalse(esc["active"])
+        self.assertEqual(esc["activated_round"], 0)
+        self.assertEqual(esc["model"], "")
+
+    def test_load_state_preserves_existing_escalation_fields(self) -> None:
+        """Load a state file that already has active escalation; verify preserved."""
+        state_path = self.opsx_plan.state_path(self.repo, "test-plan")
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = {
+            "plan": "test-plan",
+            "approvals": [],
+            "changes": {
+                "c1": {
+                    "status": self.opsx_plan.RUNNING,
+                    "phase": "implement",
+                    "round": 4,
+                    "max_rounds": 5,
+                    "no_progress_streak": 0,
+                    "latest_fix_prompt": "",
+                    "last_result": "",
+                    "task_counts": {"complete": 4, "total": 10},
+                    "tracked_change_files": [],
+                    "context_cache": self.opsx_plan.default_context_cache(),
+                    "last_review": self.opsx_plan.default_last_review(),
+                    "archive": self.opsx_plan.default_archive_state(),
+                    "history": [],
+                    "telemetry": {"latest_telemetry": ""},
+                    "escalation": {
+                        "active": True,
+                        "activated_round": 3,
+                        "model": "deepseek/v4-ultra",
+                    },
+                    "change": "c1",
+                    "attempts": 0,
+                    "reason": "",
+                    "updated_at": "",
+                    "create_attempts": 0,
+                    "created_by_orchestrator": False,
+                    "accepted": False,
+                    "last_stage": self.opsx_plan.default_last_stage(),
+                    "last_log": "",
+                }
+            },
+        }
+        state_path.write_text(json.dumps(existing), encoding="utf-8")
+        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        esc = state["changes"]["c1"]["escalation"]
+        self.assertTrue(esc["active"])
+        self.assertEqual(esc["activated_round"], 3)
+        self.assertEqual(esc["model"], "deepseek/v4-ultra")
+
+
+class ModelsCommandTests(unittest.TestCase):
+    """5.4: cmd_models_show/env/init handle the optional escalation role."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        # Save env vars so tests don't leak side effects.
+        self._saved_env = {}
+        for key in ("OPSX_IMPLEMENTER_MODEL", "OPSX_IMPLEMENTER_ESCALATION_MODEL",
+                     "OPSX_REVIEWER_MODEL", "OPSX_ARCHIVER_MODEL",
+                     "OPSX_CONTROLLER_MODEL"):
+            self._saved_env[key] = os.environ.get(key)
+        # Isolate model resolution from the real machine's home directory.
+        from lib.models import resolver as _resolver
+        self._models_patch = mock.patch.object(
+            _resolver, "USER_CONFIG_PATH",
+            Path(self.tmp.name) / "unused-home" / "models.toml"
+        )
+        self._models_patch.start()
+        self.addCleanup(self._models_patch.stop)
+        # cmd_models_init uses opsx_plan's local USER_CONFIG_PATH (imported
+        # via ``from lib.models.resolver import ...`` at module load time),
+        # so patching only resolver.USER_CONFIG_PATH leaves the module-level
+        # name pointing at the real user-global file.  Patch the module
+        # attribute so the generated models.toml lands in the temp tree.
+        self._module_config_patch = mock.patch.object(
+            self.opsx_plan, "USER_CONFIG_PATH",
+            Path(self.tmp.name) / "unused-home" / "models.toml",
+        )
+        self._module_config_patch.start()
+        self.addCleanup(self._module_config_patch.stop)
+
+    def tearDown(self) -> None:
+        # Restore env vars that tests may have modified.
+        for key, val in self._saved_env.items():
+            if val is not None:
+                os.environ[key] = val
+            else:
+                os.environ.pop(key, None)
+        self.tmp.cleanup()
+
+    def _write_config(self, content: str) -> None:
+        cfg_path = self.repo / ".opsx-plan" / "models.toml"
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(textwrap.dedent(content), encoding="utf-8")
+
+    def test_models_show_includes_escalation(self) -> None:
+        """5.4: models show prints escalation row"""
+        self._write_config(
+            """\
+            [adapters.opencode]
+            controller = "github-copilot/gpt-5.4"
+            implementer = "deepseek/deepseek-v4-pro"
+            implementer_escalation = "deepseek/deepseek-v4-ultra"
+            reviewer = "github-copilot/gpt-5.4"
+            archiver = "github-copilot/gpt-5.4"
+            """
+        )
+        args = argparse.Namespace(repo=str(self.repo), adapter="opencode")
+        stdout = io.StringIO()
+        with mock.patch("sys.stdout", stdout):
+            rc = self.opsx_plan.cmd_models_show(args)
+        self.assertEqual(rc, 0)
+        output = stdout.getvalue()
+        self.assertIn("implementer_escalation", output)
+        self.assertIn("deepseek/deepseek-v4-ultra", output)
+
+    def test_models_env_exits_zero_with_unresolved_escalation(self) -> None:
+        """5.4: models env exits 0 when escalation is unresolved"""
+        os.environ.pop("OPSX_IMPLEMENTER_ESCALATION_MODEL", None)
+        self._write_config(
+            """\
+            [adapters.opencode]
+            controller = "github-copilot/gpt-5.4"
+            implementer = "deepseek/deepseek-v4-pro"
+            reviewer = "github-copilot/gpt-5.4"
+            archiver = "github-copilot/gpt-5.4"
+            """
+        )
+        args = argparse.Namespace(repo=str(self.repo), adapter="opencode")
+        stdout = io.StringIO()
+        with mock.patch("sys.stdout", stdout):
+            rc = self.opsx_plan.cmd_models_env(args)
+        self.assertEqual(rc, 0,
+                         "models env must exit 0 when escalation is unresolved")
+        output = stdout.getvalue()
+        self.assertIn("OPSX_IMPLEMENTER_MODEL", output)
+        self.assertNotIn("OPSX_IMPLEMENTER_ESCALATION_MODEL", output)
+
+    def test_models_env_exports_escalation_when_resolved(self) -> None:
+        """5.4: models env emits escalation export when resolved"""
+        self._write_config(
+            """\
+            [adapters.opencode]
+            controller = "github-copilot/gpt-5.4"
+            implementer = "deepseek/deepseek-v4-pro"
+            implementer_escalation = "deepseek/deepseek-v4-ultra"
+            reviewer = "github-copilot/gpt-5.4"
+            archiver = "github-copilot/gpt-5.4"
+            """
+        )
+        args = argparse.Namespace(repo=str(self.repo), adapter="opencode")
+        stdout = io.StringIO()
+        with mock.patch("sys.stdout", stdout):
+            rc = self.opsx_plan.cmd_models_env(args)
+        self.assertEqual(rc, 0)
+        output = stdout.getvalue()
+        self.assertIn("OPSX_IMPLEMENTER_ESCALATION_MODEL", output)
+
+    def test_models_init_seeds_escalation_from_environment(self) -> None:
+        """5.4: models init seeds escalation role from env"""
+        saved_controller = os.environ.get("OPSX_CONTROLLER_MODEL", "")
+        saved_impl = os.environ.get("OPSX_IMPLEMENTER_MODEL", "")
+        saved_esc = os.environ.get("OPSX_IMPLEMENTER_ESCALATION_MODEL", "")
+        saved_rev = os.environ.get("OPSX_REVIEWER_MODEL", "")
+        saved_arc = os.environ.get("OPSX_ARCHIVER_MODEL", "")
+        try:
+            os.environ["OPSX_CONTROLLER_MODEL"] = "github-copilot/gpt-5.4"
+            os.environ["OPSX_IMPLEMENTER_MODEL"] = "deepseek/deepseek-v4-pro"
+            os.environ["OPSX_IMPLEMENTER_ESCALATION_MODEL"] = "deepseek/deepseek-v4-ultra"
+            os.environ["OPSX_REVIEWER_MODEL"] = "github-copilot/gpt-5.4"
+            os.environ["OPSX_ARCHIVER_MODEL"] = "github-copilot/gpt-5.4"
+            args = argparse.Namespace(force=True)
+            stdout = io.StringIO()
+            with mock.patch("sys.stdout", stdout):
+                rc = self.opsx_plan.cmd_models_init(args)
+            self.assertEqual(rc, 0)
+            output = stdout.getvalue()
+            self.assertIn("Created", output)
+            # 4 required roles + 1 optional = 5 roles seeded when env has all 5.
+            self.assertIn("5 role(s)", output,
+                          "must seed all 5 roles including implementer_escalation")
+            # Verify ALL_ROLES includes the escalation role (the source of truth).
+            self.assertIn(
+                "implementer_escalation", self.opsx_plan.ALL_ROLES,
+                "ALL_ROLES must include implementer_escalation for init seeding",
+            )
+            # Verify the generated TOML file contains the optional role.
+            models_path = Path(self.tmp.name) / "unused-home" / "models.toml"
+            self.assertTrue(models_path.exists(),
+                            f"models init must create {models_path}")
+            toml_content = models_path.read_text(encoding="utf-8")
+            self.assertIn("implementer_escalation", toml_content,
+                          "generated TOML must contain implementer_escalation")
+            self.assertIn("deepseek/deepseek-v4-ultra", toml_content,
+                          "generated TOML must contain the escalation model id")
+        finally:
+            for key, val in [
+                ("OPSX_CONTROLLER_MODEL", saved_controller),
+                ("OPSX_IMPLEMENTER_MODEL", saved_impl),
+                ("OPSX_IMPLEMENTER_ESCALATION_MODEL", saved_esc),
+                ("OPSX_REVIEWER_MODEL", saved_rev),
+                ("OPSX_ARCHIVER_MODEL", saved_arc),
+            ]:
+                if val:
+                    os.environ[key] = val
+                else:
+                    os.environ.pop(key, None)
 
 
 if __name__ == "__main__":

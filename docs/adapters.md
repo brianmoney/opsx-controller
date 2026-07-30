@@ -41,9 +41,11 @@ long as an appropriate `controller` model is resolved.
 ## Model configuration
 
 Configure models before your first install. Roles are `controller`,
-`implementer`, `reviewer`, and `archiver`, resolved per adapter and exported as
-`OPSX_CONTROLLER_MODEL`, `OPSX_IMPLEMENTER_MODEL`, `OPSX_REVIEWER_MODEL`, and
-`OPSX_ARCHIVER_MODEL`.
+`implementer`, `reviewer`, and `archiver` (all required), with an optional
+fifth role `implementer_escalation` exported as `OPSX_IMPLEMENTER_ESCALATION_MODEL`.
+Leaving the escalation role unresolved does not block runs unless the plan
+sets `escalate_after_review_fails > 0`, which fails closed at load time with
+guidance to resolve it.
 
 ```bash
 python3 orchestrator/opsx-plan.py models init   # seeds ~/.config/opsx-controller/models.toml

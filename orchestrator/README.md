@@ -254,6 +254,13 @@ nested controller state file.
 - Review failures loop back to implement inside `opsx-plan`; the script
   advances rounds itself and stops when `max_rounds` or `no_progress_limit` is
   reached.
+- `escalate_after_review_fails` (default 0, disabled) promotes the
+  implement stage to a stronger model after *N* failed reviews (round *N*+1
+  first uses the escalation model). The escalation model is resolved through
+  the same per-adapter precedence ladder under the optional
+  `implementer_escalation` role and exported as
+  `OPSX_IMPLEMENTER_ESCALATION_MODEL`. Runs fail closed at plan load when
+  `escalate_after_review_fails > 0` and the escalation role is unresolved.
 - Manual `/opsx-drive <change-id>` remains available for single-change control,
   but `opsx-plan` no longer nests `/opsx-drive` for OpenCode execution.
   `/opsx-drive` is **deprecated**: `opsx-run <change-id>` (equivalently
