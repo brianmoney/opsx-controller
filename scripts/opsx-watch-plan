@@ -258,7 +258,49 @@ render_verdict_banner() {
   render_banner "Review: ${verdict_label} (round ${round})" "$body_lines"
 }
 
-# Find the newest log.  The primary ordering key is the writer-guaranteed
+# -------------------------------------------------------------------
+# 5. Active-plan change-id resolution
+# -------------------------------------------------------------------
+
+# Resolve the active plan TOML path from the repo.  Checks OPSX_PLAN env
+# first, then the .opsx-plan/active-plan pointer file.
+resolve_active_plan_toml() {
+  local repo="$1"
+
+  local env_plan="${OPSX_PLAN:-}"
+  if [[ -n "$env_plan" ]]; then
+    local abs_env="$repo/$env_plan"
+    if [[ -f "$abs_env" ]]; then
+      printf '%s' "$abs_env"
+      return 0
+    fi
+  fi
+
+  local pointer="$repo/.opsx-plan/active-plan"
+  if [[ -f "$pointer" ]]; then
+    local plan_rel
+    plan_rel=$(head -1 "$pointer" 2>/dev/null | tr -d '[:space:]')
+    if [[ -n "$plan_rel" ]] && [[ -f "$repo/$plan_rel" ]]; then
+      printf '%s' "$repo/$plan_rel"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+# Extract change ids from a plan TOML.  Looks for ``id = "..."`` lines
+# (which in the opsx-plan TOML surface only appear in [[changes]] entries).
+extract_plan_change_ids() {
+  local toml="$1"
+  grep -E '^[[:space:]]*id[[:space:]]*=[[:space:]]*"[^"]*"' "$toml" 2>/dev/null | \
+    while IFS='"' read -r _ id _; do
+      printf '%s ' "$id"
+    done
+}
+
+# Find the newest log that belongs to the active plan (when active plan
+# change ids are known).  The primary ordering key is the writer-guaranteed
 # stage ordering derived from the log filename, which encodes round,
 # stage, and sequence and is entirely under the orchestrator's control.
 # When two logs share the same key the function falls back to mtime.
@@ -268,7 +310,11 @@ render_verdict_banner() {
 #   - stage within a round: implement (0) < review (1) < archive (2)
 #   - seq (higher = newer within the same stage+round)
 # This avoids non-deterministic tiebreakers like inode or filename sort.
+#
+# The first positional argument is an optional space-separated list of
+# change ids to scope selection to.  When empty, all logs are considered.
 newest_log() {
+  local allowed_ids="$1"
   local best=""
   local best_round=-1
   local best_stage_prio=-1
@@ -293,6 +339,16 @@ newest_log() {
         stage_prio=1
       else
         stage_prio=2
+      fi
+    fi
+
+    # When active-plan change ids are known, only consider logs whose
+    # change prefix matches one of the plan's change ids.
+    if [[ -n "$allowed_ids" ]]; then
+      local prefix="${f##*/}"
+      prefix="${prefix%%.*}"
+      if [[ ! " $allowed_ids " =~ " $prefix " ]]; then
+        continue
       fi
     fi
 
@@ -357,9 +413,18 @@ cleanup_follower() {
 
 trap 'cleanup_follower' EXIT
 
+# Resolve the active plan's change ids once at startup.  When an active
+# plan is available, only logs belonging to its changes are considered.
+# Without an active plan, all logs are followed (legacy / test behaviour).
+ACTIVE_PLAN_IDS=""
+active_toml=$(resolve_active_plan_toml "$REPO" 2>/dev/null || true)
+if [[ -n "$active_toml" ]]; then
+  ACTIVE_PLAN_IDS=$(extract_plan_change_ids "$active_toml" 2>/dev/null || true)
+fi
+
 current=""
 while true; do
-  candidate=$(newest_log)
+  candidate=$(newest_log "$ACTIVE_PLAN_IDS")
   if [[ -n "$candidate" && "$candidate" != "$current" ]]; then
     # Switch to a newer log: stop the current tail and start fresh.
     if [[ -n "$current" ]]; then

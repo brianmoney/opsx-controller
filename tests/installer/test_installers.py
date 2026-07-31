@@ -844,6 +844,71 @@ class WatcherBehaviorTests(unittest.TestCase):
         finally:
             self._stop_watcher(proc)
 
+    # ------------------------------------------------------------------
+    # 6.11 watcher scopes logs to active-plan change ids
+    def test_watcher_scopes_logs_to_active_plan_change_ids(self) -> None:
+        """When an active plan is resolved, the watcher must only follow logs
+        whose change prefix matches a change id in the active plan TOML.
+        Logs from changes not in the plan must be ignored."""
+        import os as _os
+
+        dot_plan = self.repo / ".opsx-plan"
+        dot_plan.mkdir(parents=True, exist_ok=True)
+        (dot_plan / ".gitignore").write_text("*\n", encoding="utf-8")
+
+        # Active plan pointer.
+        (dot_plan / "active-plan").write_text(
+            "openspec/plans/test-plan.toml\n", encoding="utf-8"
+        )
+
+        plan_dir = self.repo / "openspec" / "plans"
+        plan_dir.mkdir(parents=True)
+        plan_toml = plan_dir / "test-plan.toml"
+        plan_toml.write_text(
+            '[plan]\nname = "test-plan"\nadapter = "opencode"\n\n'
+            '[[changes]]\nid = "chg-alpha"\nphase = 1\nenabled = true\n\n'
+            '[[changes]]\nid = "chg-beta"\nphase = 2\nenabled = true\n',
+            encoding="utf-8",
+        )
+
+        in_plan_log = self.log_dir / "chg-alpha.implement.r1.1.log"
+        in_plan_log.write_text("in-plan output ZXCVB\n")
+        self.time.sleep(0.1)
+
+        out_plan_log = self.log_dir / "chg-other.review.r3.1.log"
+        out_plan_log.write_text("out-of-plan output SHOULD_NOT_APPEAR\n")
+        self.time.sleep(0.1)
+
+        proc = self._start_watcher()
+        try:
+            out = self._read_until(proc, "ZXCVB", 10.0)
+            self.assertIn(
+                "in-plan output ZXCVB",
+                out,
+                f"watcher must follow in-plan log; got: {out[:400]}",
+            )
+            self.assertNotIn(
+                "SHOULD_NOT_APPEAR",
+                out,
+                "out-of-plan log must not be followed when active plan is set",
+            )
+        finally:
+            self._stop_watcher(proc)
+
+    def test_watcher_without_active_plan_follows_all_logs(self) -> None:
+        """When no active plan is set, the watcher must follow all logs
+        (legacy / test behaviour)."""
+        log1 = self.log_dir / "chg-x.implement.r1.1.log"
+        log1.write_text("log1 output AAA\n")
+        self.time.sleep(0.1)
+
+        proc = self._start_watcher()
+        try:
+            out = self._read_until(proc, "AAA", 10.0)
+            self.assertIn("log1 output AAA", out)
+        finally:
+            self._stop_watcher(proc)
+
 
 if __name__ == "__main__":
     unittest.main()
