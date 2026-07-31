@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+  printf '%s\n' \
+    'This script must be run with bash, not sourced.' \
+    'Usage: bash install.sh --global' >&2
+  return 1 2>/dev/null || exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../../lib/install-common.sh
 source "$SCRIPT_DIR/../../lib/install-common.sh"
