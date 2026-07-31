@@ -44,6 +44,7 @@ load_model_env() {
   printf '  [defaults]\n' >&2
   printf '  controller = "openai/gpt-5.2"\n' >&2
   printf '  implementer = "openai/gpt-5.2"\n' >&2
+  printf '  implementer_escalation = "openai/gpt-5.2"\n' >&2
   printf '  reviewer = "openai/gpt-5.2"\n' >&2
   printf '  archiver = "openai/gpt-5.2"\n' >&2
   printf '\nThen re-run the installer.\n' >&2
