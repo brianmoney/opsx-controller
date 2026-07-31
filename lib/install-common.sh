@@ -14,18 +14,40 @@ OPSX_CONTROLLER_ROOT="${OPSX_CONTROLLER_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}
 # Resolve models for <adapter> through the resolver (reached via the
 # controller source tree, not PATH, so installing one adapter never depends
 # on another adapter's orchestrator install) and export OPSX_*_MODEL into
-# the current shell. Exits non-zero with actionable guidance when any role
-# is unresolved, so no artifact is ever installed with an empty model value.
+# the current shell. When no configuration exists, auto-init from ambient
+# environment variables and retry. Exits non-zero with actionable guidance
+# only when a config exists but leaves roles unresolved, so no artifact is
+# ever installed with an empty model value.
 load_model_env() {
   local adapter="$1"
   local output
-  if ! output="$(python3 "$OPSX_CONTROLLER_ROOT/orchestrator/opsx-plan.py" models env --adapter "$adapter" 2>&1)"; then
-    printf 'Could not resolve model configuration for adapter: %s\n' "$adapter" >&2
-    printf '%s\n' "$output" >&2
-    printf 'Run `opsx-plan models show --adapter %s` to inspect resolution, or `opsx-plan models init` to seed a configuration file.\n' "$adapter" >&2
-    exit 1
+  local config_path="$HOME/.config/opsx-controller/models.toml"
+
+  if output="$(python3 "$OPSX_CONTROLLER_ROOT/orchestrator/opsx-plan.py" models env --adapter "$adapter" 2>&1)"; then
+    eval "$output"
+    return 0
   fi
-  eval "$output"
+
+  if [[ ! -f "$config_path" ]]; then
+    printf 'No model configuration found. Seeding %s from environment…\n' "$config_path" >&2
+    python3 "$OPSX_CONTROLLER_ROOT/orchestrator/opsx-plan.py" models init >&2 || true
+    if output="$(python3 "$OPSX_CONTROLLER_ROOT/orchestrator/opsx-plan.py" models env --adapter "$adapter" 2>&1)"; then
+      eval "$output"
+      return 0
+    fi
+  fi
+
+  printf 'Could not resolve model configuration for adapter: %s\n' "$adapter" >&2
+  printf '%s\n' "$output" >&2
+  printf '\nEdit %s to configure your models.\n' "$config_path" >&2
+  printf 'Example:\n' >&2
+  printf '  [defaults]\n' >&2
+  printf '  controller = "openai/gpt-5.2"\n' >&2
+  printf '  implementer = "openai/gpt-5.2"\n' >&2
+  printf '  reviewer = "openai/gpt-5.2"\n' >&2
+  printf '  archiver = "openai/gpt-5.2"\n' >&2
+  printf '\nThen re-run the installer.\n' >&2
+  exit 1
 }
 
 # ---------------------------------------------------------------------------
