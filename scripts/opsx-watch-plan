@@ -300,26 +300,28 @@ extract_plan_change_ids() {
 }
 
 # Find the newest log that belongs to the active plan (when active plan
-# change ids are known).  The primary ordering key is the writer-guaranteed
-# stage ordering derived from the log filename, which encodes round,
-# stage, and sequence and is entirely under the orchestrator's control.
-# When two logs share the same key the function falls back to mtime.
+# change ids are known).  The primary ordering key is modification time,
+# which ensures a freshly-written log from the currently active stage
+# always wins over a stale log from a different round or change.  When
+# two logs share the same mtime the ordering falls back through the
+# writer-guaranteed stage ordering derived from the log filename.
 #
-# Pattern: {change}.{stage}.r{round}.{seq}.log
-#   - round (higher = newer)
+# Ordering: mtime desc → round desc → stage_prio desc → seq desc
 #   - stage within a round: implement (0) < review (1) < archive (2)
-#   - seq (higher = newer within the same stage+round)
-# This avoids non-deterministic tiebreakers like inode or filename sort.
+#
+# This matches the Python-side _collect_logs sort key
+# ``(mtime, round, seq)`` and adds stage_prio as a deterministic
+# tiebreaker for logs that share every other key.
 #
 # The first positional argument is an optional space-separated list of
 # change ids to scope selection to.  When empty, all logs are considered.
 newest_log() {
   local allowed_ids="$1"
   local best=""
+  local best_mtime=0
   local best_round=-1
   local best_stage_prio=-1
   local best_seq=-1
-  local best_mtime=0
 
   for f in "$LOG_DIR"/*.log; do
     [[ -e "$f" ]] || continue
@@ -352,22 +354,29 @@ newest_log() {
       fi
     fi
 
-    # Compare: higher round wins; within a round higher stage priority
-    # (archive > review > implement) wins; within the same stage higher seq wins;
-    # mtime is the final fallback for any remaining tie.
+    # Skip files already exhausted (switched away from).  Once the
+    # orchestrator moves on from a stage log it never returns to it,
+    # and appending to an abandoned log must not trigger a switch.
+    if [[ -n "$EXHAUSTED_FILENAMES" ]] && [[ " $EXHAUSTED_FILENAMES " =~ " ${f##*/} " ]]; then
+      continue
+    fi
+
+    # Compare: higher mtime wins; within same mtime higher round wins;
+    # within same round higher stage priority (archive > review >
+    # implement) wins; within same stage higher seq wins.
     local better=false
     if [[ -z "$best" ]]; then
       better=true
-    elif (( round > best_round )); then
+    elif (( mtime > best_mtime )); then
       better=true
-    elif (( round == best_round )); then
-      if (( stage_prio > best_stage_prio )); then
+    elif (( mtime == best_mtime )); then
+      if (( round > best_round )); then
         better=true
-      elif (( stage_prio == best_stage_prio )); then
-        if (( seq > best_seq )); then
+      elif (( round == best_round )); then
+        if (( stage_prio > best_stage_prio )); then
           better=true
-        elif (( seq == best_seq )); then
-          if (( mtime > best_mtime )); then
+        elif (( stage_prio == best_stage_prio )); then
+          if (( seq > best_seq )); then
             better=true
           fi
         fi
@@ -376,10 +385,10 @@ newest_log() {
 
     if $better; then
       best="$f"
+      best_mtime=$mtime
       best_round=$round
       best_stage_prio=$stage_prio
       best_seq=$seq
-      best_mtime=$mtime
     fi
   done
   printf '%s' "$best"
@@ -422,12 +431,18 @@ if [[ -n "$active_toml" ]]; then
   ACTIVE_PLAN_IDS=$(extract_plan_change_ids "$active_toml" 2>/dev/null || true)
 fi
 
+# Track filenames we've already switched away from.  Once the
+# orchestrator moves on from a stage log it never returns, and
+# appending to an abandoned log must not trigger a switch back.
+EXHAUSTED_FILENAMES=""
+
 current=""
 while true; do
   candidate=$(newest_log "$ACTIVE_PLAN_IDS")
   if [[ -n "$candidate" && "$candidate" != "$current" ]]; then
     # Switch to a newer log: stop the current tail and start fresh.
     if [[ -n "$current" ]]; then
+      EXHAUSTED_FILENAMES="$EXHAUSTED_FILENAMES ${current##*/}"
       cleanup_follower
     fi
 
