@@ -8,6 +8,8 @@
 # automatically switches to a newer log when one appears.  The
 # comment-prefixed OPSX WORKER INPUT block in each direct-stage log
 # (including corrective handoffs) is visible as the stage begins.
+#
+# Renders stage-handoff and review-verdict banners as they occur.
 set -euo pipefail
 
 REPO="${1:-${PWD}}"
@@ -19,13 +21,242 @@ if [[ ! -d "$LOG_DIR" ]]; then
   exit 1
 fi
 
-# Collect existing logs up front so the head start for a pre-existing
-# log is never more than one poll cycle.
-declare -A seen=()
-for f in "$LOG_DIR"/*.log; do
-  [[ -e "$f" ]] || continue
-  seen["$f"]=1
-done
+# -------------------------------------------------------------------
+# 1. Rendering primitives
+# -------------------------------------------------------------------
+
+banner_width() {
+  local w="${COLUMNS:-}"
+  if [[ -z "$w" ]]; then
+    w=$(tput cols 2>/dev/null || true)
+  fi
+  if [[ -z "$w" ]] || ! [[ "$w" =~ ^[0-9]+$ ]]; then
+    w=80
+  fi
+  w=$(( w - 2 ))
+  if (( w > 78 )); then w=78; fi
+  if (( w < 1 )); then w=1; fi
+  printf '%d' "$w"
+}
+
+banner_style() {
+  local width
+  width=$(banner_width)
+  if [[ -t 1 ]] && (( width >= 40 )); then
+    echo "box"
+  else
+    echo "plain"
+  fi
+}
+
+strip_ansi() {
+  printf '%s\n' "${1:-}" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g'
+}
+
+wrap_text() {
+  local text="$1" width="$2"
+  if [[ -z "$text" ]]; then
+    return
+  fi
+  printf '%s\n' "$text" | fold -s -w "$width"
+}
+
+render_banner() {
+  local title="$1" body="${2:-}" footer="${3:-}" style
+  style=$(banner_style)
+
+  local width
+  width=$(banner_width)
+
+  local bar
+  bar=$(printf '%*s' "$width" '' | tr ' ' '─')
+
+  if [[ "$style" == "box" ]]; then
+    printf '┌%s┐\n' "$bar"
+    printf '│ %-*s │\n' "$((width - 2))" "$title"
+    printf '├%s┤\n' "$bar"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      printf '│ %-*s │\n' "$((width - 2))" "$line"
+    done <<< "$body"
+    if [[ -n "$footer" ]]; then
+      printf '├%s┤\n' "$bar"
+      printf '│ %-*s │\n' "$((width - 2))" "$footer"
+    fi
+    printf '└%s┘\n' "$bar"
+  else
+    printf '\n--- %s ---\n' "$title"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      printf '| %s\n' "$line"
+    done <<< "$body"
+    if [[ -n "$footer" ]]; then
+      printf '|\n'
+      printf '| %s\n' "$footer"
+    fi
+    printf -- '----------------\n'
+  fi
+}
+
+# -------------------------------------------------------------------
+# 2. Fix-prompt formatting
+# -------------------------------------------------------------------
+
+format_fix_prompt() {
+  local prompt="$1" width
+  width=$(banner_width)
+
+  if [[ -z "$prompt" ]]; then
+    return
+  fi
+
+  if ! [[ "$prompt" =~ (FINDINGS:|CORRECTIVE[[:space:]]GUIDANCE:|VERIFY:) ]]; then
+    wrap_text "$prompt" "$width"
+    return
+  fi
+
+  prompt="${prompt//FINDINGS:/$'\n'FINDINGS:}"
+  prompt="${prompt//CORRECTIVE GUIDANCE:/$'\n'CORRECTIVE GUIDANCE:}"
+  prompt="${prompt//VERIFY:/$'\n'VERIFY:}"
+  prompt="${prompt//- \[critical\]/$'\n'- [critical]}"
+  prompt="${prompt//- \[warning\]/$'\n'- [warning]}"
+  prompt="${prompt//- \[note\]/$'\n'- [note]}"
+
+  prompt="${prompt#$'\n'}"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ -n "$line" ]]; then
+      wrap_text "$line" "$width"
+    else
+      echo
+    fi
+  done <<< "$prompt"
+}
+
+# -------------------------------------------------------------------
+# 3. Stage handoff banner
+# -------------------------------------------------------------------
+
+read_worker_input_header() {
+  local logfile="$1" in_block=0 found=0
+  while IFS= read -r line; do
+    if [[ "$line" == "# --- OPSX WORKER INPUT ---" ]]; then
+      in_block=1
+      found=1
+      continue
+    fi
+    if [[ "$line" == "# --- END OPSX WORKER INPUT ---" ]]; then
+      break
+    fi
+    if (( in_block )); then
+      printf '%s\n' "${line#\# }"
+    fi
+  done < "$logfile"
+  if (( ! found )); then
+    return 1
+  fi
+}
+
+render_stage_banner() {
+  local logfile="$1"
+  local header_data change round fix_prompt stage_name
+
+  header_data=$(read_worker_input_header "$logfile" 2>/dev/null || true)
+  if [[ -z "$header_data" ]]; then
+    return
+  fi
+
+  change=$(printf '%s\n' "$header_data" | sed -n 's/^CHANGE: //p')
+  round=$(printf '%s\n' "$header_data" | sed -n 's/^ROUND: //p')
+  fix_prompt=$(printf '%s\n' "$header_data" | sed -n 's/^LATEST_FIX_PROMPT: //p')
+
+  if [[ -z "$change" ]] || [[ -z "$round" ]]; then
+    return
+  fi
+
+  stage_name=$(basename "$logfile")
+  if [[ "$stage_name" =~ \.(implement|review|archive)\. ]]; then
+    stage_name="${BASH_REMATCH[1]}"
+  fi
+
+  local body_lines=""
+  body_lines+="Change: ${change}"$'\n'
+  body_lines+="Round:  ${round}"$'\n'
+  body_lines+="Stage:  ${stage_name}"
+
+  if [[ -n "$fix_prompt" ]] && [[ "$fix_prompt" != "none" ]]; then
+    local formatted
+    formatted=$(format_fix_prompt "$fix_prompt" 2>/dev/null || true)
+    if [[ -n "$formatted" ]]; then
+      body_lines+=$'\n'$'\n'"$formatted"
+    fi
+  fi
+
+  render_banner "Stage: ${stage_name} (${change}, round ${round})" "$body_lines"
+}
+
+# -------------------------------------------------------------------
+# 4. Review verdict banner
+# -------------------------------------------------------------------
+
+render_verdict_banner() {
+  local stripped="$1"
+
+  local verdict="" round="" crit="" warn="" note="" summary="" fix_prompt="" next_phase=""
+
+  if [[ "$stripped" =~ \"verdict\":\"([^\"]+)\" ]]; then
+    verdict="${BASH_REMATCH[1]}"
+  fi
+  if [[ "$stripped" =~ \"round\":([0-9]+) ]]; then
+    round="${BASH_REMATCH[1]}"
+  fi
+  if [[ "$stripped" =~ \"critical\":([0-9]+) ]]; then
+    crit="${BASH_REMATCH[1]}"
+  fi
+  if [[ "$stripped" =~ \"warning\":([0-9]+) ]]; then
+    warn="${BASH_REMATCH[1]}"
+  fi
+  if [[ "$stripped" =~ \"note\":([0-9]+) ]]; then
+    note="${BASH_REMATCH[1]}"
+  fi
+  if [[ "$stripped" =~ \"summary\":\"([^\"]*)\" ]]; then
+    summary="${BASH_REMATCH[1]}"
+  fi
+  if [[ "$stripped" =~ \"fix_prompt\":\"(.*)\",\"next_phase\":\"([^\"]+)\" ]]; then
+    fix_prompt="${BASH_REMATCH[1]}"
+    next_phase="${BASH_REMATCH[2]}"
+  fi
+
+  if [[ -z "$verdict" ]]; then
+    return
+  fi
+
+  local verdict_label
+  if [[ "$verdict" == "pass" ]]; then
+    verdict_label="PASS"
+  else
+    verdict_label="FAIL"
+  fi
+
+  local body_lines=""
+  body_lines+="Verdict:  ${verdict_label}"$'\n'
+  body_lines+="Critical: ${crit:-0}  Warning: ${warn:-0}  Note: ${note:-0}"
+  if [[ -n "$summary" ]]; then
+    body_lines+=$'\n'"Summary:  ${summary}"
+  fi
+  if [[ -n "$next_phase" ]]; then
+    body_lines+=$'\n'"Next:     ${next_phase}"
+  fi
+
+  if [[ -n "$fix_prompt" ]] && [[ "$verdict" != "pass" ]]; then
+    local decoded fixed_formatted
+    decoded=$(printf '%b' "$fix_prompt" 2>/dev/null || echo "$fix_prompt")
+    fixed_formatted=$(format_fix_prompt "$decoded" 2>/dev/null || true)
+    if [[ -n "$fixed_formatted" ]]; then
+      body_lines+=$'\n'$'\n'"$fixed_formatted"
+    fi
+  fi
+
+  render_banner "Review: ${verdict_label} (round ${round})" "$body_lines"
+}
 
 # Find the newest log.  The primary ordering key is the writer-guaranteed
 # stage ordering derived from the log filename, which encodes round,
@@ -98,26 +329,66 @@ newest_log() {
   printf '%s' "$best"
 }
 
+# Track the follower process pair so we can kill both tail and reader on
+# switch.  A plain `kill %1` only signalled the wrapping { ... } & subshell,
+# never the tail piped inside it — the old tail -f stayed alive as an orphan
+# and leaked output into the active stream.  We now feed tail output through a
+# named pipe to break the pipeline, capture both PIDs explicitly, and clean up
+# both unconditionally on the next switch.
+tail_pid=""
+reader_pid=""
+fifo_path=""
+
+cleanup_follower() {
+  local tp="$tail_pid" rp="$reader_pid" fp="$fifo_path"
+  tail_pid=""; reader_pid=""; fifo_path=""
+  if [[ -n "$tp" ]]; then
+    kill "$tp" 2>/dev/null || true
+    wait "$tp" 2>/dev/null || true
+  fi
+  if [[ -n "$rp" ]]; then
+    kill "$rp" 2>/dev/null || true
+    wait "$rp" 2>/dev/null || true
+  fi
+  if [[ -n "$fp" && -p "$fp" ]]; then
+    rm -f "$fp"
+  fi
+}
+
+trap 'cleanup_follower' EXIT
+
 current=""
 while true; do
   candidate=$(newest_log)
   if [[ -n "$candidate" && "$candidate" != "$current" ]]; then
     # Switch to a newer log: stop the current tail and start fresh.
     if [[ -n "$current" ]]; then
-      kill %1 2>/dev/null || true  # stop background tail
-      wait 2>/dev/null || true
+      cleanup_follower
     fi
-    if [[ -z "${seen["$candidate"]:-}" ]]; then
-      # New log: print the full log (including the worker-input header)
-      # then follow.
-      printf '\n--- opsx-watch-plan: %s ---\n' "$(basename "$candidate")"
-      cat -- "$candidate"
-    else
-      printf '\n--- opsx-watch-plan: switching to %s ---\n' "$(basename "$candidate")"
-    fi
-    seen["$candidate"]=1
+
+    # Render stage handoff banner when switching to a new or existing log.
+    render_stage_banner "$candidate" 2>/dev/null || true
+
     current="$candidate"
-    tail -f -n +1 -- "$current" &
+
+    fifo_path=$(mktemp -u "${TMPDIR:-/tmp}/opsx-watch-plan.XXXXXX")
+    mkfifo "$fifo_path" 2>/dev/null || { fifo_path=""; continue; }
+
+    tail -f -n +1 -- "$current" 2>/dev/null > "$fifo_path" &
+    tail_pid=$!
+
+    {
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        printf '%s\n' "$line"
+
+        stripped=$(strip_ansi "$line")
+        if [[ "$stripped" == *'"status":"reviewed"'* || "$stripped" == *'"status": "reviewed"'* ]] && \
+           [[ "$stripped" == *'"verdict"'* ]]; then
+          render_verdict_banner "$stripped" 2>/dev/null || true
+        fi
+      done < "$fifo_path"
+    } &
+    reader_pid=$!
   fi
   sleep 2
 done
