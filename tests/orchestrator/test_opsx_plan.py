@@ -10872,6 +10872,49 @@ class ActivePlanResolutionTests(unittest.TestCase):
         finally:
             self.opsx_plan.run_direct_change = original
 
+    def test_run_preserves_manifest_skip_keys_without_cli_flags(self) -> None:
+        """`--skip-warning` defaults to False and must not clobber a manifest.
+
+        The flags are additive overrides; a plan that opts into skipping keeps
+        that setting when the operator does not repeat it on the command line.
+        """
+        plan = self._write_plan_toml(
+            "skip-plan.toml",
+            '[plan]\nname = "skip-plan"\nadapter = "opencode"\n'
+            "require_clean_tracked = false\n"
+            "skip_warning = true\n\n"
+            '[[changes]]\nid = "test-change"\n',
+        )
+        cdir = self.repo / "openspec" / "changes" / "test-change"
+        cdir.mkdir(parents=True)
+        (cdir / "proposal.md").write_text("## Why\n", encoding="utf-8")
+        (cdir / "tasks.md").write_text("- [ ] 1.1 task\n", encoding="utf-8")
+        os.environ["OPSX_CONTROLLER_MODEL"] = "test-model"
+
+        seen: dict = {}
+
+        def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None, budget_usd=0.0):
+            seen.update(cfg)
+            return self.opsx_plan.DONE
+
+        original = self.opsx_plan.run_direct_change
+        try:
+            self.opsx_plan.run_direct_change = fake_run_direct_change
+            args = argparse.Namespace(
+                repo=str(self.repo), plan=str(plan),
+                dry_run=False, budget_minutes=0, max_changes=0,
+                only=[], create_only=False,
+            )
+            self.assertEqual(self.opsx_plan.cmd_run(args), 0)
+        finally:
+            self.opsx_plan.run_direct_change = original
+
+        self.assertTrue(
+            seen.get("skip_warning"),
+            "manifest skip_warning must survive an absent --skip-warning flag",
+        )
+        self.assertFalse(seen.get("skip_suggestion"))
+
     def test_run_explicit_failed_load_does_not_activate(self) -> None:
         """When load_plan fails for an explicit plan, the active-plan pointer
         must not be written (bug fix verification)."""
@@ -16344,6 +16387,7 @@ class SamplePlanTests(unittest.TestCase):
             "timeout_minutes", "max_attempts", "max_rounds", "no_progress_limit",
             "escalate_after_review_fails",
             "fast_checks", "check_timeout_minutes", "require_clean_tracked",
+            "skip_warning", "skip_suggestion",
             "notify_cmd", "plan_doc", "create_invoke",
             "create_timeout_minutes", "create_max_attempts",
             "review_created", "created_check", "git_delivery",
@@ -16515,7 +16559,8 @@ class SamplePlanTests(unittest.TestCase):
             "timeout_minutes", "max_attempts", "max_rounds",
             "no_progress_limit", "escalate_after_review_fails",
             "fast_checks", "check_timeout_minutes",
-            "require_clean_tracked", "notify_cmd", "plan_doc",
+            "require_clean_tracked", "skip_warning", "skip_suggestion",
+            "notify_cmd", "plan_doc",
             "create_invoke", "create_timeout_minutes", "create_max_attempts",
             "review_created", "created_check", "git_delivery",
         }
@@ -16920,6 +16965,118 @@ class ModelsCommandTests(unittest.TestCase):
                     os.environ[key] = val
                 else:
                     os.environ.pop(key, None)
+
+
+class ReviewGateSkipSeverityTests(unittest.TestCase):
+    """The skip_warning / skip_suggestion gate in apply_review_result.
+
+    Review workers apply a strict rule and recommend `fail` for any non-zero
+    finding count, so a gate that also required `verdict == "pass"` could never
+    honour either skip key. These tests pin the severities that gate under each
+    configuration, and that the strict default is unchanged.
+    """
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        self.cid = "add-thing"
+        self.state = {"changes": {}}
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _cfg(self, **overrides) -> dict:
+        cfg = {
+            "name": "gate-plan",
+            "max_rounds": 5,
+            "skip_warning": False,
+            "skip_suggestion": False,
+        }
+        cfg.update(overrides)
+        return cfg
+
+    def _review(self, verdict: str, critical: int, warning: int, note: int) -> dict:
+        return {
+            "status": "reviewed",
+            "change": self.cid,
+            "round": 1,
+            "verdict": verdict,
+            "finding_counts": {
+                "critical": critical,
+                "warning": warning,
+                "note": note,
+            },
+            "summary": "review completed",
+            "fix_prompt": "" if verdict == "pass" else "CHANGE: add-thing ...",
+            "next_phase": "archive" if verdict == "pass" else "implement",
+        }
+
+    def _apply(self, cfg: dict, payload: dict) -> tuple[str, dict]:
+        action = self.opsx_plan.apply_review_result(
+            self.repo, cfg, self.state, self.cid, payload
+        )
+        return action, self.opsx_plan.rec(self.state, self.cid)
+
+    def test_default_gate_requires_all_counts_zero(self) -> None:
+        _, record = self._apply(self._cfg(), self._review("fail", 0, 1, 0))
+        self.assertEqual(record["last_result"], "review_failed")
+        self.assertEqual(record["phase"], "implement")
+
+    def test_default_gate_passes_on_clean_review(self) -> None:
+        _, record = self._apply(self._cfg(), self._review("pass", 0, 0, 0))
+        self.assertEqual(record["last_result"], "review_passed")
+        self.assertEqual(record["phase"], "archive")
+
+    def test_default_gate_still_defers_to_a_failing_verdict(self) -> None:
+        """A zero-count `fail` recommendation must not pass the strict gate."""
+        _, record = self._apply(self._cfg(), self._review("fail", 0, 0, 0))
+        self.assertEqual(record["last_result"], "review_failed")
+
+    def test_skip_warning_passes_warnings_and_notes(self) -> None:
+        _, record = self._apply(
+            self._cfg(skip_warning=True), self._review("fail", 0, 2, 1)
+        )
+        self.assertEqual(record["last_result"], "review_passed")
+        self.assertEqual(record["phase"], "archive")
+        self.assertEqual(record["latest_fix_prompt"], "")
+
+    def test_skip_warning_still_blocks_on_criticals(self) -> None:
+        _, record = self._apply(
+            self._cfg(skip_warning=True), self._review("fail", 1, 0, 0)
+        )
+        self.assertEqual(record["last_result"], "review_failed")
+        self.assertEqual(record["phase"], "implement")
+
+    def test_skip_suggestion_passes_notes_only(self) -> None:
+        _, record = self._apply(
+            self._cfg(skip_suggestion=True), self._review("fail", 0, 0, 3)
+        )
+        self.assertEqual(record["last_result"], "review_passed")
+
+    def test_skip_suggestion_still_blocks_on_warnings(self) -> None:
+        _, record = self._apply(
+            self._cfg(skip_suggestion=True), self._review("fail", 0, 1, 0)
+        )
+        self.assertEqual(record["last_result"], "review_failed")
+
+    def test_skip_gate_still_rejects_an_unexpected_verdict(self) -> None:
+        """Relaxing the gate must not stop validating the verdict field."""
+        _, record = self._apply(
+            self._cfg(skip_warning=True), self._review("maybe", 0, 0, 0)
+        )
+        self.assertEqual(record["last_result"], "review_invalid")
+        self.assertEqual(record["status"], self.opsx_plan.FAILED)
+
+    def test_review_history_records_counts_regardless_of_gate(self) -> None:
+        self._apply(self._cfg(skip_warning=True), self._review("fail", 0, 2, 1))
+        record = self.opsx_plan.rec(self.state, self.cid)
+        entry = record["history"][-1]
+        self.assertEqual(entry["phase"], "review")
+        self.assertEqual(
+            entry["finding_counts"], {"critical": 0, "warning": 2, "note": 1}
+        )
+        self.assertEqual(record["last_review"]["verdict"], "fail")
 
 
 if __name__ == "__main__":
