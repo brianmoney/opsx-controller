@@ -49,6 +49,16 @@ executables (via `scripts/install-orchestrator.sh`), so a maintainer only
 needs to rerun one installer — the installed runtime location is the same
 regardless of which adapter deployed it.
 
+The orchestrator's implementation is split between the entrypoint
+(`orchestrator/opsx-plan.py`) and the installed `lib/orchestrator/` runtime
+package (see `orchestrator/README.md#source-layout`). Because of this, the
+reinstall after an `orchestrator/` or `lib/orchestrator/` change is
+**required, not merely recommended**: a stale installed runtime is missing
+whole modules, not just running outdated logic, and commands like
+`opsx-plan report` or `opsx-plan dashboard` fail outright — with a
+diagnostic naming the missing package, per `opsx-plan doctor` — rather than
+silently serving old behavior.
+
 ## Sandbox / filesystem discipline
 
 Workers run headless under a sandbox that auto-rejects `external_directory`

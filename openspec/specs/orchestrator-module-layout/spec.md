@@ -1,4 +1,13 @@
-## ADDED Requirements
+# orchestrator-module-layout Specification
+
+## Purpose
+
+Define how the orchestrator's Python implementation is organized into
+importable runtime modules under `lib/orchestrator/`, and how that layout
+stays behavior-preserving, testable, and diagnosable as the entrypoint and
+its installed runtime package evolve.
+
+## Requirements
 
 ### Requirement: Orchestrator source is organized into importable runtime modules
 
