@@ -1,4 +1,12 @@
-## ADDED Requirements
+# finding-recurrence-detection Specification
+
+## Purpose
+
+Detect when a change is stuck re-reporting the same review finding across
+rounds, and halt it for operator triage before the orchestrator burns further
+implement/review cycles on a locus that never actually gets fixed.
+
+## Requirements
 
 ### Requirement: Reviews persist their findings per round in controller state
 

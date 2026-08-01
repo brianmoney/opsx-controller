@@ -22,6 +22,7 @@ max_attempts = 2
 max_rounds = 5
 no_progress_limit = 2
 escalate_after_review_fails = 0
+finding_recurrence_limit = 0
 require_clean_tracked = true
 skip_warning = false
 skip_suggestion = false
