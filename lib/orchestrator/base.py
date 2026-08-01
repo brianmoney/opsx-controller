@@ -1,0 +1,82 @@
+"""Foundational orchestrator primitives: logging, timestamps, plan status.
+
+Zero dependencies on any other orchestrator module — everything else may
+import this one.
+"""
+from __future__ import annotations
+
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+DONE = "done"
+PENDING = "pending"
+RUNNING = "running"
+FAILED = "failed"
+SKIPPED = "skipped"
+
+# Adapter defaults. Both fields accept a {change} placeholder and may be
+# overridden in the [plan] table. Verify the invoke command for your client
+# version before an unattended run.
+ADAPTER_DEFAULTS = {
+    "opencode": {
+        "invoke": 'opencode run "/opsx-drive {change}"',
+        "state_file": ".opencode/opsx-controller/{change}.json",
+        "implement_invoke": (
+            'opencode run --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL"'
+        ),
+        "review_invoke": (
+            'opencode run --agent opsx-reviewer --model "$OPSX_REVIEWER_MODEL"'
+        ),
+        "archive_invoke": (
+            'opencode run --agent opsx-archiver --model "$OPSX_ARCHIVER_MODEL"'
+        ),
+    },
+    "claude-code": {
+        "invoke": 'claude -p "/opsx-drive {change}"',
+        "state_file": ".claude/opsx-controller/{change}.json",
+        "implement_invoke": (
+            'claude -p --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL" '
+            "--permission-mode bypassPermissions --output-format json"
+        ),
+        "review_invoke": (
+            'claude -p --agent opsx-reviewer --model "$OPSX_REVIEWER_MODEL" '
+            "--permission-mode bypassPermissions --output-format json"
+        ),
+        "archive_invoke": (
+            'claude -p --agent opsx-archiver --model "$OPSX_ARCHIVER_MODEL" '
+            "--permission-mode bypassPermissions --output-format json"
+        ),
+    },
+    "codex-cli": {
+        "invoke": 'codex exec "$opsx-drive {change}"',
+        "state_file": ".opsx-controller/{change}.json",
+    },
+}
+
+
+class PlanError(Exception):
+    pass
+
+
+def utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def log(msg: str) -> None:
+    print(f"[opsx-plan {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def ensure_own_root_on_syspath() -> None:
+    """Re-add this package's own runtime root to sys.path if missing.
+
+    Mirrors the entrypoint's own startup `sys.path` bootstrap, for modules
+    that may be imported and called in isolation (e.g. a stage-recording
+    call path) without that bootstrap having already run in-process.
+    Unlike the entrypoint, this module's own file location already pins the
+    one correct root (`lib/orchestrator/base.py`'s grandparent), so there is
+    no candidate list to search.
+    """
+    root = str(Path(__file__).resolve().parents[2])
+    if root not in sys.path:
+        sys.path.insert(0, root)

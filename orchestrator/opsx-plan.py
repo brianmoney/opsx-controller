@@ -68,46 +68,11 @@ try:
 except ModuleNotFoundError as exc:  # pragma: no cover
     sys.exit(f"opsx-plan requires the lib.models runtime package: {exc}")
 
-# ---------------------------------------------------------------------------
-# Adapter defaults. Both fields accept a {change} placeholder and may be
-# overridden in the [plan] table. Verify the invoke command for your client
-# version before an unattended run.
-# ---------------------------------------------------------------------------
-ADAPTER_DEFAULTS = {
-    "opencode": {
-        "invoke": 'opencode run "/opsx-drive {change}"',
-        "state_file": ".opencode/opsx-controller/{change}.json",
-        "implement_invoke": (
-            'opencode run --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL"'
-        ),
-        "review_invoke": (
-            'opencode run --agent opsx-reviewer --model "$OPSX_REVIEWER_MODEL"'
-        ),
-        "archive_invoke": (
-            'opencode run --agent opsx-archiver --model "$OPSX_ARCHIVER_MODEL"'
-        ),
-    },
-    "claude-code": {
-        "invoke": 'claude -p "/opsx-drive {change}"',
-        "state_file": ".claude/opsx-controller/{change}.json",
-        "implement_invoke": (
-            'claude -p --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL" '
-            "--permission-mode bypassPermissions --output-format json"
-        ),
-        "review_invoke": (
-            'claude -p --agent opsx-reviewer --model "$OPSX_REVIEWER_MODEL" '
-            "--permission-mode bypassPermissions --output-format json"
-        ),
-        "archive_invoke": (
-            'claude -p --agent opsx-archiver --model "$OPSX_ARCHIVER_MODEL" '
-            "--permission-mode bypassPermissions --output-format json"
-        ),
-    },
-    "codex-cli": {
-        "invoke": 'codex exec "$opsx-drive {change}"',
-        "state_file": ".opsx-controller/{change}.json",
-    },
-}
+try:
+    from lib.orchestrator import base, dashboard, planref, report
+    from lib.orchestrator import cost as cost_mod
+except ModuleNotFoundError as exc:  # pragma: no cover
+    sys.exit(f"opsx-plan requires the lib.orchestrator runtime package: {exc}")
 
 ADAPTER_CLIENTS = {
     "opencode": "opencode",
@@ -138,25 +103,11 @@ COMPILE_CLIENTS: dict[str, dict] = {
     },
 }
 
-DONE = "done"
-PENDING = "pending"
-RUNNING = "running"
-FAILED = "failed"
-SKIPPED = "skipped"
-
 ARCHIVE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-")
 TASK_RE = re.compile(r"^- \[(?P<done>[ xX])\]\s+")
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 _current_proc: subprocess.Popen | None = None
-
-
-def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def log(msg: str) -> None:
-    print(f"[opsx-plan {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
 def _build_notification_payload(
@@ -181,7 +132,7 @@ def _build_notification_payload(
     payload: dict = {
         "event_type": event_type,
         "plan_name": plan_name,
-        "timestamp": utcnow(),
+        "timestamp": base.utcnow(),
         "summary": summary,
     }
     if change_id:
@@ -220,7 +171,7 @@ def _try_notify(
     try:
         cmd_parts = shlex.split(notify_cmd)
         cmd = cmd_parts + [payload_json]
-        log(f"  notify: {event_type} -> {notify_cmd}")
+        base.log(f"  notify: {event_type} -> {notify_cmd}")
 
         proc = subprocess.run(
             cmd,
@@ -231,136 +182,21 @@ def _try_notify(
         if proc.returncode != 0:
             stderr_tail = (proc.stderr or "").strip().splitlines()[-3:]
             detail = "; " + " | ".join(stderr_tail) if stderr_tail else ""
-            log(
+            base.log(
                 f"  notify failed ({event_type}): "
                 f"exit={proc.returncode}{detail}"
             )
     except subprocess.TimeoutExpired:
-        log(f"  notify timed out ({event_type}): {notify_cmd}")
+        base.log(f"  notify timed out ({event_type}): {notify_cmd}")
     except FileNotFoundError:
-        log(f"  notify command not found ({event_type}): {notify_cmd}")
+        base.log(f"  notify command not found ({event_type}): {notify_cmd}")
     except Exception as exc:
-        log(f"  notify error ({event_type}): {exc}")
+        base.log(f"  notify error ({event_type}): {exc}")
 
 
 # ---------------------------------------------------------------------------
 # Plan manifest
 # ---------------------------------------------------------------------------
-
-class PlanError(Exception):
-    pass
-
-
-def load_plan(path: Path, repo: Path | None = None) -> dict:
-    try:
-        with open(path, "rb") as fh:
-            raw = tomllib.load(fh)
-    except Exception as exc:
-        raise PlanError(f"cannot parse plan {path.name}: {exc}") from exc
-
-    plan = raw.get("plan", {})
-    changes = raw.get("changes", [])
-    if not changes:
-        raise PlanError("plan has no [[changes]] entries")
-
-    adapter = plan.get("adapter", "opencode")
-    if adapter not in ADAPTER_DEFAULTS and not (
-        plan.get("invoke") and plan.get("state_file")
-    ):
-        raise PlanError(
-            f"unknown adapter '{adapter}' and no invoke/state_file overrides given"
-        )
-    defaults = ADAPTER_DEFAULTS.get(adapter, {})
-
-    cfg = {
-        "name": plan.get("name") or path.stem,
-        "adapter": adapter,
-        "invoke": plan.get("invoke", defaults.get("invoke")),
-        "state_file": plan.get("state_file", defaults.get("state_file")),
-        "implement_invoke": plan.get(
-            "implement_invoke", defaults.get("implement_invoke", "")
-        ),
-        "review_invoke": plan.get(
-            "review_invoke", defaults.get("review_invoke", "")
-        ),
-        "archive_invoke": plan.get(
-            "archive_invoke", defaults.get("archive_invoke", "")
-        ),
-        "timeout_minutes": float(plan.get("timeout_minutes", 90)),
-        "max_attempts": int(plan.get("max_attempts", 2)),
-        "max_rounds": int(plan.get("max_rounds", 5)),
-        "no_progress_limit": int(plan.get("no_progress_limit", 2)),
-        "fast_checks": list(plan.get("fast_checks", [])),
-        "check_timeout_minutes": float(plan.get("check_timeout_minutes", 15)),
-        "require_clean_tracked": bool(plan.get("require_clean_tracked", True)),
-        "escalate_after_review_fails": _parse_escalation_threshold(
-            plan.get("escalate_after_review_fails", 0)
-        ),
-        "finding_recurrence_limit": _parse_finding_recurrence_limit(
-            plan.get("finding_recurrence_limit", 0)
-        ),
-        "skip_warning": bool(plan.get("skip_warning", False)),
-        "skip_suggestion": bool(plan.get("skip_suggestion", False)),
-        # --- run-event notifications ---
-        "notify_cmd": plan.get("notify_cmd", "").strip() if plan.get("notify_cmd") else "",
-        # --- create stage (the /opsx-ff automation) ---
-        "plan_doc": plan.get("plan_doc", ""),
-        "create_invoke": plan.get("create_invoke", ""),
-        "create_timeout_minutes": float(plan.get("create_timeout_minutes", 30)),
-        "create_max_attempts": int(plan.get("create_max_attempts", 2)),
-        "review_created": bool(plan.get("review_created", True)),
-        "created_check": plan.get(
-            "created_check", "openspec validate {change} --strict"
-        ),
-        # --- git delivery ---
-        "git_delivery": _parse_git_delivery_config(plan.get("git_delivery", {})),
-    }
-
-    by_id: dict[str, dict] = {}
-    for c in changes:
-        cid = c.get("id")
-        if not cid:
-            raise PlanError("a [[changes]] entry is missing 'id'")
-        if cid in by_id:
-            raise PlanError(f"duplicate change id: {cid}")
-        by_id[cid] = {
-            "id": cid,
-            "phase": c.get("phase"),
-            "depends_on": list(c.get("depends_on", [])),
-            "pause_before": bool(c.get("pause_before", False)),
-            "enabled": bool(c.get("enabled", True)),
-            "timeout_minutes": float(
-                c.get("timeout_minutes", cfg["timeout_minutes"])
-            ),
-            "max_attempts": int(c.get("max_attempts", cfg["max_attempts"])),
-            "create_invoke": c.get("create_invoke", cfg["create_invoke"]),
-            "create_max_attempts": int(
-                c.get("create_max_attempts", cfg["create_max_attempts"])
-            ),
-        }
-
-    for c in by_id.values():
-        for dep in c["depends_on"]:
-            if dep not in by_id:
-                raise PlanError(f"{c['id']}: unknown dependency '{dep}'")
-
-    cfg["order"] = topo_sort(by_id)
-    cfg["changes"] = by_id
-
-    try:
-        cfg["models"] = resolve_models(adapter, repo=repo)
-    except ModelConfigError as exc:
-        raise PlanError(str(exc)) from exc
-
-    if not is_direct_mode(cfg):
-        log(
-            f"warning: plan '{cfg['name']}' resolves to the deprecated nested-controller "
-            f"'/opsx-drive' path (fewer than all three stage invokes configured); "
-            f"direct dispatch (opsx-run <change-id> or full implement/review/archive "
-            f"stage invokes) is the supported replacement"
-        )
-
-    return cfg
 
 
 def build_single_change_config(repo: Path, change_id: str) -> dict:
@@ -374,14 +210,14 @@ def build_single_change_config(repo: Path, change_id: str) -> dict:
     """
     cdir = change_dir(repo, change_id)
     if not cdir.is_dir():
-        raise PlanError(f"openspec/changes/{change_id} does not exist")
+        raise base.PlanError(f"openspec/changes/{change_id} does not exist")
     if not change_authored(repo, change_id):
-        raise PlanError(
+        raise base.PlanError(
             f"openspec/changes/{change_id} is missing required artifacts "
             f"({', '.join(AUTHORED_ARTIFACTS)})"
         )
 
-    defaults = ADAPTER_DEFAULTS["opencode"]
+    defaults = base.ADAPTER_DEFAULTS["opencode"]
     plan_name = f"run-{change_id}"
 
     cfg = {
@@ -410,7 +246,7 @@ def build_single_change_config(repo: Path, change_id: str) -> dict:
         "create_max_attempts": 2,
         "review_created": False,
         "created_check": "openspec validate {change} --strict",
-        "git_delivery": _parse_git_delivery_config({}),
+        "git_delivery": planref._parse_git_delivery_config({}),
     }
 
     by_id = {
@@ -433,7 +269,7 @@ def build_single_change_config(repo: Path, change_id: str) -> dict:
     try:
         cfg["models"] = resolve_models("opencode", repo=repo)
     except ModelConfigError as exc:
-        raise PlanError(str(exc)) from exc
+        raise base.PlanError(str(exc)) from exc
     apply_model_env(cfg)
 
     return cfg
@@ -542,7 +378,7 @@ def write_single_change_manifest(repo: Path, change_id: str, cfg: dict) -> None:
     position.  Raises ``PlanError`` on divergence.
     """
     ensure_opsx_plan_dir(repo)
-    manifest_path = single_change_manifest_path(repo, change_id)
+    manifest_path = planref.single_change_manifest_path(repo, change_id)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
     toml_text = render_single_change_manifest(cfg)
@@ -551,17 +387,17 @@ def write_single_change_manifest(repo: Path, change_id: str, cfg: dict) -> None:
     try:
         tmp_path.write_text(toml_text, encoding="utf-8")
     except OSError as exc:
-        raise PlanError(f"could not stage derived manifest: {exc}") from exc
+        raise base.PlanError(f"could not stage derived manifest: {exc}") from exc
 
     # Round-trip: load it back through load_plan.
     try:
-        loaded = load_plan(tmp_path, repo=repo)
-    except PlanError:
+        loaded = planref.load_plan(tmp_path, repo=repo)
+    except base.PlanError:
         tmp_path.unlink(missing_ok=True)
         raise
     except Exception as exc:
         tmp_path.unlink(missing_ok=True)
-        raise PlanError(
+        raise base.PlanError(
             f"derived manifest failed to load: {exc}"
         ) from exc
 
@@ -617,7 +453,7 @@ def _compare_configs(
     if diverging:
         tmp_path.unlink(missing_ok=True)
         manifest_path.unlink(missing_ok=True)
-        raise PlanError(
+        raise base.PlanError(
             f"round-trip divergence in derived manifest: "
             f"{', '.join(diverging)}"
         )
@@ -658,7 +494,7 @@ def apply_model_env(cfg: dict) -> None:
     models: dict = cfg.get("models") or {}
     unresolved = [role for role in ROLES if not (models.get(role) and models[role].model)]
     if unresolved:
-        raise PlanError(
+        raise base.PlanError(
             f"cannot activate models for adapter '{cfg.get('adapter', '?')}': "
             f"unresolved role(s): {', '.join(unresolved)}\n"
             f"Run `opsx-plan models show --adapter {cfg.get('adapter', '?')}` to "
@@ -671,7 +507,7 @@ def apply_model_env(cfg: dict) -> None:
     escalate_threshold = cfg.get("escalate_after_review_fails", 0)
     escalation_entry = models.get(escalation_role)
     if escalate_threshold > 0 and not (escalation_entry and escalation_entry.model):
-        raise PlanError(
+        raise base.PlanError(
             f"escalate_after_review_fails is {escalate_threshold} but "
             f"the '{escalation_role}' role is unresolved for adapter "
             f"'{cfg.get('adapter', '?')}'.\n"
@@ -693,92 +529,12 @@ def apply_model_env(cfg: dict) -> None:
         os.environ.pop(ROLE_ENV[escalation_role], None)
 
 
-def _parse_escalation_threshold(value: object) -> int:
-    """Parse ``escalate_after_review_fails`` into a non-negative integer.
-
-    Raises ``PlanError`` naming the key on a negative value.
-    """
-    threshold = int(value)
-    if threshold < 0:
-        raise PlanError(
-            "escalate_after_review_fails must be >= 0, "
-            f"got {threshold}"
-        )
-    return threshold
-
-
-def _parse_finding_recurrence_limit(value: object) -> int:
-    """Parse ``finding_recurrence_limit`` into a non-negative integer.
-
-    Raises ``PlanError`` naming the key on a negative value. ``0`` disables
-    recurrence halting.
-    """
-    limit = int(value)
-    if limit < 0:
-        raise PlanError(
-            "finding_recurrence_limit must be >= 0, "
-            f"got {limit}"
-        )
-    return limit
-
-
-def _parse_git_delivery_config(raw: dict) -> dict:
-    """Parse ``[plan.git_delivery]`` from a TOML plan into a validated cfg dict."""
-    enabled = raw.get("enabled", False)
-    if not isinstance(enabled, bool):
-        enabled = False
-    branch = str(raw.get("branch", "")).strip() if raw.get("branch") else ""
-    base_ref = str(raw.get("base_ref", "")).strip() if raw.get("base_ref") else ""
-    create_pull_request = raw.get("create_pull_request", False)
-    if not isinstance(create_pull_request, bool):
-        create_pull_request = False
-    if create_pull_request and not enabled:
-        raise PlanError(
-            "plan.git_delivery.create_pull_request requires plan.git_delivery.enabled = true"
-        )
-    return {
-        "enabled": enabled,
-        "branch": branch,
-        "base_ref": base_ref,
-        "create_pull_request": create_pull_request,
-    }
-
-
-def topo_sort(by_id: dict[str, dict]) -> list[str]:
-    """Kahn's algorithm; deterministic (manifest order breaks ties)."""
-    ids = list(by_id)
-    indeg = {cid: len(by_id[cid]["depends_on"]) for cid in ids}
-    dependents: dict[str, list[str]] = {cid: [] for cid in ids}
-    for cid in ids:
-        for dep in by_id[cid]["depends_on"]:
-            dependents[dep].append(cid)
-
-    queue = [cid for cid in ids if indeg[cid] == 0]
-    order: list[str] = []
-    while queue:
-        cid = queue.pop(0)
-        order.append(cid)
-        for nxt in dependents[cid]:
-            indeg[nxt] -= 1
-            if indeg[nxt] == 0:
-                queue.append(nxt)
-    if len(order) != len(ids):
-        cyclic = sorted(set(ids) - set(order))
-        raise PlanError(f"dependency cycle involving: {', '.join(cyclic)}")
-    return order
-
-
 # ---------------------------------------------------------------------------
 # Orchestrator state (.opsx-plan/<name>.state.json)
 # ---------------------------------------------------------------------------
 
 def state_path(repo: Path, plan_name: str) -> Path:
     return repo / ".opsx-plan" / f"{plan_name}.state.json"
-
-
-def single_change_manifest_path(repo: Path, change_id: str) -> Path:
-    """Path to the derived single-change manifest under .opsx-plan/plans/."""
-    return repo / ".opsx-plan" / "plans" / f"run-{change_id}.toml"
 
 
 def default_context_cache() -> dict:
@@ -833,7 +589,7 @@ def default_last_stage() -> dict:
 
 def new_change_record() -> dict:
     return {
-        "status": PENDING,
+        "status": base.PENDING,
         "attempts": 0,
         "reason": "",
         "updated_at": "",
@@ -927,13 +683,7 @@ def set_status(state: dict, cid: str, status: str, reason: str = "") -> None:
     r = rec(state, cid)
     r["status"] = status
     r["reason"] = reason
-    r["updated_at"] = utcnow()
-
-
-def is_direct_mode(cfg: dict) -> bool:
-    return all(
-        cfg.get(name) for name in ("implement_invoke", "review_invoke", "archive_invoke")
-    )
+    r["updated_at"] = base.utcnow()
 
 
 def change_task_counts(repo: Path, cid: str) -> dict:
@@ -978,8 +728,6 @@ def change_context_paths(repo: Path, cid: str) -> list[str]:
 # Active plan pointer
 # ---------------------------------------------------------------------------
 
-ACTIVE_PLAN_FILENAME = "active-plan"
-
 
 def ensure_opsx_plan_dir(repo: Path) -> Path:
     """Ensure ``.opsx-plan/`` exists with a self-ignoring ``.gitignore``.
@@ -994,26 +742,6 @@ def ensure_opsx_plan_dir(repo: Path) -> Path:
     return dot_dir
 
 
-def active_plan_pointer_path(repo: Path) -> Path:
-    """Path to the active-plan pointer file under .opsx-plan/."""
-    return repo / ".opsx-plan" / ACTIVE_PLAN_FILENAME
-
-
-def read_active_plan(repo: Path) -> str | None:
-    """Read the active plan pointer, returning the repo-relative TOML path or None.
-
-    The pointer file contains a single line with a repo-relative path.
-    Leading/trailing whitespace is stripped.
-    """
-    p = active_plan_pointer_path(repo)
-    if not p.is_file():
-        return None
-    content = p.read_text(encoding="utf-8").strip()
-    if not content:
-        return None
-    return content.splitlines()[0].strip() or None
-
-
 def write_active_plan(repo: Path, plan_rel: str) -> None:
     """Write or update the active-plan pointer file.
 
@@ -1022,7 +750,7 @@ def write_active_plan(repo: Path, plan_rel: str) -> None:
     when missing.
     """
     ensure_opsx_plan_dir(repo)
-    p = active_plan_pointer_path(repo)
+    p = planref.active_plan_pointer_path(repo)
     tmp = p.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as fh:
         fh.write(plan_rel.strip() + "\n")
@@ -1039,65 +767,15 @@ def validate_active_plan(repo: Path, plan_rel: str) -> Path:
     """
     plan_path = (repo / plan_rel).resolve()
     if not plan_path.is_file():
-        raise PlanError(
+        raise base.PlanError(
             f"active plan target does not exist: {plan_rel}"
         )
     # Verify it is loadable through the existing parser
     try:
-        load_plan(plan_path, repo=repo)
-    except PlanError as exc:
-        raise PlanError(f"active plan cannot be loaded: {exc}")
+        planref.load_plan(plan_path, repo=repo)
+    except base.PlanError as exc:
+        raise base.PlanError(f"active plan cannot be loaded: {exc}")
     return plan_path
-
-
-def resolve_plan(repo: Path, explicit: str | None) -> str:
-    """Resolve a plan path using the standard precedence:
-
-    1. Explicit CLI argument
-    2. ``OPSX_PLAN`` environment variable
-    3. Active-plan pointer file under ``.opsx-plan/``
-
-    Raises PlanError when no plan can be resolved or when the stored
-    pointer references a missing file (fail-closed).
-    """
-    if explicit:
-        return explicit
-
-    env_plan = os.environ.get("OPSX_PLAN", "").strip()
-    if env_plan:
-        norm = str(Path(env_plan))
-        log(f"using plan from OPSX_PLAN: {norm}")
-        return norm
-
-    pointer = read_active_plan(repo)
-    if pointer:
-        plan_path = repo / pointer
-        if not plan_path.is_file():
-            raise PlanError(
-                f"active plan pointer references missing file: {pointer}\n"
-                f"Set a new active plan with: opsx-plan use <plan.toml>"
-            )
-        log(f"using active plan: {pointer}")
-        return pointer
-
-    raise PlanError(
-        "no plan specified\n"
-        "Activate a plan with: opsx-plan use <plan.toml>\n"
-        "Or set the OPSX_PLAN environment variable."
-    )
-
-
-def _resolve_plan_path(repo: Path, plan_src: str) -> Path:
-    """Resolve a plan source string to an absolute ``Path``.
-
-    When *plan_src* is relative it is resolved against *repo*, not the
-    current working directory.  This ensures repo-relative active plan
-    pointers and ``OPSX_PLAN`` values work correctly with ``--repo``.
-    """
-    p = Path(plan_src)
-    if p.is_absolute():
-        return p.resolve()
-    return (repo / p).resolve()
 
 
 def worker_state_path(repo: Path, plan_name: str, cid: str) -> Path:
@@ -1115,7 +793,7 @@ def save_json(path: Path, payload: dict) -> None:
 
 
 def save_worker_state(repo: Path, cfg: dict, state: dict, cid: str) -> None:
-    if not is_direct_mode(cfg):
+    if not planref.is_direct_mode(cfg):
         return
     r = rec(state, cid)
     payload = {
@@ -1123,8 +801,8 @@ def save_worker_state(repo: Path, cfg: dict, state: dict, cid: str) -> None:
         "change": cid,
         "schema": "spec-driven",
         "status": (
-            "completed" if r["status"] == DONE else "blocked"
-            if r["status"] == FAILED else "running"
+            "completed" if r["status"] == base.DONE else "blocked"
+            if r["status"] == base.FAILED else "running"
         ),
         "phase": r["phase"],
         "round": r["round"],
@@ -1149,7 +827,7 @@ def persist_direct_state(repo: Path, cfg: dict, state: dict, cid: str) -> None:
 
 
 def sync_direct_worker_state(repo: Path, cfg: dict, state: dict) -> None:
-    if not is_direct_mode(cfg):
+    if not planref.is_direct_mode(cfg):
         return
     for cid in cfg["order"]:
         save_worker_state(repo, cfg, state, cid)
@@ -1271,7 +949,7 @@ def record_stage_log(
         "round": round_num,
         "outcome": outcome,
         "log_path": str(log_path),
-        "updated_at": utcnow(),
+        "updated_at": base.utcnow(),
     }
 
 
@@ -2116,7 +1794,7 @@ def get_or_create_run_id(repo: Path, cfg: dict, state: dict) -> str:
         run_id = started_at.replace(":", "").replace("-", "").replace("T", "-")
     else:
         # First run: generate UUID, persist started_at and run_id
-        now = utcnow()
+        now = base.utcnow()
         state["started_at"] = now
         run_id = now.replace(":", "").replace("-", "").replace("T", "-")
     state["run_id"] = run_id
@@ -2206,7 +1884,7 @@ def _record_stage_telemetry(
 
     # Attempt cost estimation (best-effort; never fail telemetry write).
     try:
-        cost = estimate_stage_cost(record["usage"], record["model"], repo=repo)
+        cost = cost_mod.estimate_stage_cost(record["usage"], record["model"], repo=repo)
         record["cost"].update(cost)
     except Exception:
         pass
@@ -2219,230 +1897,6 @@ def _record_stage_telemetry(
 # Cost estimation for direct stage telemetry
 # ---------------------------------------------------------------------------
 
-# Subscription usage denominator configuration.
-# Maps provider -> model_id -> denominator (positive float).
-# Populated by the operator for subscription-billed models.
-SUBSCRIPTION_DENOMINATORS: dict[str, dict[str, float]] = {}
-
-# Module-level catalog instance (lazy-init).
-_cost_catalog: object = None  # PricingCatalog | None
-
-
-def _get_catalog(repo: Path | None = None):
-    """Lazily initialise and return the pricing catalog.
-
-    Returns ``(PricingCatalog, UnresolvedPrice)`` or None on failure.
-    """
-    global _cost_catalog
-    if _cost_catalog is None:
-        try:
-            _ensure_runtime_modules()
-            from lib.pricing import PricingCatalog, UnresolvedPrice  # noqa: F811
-
-            _cost_catalog = (PricingCatalog(), UnresolvedPrice)
-        except Exception:
-            _cost_catalog = False  # Sentinel for failed init
-    if _cost_catalog is False:
-        return None
-    return _cost_catalog  # (PricingCatalog, UnresolvedPrice) tuple
-
-
-def _build_price_snapshot(resolved_price, catalog_version,
-                          denom_value=None, denom_source=None):
-    """Build a ``price_snapshot`` dict from a resolved pricing entry.
-
-    For per_token models, includes all rate fields from the catalog entry.
-    For subscription models, also includes denominator fields when present.
-    Returns ``None`` when *resolved_price* is None.
-    """
-    if resolved_price is None:
-        return None
-
-    snapshot = {
-        "provider": resolved_price.provider,
-        "model_id": resolved_price.model_id,
-        "display_name": resolved_price.display_name,
-        "billing_mode": resolved_price.billing_mode,
-        "currency": resolved_price.currency,
-        "effective_date": resolved_price.effective_date,
-        "catalog_version": catalog_version,
-    }
-
-    if resolved_price.billing_mode == "per_token":
-        snapshot["input_price_per_mtok"] = resolved_price.input_price_per_mtok
-        snapshot["output_price_per_mtok"] = resolved_price.output_price_per_mtok
-        snapshot["cached_input_price_per_mtok"] = resolved_price.cached_input_price_per_mtok
-        snapshot["reasoning_price_per_mtok"] = resolved_price.reasoning_price_per_mtok
-    elif resolved_price.billing_mode == "subscription":
-        snapshot["subscription_period"] = resolved_price.subscription_period
-        snapshot["subscription_price"] = resolved_price.subscription_price
-        if denom_value is not None:
-            snapshot["usage_denominator_units"] = denom_value
-            snapshot["usage_denominator_source"] = denom_source or "config"
-
-    return snapshot
-
-
-def _compute_per_token_cost(usage, resolved_price):
-    """Compute per-token cost or return ``(None, unresolved_reason)``.
-
-    When *estimated_cost* is not None the estimate succeeded.
-    When *unresolved_reason* is not None estimation was not possible.
-    """
-    total = 0.0
-
-    token_categories = [
-        ("input_tokens", "input_price_per_mtok"),
-        ("output_tokens", "output_price_per_mtok"),
-        ("cached_input_tokens", "cached_input_price_per_mtok"),
-        ("reasoning_tokens", "reasoning_price_per_mtok"),
-    ]
-
-    for token_field, rate_field in token_categories:
-        token_count = usage.get(token_field)
-        rate = getattr(resolved_price, rate_field, None)
-
-        # null token counts are unavailable — skip
-        if token_count is None:
-            continue
-
-        # positive usage with no matching rate is unresolved
-        if token_count > 0 and rate is None:
-            return None, f"missing rate for observed token category: {token_field}"
-
-        if token_count > 0 and rate is not None:
-            total += (token_count / 1_000_000.0) * rate
-
-    return total, None
-
-
-def _compute_subscription_cost(usage, resolved_price, denominator):
-    """Compute subscription cost or return ``(None, unresolved_reason)``."""
-    if denominator is None:
-        return None, "missing subscription denominator"
-    if not isinstance(denominator, (int, float)):
-        return None, "invalid subscription denominator"
-    # NaN is technically a float, but it is not a usable number.
-    # NaN != NaN evaluates to True, which is the standard Python idiom for NaN
-    # detection without importing math.
-    if denominator != denominator:
-        return None, "invalid subscription denominator"
-    if denominator <= 0:
-        return None, "invalid subscription denominator"
-
-    # Derive stage usage units
-    stage_units = usage.get("total_tokens")
-    if stage_units is None:
-        # Fall back to the sum of non-null token categories
-        stage_units = 0
-        found_any = False
-        for field in ("input_tokens", "output_tokens",
-                       "cached_input_tokens", "reasoning_tokens"):
-            val = usage.get(field)
-            if isinstance(val, (int, float)):
-                stage_units += val
-                found_any = True
-        if not found_any:
-            return None, "usage unavailable"
-
-    return resolved_price.subscription_price * (stage_units / denominator), None
-
-
-def estimate_stage_cost(usage, model,
-                        subscription_denominators=None,
-                        repo: Path | None = None):
-    """Estimate stage cost from telemetry *usage*, *model*, and pricing catalog.
-
-    Args:
-        usage: Normalised usage dict from ``extract_usage_and_model``.
-        model: Normalised model dict from ``extract_usage_and_model``.
-        subscription_denominators: Optional ``provider -> model_id -> float``
-            mapping.  When ``None``, uses the module-level
-            ``SUBSCRIPTION_DENOMINATORS``.
-        repo: Optional repo-root path.  Passed through to the catalog
-            loader so installed orchestrator copies can discover
-            ``lib.pricing``.
-
-    Returns a dict matching the telemetry ``cost`` schema with keys
-    ``status``, ``pricing_catalog_version``, ``price_snapshot``,
-    ``unresolved_reason``, and ``estimated_cost``.
-    """
-    result = {
-        "status": "unavailable",
-        "pricing_catalog_version": None,
-        "price_snapshot": None,
-        "unresolved_reason": None,
-        "estimated_cost": None,
-    }
-
-    # Check usage availability -----------------------------------------------
-    if not usage.get("usage_available"):
-        result["status"] = "unresolved"
-        result["unresolved_reason"] = "usage unavailable"
-        return result
-
-    # Check model identity ---------------------------------------------------
-    provider = (model.get("provider") or "").strip()
-    model_id = (model.get("model_id") or "").strip()
-    if not provider or not model_id:
-        result["status"] = "unresolved"
-        result["unresolved_reason"] = "model identity unavailable"
-        return result
-
-    # Resolve pricing --------------------------------------------------------
-    catalog_info = _get_catalog(repo)
-    if catalog_info is None:
-        result["status"] = "unresolved"
-        result["unresolved_reason"] = "pricing catalog failed to load"
-        return result
-
-    catalog, UnresolvedPriceCls = catalog_info
-    catalog_version = catalog.get_catalog_version()
-    result["pricing_catalog_version"] = catalog_version
-
-    price_result = catalog.resolve(provider, model_id)
-
-    if isinstance(price_result, UnresolvedPriceCls):
-        result["status"] = "unresolved"
-        result["unresolved_reason"] = price_result.reason
-        return result
-
-    # Compute estimate based on billing mode ---------------------------------
-    if price_result.billing_mode == "per_token":
-        estimated_cost, unresolved = _compute_per_token_cost(usage, price_result)
-        if unresolved is not None:
-            result["status"] = "unresolved"
-            result["unresolved_reason"] = unresolved
-        else:
-            result["status"] = "estimated"
-            result["estimated_cost"] = estimated_cost
-            result["price_snapshot"] = _build_price_snapshot(price_result, catalog_version)
-
-    elif price_result.billing_mode == "subscription":
-        denoms = (subscription_denominators
-                  if subscription_denominators is not None
-                  else SUBSCRIPTION_DENOMINATORS)
-        denom_value = None
-        denom_source = None
-        provider_denoms = denoms.get(provider, {})
-        if model_id in provider_denoms:
-            denom_value = provider_denoms[model_id]
-            denom_source = "config"
-
-        estimated_cost, unresolved = _compute_subscription_cost(
-            usage, price_result, denom_value,
-        )
-        if unresolved is not None:
-            result["status"] = "unresolved"
-            result["unresolved_reason"] = unresolved
-        else:
-            result["status"] = "estimated"
-            result["estimated_cost"] = estimated_cost
-            result["price_snapshot"] = _build_price_snapshot(
-                price_result, catalog_version, denom_value, denom_source,
-            )
-
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2685,21 +2139,21 @@ def verify_direct_archive_done(repo: Path, cid: str, record: dict) -> tuple[bool
     if not commit:
         if not commit_optional:
             return False, "archive worker did not record archive commit"
-        log(
+        base.log(
             f"  note: {cid} archived with no archive(<id>): commit "
             f"(archive directory is gitignored)"
         )
     elif not reachable_commit(repo, commit):
         if not commit_optional:
             return False, f"archive commit not reachable from HEAD: {commit}"
-        log(f"  note: {cid} archive commit not reachable from HEAD: {commit}")
+        base.log(f"  note: {cid} archive commit not reachable from HEAD: {commit}")
     else:
         resolved_commit = resolve_commit(repo, commit)
         if not resolved_commit and not commit_optional:
             return False, f"archive commit could not be resolved: {commit}"
         latest_commit = find_archive_commit(repo, cid)
         if latest_commit and resolved_commit and latest_commit != resolved_commit:
-            log(
+            base.log(
                 f"  note: {cid} archive state recorded {resolved_commit[:12]} but "
                 f"newer archive(<change>) commit {latest_commit[:12]} is reachable"
             )
@@ -2846,15 +2300,15 @@ def invoke_direct_stage(
                 f"'{missing_var}'"
             )
             log_path = next_stage_log_path(repo, cid, stage, round_num)
-            log_path.write_text(f"# {utcnow()} {stage}: {message}\n", encoding="utf-8")
-            log(f"  exec[{stage}]: aborted - {message}")
+            log_path.write_text(f"# {base.utcnow()} {stage}: {message}\n", encoding="utf-8")
+            base.log(f"  exec[{stage}]: aborted - {message}")
             return "env_error", log_path
         expanded_tokens.append(value)
 
     cmd = expanded_tokens + [input_block]
     log_path = next_stage_log_path(repo, cid, stage, round_num)
     timeout_s = cfg["changes"][cid]["timeout_minutes"] * 60
-    log(
+    base.log(
         f"  exec[{stage}]: {' '.join(cmd[:-1])} <input> "
         f"(timeout {timeout_s / 60:g}m, log {log_path})"
     )
@@ -2880,7 +2334,7 @@ def run_logged_command(
         header_cmd = cmd[:-1] + ["<input>"]
     try:
         with open(log_path, "w", encoding="utf-8") as lf:
-            lf.write(f"# {utcnow()} {stage} attempt {attempt}: {' '.join(header_cmd)}\n")
+            lf.write(f"# {base.utcnow()} {stage} attempt {attempt}: {' '.join(header_cmd)}\n")
             # Write the worker input block as comment-prefixed metadata so
             # operators can inspect the exact dispatched fields (including
             # corrective handoffs) while the existing JSON/failure-marker
@@ -2937,11 +2391,11 @@ def apply_implement_result(
                 "reason": payload.get("reason", "implement blocked"),
             },
         )
-        set_status(state, cid, FAILED, payload.get("reason", "implement blocked"))
+        set_status(state, cid, base.FAILED, payload.get("reason", "implement blocked"))
         _try_notify(cfg, "change_failed", payload.get("summary", "change blocked"), change_id=cid)
         return "stop"
     if status != "implemented":
-        set_status(state, cid, FAILED, f"implement returned unexpected status={status}")
+        set_status(state, cid, base.FAILED, f"implement returned unexpected status={status}")
         r["last_result"] = "implement_invalid"
         _try_notify(cfg, "change_failed", f"implement returned unexpected status={status}", change_id=cid)
         return "stop"
@@ -2991,11 +2445,11 @@ def apply_implement_result(
     )
     if r["no_progress_streak"] >= cfg["no_progress_limit"]:
         r["last_result"] = "no_progress"
-        set_status(state, cid, FAILED, "no progress ceiling reached")
+        set_status(state, cid, base.FAILED, "no progress ceiling reached")
         _try_notify(cfg, "change_failed", "no progress ceiling reached", change_id=cid)
         return "stop"
     r["phase"] = "review"
-    set_status(state, cid, PENDING, payload.get("summary", "implementation complete"))
+    set_status(state, cid, base.PENDING, payload.get("summary", "implementation complete"))
     return "continue"
 
 
@@ -3076,7 +2530,7 @@ def apply_review_result(repo: Path, cfg: dict, state: dict, cid: str, payload: d
         set_status(
             state,
             cid,
-            FAILED,
+            base.FAILED,
             f"review returned unexpected status={payload.get('status')}",
         )
         r["last_result"] = "review_invalid"
@@ -3107,7 +2561,7 @@ def apply_review_result(repo: Path, cfg: dict, state: dict, cid: str, payload: d
         },
     )
     if verdict not in {"pass", "fail"}:
-        set_status(state, cid, FAILED, f"review returned unexpected verdict={verdict}")
+        set_status(state, cid, base.FAILED, f"review returned unexpected verdict={verdict}")
         r["last_result"] = "review_invalid"
         _try_notify(cfg, "change_failed", f"review returned unexpected verdict={verdict}", change_id=cid)
         return "stop"
@@ -3132,7 +2586,7 @@ def apply_review_result(repo: Path, cfg: dict, state: dict, cid: str, payload: d
         r["latest_fix_prompt"] = ""
         r["last_result"] = "review_passed"
         r["phase"] = "archive"
-        set_status(state, cid, PENDING, summary)
+        set_status(state, cid, base.PENDING, summary)
         return "continue"
     r["latest_fix_prompt"] = fix_prompt
     recurrence_limit = cfg.get("finding_recurrence_limit", 0)
@@ -3146,18 +2600,18 @@ def apply_review_result(repo: Path, cfg: dict, state: dict, cid: str, payload: d
                     f"blocking finding in rounds {rounds_desc}"
                 )
                 r["last_result"] = "finding_recurrence_exceeded"
-                set_status(state, cid, FAILED, reason)
+                set_status(state, cid, base.FAILED, reason)
                 _try_notify(cfg, "change_failed", reason, change_id=cid)
                 return "stop"
     if r["round"] >= r["max_rounds"]:
         r["last_result"] = "max_rounds_reached"
-        set_status(state, cid, FAILED, "review retry budget exhausted")
+        set_status(state, cid, base.FAILED, "review retry budget exhausted")
         _try_notify(cfg, "change_failed", "review retry budget exhausted", change_id=cid)
         return "stop"
     r["last_result"] = "review_failed"
     r["round"] += 1
     r["phase"] = "implement"
-    set_status(state, cid, PENDING, summary)
+    set_status(state, cid, base.PENDING, summary)
     return "continue"
 
 
@@ -3187,14 +2641,14 @@ def apply_archive_result(repo: Path, cfg: dict, state: dict, cid: str, payload: 
                 "reason": payload.get("reason", "archive blocked"),
             },
         )
-        set_status(state, cid, FAILED, payload.get("reason", "archive blocked"))
+        set_status(state, cid, base.FAILED, payload.get("reason", "archive blocked"))
         _try_notify(cfg, "change_failed", payload.get("summary", "archive blocked"), change_id=cid)
         return "stop"
     if payload.get("status") != "archived":
         set_status(
             state,
             cid,
-            FAILED,
+            base.FAILED,
             f"archive returned unexpected status={payload.get('status')}",
         )
         archive["status"] = "failed"
@@ -3229,7 +2683,7 @@ def apply_archive_result(repo: Path, cfg: dict, state: dict, cid: str, payload: 
     if not ok:
         archive["status"] = "failed"
         archive["reason"] = why
-        set_status(state, cid, FAILED, f"archive unverified: {why}")
+        set_status(state, cid, base.FAILED, f"archive unverified: {why}")
         _try_notify(cfg, "change_failed", f"archive unverified: {why}", change_id=cid)
         return "stop"
     checks_ok, check_why = run_fast_checks(repo, cfg)
@@ -3237,7 +2691,7 @@ def apply_archive_result(repo: Path, cfg: dict, state: dict, cid: str, payload: 
         archive["status"] = "failed"
         archive["reason"] = f"post-archive {check_why}"
         r["last_result"] = "post_archive_check_failed"
-        set_status(state, cid, FAILED, f"post-archive {check_why}")
+        set_status(state, cid, base.FAILED, f"post-archive {check_why}")
         _try_notify(cfg, "change_failed", f"post-archive {check_why}", change_id=cid)
         return "stop"
     clean_ok, clean_why = verify_post_archive_clean(repo, cfg)
@@ -3245,11 +2699,11 @@ def apply_archive_result(repo: Path, cfg: dict, state: dict, cid: str, payload: 
         archive["status"] = "failed"
         archive["reason"] = f"post-archive {clean_why}"
         r["last_result"] = "post_archive_dirty_tracked"
-        set_status(state, cid, FAILED, f"post-archive {clean_why}")
+        set_status(state, cid, base.FAILED, f"post-archive {clean_why}")
         _try_notify(cfg, "change_failed", f"post-archive {clean_why}", change_id=cid)
         return "stop"
     r["phase"] = "done"
-    set_status(state, cid, DONE, "verified + checks passed")
+    set_status(state, cid, base.DONE, "verified + checks passed")
     _try_notify(cfg, "change_done", f"change {cid} completed", change_id=cid)
     return "done"
 
@@ -3278,7 +2732,7 @@ def run_direct_change(
     r = rec(state, cid)
     while True:
         if budget_deadline and time.monotonic() > budget_deadline:
-            set_status(state, cid, PENDING, f"budget exhausted while waiting to run {r['phase']}")
+            set_status(state, cid, base.PENDING, f"budget exhausted while waiting to run {r['phase']}")
             persist_direct_state(repo, cfg, state, cid)
             return "budget"
         stage = r["phase"]
@@ -3286,9 +2740,9 @@ def run_direct_change(
         if stage == "done":
             ok, why = verify_direct_archive_done(repo, cid, r)
             if ok:
-                set_status(state, cid, DONE, "verified + checks passed")
+                set_status(state, cid, base.DONE, "verified + checks passed")
             else:
-                set_status(state, cid, FAILED, f"completed state no longer verifiable: {why}")
+                set_status(state, cid, base.FAILED, f"completed state no longer verifiable: {why}")
             persist_direct_state(repo, cfg, state, cid)
             return r["status"]
         # --- spend-budget pre-dispatch check ---
@@ -3304,8 +2758,8 @@ def run_direct_change(
                         f"{spend['unresolved_stages']} unresolved)"
                     )
                     r["last_result"] = "spend_budget_exhausted"
-                    set_status(state, cid, PENDING, reason)
-                    log(f"  {reason}")
+                    set_status(state, cid, base.PENDING, reason)
+                    base.log(f"  {reason}")
                     persist_direct_state(repo, cfg, state, cid)
                     return "budget"
         if stage not in {"implement", "review", "archive"}:
@@ -3313,11 +2767,11 @@ def run_direct_change(
             stage = "implement"
 
         input_block = build_worker_input(repo, cfg, state, cid, stage=stage)
-        set_status(state, cid, RUNNING, f"{stage} round {round_num}")
+        set_status(state, cid, base.RUNNING, f"{stage} round {round_num}")
         persist_direct_state(repo, cfg, state, cid)
 
         # 3.1 Capture started_at before invocation
-        started_at = utcnow()
+        started_at = base.utcnow()
         plan_name = cfg["name"]
         run_id = get_or_create_run_id(repo, cfg, state)
 
@@ -3345,7 +2799,7 @@ def run_direct_change(
                     envelope=envelope,
                 )
             except Exception as exc:
-                log(f"warning: failed to write telemetry for {cid}/{stage} r{round_num}: {exc}")
+                base.log(f"warning: failed to write telemetry for {cid}/{stage} r{round_num}: {exc}")
 
         # ---- escalation: swap OPSX_IMPLEMENTER_MODEL before each implement dispatch ----
         if stage == "implement":
@@ -3389,7 +2843,7 @@ def run_direct_change(
         record_stage_log(state, cid, stage, round_num, outcome, log_path)
 
         # 3.2 Capture ended_at, compute duration, determine telemetry status
-        ended_at = utcnow()
+        ended_at = base.utcnow()
         duration_ms = compute_duration_ms(started_at, ended_at)
         payload: dict | None = None
         parse_why = ""
@@ -3399,7 +2853,7 @@ def run_direct_change(
             reason = log_path.read_text(encoding="utf-8").splitlines()[0].split(": ", 1)[-1]
             _write_telemetry("spawn_error", reason)
             rec(state, cid)["last_result"] = f"{stage}_env_error"
-            set_status(state, cid, FAILED, reason)
+            set_status(state, cid, base.FAILED, reason)
             _try_notify(cfg, "change_failed", reason, change_id=cid)
             persist_direct_state(repo, cfg, state, cid)
             return "spawn_error"
@@ -3410,7 +2864,7 @@ def run_direct_change(
                 f"could not spawn {stage}: {cfg[f'{stage}_invoke']}",
             )
             rec(state, cid)["last_result"] = f"{stage}_spawn_error"
-            set_status(state, cid, FAILED, f"could not spawn {stage}: {cfg[f'{stage}_invoke']}")
+            set_status(state, cid, base.FAILED, f"could not spawn {stage}: {cfg[f'{stage}_invoke']}")
             _try_notify(cfg, "change_failed", f"could not spawn {stage}", change_id=cid)
             persist_direct_state(repo, cfg, state, cid)
             return "spawn_error"
@@ -3418,7 +2872,7 @@ def run_direct_change(
         if outcome == "timeout":
             _write_telemetry("timeout", f"{stage} timed out")
             rec(state, cid)["last_result"] = f"{stage}_timeout"
-            set_status(state, cid, FAILED, f"{stage} timed out")
+            set_status(state, cid, base.FAILED, f"{stage} timed out")
             _try_notify(cfg, "change_failed", f"{stage} timed out", change_id=cid)
             persist_direct_state(repo, cfg, state, cid)
             return "failed"
@@ -3430,7 +2884,7 @@ def run_direct_change(
             if stage == "archive":
                 rec(state, cid)["archive"]["status"] = "failed"
                 rec(state, cid)["archive"]["reason"] = parse_why
-            set_status(state, cid, FAILED, f"{stage} output invalid: {parse_why}")
+            set_status(state, cid, base.FAILED, f"{stage} output invalid: {parse_why}")
             _try_notify(cfg, "change_failed", f"{stage} output invalid", change_id=cid)
             persist_direct_state(repo, cfg, state, cid)
             return "failed"
@@ -3569,7 +3023,7 @@ def verify_change_done(repo: Path, cfg: dict, cid: str) -> tuple[bool, str]:
                 warnings.append("controller archive state not passed")
 
     if warnings:
-        log(f"  note: {cid} archived but {'; '.join(warnings)}")
+        base.log(f"  note: {cid} archived but {'; '.join(warnings)}")
 
     return True, ""
 
@@ -3577,7 +3031,7 @@ def verify_change_done(repo: Path, cfg: dict, cid: str) -> tuple[bool, str]:
 def run_fast_checks(repo: Path, cfg: dict) -> tuple[bool, str]:
     timeout = cfg["check_timeout_minutes"] * 60
     for cmd in cfg["fast_checks"]:
-        log(f"  check: {cmd}")
+        base.log(f"  check: {cmd}")
         try:
             res = subprocess.run(
                 shlex.split(cmd), cwd=repo, capture_output=True, text=True,
@@ -3804,7 +3258,7 @@ def ensure_delivery_branch(
 
     # --- First run: create delivery branch ---
     if no_branch:
-        log("--no-branch: skipping delivery branch creation for this run")
+        base.log("--no-branch: skipping delivery branch creation for this run")
         return True, None
 
     if not tracked_tree_clean(repo):
@@ -3818,13 +3272,13 @@ def ensure_delivery_branch(
     if err:
         return False, err
 
-    log(f"git delivery: creating branch '{branch_name}' from '{base_ref}'")
+    base.log(f"git delivery: creating branch '{branch_name}' from '{base_ref}'")
 
     if _git_branch_exists(repo, branch_name):
         # Branch exists but state doesn't record it — transition state
         # (branch may have been created manually or from a previous
         # interrupted run).  We treat this as the recorded branch.
-        log(f"  branch '{branch_name}' already exists; recording in state")
+        base.log(f"  branch '{branch_name}' already exists; recording in state")
     else:
         create_err = _git_create_and_checkout_branch(repo, branch_name, base_ref)
         if create_err:
@@ -3840,7 +3294,7 @@ def ensure_delivery_branch(
     gd_state["base_ref"] = base_ref
     gd_state["branch_name"] = branch_name
     gd_state["delivery_status"] = "branch_ready"
-    log(f"git delivery: branch '{branch_name}' ready (base: {base_ref})")
+    base.log(f"git delivery: branch '{branch_name}' ready (base: {base_ref})")
 
     return True, None
 
@@ -3905,7 +3359,7 @@ def push_delivery_branch(repo: Path, cfg: dict, state: dict) -> tuple[bool, str 
 
     remote_name = gd_state.get("remote_name", "origin")
 
-    log(f"git delivery: pushing branch '{branch_name}' to remote '{remote_name}'")
+    base.log(f"git delivery: pushing branch '{branch_name}' to remote '{remote_name}'")
 
     res = git(repo, "push", "--set-upstream", remote_name, branch_name)
     if res.returncode != 0:
@@ -3915,7 +3369,7 @@ def push_delivery_branch(repo: Path, cfg: dict, state: dict) -> tuple[bool, str 
             f"{res.stderr.strip() or 'unknown error'}"
         )
 
-    log(f"git delivery: pushed '{branch_name}' successfully")
+    base.log(f"git delivery: pushed '{branch_name}' successfully")
     return True, None
 
 
@@ -4051,7 +3505,7 @@ def create_github_pull_request(
 
     title = f"opsx-plan: {cfg['name']}"
 
-    log(f"git delivery: creating PR '{title}' from '{branch_name}' to '{base_ref}'")
+    base.log(f"git delivery: creating PR '{title}' from '{branch_name}' to '{base_ref}'")
 
     cmd = [
         "gh", "pr", "create",
@@ -4080,7 +3534,7 @@ def create_github_pull_request(
         ), None
 
     pr_url = res.stdout.strip()
-    log(f"git delivery: PR created: {pr_url}")
+    base.log(f"git delivery: PR created: {pr_url}")
     return True, None, pr_url
 
 
@@ -4103,7 +3557,7 @@ def attempt_pr_delivery(
     gd_state = state.get("git_delivery", {})
 
     if no_pr:
-        log("git delivery: --no-pr supplied; skipping PR delivery")
+        base.log("git delivery: --no-pr supplied; skipping PR delivery")
         return True, None
 
     if not git_delivery_cfg.get("create_pull_request", False):
@@ -4112,7 +3566,7 @@ def attempt_pr_delivery(
     # Idempotency: if PR already recorded, do not create a duplicate
     existing_url = gd_state.get("pull_request_url")
     if existing_url:
-        log(f"git delivery: PR already recorded ({existing_url}); skipping creation")
+        base.log(f"git delivery: PR already recorded ({existing_url}); skipping creation")
         return True, None
 
     # Push the delivery branch
@@ -4134,7 +3588,7 @@ def attempt_pr_delivery(
     # Record delivery outcome in plan state
     gd_state["pull_request_url"] = pr_url
     gd_state["delivery_status"] = "pr_opened"
-    log(f"git delivery: delivery complete, PR opened at {pr_url}")
+    base.log(f"git delivery: delivery complete, PR opened at {pr_url}")
 
     return True, None
 
@@ -4157,8 +3611,39 @@ def verify_post_archive_clean(repo: Path, cfg: dict) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 
+def _diff_orchestrator_package(repo_pkg: Path, installed_pkg: Path) -> str:
+    """Compare the installed lib.orchestrator tree against the repo copy.
+
+    Returns a non-empty reason string when a module differs, is missing, or
+    exists only in the installed copy; returns "" when they match.
+    """
+    import hashlib
+
+    if not installed_pkg.is_dir():
+        return "Installed lib.orchestrator runtime package is missing; rerun a global installer"
+
+    def hashes(root: Path) -> dict[str, bytes]:
+        return {
+            str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).digest()
+            for p in sorted(root.rglob("*.py"))
+        }
+
+    try:
+        repo_hashes = hashes(repo_pkg)
+        installed_hashes = hashes(installed_pkg)
+    except OSError:
+        return ""
+
+    if repo_hashes.keys() != installed_hashes.keys() or any(
+        repo_hashes[name] != installed_hashes[name] for name in repo_hashes
+    ):
+        return "Installed lib.orchestrator runtime package is stale; rerun a global installer"
+    return ""
+
+
 def _check_stale_install(repo: Path) -> tuple[bool, str, str]:
-    """Check that installed ~/.local/bin/opsx-plan matches repo copy by content hash."""
+    """Check that installed ~/.local/bin/opsx-plan and its lib.orchestrator
+    runtime package match the repo copy by content hash."""
     import hashlib
 
     label = "Installed orchestrator matches repo copy"
@@ -4175,6 +3660,13 @@ def _check_stale_install(repo: Path) -> tuple[bool, str, str]:
             return (False, label, "Installed copy is stale; rerun the installer")
     except OSError:
         return (True, label, "")
+
+    repo_pkg = repo / "lib" / "orchestrator"
+    if repo_pkg.is_dir():
+        installed_pkg = Path.home() / ".local" / "lib" / "opsx-controller" / "lib" / "orchestrator"
+        stale_reason = _diff_orchestrator_package(repo_pkg, installed_pkg)
+        if stale_reason:
+            return (False, label, stale_reason)
 
     return (True, label, "")
 
@@ -4274,9 +3766,9 @@ def _check_plan_loads(repo: Path, plan_src: str | None) -> tuple[bool, str, str]
     if plan_src is None:
         return (True, label, "")
     try:
-        load_plan(_resolve_plan_path(repo, plan_src), repo=repo)
+        planref.load_plan(planref._resolve_plan_path(repo, plan_src), repo=repo)
         return (True, label, "")
-    except PlanError as exc:
+    except base.PlanError as exc:
         return (False, label, f"Plan load failed: {exc}")
     except Exception as exc:
         return (False, label, f"Plan load error: {exc}")
@@ -4288,7 +3780,7 @@ def _check_pr_delivery(repo: Path, plan_src: str | None) -> tuple[bool, str, str
     if plan_src is None:
         return (True, label, "")
 
-    plan_path = _resolve_plan_path(repo, plan_src)
+    plan_path = planref._resolve_plan_path(repo, plan_src)
     try:
         with open(plan_path, "rb") as fh:
             raw = tomllib.load(fh)
@@ -4333,7 +3825,7 @@ def _check_direct_worker_agents(cfg: dict | None, repo: Path | None = None) -> t
     either a repo-local install (when *repo* is given) or the home-rooted
     one."""
     label = "Direct-dispatch worker agents installed"
-    if cfg is None or not is_direct_mode(cfg):
+    if cfg is None or not planref.is_direct_mode(cfg):
         return (True, label, "")
 
     adapter = cfg["adapter"]
@@ -4410,7 +3902,7 @@ def run_preflight_warnings(repo: Path, plan_src: str | None,
     for passed, label, remediation in checks:
         if not passed:
             detail = f"{label}: {remediation}" if remediation else label
-            log(f"  \u26a0 {detail}")
+            base.log(f"  \u26a0 {detail}")
 
 
 # ---------------------------------------------------------------------------
@@ -4462,7 +3954,7 @@ def run_stage(
                           controller_model=os.environ.get("OPSX_CONTROLLER_MODEL", ""))
     )
     timeout_s = timeout_minutes * 60
-    log(f"  exec[{stage}]: {' '.join(cmd)}  "
+    base.log(f"  exec[{stage}]: {' '.join(cmd)}  "
         f"(timeout {timeout_s/60:g}m, log {log_path})")
     return run_logged_command(repo, cmd, log_path, timeout_s, stage, attempt)
 
@@ -4493,7 +3985,7 @@ def terminate_group(proc: subprocess.Popen, grace: float = 15.0) -> None:
 
 
 def handle_sigint(signum, frame):  # noqa: ARG001
-    log("interrupted; terminating active stage process group")
+    base.log("interrupted; terminating active stage process group")
     if _current_proc is not None:
         terminate_group(_current_proc)
     sys.exit(130)
@@ -4508,15 +4000,15 @@ def classify(cfg: dict, state: dict, cid: str) -> str:
     c = cfg["changes"][cid]
     r = rec(state, cid)
     if not c["enabled"]:
-        return SKIPPED
-    if r["status"] in (DONE, FAILED, RUNNING):
+        return base.SKIPPED
+    if r["status"] in (base.DONE, base.FAILED, base.RUNNING):
         return r["status"]
     for dep in c["depends_on"]:
         dep_status = classify(cfg, state, dep)
-        if dep_status in (FAILED, "blocked"):
+        if dep_status in (base.FAILED, "blocked"):
             return "blocked"
-        if dep_status != DONE:
-            return PENDING
+        if dep_status != base.DONE:
+            return base.PENDING
     if c["pause_before"] and cid not in state["approvals"]:
         return "awaiting_approval"
     if (
@@ -4535,27 +4027,27 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
         archived_on_disk = (
             not change_dir(repo, cid).exists() and find_archive_dir(repo, cid) is not None
         )
-        if is_direct_mode(cfg):
+        if planref.is_direct_mode(cfg):
             r["max_rounds"] = cfg["max_rounds"]
-        if r["status"] == RUNNING:  # stale from a killed run
-            set_status(state, cid, PENDING, "recovered from interrupted run")
+        if r["status"] == base.RUNNING:  # stale from a killed run
+            set_status(state, cid, base.PENDING, "recovered from interrupted run")
         # A change that failed only because no create_invoke was configured
         # (so create never ran: create_attempts == 0) should re-queue once the
         # operator supplies one — otherwise the stale reason keeps reporting
         # "no create_invoke configured" even after the plan is fixed, and the
         # operator has to guess that a manual `reset` is required.
         if (
-            r["status"] == FAILED
+            r["status"] == base.FAILED
             and r.get("create_attempts", 0) == 0
             and not change_authored(repo, cid)
             and not archived_on_disk
             and cfg["changes"][cid]["create_invoke"]
         ):
-            set_status(state, cid, PENDING, "create_invoke now configured; will retry")
-            log(f"reconcile: {cid} create config now present; re-queued")
+            set_status(state, cid, base.PENDING, "create_invoke now configured; will retry")
+            base.log(f"reconcile: {cid} create config now present; re-queued")
             continue
-        if r["status"] != DONE:
-            if is_direct_mode(cfg):
+        if r["status"] != base.DONE:
+            if planref.is_direct_mode(cfg):
                 if archived_on_disk and record_archive_evidence(repo, r, cid):
                     ok, why = verify_direct_archive_done(repo, cid, r)
                     if ok:
@@ -4563,10 +4055,10 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
                         set_status(
                             state,
                             cid,
-                            DONE,
+                            base.DONE,
                             "verified from repository archive evidence",
                         )
-                        log(f"reconcile: {cid} already archived; marked done")
+                        base.log(f"reconcile: {cid} already archived; marked done")
                         continue
                     r["archive"]["status"] = "failed"
                     r["archive"]["reason"] = why
@@ -4577,39 +4069,39 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
                         set_status(
                             state,
                             cid,
-                            DONE,
+                            base.DONE,
                             "verified from plan state + repository evidence",
                         )
-                        log(f"reconcile: {cid} already archived; marked done")
+                        base.log(f"reconcile: {cid} already archived; marked done")
                         continue
                     if archived_on_disk:
                         set_status(
                             state,
                             cid,
-                            FAILED,
+                            base.FAILED,
                             f"recorded archive success but evidence is inconsistent: {why}",
                         )
-                        log(f"reconcile: {cid} archive evidence inconsistent: {why}")
+                        base.log(f"reconcile: {cid} archive evidence inconsistent: {why}")
                         continue
                 elif archived_on_disk:
                     set_status(
                         state,
                         cid,
-                        FAILED,
+                        base.FAILED,
                         "repository archived change but plan state lacks archive worker evidence",
                     )
-                    log(
+                    base.log(
                         f"reconcile: {cid} archived on disk without plan-owned archive evidence"
                     )
                     continue
             else:
                 ok, _ = verify_change_done(repo, cfg, cid)
                 if ok:
-                    set_status(state, cid, DONE, "verified from repository evidence")
-                    log(f"reconcile: {cid} already archived; marked done")
+                    set_status(state, cid, base.DONE, "verified from repository evidence")
+                    base.log(f"reconcile: {cid} already archived; marked done")
                     continue
             if (
-                r["status"] == PENDING
+                r["status"] == base.PENDING
                 and r.get("create_attempts", 0) > 0
                 and change_authored(repo, cid)
                 and not r.get("created_by_orchestrator")
@@ -4617,24 +4109,24 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
                 created_ok, created_why = verify_change_created(repo, cfg, cid)
                 if created_ok:
                     r["created_by_orchestrator"] = True
-                    set_status(state, cid, PENDING, "created and verified")
-                    log(f"reconcile: {cid} already created; marked for acceptance")
+                    set_status(state, cid, base.PENDING, "created and verified")
+                    base.log(f"reconcile: {cid} already created; marked for acceptance")
                 else:
                     set_status(
-                        state, cid, PENDING,
+                        state, cid, base.PENDING,
                         f"create verification pending: {created_why}",
                     )
         else:
-            if is_direct_mode(cfg):
+            if planref.is_direct_mode(cfg):
                 ok, why = verify_direct_archive_done(repo, cid, r)
             else:
                 ok, why = verify_change_done(repo, cfg, cid)
             if not ok:
                 set_status(
-                    state, cid, FAILED,
+                    state, cid, base.FAILED,
                     f"recorded done but evidence missing: {why}",
                 )
-                log(f"reconcile: {cid} done-state no longer verifiable: {why}")
+                base.log(f"reconcile: {cid} done-state no longer verifiable: {why}")
 
 
 # ---------------------------------------------------------------------------
@@ -4649,9 +4141,9 @@ def resolve_compile_source(repo: Path, source: str) -> Path:
     """
     p = (repo / source).resolve()
     if not p.is_file():
-        raise PlanError(f"source not found: {p}")
+        raise base.PlanError(f"source not found: {p}")
     if p.suffix.lower() != ".md":
-        raise PlanError(f"source must be a markdown file (.md): {p}")
+        raise base.PlanError(f"source must be a markdown file (.md): {p}")
     return p
 
 
@@ -4663,7 +4155,7 @@ def resolve_compile_output(repo: Path, output: str, force: bool) -> Path:
     """
     p = (repo / output).resolve()
     if p.exists() and not force:
-        raise PlanError(
+        raise base.PlanError(
             f"output exists: {p}  (use --force to overwrite)"
         )
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -4680,10 +4172,10 @@ def check_controller_model(repo: Path | None = None, adapter: str = "opencode") 
     try:
         resolved = resolve_models(adapter, repo=repo)
     except ModelConfigError as exc:
-        raise PlanError(str(exc)) from exc
+        raise base.PlanError(str(exc)) from exc
     model = resolved["controller"].model
     if not model:
-        raise PlanError(
+        raise base.PlanError(
             f"controller model is not configured for the {adapter} adapter; "
             f"compile requires a controller model to invoke the selected client "
             f"(run `opsx-plan models show --adapter {adapter}` to inspect, "
@@ -4696,7 +4188,7 @@ def check_controller_model(repo: Path | None = None, adapter: str = "opencode") 
     warnings = validate_models(adapter, resolved)
     controller_warnings = [w for w in warnings if w.startswith("controller:")]
     if controller_warnings:
-        raise PlanError(
+        raise base.PlanError(
             f"controller model '{model}' is not valid for the {adapter} adapter: "
             f"{controller_warnings[0]}\n"
             f"Run `opsx-plan models show --adapter {adapter}` to inspect "
@@ -4777,7 +4269,7 @@ def build_schema_guidance(adapter: str = "opencode") -> str:
     selected adapter's own defaults, not a generic template.
     """
     default_adapter = adapter
-    defaults = ADAPTER_DEFAULTS[default_adapter]
+    defaults = base.ADAPTER_DEFAULTS[default_adapter]
     invoke = defaults.get("invoke", "")
     state_file = defaults.get("state_file", "")
     impl_invoke = defaults.get("implement_invoke", "")
@@ -4966,10 +4458,10 @@ def _build_compile_argv(adapter: str, model: str, prompt: str,
     """
     entry = COMPILE_CLIENTS.get(adapter)
     if entry is None:
-        raise PlanError(f"unknown adapter '{adapter}'; "
+        raise base.PlanError(f"unknown adapter '{adapter}'; "
                         f"known adapters: {', '.join(sorted(COMPILE_CLIENTS))}")
     if not entry.get("supported", False):
-        raise PlanError(
+        raise base.PlanError(
             f"compilation through the {adapter} adapter is not supported "
             f"in this release; select a supported adapter "
             f"({'opencode'} or {'claude-code'})"
@@ -5025,20 +4517,20 @@ def run_compile_client(repo: Path, adapter: str, model: str,
             timeout=600,  # 10 minute timeout for model invocation
         )
     except FileNotFoundError:
-        raise PlanError(
+        raise base.PlanError(
             f"could not spawn {executable}; is it installed and on PATH?"
         )
     except OSError as exc:
-        raise PlanError(f"could not spawn {executable}: {exc}") from exc
+        raise base.PlanError(f"could not spawn {executable}: {exc}") from exc
     except subprocess.TimeoutExpired:
-        raise PlanError(
+        raise base.PlanError(
             f"{executable} compile invocation timed out after 600s"
         )
     finally:
         if prompt_file is not None:
             prompt_file.unlink(missing_ok=True)
     if proc.returncode != 0:
-        raise PlanError(
+        raise base.PlanError(
             f"{executable} exited with code {proc.returncode}\n"
             f"stderr: {proc.stderr[:500]}"
         )
@@ -5089,11 +4581,11 @@ def extract_toml(output: str, adapter: str = "opencode") -> str:
     stripped = output.strip()
     if not stripped:
         client = COMPILE_CLIENTS.get(adapter, {}).get("executable", adapter)
-        raise PlanError(f"{client} returned empty output; no TOML to compile")
+        raise base.PlanError(f"{client} returned empty output; no TOML to compile")
 
     fenced_matches = list(re.finditer(r"```(?:toml)?\s*\n(.*?)```", stripped, re.DOTALL))
     if len(fenced_matches) > 1:
-        raise PlanError(
+        raise base.PlanError(
             "ambiguous model output: multiple fenced TOML blocks found; "
             "expected a single clean TOML payload"
         )
@@ -5102,7 +4594,7 @@ def extract_toml(output: str, adapter: str = "opencode") -> str:
         before = stripped[:match.start()].strip()
         after = stripped[match.end():].strip()
         if before or after:
-            raise PlanError(
+            raise base.PlanError(
                 "ambiguous model output: extra content found around "
                 "the fenced TOML payload; expected only the TOML block"
             )
@@ -5112,7 +4604,7 @@ def extract_toml(output: str, adapter: str = "opencode") -> str:
         return stripped
 
     client = COMPILE_CLIENTS.get(adapter, {}).get("executable", adapter)
-    raise PlanError(
+    raise base.PlanError(
         f"could not extract TOML from {client} output; "
         "output does not contain a fenced toml block or bare TOML"
     )
@@ -5322,8 +4814,8 @@ def cmd_use(args: argparse.Namespace) -> int:
         return 2
     # Validate through the existing plan loader before writing the pointer
     try:
-        load_plan(plan_path, repo=repo)
-    except (PlanError, Exception) as exc:
+        planref.load_plan(plan_path, repo=repo)
+    except (base.PlanError, Exception) as exc:
         # tomllib.TOMLDecodeError and PlanError both indicate invalid plan
         print(f"error: invalid plan: {exc}", file=sys.stderr)
         return 2
@@ -5333,16 +4825,16 @@ def cmd_use(args: argparse.Namespace) -> int:
         print(f"error: plan must be inside the repository: {plan_path}", file=sys.stderr)
         return 2
     write_active_plan(repo, rel)
-    log(f"active plan set to: {rel}")
+    base.log(f"active plan set to: {rel}")
     print(f"Activated: {rel}")
     return 0
 
 
 def cmd_run(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
-    plan_src = resolve_plan(repo, args.plan)
-    plan_abs = _resolve_plan_path(repo, plan_src)
-    cfg = load_plan(plan_abs, repo=repo)
+    plan_src = planref.resolve_plan(repo, args.plan)
+    plan_abs = planref._resolve_plan_path(repo, plan_src)
+    cfg = planref.load_plan(plan_abs, repo=repo)
     # The flags are additive overrides: passing one turns the skip on for this
     # run, but omitting one must not clobber a manifest that already set it.
     cfg["skip_warning"] = bool(cfg.get("skip_warning", False)) or getattr(
@@ -5353,7 +4845,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
     try:
         apply_model_env(cfg)
-    except PlanError as exc:
+    except base.PlanError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     # Auto-activate when an explicit path was supplied (only after load_plan
@@ -5362,7 +4854,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         try:
             rel = str(plan_abs.relative_to(repo))
             write_active_plan(repo, rel)
-            log(f"active plan set to: {rel}")
+            base.log(f"active plan set to: {rel}")
         except ValueError:
             pass  # plan outside repo — skip auto-activation
     state = load_state(repo, cfg["name"])
@@ -5424,10 +4916,10 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     while True:
         if budget_deadline and time.monotonic() > budget_deadline:
-            log("wall-clock budget exhausted; stopping")
+            base.log("wall-clock budget exhausted; stopping")
             break
         if args.max_changes and ran >= args.max_changes:
-            log("max-changes reached; stopping")
+            base.log("max-changes reached; stopping")
             break
 
         create_only_ok = {"ready", "awaiting_approval"} if args.create_only else {"ready"}
@@ -5459,15 +4951,15 @@ def cmd_run(args: argparse.Namespace) -> int:
         needs_create = not change_authored(repo, cid)
 
         if cfg["require_clean_tracked"] and not tracked_tree_clean(repo):
-            log("tracked worktree is dirty; refusing to start a new stage")
-            log("commit/stash tracked modifications, then re-run")
+            base.log("tracked worktree is dirty; refusing to start a new stage")
+            base.log("commit/stash tracked modifications, then re-run")
             return 2
 
         # ----- create stage: automate the repetitive /opsx-ff invocation -----
         if needs_create:
             if not change_cfg["create_invoke"]:
                 set_status(
-                    state, cid, FAILED,
+                    state, cid, base.FAILED,
                     "change not created and no create_invoke configured",
                 )
                 save_state(repo, cfg["name"], state)
@@ -5479,11 +4971,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             if change_dir(repo, cid).is_dir():
                 if scaffold_is_clearable(repo, cid):
                     shutil.rmtree(change_dir(repo, cid))
-                    log(f"  removed incomplete scaffold openspec/changes/{cid}/ "
+                    base.log(f"  removed incomplete scaffold openspec/changes/{cid}/ "
                         f"before re-create")
                 else:
                     set_status(
-                        state, cid, FAILED,
+                        state, cid, base.FAILED,
                         f"openspec/changes/{cid} exists but is incomplete "
                         f"(missing {', '.join(AUTHORED_ARTIFACTS)}) and holds "
                         f"authored or tracked content; finish or remove it, "
@@ -5493,14 +4985,14 @@ def cmd_run(args: argparse.Namespace) -> int:
                     continue
             c_attempt = r["create_attempts"] + 1
             if c_attempt > change_cfg["create_max_attempts"]:
-                set_status(state, cid, FAILED, "create retry budget exhausted")
+                set_status(state, cid, base.FAILED, "create retry budget exhausted")
                 save_state(repo, cfg["name"], state)
                 continue
 
-            log(f"=== {cid} create "
+            base.log(f"=== {cid} create "
                 f"(attempt {c_attempt}/{change_cfg['create_max_attempts']}) ===")
             r["create_attempts"] = c_attempt
-            set_status(state, cid, RUNNING, "creating change")
+            set_status(state, cid, base.RUNNING, "creating change")
             save_state(repo, cfg["name"], state)
             before_tracked = tracked_worktree_snapshot(repo)
 
@@ -5511,7 +5003,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             r["last_log"] = str(log_path)
 
             if outcome == "spawn_error":
-                set_status(state, cid, FAILED,
+                set_status(state, cid, base.FAILED,
                            f"could not spawn create: {change_cfg['create_invoke']}")
                 save_state(repo, cfg["name"], state)
                 return 2
@@ -5519,10 +5011,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             ok, why = verify_change_created(repo, cfg, cid, before_tracked)
             if ok:
                 r["created_by_orchestrator"] = True
-                set_status(state, cid, PENDING, "created and verified")
-                log(f"  created: {cid}")
+                set_status(state, cid, base.PENDING, "created and verified")
+                base.log(f"  created: {cid}")
                 if cfg["review_created"]:
-                    log(f"  awaiting acceptance — review openspec/changes/{cid}/ "
+                    base.log(f"  awaiting acceptance — review openspec/changes/{cid}/ "
                         f"then run: opsx-plan accept <plan> {cid}")
                     change_notified = notified.setdefault(cid, [])
                     if "awaiting_acceptance" not in change_notified:
@@ -5532,11 +5024,11 @@ def cmd_run(args: argparse.Namespace) -> int:
                 if outcome == "timeout":
                     why = f"create timed out; {why}"
                 if c_attempt < change_cfg["create_max_attempts"]:
-                    set_status(state, cid, PENDING, f"create will retry: {why}")
-                    log(f"  create not verified ({why}); retrying")
+                    set_status(state, cid, base.PENDING, f"create will retry: {why}")
+                    base.log(f"  create not verified ({why}); retrying")
                 else:
-                    set_status(state, cid, FAILED, f"create failed: {why}")
-                    log(f"  CREATE FAILED: {why}")
+                    set_status(state, cid, base.FAILED, f"create failed: {why}")
+                    base.log(f"  CREATE FAILED: {why}")
             save_state(repo, cfg["name"], state)
             # re-classify: acceptance gate may now hold this change
             continue
@@ -5545,11 +5037,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             visited.add(cid)  # exists already; nothing to create, don't drive
             continue
 
-        if is_direct_mode(cfg):
-            log(f"=== {cid} direct {cfg['adapter']} execution (round {r['round']}) ===")
+        if planref.is_direct_mode(cfg):
+            base.log(f"=== {cid} direct {cfg['adapter']} execution (round {r['round']}) ===")
             result = run_direct_change(repo, cfg, state, cid, budget_deadline, budget_usd)
-            if result == DONE:
-                log(f"  done: {cid}")
+            if result == base.DONE:
+                base.log(f"  done: {cid}")
                 ran += 1
             elif result == "spawn_error":
                 return 2
@@ -5559,20 +5051,20 @@ def cmd_run(args: argparse.Namespace) -> int:
         # ----- drive stage -----
         attempt = r["attempts"] + 1
         if attempt > change_cfg["max_attempts"]:
-            set_status(state, cid, FAILED, "retry budget exhausted")
+            set_status(state, cid, base.FAILED, "retry budget exhausted")
             save_state(repo, cfg["name"], state)
             continue
 
-        log(f"=== {cid} (attempt {attempt}/{change_cfg['max_attempts']}) ===")
+        base.log(f"=== {cid} (attempt {attempt}/{change_cfg['max_attempts']}) ===")
         r["attempts"] = attempt
-        set_status(state, cid, RUNNING)
+        set_status(state, cid, base.RUNNING)
         save_state(repo, cfg["name"], state)
 
         outcome, log_path = drive_change(repo, cfg, cid, attempt)
         rec(state, cid)["last_log"] = str(log_path)
 
         if outcome == "spawn_error":
-            set_status(state, cid, FAILED, f"could not spawn: {cfg['invoke']}")
+            set_status(state, cid, base.FAILED, f"could not spawn: {cfg['invoke']}")
             save_state(repo, cfg["name"], state)
             return 2
 
@@ -5580,14 +5072,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         if ok:
             checks_ok, check_why = run_fast_checks(repo, cfg)
             if checks_ok:
-                set_status(state, cid, DONE, "verified + checks passed")
-                log(f"  done: {cid}")
+                set_status(state, cid, base.DONE, "verified + checks passed")
+                base.log(f"  done: {cid}")
                 ran += 1
             else:
                 # The change is archived but the repo fails checks. Re-driving
                 # cannot fix this; an operator must intervene.
-                set_status(state, cid, FAILED, f"post-archive {check_why}")
-                log(f"  FAILED post-archive checks: {check_why}")
+                set_status(state, cid, base.FAILED, f"post-archive {check_why}")
+                base.log(f"  FAILED post-archive checks: {check_why}")
         else:
             cs = read_controller_state(repo, cfg, cid)
             can_retry, retry_why = retry_makes_sense(cs)
@@ -5595,11 +5087,11 @@ def cmd_run(args: argparse.Namespace) -> int:
                 why = f"drive timed out; {why}"
             detail = f"{why} :: {retry_why}"
             if can_retry and attempt < change_cfg["max_attempts"]:
-                set_status(state, cid, PENDING, f"will retry: {detail}")
-                log(f"  not done yet ({detail}); retrying")
+                set_status(state, cid, base.PENDING, f"will retry: {detail}")
+                base.log(f"  not done yet ({detail}); retrying")
             else:
-                set_status(state, cid, FAILED, detail)
-                log(f"  FAILED: {detail}")
+                set_status(state, cid, base.FAILED, detail)
+                base.log(f"  FAILED: {detail}")
 
         save_state(repo, cfg["name"], state)
 
@@ -5607,7 +5099,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not args.dry_run:
         no_pr = getattr(args, "no_pr", False)
         all_done = all(
-            classify(cfg, state, cid) == DONE
+            classify(cfg, state, cid) == base.DONE
             for cid in cfg["order"]
             if cfg["changes"][cid]["enabled"]
         )
@@ -5641,14 +5133,14 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
-    plan_src = resolve_plan(repo, args.plan)
-    cfg = load_plan(_resolve_plan_path(repo, plan_src), repo=repo)
+    plan_src = planref.resolve_plan(repo, args.plan)
+    cfg = planref.load_plan(planref._resolve_plan_path(repo, plan_src), repo=repo)
     state = load_state(repo, cfg["name"])
     reconcile(repo, cfg, state)
     save_state(repo, cfg["name"], state)
     sync_direct_worker_state(repo, cfg, state)
     header = f"plan: {cfg['name']}"
-    active = read_active_plan(repo)
+    active = planref.read_active_plan(repo)
     if active:
         header += f"  (active: {active})"
     # Determine the effective plan source for the [inspected:] note.
@@ -5692,11 +5184,11 @@ def cmd_status_inner(cfg: dict, state: dict, header: str,
     for cid in display_order(cfg):
         status = classify(cfg, state, cid)
         r = rec(state, cid)
-        extra = f"  ({r['reason']})" if r.get("reason") and status != DONE else ""
+        extra = f"  ({r['reason']})" if r.get("reason") and status != base.DONE else ""
         phase = cfg["changes"][cid].get("phase")
         phase_s = f"P{phase} " if phase is not None else ""
         print(f"  {phase_s}{cid.ljust(width)}  {status}{extra}")
-        if status in (FAILED, "blocked"):
+        if status in (base.FAILED, "blocked"):
             failed += 1
         # Next-command guidance for blocked changes
         if status == "awaiting_approval":
@@ -5709,7 +5201,7 @@ def cmd_status_inner(cfg: dict, state: dict, header: str,
                 print(f"    \u2192 opsx-plan accept {plan_arg} {cid}")
             else:
                 print(f"    \u2192 opsx-plan accept {cid}")
-        elif status == FAILED:
+        elif status == base.FAILED:
             if plan_arg:
                 print(f"    \u2192 opsx-plan reset {plan_arg} {cid}")
             else:
@@ -5747,8 +5239,8 @@ def cmd_approve(args: argparse.Namespace) -> int:
         args.change.insert(0, args.plan)
         args.plan = None
 
-    plan_path = resolve_plan(repo, args.plan)
-    cfg = load_plan(_resolve_plan_path(repo, plan_path), repo=repo)
+    plan_path = planref.resolve_plan(repo, args.plan)
+    cfg = planref.load_plan(planref._resolve_plan_path(repo, plan_path), repo=repo)
     state = load_state(repo, cfg["name"])
 
     if args.approve_all:
@@ -5762,7 +5254,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
         for cid in affected:
             if cid not in state["approvals"]:
                 state["approvals"].append(cid)
-                log(f"approved: {cid}")
+                base.log(f"approved: {cid}")
         print(f"Approved: {', '.join(affected)}")
         save_state(repo, cfg["name"], state)
         return 0
@@ -5776,7 +5268,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
     for cid in changes:
         if cid not in state["approvals"]:
             state["approvals"].append(cid)
-            log(f"approved: {cid}")
+            base.log(f"approved: {cid}")
     save_state(repo, cfg["name"], state)
     return 0
 
@@ -5792,8 +5284,8 @@ def cmd_accept(args: argparse.Namespace) -> int:
         args.change.insert(0, args.plan)
         args.plan = None
 
-    plan_path = resolve_plan(repo, args.plan)
-    cfg = load_plan(_resolve_plan_path(repo, plan_path), repo=repo)
+    plan_path = planref.resolve_plan(repo, args.plan)
+    cfg = planref.load_plan(planref._resolve_plan_path(repo, plan_path), repo=repo)
     state = load_state(repo, cfg["name"])
 
     if args.accept_all:
@@ -5813,7 +5305,7 @@ def cmd_accept(args: argparse.Namespace) -> int:
                 had_failure = True
                 continue
             rec(state, cid)["accepted"] = True
-            log(f"accepted: {cid}")
+            base.log(f"accepted: {cid}")
             accepted.append(cid)
         if accepted:
             print(f"Accepted: {', '.join(accepted)}")
@@ -5835,7 +5327,7 @@ def cmd_accept(args: argparse.Namespace) -> int:
             had_failure = True
             continue
         rec(state, cid)["accepted"] = True
-        log(f"accepted: {cid}")
+        base.log(f"accepted: {cid}")
         changed = True
     if changed:
         save_state(repo, cfg["name"], state)
@@ -5852,14 +5344,14 @@ def cmd_reset(args: argparse.Namespace) -> int:
         args.change.insert(0, args.plan)
         args.plan = None
 
-    plan_path = resolve_plan(repo, args.plan)
-    cfg = load_plan(_resolve_plan_path(repo, plan_path), repo=repo)
+    plan_path = planref.resolve_plan(repo, args.plan)
+    cfg = planref.load_plan(planref._resolve_plan_path(repo, plan_path), repo=repo)
     state = load_state(repo, cfg["name"])
 
     if args.failed:
         affected = [
             cid for cid in cfg["order"]
-            if classify(cfg, state, cid) == FAILED
+            if classify(cfg, state, cid) == base.FAILED
         ]
         if not affected:
             print("No failed changes to reset.")
@@ -5868,8 +5360,8 @@ def cmd_reset(args: argparse.Namespace) -> int:
             state["changes"][cid] = new_change_record()
             state["changes"][cid]["max_rounds"] = cfg["max_rounds"]
             state["changes"][cid]["reason"] = "reset by operator"
-            state["changes"][cid]["updated_at"] = utcnow()
-            log(f"reset: {cid}")
+            state["changes"][cid]["updated_at"] = base.utcnow()
+            base.log(f"reset: {cid}")
         print(f"Reset: {', '.join(affected)}")
         save_state(repo, cfg["name"], state)
         return 0
@@ -5884,8 +5376,8 @@ def cmd_reset(args: argparse.Namespace) -> int:
         state["changes"][cid] = new_change_record()
         state["changes"][cid]["max_rounds"] = cfg["max_rounds"]
         state["changes"][cid]["reason"] = "reset by operator"
-        state["changes"][cid]["updated_at"] = utcnow()
-        log(f"reset: {cid}")
+        state["changes"][cid]["updated_at"] = base.utcnow()
+        base.log(f"reset: {cid}")
     save_state(repo, cfg["name"], state)
     return 0
 
@@ -5937,18 +5429,18 @@ def cmd_run_one(args: argparse.Namespace) -> int:
     sync_direct_worker_state(repo, cfg, state)
 
     r = rec(state, change_id)
-    if r["status"] == DONE:
-        log(f"{change_id} is already done")
+    if r["status"] == base.DONE:
+        base.log(f"{change_id} is already done")
         return 0
 
-    log(f"=== {change_id} direct {cfg['adapter']} execution (round {r['round']}) ===")
+    base.log(f"=== {change_id} direct {cfg['adapter']} execution (round {r['round']}) ===")
     budget_usd = (
         float(args.budget_usd) if getattr(args, "budget_usd", 0) and float(args.budget_usd) > 0 else 0.0
     )
     result = run_direct_change(repo, cfg, state, change_id, budget_usd=budget_usd)
 
-    if result == DONE:
-        log(f"  done: {change_id}")
+    if result == base.DONE:
+        base.log(f"  done: {change_id}")
     elif result == "spawn_error":
         failed_stage = r.get("phase")
         failed_invoke = (
@@ -5963,7 +5455,7 @@ def cmd_run_one(args: argparse.Namespace) -> int:
         )
         return 2
 
-    manifest_rel = single_change_manifest_path(repo, change_id).relative_to(repo)
+    manifest_rel = planref.single_change_manifest_path(repo, change_id).relative_to(repo)
     print(f"  Report:  opsx-plan report {manifest_rel}")
     print(f"           opsx-plan report --for-change {change_id}")
     print(f"  Dashboard: opsx-plan dashboard {manifest_rel}")
@@ -5973,7 +5465,7 @@ def cmd_run_one(args: argparse.Namespace) -> int:
     if r.get("reason"):
         display += f" ({r['reason']})"
     print(f"  {change_id}  {display}")
-    return 0 if result == DONE else 1
+    return 0 if result == base.DONE else 1
 
 
 def cmd_compile(args: argparse.Namespace) -> int:
@@ -6002,7 +5494,7 @@ def cmd_compile(args: argparse.Namespace) -> int:
         output_rel = f"openspec/plans/{source_path.stem}.toml"
         output_path = (repo / output_rel).resolve()
         if output_path.exists() and not args.force:
-            raise PlanError(
+            raise base.PlanError(
                 f"output exists: {output_path}  (use --force to overwrite)"
             )
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -6011,48 +5503,48 @@ def cmd_compile(args: argparse.Namespace) -> int:
     model = check_controller_model(repo, adapter=adapter)
 
     client_name = entry["executable"]
-    log(f"compile: {source_path} -> {output_path}  "
+    base.log(f"compile: {source_path} -> {output_path}  "
         f"(adapter: {adapter}, client: {client_name}, model: {model})")
 
     source_content = source_path.read_text(encoding="utf-8")
     prompt = build_compile_prompt(source_content, source_path, repo, adapter=adapter)
-    log(f"  prompt size: {len(prompt)} chars")
+    base.log(f"  prompt size: {len(prompt)} chars")
 
-    log(f"  invoking {client_name} ...")
+    base.log(f"  invoking {client_name} ...")
     stdout, stderr = run_compile_client(repo, adapter, model, prompt)
     if stderr.strip():
-        log(f"  {client_name} stderr: {stderr.strip()[:500]}")
+        base.log(f"  {client_name} stderr: {stderr.strip()[:500]}")
 
     toml_text = extract_toml(stdout, adapter=adapter)
     if not toml_text:
-        raise PlanError("extracted TOML payload is empty")
+        raise base.PlanError("extracted TOML payload is empty")
 
     # Validate through existing load_plan() path
     try:
         parsed = tomllib.loads(toml_text)
     except Exception as exc:
-        raise PlanError(f"generated TOML is not valid TOML: {exc}")
+        raise base.PlanError(f"generated TOML is not valid TOML: {exc}")
 
     if not isinstance(parsed, dict):
-        raise PlanError("generated manifest must be a TOML table")
+        raise base.PlanError("generated manifest must be a TOML table")
 
     plan_table = parsed.get("plan", {})
     if not isinstance(plan_table, dict):
-        raise PlanError("generated manifest [plan] must be a TOML table")
+        raise base.PlanError("generated manifest [plan] must be a TOML table")
 
     changes = parsed.get("changes", [])
     if not isinstance(changes, list):
-        raise PlanError("generated manifest [[changes]] must be an array of TOML tables")
+        raise base.PlanError("generated manifest [[changes]] must be an array of TOML tables")
     for index, change in enumerate(changes, 1):
         if not isinstance(change, dict):
-            raise PlanError(
+            raise base.PlanError(
                 f"generated manifest [[changes]] entry {index} must be a TOML table"
             )
 
     # Require the generated adapter field to match the selected adapter.
     generated_adapter = plan_table.get("adapter", "")
     if generated_adapter != adapter:
-        raise PlanError(
+        raise base.PlanError(
             f"generated manifest adapter is '{generated_adapter}' but "
             f"compilation selected '{adapter}'; "
             f"the {client_name} output must use adapter = \"{adapter}\""
@@ -6062,20 +5554,20 @@ def cmd_compile(args: argparse.Namespace) -> int:
     try:
         tmp_path.write_text(toml_text, encoding="utf-8")
         try:
-            cfg = load_plan(tmp_path, repo=repo)
-        except PlanError:
+            cfg = planref.load_plan(tmp_path, repo=repo)
+        except base.PlanError:
             raise
         except Exception as exc:
-            raise PlanError(f"generated manifest failed validation: {exc}") from exc
-    except PlanError:
+            raise base.PlanError(f"generated manifest failed validation: {exc}") from exc
+    except base.PlanError:
         tmp_path.unlink(missing_ok=True)
         raise
     except OSError as exc:
         tmp_path.unlink(missing_ok=True)
-        raise PlanError(f"could not stage generated manifest: {exc}") from exc
+        raise base.PlanError(f"could not stage generated manifest: {exc}") from exc
 
     os.replace(tmp_path, output_path)
-    log(f"  validated: {len(cfg['order'])} changes, {cfg['changes'].get(cfg['order'][0], {}).get('phase', 'no-phase') or 'no phase'}")
+    base.log(f"  validated: {len(cfg['order'])} changes, {cfg['changes'].get(cfg['order'][0], {}).get('phase', 'no-phase') or 'no phase'}")
 
     change_count = len(cfg["order"])
     phases = sorted({cfg["changes"][cid].get("phase") for cid in cfg["order"] if cfg["changes"][cid].get("phase") is not None})
@@ -6096,9 +5588,9 @@ def cmd_compile(args: argparse.Namespace) -> int:
     try:
         rel = str(output_path.resolve().relative_to(repo))
         write_active_plan(repo, rel)
-        log(f"  active plan set to: {rel}")
+        base.log(f"  active plan set to: {rel}")
     except ValueError:
-        log(f"  warning: compiled plan {output_path} is outside the repo; cannot auto-activate")
+        base.log(f"  warning: compiled plan {output_path} is outside the repo; cannot auto-activate")
 
     return 0
 
@@ -6150,9 +5642,9 @@ def cmd_archive_plan(args: argparse.Namespace) -> int:
         _git_mv_or_rename(repo, md_path, md_dst)
 
     # Clear the active-plan pointer when it referenced the archived plan
-    active = read_active_plan(repo)
+    active = planref.read_active_plan(repo)
     if active == plan_rel:
-        pointer = active_plan_pointer_path(repo)
+        pointer = planref.active_plan_pointer_path(repo)
         if pointer.is_file():
             pointer.unlink()
 
@@ -6185,1457 +5677,13 @@ def _git_mv_or_rename(repo: Path, src: Path, dst: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Report command
+# Report command: implementation lives in lib/orchestrator/report.py
 # ---------------------------------------------------------------------------
 
 
-# -- formatting helpers -------------------------------------------------------
-
-def _fmt_duration(ms: int | float | None) -> str:
-    """Format milliseconds as human-readable duration, e.g. '1m30s' or '—'."""
-    if ms is None:
-        return "—"
-    total_s = int(ms) // 1000
-    minutes = total_s // 60
-    seconds = total_s % 60
-    return f"{minutes}m{seconds}s"
-
-
-def _fmt_tokens(n: int | float | None) -> str:
-    """Format token count with K/M suffix, e.g. '1.2K', '3.5M', or '—'."""
-    if n is None:
-        return "—"
-    n = int(n)
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}K"
-    return str(n)
-
-
-def _fmt_cost(estimated_cost: float | None, cost_status: str) -> str:
-    """Format cost as '$X.XX', 'unresolved', 'unavailable', or '—'."""
-    if cost_status == "unavailable":
-        return "unavailable"
-    if cost_status == "unresolved":
-        return "unresolved"
-    if estimated_cost is not None:
-        return f"${estimated_cost:.2f}"
-    return "—"
-
-
-def _fmt_pct(val: float | None) -> str:
-    """Format a 0–1 fraction as percentage string, or '—'."""
-    if val is None:
-        return "—"
-    return f"{val * 100:.1f}%"
-
-
-def _fmt_bool(val: bool | None) -> str:
-    """Format optional boolean as 'yes', 'no', or '—'."""
-    if val is None:
-        return "—"
-    return "yes" if val else "no"
-
-
-def _truncate_id(s: str | None, max_len: int = 30) -> str:
-    """Truncate long identifiers with '…'."""
-    if s is None:
-        return "—"
-    if len(s) <= max_len:
-        return s
-    return s[: max_len - 1] + "…"
-
-
-def _col_widths(headers: list[str], rows: list[list[str]],
-                min_widths: dict[int, int] | None = None) -> list[int]:
-    """Compute column widths that accommodate headers and all row values."""
-    widths = [len(h) for h in headers]
-    for row in rows:
-        for i, cell in enumerate(row):
-            widths[i] = max(widths[i], len(cell))
-    if min_widths:
-        for i, w in min_widths.items():
-            widths[i] = max(widths[i], w)
-    return widths
-
-
-# -- table rendering ----------------------------------------------------------
-
-def _print_plan_summary(pm, plan_name: str, run_id: str,
-                        filters: dict) -> None:
-    """Print plan summary section."""
-    print("=== Plan Summary ===")
-
-    # Show active filters
-    active = {k: v for k, v in filters.items() if v}
-    if active:
-        parts = [f"{k}={v}" for k, v in active.items()]
-        print(f"Filters: {', '.join(parts)}")
-
-    print(f"Plan:       {plan_name}")
-    print(f"Run:        {run_id or '—'}")
-    print(
-        f"Changes:    {pm.total_changes} total "
-        f"({pm.completed_changes} completed, "
-        f"{pm.failed_changes} failed, "
-        f"{pm.blocked_changes} blocked, "
-        f"{pm.incomplete_changes} incomplete)"
-    )
-    print(f"Completion: {_fmt_pct(pm.completion_rate)}")
-    print(f"Success:    {_fmt_pct(pm.success_rate)}")
-    print(f"Duration:   {_fmt_duration(pm.total_duration_ms)}")
-    print(f"Tokens:     {_fmt_tokens(pm.total_tokens)}")
-
-    if pm.total_estimated_cost is not None:
-        cost_str = _fmt_cost(pm.total_estimated_cost,
-                             "estimated" if pm.unresolved_cost_changes == 0 else "partial")
-    elif pm.unresolved_cost_changes > 0:
-        cost_str = "unresolved"
-    else:
-        cost_str = "—"
-    print(
-        f"Cost:       {cost_str} "
-        f"({pm.estimated_cost_changes} estimated, "
-        f"{pm.unresolved_cost_changes} unresolved, "
-        f"{pm.unknown_cost_changes} unknown)"
-    )
-
-    if pm.total_changes == 0:
-        print("\nNo telemetry records found.")
-
-
-def _print_change_table(cm_list: list) -> None:
-    """Print per-change metrics table."""
-    if not cm_list:
-        print("\n=== Per-Change Metrics ===\n"
-              "  No change metrics available.")
-        return
-
-    headers = [
-        "Change ID", "Status", "Rnds", "Duration", "Tokens",
-        "Cost", "Cost Status", "First Pass", "Rev Fails",
-        "No Prog", "Max Rnd", "Arch Fail", "Fast Chk",
-    ]
-
-    rows: list[list[str]] = []
-    for c in cm_list:
-        rows.append([
-            _truncate_id(c.change_id),
-            c.status,
-            str(c.total_rounds),
-            _fmt_duration(c.duration_ms),
-            _fmt_tokens(c.tokens),
-            _fmt_cost(c.estimated_cost, c.cost_status),
-            c.cost_status,
-            _fmt_bool(c.first_pass_review),
-            str(c.review_failures),
-            _fmt_bool(c.no_progress),
-            _fmt_bool(c.max_rounds_exceeded),
-            _fmt_bool(c.archive_failed),
-            _fmt_bool(c.fast_check_failed),
-        ])
-
-    widths = _col_widths(headers, rows, {0: 12, 1: 12})
-    fmt = "  " + "  ".join(
-        f"{{:<{w}}}" for w in widths
-    )
-
-    print("\n=== Per-Change Metrics ===")
-    print(fmt.format(*headers))
-    print(fmt.format(*["-" * w for w in widths]))
-    for row in rows:
-        print(fmt.format(*row))
-
-
-def _print_stage_aggregates(sa, stage_filter: str | None = None) -> None:
-    """Print stage aggregates section."""
-    print("\n=== Stage Aggregates ===")
-
-    def _line(label: str, value: str) -> None:
-        print(f"  {label.ljust(22)} {value}")
-
-    if stage_filter is None:
-        _line("Average Rounds:", (
-            f"{sa.average_rounds:.1f}" if sa.average_rounds is not None else "—"
-        ))
-        _line("Median Rounds:", (
-            f"{sa.median_rounds:.1f}" if sa.median_rounds is not None else "—"
-        ))
-        _line("Avg Implement Duration:", _fmt_duration(sa.average_duration_implement))
-        _line("Avg Review Duration:", _fmt_duration(sa.average_duration_review))
-        _line("Avg Archive Duration:", _fmt_duration(sa.average_duration_archive))
-        _line("Review Failure Rate:", _fmt_pct(sa.review_failure_rate))
-        _line("Avg Tokens / Change:", _fmt_tokens(sa.average_tokens_per_change))
-        _line("Avg Cost / Change:", (
-            f"${sa.average_cost_per_change:.2f}"
-            if sa.average_cost_per_change is not None else "—"
-        ))
-    else:
-        if stage_filter == "implement":
-            _line("Avg Implement Duration:", _fmt_duration(sa.average_duration_implement))
-        elif stage_filter == "review":
-            _line("Avg Review Duration:", _fmt_duration(sa.average_duration_review))
-            _line("Review Failure Rate:", _fmt_pct(sa.review_failure_rate))
-        elif stage_filter == "archive":
-            _line("Avg Archive Duration:", _fmt_duration(sa.average_duration_archive))
-        _line("Average Rounds:", (
-            f"{sa.average_rounds:.1f}" if sa.average_rounds is not None else "—"
-        ))
-        _line("Avg Tokens / Change:", _fmt_tokens(sa.average_tokens_per_change))
-        _line("Avg Cost / Change:", (
-            f"${sa.average_cost_per_change:.2f}"
-            if sa.average_cost_per_change is not None else "—"
-        ))
-
-
-def _print_model_leaderboard(ml: list) -> None:
-    """Print model leaderboard table."""
-    if not ml:
-        print("\n=== Model Leaderboard ===\n"
-              "  No leaderboard entries.")
-        return
-
-    headers = [
-        "Implementer", "Reviewer", "Archiver",
-        "Changes", "Success", "1st Pass",
-        "Avg Rnds", "Avg Dur", "Avg Tokens", "Avg Cost",
-    ]
-
-    rows: list[list[str]] = []
-    for e in ml:
-        rows.append([
-            _truncate_id(e.implementer_model),
-            _truncate_id(e.reviewer_model),
-            _truncate_id(e.archiver_model),
-            str(e.change_count),
-            _fmt_pct(e.success_rate),
-            _fmt_pct(e.first_pass_rate),
-            (f"{e.average_rounds:.1f}" if e.average_rounds is not None else "—"),
-            _fmt_duration(e.average_duration_ms),
-            _fmt_tokens(e.average_tokens),
-            _fmt_cost(e.average_cost,
-                      "estimated" if e.average_cost is not None else "unavailable"),
-        ])
-
-    widths = _col_widths(headers, rows, {0: 14, 1: 12, 2: 12})
-    fmt = "  " + "  ".join(f"{{:<{w}}}" for w in widths)
-
-    print("\n=== Model Leaderboard ===")
-    print(fmt.format(*headers))
-    print(fmt.format(*["-" * w for w in widths]))
-    for row in rows:
-        print(fmt.format(*row))
-
-
-# -- leaderboard filter helpers -----------------------------------------------
-
-def _change_model_keys(records: list[dict], change_id: str) -> set:
-    """Return the set of 'provider:model_id' keys used by a change."""
-    keys: set[str] = set()
-    for r in records:
-        if r.get("change_id") != change_id:
-            continue
-        model = r.get("model", {})
-        provider = (model.get("provider") or "").strip()
-        model_id = (model.get("model_id") or "").strip()
-        if provider and model_id:
-            keys.add(f"{provider}:{model_id}")
-    return keys
-
-
-def _leaderboard_matches_model(entry, substring: str) -> bool:
-    """Check if any role's model contains *substring* (case-insensitive)."""
-    sub = substring.lower()
-    for model in (entry.implementer_model, entry.reviewer_model,
-                  entry.archiver_model):
-        if model and sub in model.lower():
-            return True
-    return False
-
-
-def _leaderboard_matches_stage(entry, stage: str) -> bool:
-    """Check if the entry has a model for the requested *stage* role."""
-    role_map = {
-        "implement": entry.implementer_model,
-        "review": entry.reviewer_model,
-        "archive": entry.archiver_model,
-    }
-    return role_map.get(stage) is not None
-
-
-def _leaderboard_involves_change(entry, model_keys: set) -> bool:
-    """Check if any role's model is in *model_keys*."""
-    for model in (entry.implementer_model, entry.reviewer_model,
-                  entry.archiver_model):
-        if model and model in model_keys:
-            return True
-    return False
-
-
-# -- JSON output --------------------------------------------------------------
-
-def _dataclass_to_dict(obj) -> dict:
-    """Serialize a dataclass instance to a dict, preserving None as null."""
-    import dataclasses
-    if not dataclasses.is_dataclass(obj):
-        return obj
-    result = {}
-    for field in dataclasses.fields(obj):
-        value = getattr(obj, field.name)
-        if dataclasses.is_dataclass(value):
-            result[field.name] = _dataclass_to_dict(value)
-        elif isinstance(value, list):
-            result[field.name] = [
-                _dataclass_to_dict(item) if dataclasses.is_dataclass(item) else item
-                for item in value
-            ]
-        else:
-            result[field.name] = value
-    return result
-
-
-def _print_report_json(result, plan_name: str, run_id: str,
-                       filters: dict, warnings: list[str]) -> None:
-    """Emit a single JSON object to stdout."""
-    import dataclasses
-
-    output = {
-        "command": "opsx-plan report",
-        "plan_name": plan_name,
-        "run_id": run_id,
-        "filters": filters,
-        "plan_metrics": _dataclass_to_dict(result.plan_metrics),
-        "change_metrics": [
-            _dataclass_to_dict(c) for c in result.change_metrics
-        ],
-        "stage_aggregates": _dataclass_to_dict(result.stage_aggregates),
-        "model_leaderboard": [
-            _dataclass_to_dict(e) for e in result.model_leaderboard
-        ],
-        "warnings": warnings,
-    }
-    # Deterministic: sort keys, ensure_ascii=True for byte-identical output
-    print(json.dumps(output, sort_keys=True, ensure_ascii=True))
-
-
-# -- cmd_report ---------------------------------------------------------------
-
-def _resolve_for_change_plan(
-    repo: Path, for_change: str | None, plan_arg: str | None
-) -> str | None:
-    """Resolve ``--for-change <id>`` to either a derived manifest path or a
-    fallback plan name, without loading the plan.
-
-    Returns the plan source string to use with ``resolve_plan``, or ``None``
-    when *for_change* is ``None`` (caller should follow its normal plan
-    resolution path).  Raises ``PlanError`` when *for_change* is given but
-    neither the derived manifest nor the state file exists.
-    """
-    if not for_change:
-        return None
-
-    if plan_arg is not None:
-        raise PlanError(
-            "--for-change and a positional plan argument are mutually "
-            "exclusive; pick one"
-        )
-
-    manifest = single_change_manifest_path(repo, for_change)
-    if manifest.is_file():
-        return str(manifest.relative_to(repo))
-
-    state = repo / ".opsx-plan" / f"run-{for_change}.state.json"
-    if state.is_file():
-        return f"run-{for_change}"
-
-    raise PlanError(
-        f"--for-change {for_change}: no derived manifest "
-        f"(.opsx-plan/plans/run-{for_change}.toml) or state file "
-        f"(.opsx-plan/run-{for_change}.state.json) found; "
-        f"has `opsx-run {for_change}` been invoked yet?"
-    )
-
-
-def cmd_report(args: argparse.Namespace) -> int:
-    """opsx-plan report <plan> [--json] [--change <id>] [--run-id <id>]
-       [--stage <stage>] [--model <substr>] [--for-change <id>]"""
-    repo = Path(args.repo).resolve()
-    for_change_plan = _resolve_for_change_plan(
-        repo, getattr(args, "for_change", None), args.plan,
-    )
-    plan_src = for_change_plan     if for_change_plan is not None else resolve_plan(repo, args.plan)
-
-    from lib.metrics.aggregator import (
-        AggregationError,
-        _build_leaderboard,
-        _change_aggregation,
-        _read_state,
-        _read_telemetry,
-        _select_run,
-        aggregate,
-    )
-
-    # When --for-change resolves through the state-file fallback (no manifest
-    # on disk), the plan source string is a bare name (e.g. "run-<id>") that
-    # does not correspond to a loadable TOML file.  In that case we skip
-    # load_plan and use the name directly so report still works.
-    for_change = getattr(args, "for_change", None)
-    if for_change and for_change_plan == f"run-{for_change}":
-        plan_name = for_change_plan
-        cfg = {"name": plan_name, "adapter": "opencode", "changes": {}}
-    else:
-        cfg = load_plan(_resolve_plan_path(repo, plan_src), repo=repo)
-        plan_name = cfg["name"]
-    run_id = args.run_id if args.run_id else None
-
-    # Validate --stage early
-    if args.stage and args.stage not in {"implement", "review", "archive"}:
-        print(
-            f"error: invalid stage '{args.stage}'; "
-            f"valid: implement, review, archive",
-            file=sys.stderr,
-        )
-        return 2
-
-    try:
-        result = aggregate(repo, plan_name, run_id)
-    except AggregationError as exc:
-        print(f"report error: {exc}", file=sys.stderr)
-        return 2
-
-    all_warnings = list(result.warnings)
-
-    # -- Apply filters --------------------------------------------------------
-
-    if args.change:
-        # Filter change_metrics to the matching change
-        result.change_metrics = [
-            c for c in result.change_metrics if c.change_id == args.change
-        ]
-
-        # Rebuild leaderboard scoped to just this change
-        records, _ = _read_telemetry(repo, plan_name)
-        selected_records, _, _ = _select_run(records, run_id)
-        change_records = [
-            r for r in selected_records
-            if r.get("change_id") == args.change
-        ]
-        state_for_lb, _ = _read_state(repo, plan_name)
-        cm_list, _ = _change_aggregation(
-            state_for_lb, change_records, plan_name, [],
-        )
-        result.model_leaderboard = _build_leaderboard(
-            cm_list, change_records,
-        )
-
-    if args.stage:
-        # Filter leaderboard to entries with a model for the specified stage
-        result.model_leaderboard = [
-            e for e in result.model_leaderboard
-            if _leaderboard_matches_stage(e, args.stage)
-        ]
-
-    if args.model:
-        result.model_leaderboard = [
-            e for e in result.model_leaderboard
-            if _leaderboard_matches_model(e, args.model)
-        ]
-
-    filters = {
-        "change": args.change,
-        "run_id": run_id,
-        "stage": args.stage,
-        "model": args.model,
-    }
-
-    # -- Output ---------------------------------------------------------------
-
-    selected_run_id = result.plan_metrics.run_id or run_id or ""
-
-    if args.json:
-        _print_report_json(result, plan_name, selected_run_id, filters,
-                           all_warnings)
-    else:
-        # Show active filter header
-        active = {k: v for k, v in filters.items() if v}
-        if active:
-            parts = [f"{k}={v}" for k, v in active.items()]
-            print(f"[Filters: {', '.join(parts)}]")
-
-        _print_plan_summary(result.plan_metrics, plan_name, selected_run_id,
-                            filters)
-        _print_change_table(result.change_metrics)
-        _print_stage_aggregates(result.stage_aggregates, args.stage)
-        _print_model_leaderboard(result.model_leaderboard)
-
-        # Warnings section
-        if all_warnings:
-            print(f"\n=== Warnings ({len(all_warnings)}) ===")
-            for w in all_warnings:
-                print(f"  - {w}")
-
-    return 0
-
-
 # ---------------------------------------------------------------------------
-# Dashboard command
+# Dashboard command: implementation lives in lib/orchestrator/dashboard.py
 # ---------------------------------------------------------------------------
-
-# -- HTML formatting helpers --------------------------------------------------
-
-
-def _html_escape(s: str) -> str:
-    """Escape text for safe HTML embedding."""
-    return (
-        s.replace("&", "&amp;")
-         .replace("<", "&lt;")
-         .replace(">", "&gt;")
-         .replace('"', "&quot;")
-         .replace("'", "&#x27;")
-    )
-
-
-def _fmt_rate(val: float | None) -> str:
-    """Format a 0–1 fraction as 'XX%' string (HTML-safe)."""
-    if val is None:
-        return '<span class="null-value">—</span>'
-    return f"{val * 100:.1f}%"
-
-
-def _fmt_cost_html(estimated_cost: float | None, cost_status: str) -> str:
-    """Return an HTML span with appropriate cost styling.
-
-    - estimated: green text with $X.XX
-    - unresolved: amber text with (unresolved) label
-    - unavailable: gray text with —
-    - zero estimated: $0.00 in normal (green) styling
-    """
-    if cost_status == "unavailable":
-        return '<span class="cost-missing">—</span>'
-    if cost_status == "unresolved":
-        if estimated_cost is not None:
-            return (
-                f'<span class="cost-unresolved">'
-                f'${estimated_cost:.2f} <small>(unresolved)</small>'
-                f'</span>'
-            )
-        return '<span class="cost-unresolved">(unresolved)</span>'
-    if estimated_cost is not None:
-        return f'<span class="cost-estimated">${estimated_cost:.2f}</span>'
-    return '<span class="cost-missing">—</span>'
-
-
-def _fmt_nullable(val, fmt_fn) -> str:
-    """Render optional value with *fmt_fn*, or gray '—' dash."""
-    if val is None:
-        return '<span class="null-value">—</span>'
-    return fmt_fn(val)
-
-
-def _fmt_duration_html(ms: int | float | None) -> str:
-    """Format milliseconds as human-readable duration, fallback to '—'."""
-    if ms is None:
-        return '<span class="null-value">—</span>'
-    total_s = int(ms) // 1000
-    minutes = total_s // 60
-    seconds = total_s % 60
-    return f"{minutes}m{seconds}s"
-
-
-def _fmt_tokens_html(n: int | float | None) -> str:
-    """Format token count with K/M suffix, fallback to '—'."""
-    if n is None:
-        return '<span class="null-value">—</span>'
-    n = int(n)
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}K"
-    return str(n)
-
-
-def _fmt_bool_html(val: bool | None) -> str:
-    """Format optional boolean as '✓' / '✗' / '—'."""
-    if val is None:
-        return '<span class="null-value">—</span>'
-    if val:
-        return '<span class="bool-true">✓</span>'
-    return '<span class="bool-false">✗</span>'
-
-
-def _status_badge(status: str) -> str:
-    """Return an HTML color-coded badge span for a change status."""
-    color_map = {
-        "completed": "green",
-        "failed": "red",
-        "yellow": "yellow",
-        "blocked": "yellow",
-        "incomplete": "gray",
-    }
-    color = color_map.get(status, "gray")
-    return f'<span class="badge badge-{color}">{_html_escape(status)}</span>'
-
-
-def _stage_status_badge(status: str) -> str:
-    """Return an HTML color-coded badge span for a stage status."""
-    if status == "completed":
-        color = "green"
-    elif status == "failed":
-        color = "red"
-    elif status == "timeout":
-        color = "orange"
-    else:
-        color = "gray"
-    return f'<span class="badge badge-{color}">{_html_escape(status)}</span>'
-
-
-# -- CSS block ----------------------------------------------------------------
-
-
-_DASHBOARD_CSS = """\
-:root {
-    --bg: #f5f5f5;
-    --card-bg: #ffffff;
-    --text: #1a1a2e;
-    --text-secondary: #555;
-    --border: #ddd;
-    --green: #2e7d32;
-    --red: #c62828;
-    --yellow: #f9a825;
-    --orange: #ef6c00;
-    --amber: #e65100;
-    --gray: #757575;
-    --blue: #1565c0;
-    --highlight-bg: #e8f5e9;
-}
-
-* { box-sizing: border-box; margin: 0; padding: 0; }
-
-body {
-    font-family: system-ui, -apple-system, sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    line-height: 1.5;
-    padding: 20px;
-}
-
-header {
-    margin-bottom: 24px;
-}
-
-header h1 {
-    font-size: 1.6rem;
-    color: var(--text);
-}
-
-.filter-annotation {
-    font-size: 0.85rem;
-    color: var(--blue);
-    margin-top: 4px;
-}
-
-main {
-    max-width: 1200px;
-}
-
-section {
-    background: var(--card-bg);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 20px;
-    margin-bottom: 16px;
-}
-
-section h2 {
-    font-size: 1.2rem;
-    margin-bottom: 12px;
-    padding-bottom: 6px;
-    border-bottom: 2px solid var(--border);
-}
-
-/* --- Plan Summary Card --- */
-.summary-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-    gap: 12px;
-}
-
-.summary-item {
-    padding: 8px 0;
-}
-
-.summary-item .label {
-    font-size: 0.75rem;
-    text-transform: uppercase;
-    color: var(--text-secondary);
-    letter-spacing: 0.5px;
-}
-
-.summary-item .value {
-    font-size: 1.1rem;
-    font-weight: 600;
-}
-
-/* --- Tables --- */
-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 0.9rem;
-}
-
-th, td {
-    padding: 8px 10px;
-    text-align: left;
-    border-bottom: 1px solid var(--border);
-    white-space: nowrap;
-}
-
-th {
-    background: #fafafa;
-    font-weight: 600;
-    font-size: 0.8rem;
-    text-transform: uppercase;
-    color: var(--text-secondary);
-    letter-spacing: 0.3px;
-}
-
-tr:hover td {
-    background: #f0f4ff;
-}
-
-.best-value {
-    font-weight: 700;
-    color: var(--green);
-}
-
-/* --- Badges --- */
-.badge {
-    display: inline-block;
-    padding: 2px 8px;
-    border-radius: 10px;
-    font-size: 0.78rem;
-    font-weight: 600;
-    color: #fff;
-}
-
-.badge-green { background: var(--green); }
-.badge-red { background: var(--red); }
-.badge-yellow { background: var(--yellow); color: #333; }
-.badge-orange { background: var(--orange); }
-.badge-gray { background: var(--gray); }
-
-/* --- Cost styling --- */
-.cost-estimated { color: var(--green); font-weight: 500; }
-.cost-unresolved { color: var(--amber); font-weight: 500; }
-.cost-missing { color: var(--gray); }
-.null-value { color: var(--gray); }
-.bool-true { color: var(--green); font-weight: 700; }
-.bool-false { color: var(--red); }
-
-/* --- Cost Breakdown Bars --- */
-.bar-container {
-    display: flex;
-    height: 28px;
-    border-radius: 4px;
-    overflow: hidden;
-    margin-bottom: 8px;
-}
-
-.bar-segment {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 0.78rem;
-    font-weight: 600;
-    color: #fff;
-    min-width: 0;
-}
-
-.bar-estimated { background: var(--green); }
-.bar-unresolved { background: var(--amber); }
-.bar-unknown { background: var(--gray); }
-
-.bar-legend {
-    display: flex;
-    gap: 16px;
-    font-size: 0.8rem;
-    color: var(--text-secondary);
-}
-
-.bar-legend-item {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-}
-
-.bar-legend-swatch {
-    width: 12px;
-    height: 12px;
-    border-radius: 2px;
-}
-
-/* --- Histogram --- */
-.histogram {
-    display: flex;
-    align-items: flex-end;
-    gap: 4px;
-    height: 180px;
-    padding: 4px 0;
-    border-bottom: 1px solid var(--border);
-}
-
-.histogram-bar-wrapper {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    min-width: 24px;
-}
-
-.histogram-bar {
-    width: 100%;
-    background: var(--blue);
-    border-radius: 3px 3px 0 0;
-    min-height: 2px;
-    transition: background 0.2s;
-}
-
-.histogram-bar:hover {
-    background: var(--orange);
-}
-
-.histogram-count {
-    font-size: 0.72rem;
-    font-weight: 600;
-    margin-bottom: 2px;
-}
-
-.histogram-label {
-    font-size: 0.7rem;
-    color: var(--text-secondary);
-    margin-top: 4px;
-}
-
-/* --- Empty state --- */
-.empty-state {
-    color: var(--text-secondary);
-    font-style: italic;
-    padding: 12px 0;
-}
-
-/* --- Warnings --- */
-.warnings-list {
-    list-style: none;
-    padding: 0;
-}
-
-.warnings-list li {
-    padding: 4px 0;
-    color: var(--amber);
-    font-size: 0.85rem;
-}
-
-.warnings-list li::before {
-    content: "⚠ ";
-}
-"""
-
-
-# -- Dashboard HTML renderer ------------------------------------------------
-
-
-def _render_plan_summary_html(pm, plan_name, run_id, filters) -> str:
-    """Render the plan summary header section as HTML."""
-    parts: list[str] = []
-    parts.append('<section class="plan-summary">')
-    parts.append("<h2>Plan Summary</h2>")
-
-    # Filter annotation
-    active = {k: v for k, v in filters.items() if v}
-    if active:
-        filt_parts = [f"{_html_escape(k)}={_html_escape(str(v))}"
-                       for k, v in active.items()]
-        parts.append(
-            f'<div class="filter-annotation">'
-            f'[Filtered: {", ".join(filt_parts)}]'
-            f'</div>'
-        )
-
-    parts.append('<div class="summary-grid">')
-
-    def _kv(label: str, value: str) -> str:
-        return (
-            f'<div class="summary-item">'
-            f'<div class="label">{_html_escape(label)}</div>'
-            f'<div class="value">{value}</div>'
-            f'</div>'
-        )
-
-    parts.append(_kv("Plan", _html_escape(plan_name)))
-    parts.append(_kv("Run", _html_escape(run_id) if run_id else "—"))
-
-    if pm.total_changes > 0:
-        changes_detail = (
-            f"{pm.total_changes} total "
-            f"({pm.completed_changes} completed, "
-            f"{pm.failed_changes} failed, "
-            f"{pm.blocked_changes} blocked, "
-            f"{pm.incomplete_changes} incomplete)"
-        )
-        parts.append(_kv("Changes", changes_detail))
-        parts.append(_kv("Completion Rate", _fmt_rate(pm.completion_rate)))
-        parts.append(_kv("Success Rate", _fmt_rate(pm.success_rate)))
-        parts.append(_kv("Total Duration", _fmt_duration_html(pm.total_duration_ms)))
-        parts.append(_kv("Total Tokens", _fmt_tokens_html(pm.total_tokens)))
-
-        # Total cost
-        if pm.total_estimated_cost is not None:
-            if pm.unresolved_cost_changes > 0:
-                cost_val = (
-                    f'<span class="cost-unresolved">'
-                    f'${pm.total_estimated_cost:.2f}'
-                    f' <small>(partial)</small>'
-                    f'</span>'
-                )
-            else:
-                cost_val = (
-                    f'<span class="cost-estimated">'
-                    f'${pm.total_estimated_cost:.2f}'
-                    f'</span>'
-                )
-        elif pm.unresolved_cost_changes > 0:
-            cost_val = '<span class="cost-unresolved">(unresolved)</span>'
-        else:
-            cost_val = '<span class="cost-missing">—</span>'
-        cost_detail = (
-            f"{cost_val} ({pm.estimated_cost_changes} est, "
-            f"{pm.unresolved_cost_changes} unr, "
-            f"{pm.unknown_cost_changes} unk)"
-        )
-        parts.append(_kv("Total Cost", cost_detail))
-    else:
-        parts.append(_kv("Status", "No telemetry records found."))
-
-    parts.append("</div>")  # summary-grid
-    parts.append("</section>")
-    return "\n".join(parts)
-
-
-def _render_leaderboard_html(ml: list) -> str:
-    """Render the model leaderboard table as HTML."""
-    # Sort by success_rate descending (None sorts last).
-    ml_sorted = sorted(ml, key=lambda e: (
-        e.success_rate is not None,
-        e.success_rate if e.success_rate is not None else -1.0,
-    ), reverse=True)
-    parts: list[str] = []
-    parts.append('<section class="leaderboard">')
-    parts.append("<h2>Model Leaderboard</h2>")
-
-    if not ml_sorted:
-        parts.append('<p class="empty-state">No leaderboard entries.</p>')
-        parts.append("</section>")
-        return "\n".join(parts)
-
-    # Compute best values for highlighting
-    best: dict[str, tuple[float, int]] = {}
-
-    def _update_best(col: str, val: float, idx: int) -> None:
-        if val is None:
-            return
-        if col not in best or val > best[col][0]:
-            best[col] = (val, idx)
-
-    for i, e in enumerate(ml_sorted):
-        _update_best("success_rate", e.success_rate, i) if e.success_rate else None
-        _update_best("first_pass_rate", e.first_pass_rate, i) if e.first_pass_rate else None
-        # For avg_rounds, lower is better
-        if e.average_rounds is not None:
-            if "avg_rounds" not in best or e.average_rounds < best["avg_rounds"][0]:
-                best["avg_rounds"] = (e.average_rounds, i)
-        if e.average_duration_ms is not None:
-            if "avg_duration" not in best or e.average_duration_ms < best["avg_duration"][0]:
-                best["avg_duration"] = (e.average_duration_ms, i)
-        if e.average_tokens is not None:
-            if "avg_tokens" not in best or e.average_tokens < best["avg_tokens"][0]:
-                best["avg_tokens"] = (e.average_tokens, i)
-        if e.average_cost is not None:
-            if "avg_cost" not in best or e.average_cost < best["avg_cost"][0]:
-                best["avg_cost"] = (e.average_cost, i)
-
-    best_rows: dict[str, set[int]] = {col: {info[1]} for col, info in best.items()}
-
-    def _best_class(col: str, idx: int) -> str:
-        if idx in best_rows.get(col, set()):
-            return ' class="best-value"'
-        return ""
-
-    parts.append("<table><thead><tr>")
-    headers = [
-        "Implementer", "Reviewer", "Archiver",
-        "Changes", "Success", "1st Pass",
-        "Avg Rnds", "Avg Dur", "Avg Tokens", "Avg Cost",
-    ]
-    for h in headers:
-        parts.append(f"<th>{_html_escape(h)}</th>")
-    parts.append("</tr></thead><tbody>")
-
-    for i, e in enumerate(ml_sorted):
-        parts.append("<tr>")
-        parts.append(
-            f"<td{_best_class('success_rate', i)}>"
-            f"{_html_escape(e.implementer_model or 'unknown')}</td>"
-        )
-        parts.append(
-            f"<td>{_html_escape(e.reviewer_model or 'unknown')}</td>"
-        )
-        parts.append(
-            f"<td>{_html_escape(e.archiver_model or 'unknown')}</td>"
-        )
-        parts.append(f"<td>{e.change_count}</td>")
-        parts.append(
-            f"<td{_best_class('success_rate', i)}>"
-            f"{_fmt_rate(e.success_rate)}</td>"
-        )
-        parts.append(
-            f"<td{_best_class('first_pass_rate', i)}>"
-            f"{_fmt_rate(e.first_pass_rate)}</td>"
-        )
-        if e.average_rounds is not None:
-            avg_rnds_val = f"{e.average_rounds:.1f}"
-        else:
-            avg_rnds_val = '<span class="null-value">—</span>'
-        parts.append(
-            f"<td{_best_class('avg_rounds', i)}>{avg_rnds_val}</td>"
-        )
-        parts.append(
-            f"<td{_best_class('avg_duration', i)}>"
-            f"{_fmt_duration_html(e.average_duration_ms)}</td>"
-        )
-        parts.append(
-            f"<td{_best_class('avg_tokens', i)}>"
-            f"{_fmt_tokens_html(e.average_tokens)}</td>"
-        )
-        parts.append(
-            f"<td{_best_class('avg_cost', i)}>"
-            f"{_fmt_cost_html(e.average_cost, 'estimated' if e.average_cost is not None else 'unavailable')}</td>"
-        )
-        parts.append("</tr>")
-
-    parts.append("</tbody></table>")
-    parts.append("</section>")
-    return "\n".join(parts)
-
-
-def _render_change_table_html(cm_list: list) -> str:
-    """Render the per-change detail table as HTML."""
-    parts: list[str] = []
-    parts.append('<section class="per-change">')
-    parts.append("<h2>Per-Change Details</h2>")
-
-    if not cm_list:
-        parts.append('<p class="empty-state">No change metrics available.</p>')
-        parts.append("</section>")
-        return "\n".join(parts)
-
-    parts.append("<table><thead><tr>")
-    headers = [
-        "Change ID", "Status", "Rnds", "Duration", "Tokens",
-        "Cost", "Cost Status", "1st Pass", "Rev Fails",
-        "No Prog", "Max Rnd", "Arch Fail", "Fast Chk",
-    ]
-    for h in headers:
-        parts.append(f"<th>{_html_escape(h)}</th>")
-    parts.append("</tr></thead><tbody>")
-
-    for c in cm_list:
-        parts.append("<tr>")
-        parts.append(f"<td>{_html_escape(c.change_id)}</td>")
-        parts.append(f"<td>{_status_badge(c.status)}</td>")
-        parts.append(f"<td>{c.total_rounds}</td>")
-        parts.append(f"<td>{_fmt_duration_html(c.duration_ms)}</td>")
-        parts.append(f"<td>{_fmt_tokens_html(c.tokens)}</td>")
-        parts.append(f"<td>{_fmt_cost_html(c.estimated_cost, c.cost_status)}</td>")
-        parts.append(f"<td>{_html_escape(c.cost_status)}</td>")
-        parts.append(f"<td>{_fmt_bool_html(c.first_pass_review)}</td>")
-        parts.append(f"<td>{c.review_failures}</td>")
-        parts.append(f"<td>{_fmt_bool_html(c.no_progress)}</td>")
-        parts.append(f"<td>{_fmt_bool_html(c.max_rounds_exceeded)}</td>")
-        parts.append(f"<td>{_fmt_bool_html(c.archive_failed)}</td>")
-        parts.append(f"<td>{_fmt_bool_html(c.fast_check_failed)}</td>")
-        parts.append("</tr>")
-
-    parts.append("</tbody></table>")
-    parts.append("</section>")
-    return "\n".join(parts)
-
-
-def _render_failure_breakdown_html(cm_list: list) -> str:
-    """Render the failure breakdown section."""
-    parts: list[str] = []
-    parts.append('<section class="failures">')
-    parts.append("<h2>Failure Breakdown</h2>")
-
-    failed = [c for c in cm_list if c.status == "failed"]
-    if not failed:
-        parts.append('<p class="empty-state">No failures</p>')
-        parts.append("</section>")
-        return "\n".join(parts)
-
-    parts.append("<ul>")
-    for c in failed:
-        reasons: list[str] = []
-        if c.max_rounds_exceeded:
-            reasons.append("max_rounds_exceeded")
-        if c.archive_failed:
-            reasons.append("archive_failed")
-        if c.review_failures > 0:
-            reasons.append(f"review_failures: {c.review_failures}")
-        if not reasons:
-            reasons.append("unknown")
-        reason_str = ", ".join(reasons)
-        parts.append(
-            f"<li><strong>{_html_escape(c.change_id)}</strong>: "
-            f"{_html_escape(reason_str)}</li>"
-        )
-    parts.append("</ul>")
-    parts.append("</section>")
-    return "\n".join(parts)
-
-
-def _render_cost_breakdown_html(pm) -> str:
-    """Render the cost breakdown bar section."""
-    parts: list[str] = []
-    parts.append('<section class="cost-breakdown">')
-    parts.append("<h2>Cost Breakdown</h2>")
-
-    total = pm.estimated_cost_changes + pm.unresolved_cost_changes + pm.unknown_cost_changes
-    if total == 0:
-        parts.append('<p class="empty-state">No cost data available.</p>')
-        parts.append("</section>")
-        return "\n".join(parts)
-
-    # Calculate percentages
-    pct_est = pm.estimated_cost_changes / total * 100
-    pct_unr = pm.unresolved_cost_changes / total * 100
-    pct_unk = pm.unknown_cost_changes / total * 100
-
-    parts.append('<div class="bar-container">')
-    if pm.estimated_cost_changes > 0:
-        parts.append(
-            f'<div class="bar-segment bar-estimated" style="width:{pct_est:.1f}%">'
-            f'{pm.estimated_cost_changes}</div>'
-        )
-    if pm.unresolved_cost_changes > 0:
-        parts.append(
-            f'<div class="bar-segment bar-unresolved" style="width:{pct_unr:.1f}%">'
-            f'{pm.unresolved_cost_changes}</div>'
-        )
-    if pm.unknown_cost_changes > 0:
-        parts.append(
-            f'<div class="bar-segment bar-unknown" style="width:{pct_unk:.1f}%">'
-            f'{pm.unknown_cost_changes}</div>'
-        )
-    parts.append("</div>")
-
-    parts.append('<div class="bar-legend">')
-    parts.append(
-        f'<div class="bar-legend-item">'
-        f'<div class="bar-legend-swatch" style="background:var(--green)"></div>'
-        f'Estimated ({pm.estimated_cost_changes})'
-        f'</div>'
-    )
-    parts.append(
-        f'<div class="bar-legend-item">'
-        f'<div class="bar-legend-swatch" style="background:var(--amber)"></div>'
-        f'Unresolved ({pm.unresolved_cost_changes})'
-        f'</div>'
-    )
-    parts.append(
-        f'<div class="bar-legend-item">'
-        f'<div class="bar-legend-swatch" style="background:var(--gray)"></div>'
-        f'Unknown ({pm.unknown_cost_changes})'
-        f'</div>'
-    )
-    parts.append("</div>")
-
-    parts.append("</section>")
-    return "\n".join(parts)
-
-
-def _render_rounds_histogram_html(cm_list: list) -> str:
-    """Render the rounds histogram section."""
-    parts: list[str] = []
-    parts.append('<section class="histogram-section">')
-    parts.append("<h2>Rounds Histogram</h2>")
-
-    completed = [c for c in cm_list if c.status == "completed"]
-    if not completed:
-        parts.append(
-            '<p class="empty-state">No completed changes for histogram.</p>'
-        )
-        parts.append("</section>")
-        return "\n".join(parts)
-
-    # Build frequency map
-    freq: dict[int, int] = {}
-    for c in completed:
-        rnd = c.total_rounds
-        freq[rnd] = freq.get(rnd, 0) + 1
-
-    max_count = max(freq.values())
-    max_round = max(freq.keys())
-
-    parts.append('<div class="histogram">')
-    for r in range(1, max_round + 1):
-        count = freq.get(r, 0)
-        height_pct = (count / max_count * 100) if max_count > 0 else 0
-        parts.append(
-            f'<div class="histogram-bar-wrapper">'
-            f'<div class="histogram-count">{count}</div>'
-            f'<div class="histogram-bar" style="height:{height_pct:.1f}%"></div>'
-            f'<div class="histogram-label">{r}</div>'
-            f'</div>'
-        )
-    parts.append("</div>")
-
-    parts.append("</section>")
-    return "\n".join(parts)
-
-
-def _render_timeline_html(records: list[dict]) -> str:
-    """Render the stage timeline HTML section."""
-    parts: list[str] = []
-    parts.append('<section class="timeline">')
-    parts.append("<h2>Stage Timeline</h2>")
-
-    if not records:
-        parts.append('<p class="empty-state">No stage records available.</p>')
-        parts.append("</section>")
-        return "\n".join(parts)
-
-    # Sort by started_at ascending
-    sorted_records = sorted(
-        records,
-        key=lambda r: r.get("started_at", ""),
-    )
-
-    parts.append("<table><thead><tr>")
-    headers = ["Change ID", "Stage", "Round", "Started At", "Duration", "Status"]
-    for h in headers:
-        parts.append(f"<th>{_html_escape(h)}</th>")
-    parts.append("</tr></thead><tbody>")
-
-    for r in sorted_records:
-        cid = r.get("change_id", "")
-        stage = r.get("stage", "")
-        rnd = r.get("round", "")
-        started = r.get("started_at", "")
-        dur = r.get("duration_ms")
-        status = r.get("status", "")
-
-        parts.append("<tr>")
-        parts.append(f"<td>{_html_escape(cid)}</td>")
-        parts.append(f"<td>{_html_escape(stage)}</td>")
-        parts.append(f"<td>{rnd}</td>")
-        parts.append(f"<td>{_html_escape(started)}</td>")
-        parts.append(f"<td>{_fmt_duration_html(dur)}</td>")
-        parts.append(f"<td>{_stage_status_badge(status)}</td>")
-        parts.append("</tr>")
-
-    parts.append("</tbody></table>")
-    parts.append("</section>")
-    return "\n".join(parts)
-
-
-def _render_warnings_html(warnings: list[str]) -> str:
-    """Render the warnings section."""
-    if not warnings:
-        return ""
-    parts: list[str] = []
-    parts.append('<section class="warnings">')
-    parts.append(f"<h2>Warnings ({len(warnings)})</h2>")
-    parts.append('<ul class="warnings-list">')
-    for w in warnings:
-        parts.append(f"<li>{_html_escape(w)}</li>")
-    parts.append("</ul>")
-    parts.append("</section>")
-    return "\n".join(parts)
-
-
-def _render_dashboard_html(
-    result,
-    plan_name: str,
-    run_id: str,
-    change_id: str | None = None,
-    timeline_records: list[dict] | None = None,
-    filters: dict | None = None,
-) -> str:
-    """Render the complete HTML dashboard as a self-contained document."""
-    if filters is None:
-        filters = {}
-    if timeline_records is None:
-        timeline_records = []
-
-    pm = result.plan_metrics
-    cm_list = result.change_metrics
-
-    parts: list[str] = []
-    parts.append("<!DOCTYPE html>")
-    parts.append('<html lang="en">')
-    parts.append("<head>")
-    parts.append('<meta charset="utf-8">')
-    parts.append('<meta name="viewport" content="width=device-width, initial-scale=1.0">')
-    parts.append(
-        f"<title>Plan Dashboard: {_html_escape(plan_name)}</title>"
-    )
-    parts.append(f"<style>{_DASHBOARD_CSS}</style>")
-    parts.append("</head>")
-    parts.append("<body>")
-    parts.append(
-        f"<header><h1>opsx-plan Dashboard: "
-        f"{_html_escape(plan_name)}</h1></header>"
-    )
-    parts.append("<main>")
-
-    # 1. Plan Summary Header
-    parts.append(_render_plan_summary_html(pm, plan_name, run_id, filters))
-
-    # 2. Model Leaderboard Table
-    parts.append(_render_leaderboard_html(result.model_leaderboard))
-
-    # 3. Per-Change Table
-    parts.append(_render_change_table_html(cm_list))
-
-    # 4. Failure Breakdown
-    parts.append(_render_failure_breakdown_html(cm_list))
-
-    # 5. Cost Breakdown
-    parts.append(_render_cost_breakdown_html(pm))
-
-    # 6. Rounds Histogram
-    parts.append(_render_rounds_histogram_html(cm_list))
-
-    # 7. Stage Timeline
-    parts.append(_render_timeline_html(timeline_records))
-
-    # Warnings
-    if result.warnings:
-        parts.append(_render_warnings_html(result.warnings))
-
-    parts.append("</main>")
-    parts.append("</body>")
-    parts.append("</html>")
-
-    return "\n".join(parts) + "\n"
-
-
-# -- cmd_dashboard -----------------------------------------------------------
-
-
-def cmd_dashboard(args: argparse.Namespace) -> int:
-    """opsx-plan dashboard <plan> [--output <path>] [--run-id <id>]
-       [--change <id>] [--for-change <id>]"""
-    repo = Path(args.repo).resolve()
-    for_change_plan = _resolve_for_change_plan(
-        repo, getattr(args, "for_change", None), args.plan,
-    )
-    plan_src = for_change_plan if for_change_plan is not None else resolve_plan(repo, args.plan)
-    from lib.metrics.aggregator import (
-        AggregationError,
-        _build_leaderboard,
-        _change_aggregation,
-        _read_state,
-        _read_telemetry,
-        _select_run,
-        aggregate,
-    )
-
-    for_change = getattr(args, "for_change", None)
-    if for_change and for_change_plan == f"run-{for_change}":
-        plan_name = for_change_plan
-        cfg = {"name": plan_name, "adapter": "opencode", "changes": {}}
-    else:
-        cfg = load_plan(_resolve_plan_path(repo, plan_src), repo=repo)
-        plan_name = cfg["name"]
-    run_id = args.run_id if args.run_id else None
-
-    try:
-        result = aggregate(repo, plan_name, run_id)
-    except AggregationError as exc:
-        print(f"dashboard error: {exc}", file=sys.stderr)
-        return 2
-
-    selected_run_id = result.plan_metrics.run_id or run_id or ""
-    filters = {
-        "change": args.change,
-        "run_id": run_id,
-    }
-
-    # -- Determine output path ------------------------------------------------
-    if args.output:
-        output_path = Path(args.output).resolve()
-    else:
-        output_path = (
-            repo / ".opsx-plan" / "dashboards" / f"{plan_name}.html"
-        ).resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # -- Gather timeline records ----------------------------------------------
-    records, _ = _read_telemetry(repo, plan_name)
-    selected_records, selected_run, _ = _select_run(records, run_id)
-
-    # -- Apply --change filter ------------------------------------------------
-    if args.change:
-        # Keep unfiltered plan_metrics for the summary header
-        # But filter change_metrics and rebuild leaderboard
-        unfiltered_result = result
-        result.change_metrics = [
-            c for c in result.change_metrics if c.change_id == args.change
-        ]
-
-        # Rebuild leaderboard scoped to just this change
-        change_records = [
-            r for r in selected_records
-            if r.get("change_id") == args.change
-        ]
-        state_for_lb, _ = _read_state(repo, plan_name)
-        cm_list, _ = _change_aggregation(
-            state_for_lb, change_records, plan_name, [],
-        )
-        result.model_leaderboard = _build_leaderboard(cm_list, change_records)
-
-        # Narrow timeline to this change
-        timeline_records = change_records
-    else:
-        timeline_records = selected_records
-
-    # -- Render and write HTML ------------------------------------------------
-    html = _render_dashboard_html(
-        result,
-        plan_name,
-        selected_run_id,
-        change_id=args.change,
-        timeline_records=timeline_records,
-        filters=filters,
-    )
-
-    # Atomic write
-    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as fh:
-            fh.write(html)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp_path, output_path)
-    except OSError as exc:
-        print(f"dashboard error: failed to write {output_path}: {exc}",
-              file=sys.stderr)
-        return 2
-
-    print(f"Dashboard written to: {output_path}")
-    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -7652,8 +5700,8 @@ def _resolve_models_adapter(args: argparse.Namespace, repo: Path) -> str:
     adapter = getattr(args, "adapter", None)
     if adapter:
         return adapter
-    plan_src = resolve_plan(repo, None)
-    cfg = load_plan(_resolve_plan_path(repo, plan_src), repo=repo)
+    plan_src = planref.resolve_plan(repo, None)
+    cfg = planref.load_plan(planref._resolve_plan_path(repo, plan_src), repo=repo)
     return cfg["adapter"]
 
 
@@ -7662,7 +5710,7 @@ def cmd_models_show(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
     try:
         adapter = _resolve_models_adapter(args, repo)
-    except PlanError as exc:
+    except base.PlanError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     try:
@@ -7691,7 +5739,7 @@ def cmd_models_env(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
     try:
         adapter = _resolve_models_adapter(args, repo)
-    except PlanError as exc:
+    except base.PlanError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     try:
@@ -7765,16 +5813,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if args.plan is not None:
         # Explicit plan argument: fail hard when plan can't be resolved/loaded.
         plan_src = args.plan
-        plan_abs = _resolve_plan_path(repo, plan_src)
+        plan_abs = planref._resolve_plan_path(repo, plan_src)
         if not plan_abs.is_file():
             print(f"error: plan not found: {plan_src}", file=sys.stderr)
             return 2
     else:
         try:
-            plan_src = resolve_plan(repo, None)
-        except PlanError:
+            plan_src = planref.resolve_plan(repo, None)
+        except base.PlanError:
             # Surface stale active-plan pointer errors; do not swallow them.
-            pointer = read_active_plan(repo)
+            pointer = planref.read_active_plan(repo)
             if pointer:
                 plan_path = repo / pointer
                 if not plan_path.is_file():
@@ -7799,10 +5847,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     cfg: dict | None = None
     if plan_src:
         try:
-            cfg = load_plan(_resolve_plan_path(repo, plan_src), repo=repo)
+            cfg = planref.load_plan(planref._resolve_plan_path(repo, plan_src), repo=repo)
             # A resolved plan's adapter is authoritative; --adapter is ignored.
             adapter = cfg["adapter"]
-        except PlanError:
+        except base.PlanError:
             print(f"error: cannot load plan: {plan_src}", file=sys.stderr)
             return 2
 
@@ -7826,8 +5874,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def cmd_logs(args: argparse.Namespace) -> int:
     """opsx-plan logs [plan] [--change <id>] [--stage <stage>] [--list] [--follow]"""
     repo = Path(args.repo).resolve()
-    plan_src = resolve_plan(repo, args.plan)
-    cfg = load_plan(_resolve_plan_path(repo, plan_src), repo=repo)
+    plan_src = planref.resolve_plan(repo, args.plan)
+    cfg = planref.load_plan(planref._resolve_plan_path(repo, plan_src), repo=repo)
     plan_name = cfg["name"]
 
     change_filter = args.change if args.change else None
@@ -8094,7 +6142,7 @@ def main() -> int:
         help="target the derived single-change manifest instead of a plan "
              "path (mutually exclusive with positional plan)",
     )
-    p_report.set_defaults(fn=cmd_report)
+    p_report.set_defaults(fn=report.cmd_report)
 
     p_dashboard = sub.add_parser(
         "dashboard",
@@ -8122,7 +6170,7 @@ def main() -> int:
         help="target the derived single-change manifest instead of a plan "
              "path (mutually exclusive with positional plan)",
     )
-    p_dashboard.set_defaults(fn=cmd_dashboard)
+    p_dashboard.set_defaults(fn=dashboard.cmd_dashboard)
 
     p_run_one = sub.add_parser(
         "run-one", help="run a single authored OpenSpec change directly"
@@ -8209,7 +6257,7 @@ def main() -> int:
     args = ap.parse_args()
     try:
         return args.fn(args)
-    except PlanError as exc:
+    except base.PlanError as exc:
         print(f"plan error: {exc}", file=sys.stderr)
         return 2
 

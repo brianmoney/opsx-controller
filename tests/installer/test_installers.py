@@ -91,6 +91,39 @@ class SharedInstallerHelperTests(unittest.TestCase):
         self.assertTrue(self.lib_dir.joinpath("metrics").is_dir())
         self.assertTrue(self.lib_dir.joinpath("pricing").is_dir())
         self.assertTrue(self.lib_dir.joinpath("models").is_dir())
+        self.assertTrue(self.lib_dir.joinpath("orchestrator").is_dir())
+
+    def test_helper_deploys_orchestrator_package_matching_repo(self) -> None:
+        """The installed lib.orchestrator tree matches the repo copy byte-for-byte."""
+        self._run_helper()
+        installed_pkg = self.lib_dir / "orchestrator"
+        repo_pkg = _REPO / "lib" / "orchestrator"
+        repo_files = sorted(p.relative_to(repo_pkg) for p in repo_pkg.rglob("*.py"))
+        self.assertTrue(repo_files, "expected lib/orchestrator to contain .py modules")
+        for rel in repo_files:
+            installed_file = installed_pkg / rel
+            self.assertTrue(installed_file.is_file(), f"missing installed module: {rel}")
+            self.assertEqual(
+                hashlib.sha256((repo_pkg / rel).read_bytes()).digest(),
+                hashlib.sha256(installed_file.read_bytes()).digest(),
+                f"installed module differs from repo copy: {rel}",
+            )
+
+    def test_repeated_install_removes_deleted_orchestrator_module(self) -> None:
+        """A module present in a prior install but deleted from the repo
+        must not persist in the installed copy after a repeat install."""
+        self._run_helper()
+        installed_pkg = self.lib_dir / "orchestrator"
+        stale_module = installed_pkg / "_no_longer_in_repo.py"
+        stale_module.write_text("# stale leftover module\n", encoding="utf-8")
+        self.assertTrue(stale_module.is_file())
+
+        self._run_helper()
+        self.assertFalse(
+            stale_module.is_file(),
+            "repeated install must replace the managed orchestrator package, "
+            "not merge into it",
+        )
 
     def test_executables_match_repo_copy(self) -> None:
         """Content-hash check: installed copy equals repository copy."""
@@ -151,7 +184,7 @@ class AdapterInstallerTests(unittest.TestCase):
 
     def _assert_runtime_libraries_installed(self) -> None:
         lib = self._lib_dir()
-        for pkg in ("metrics", "pricing", "models"):
+        for pkg in ("metrics", "pricing", "models", "orchestrator"):
             self.assertTrue(
                 lib.joinpath(pkg).is_dir(),
                 f"runtime library '{pkg}' missing in {lib}",
@@ -264,6 +297,53 @@ class StaleInstallDetectionTests(unittest.TestCase):
         )
         self.assertFalse(ok, "stale check should detect content mismatch after codex install")
         self.assertIn("stale", msg.lower())
+
+    def _installed_orchestrator_pkg(self) -> Path:
+        return (
+            Path(self.home.name) / ".local" / "lib" / "opsx-controller"
+            / "lib" / "orchestrator"
+        )
+
+    def test_detects_missing_orchestrator_package(self) -> None:
+        """An installed runtime with metrics/pricing/models but no
+        orchestrator package (predates this layout) must be reported stale,
+        not raise, even though the entrypoint itself still matches."""
+        import shutil as _shutil
+
+        self._install_via(_OPENCODE_INSTALLER)
+        _shutil.rmtree(self._installed_orchestrator_pkg())
+        ok, label, msg = self._call_stale_check(
+            self._load_opsx_plan(), self.home.name
+        )
+        self.assertFalse(ok, "stale check should detect a missing orchestrator package")
+        self.assertIn("orchestrator", msg.lower())
+
+    def test_detects_stale_orchestrator_module(self) -> None:
+        """A single differing module inside the installed lib.orchestrator
+        tree must be reported stale even though the entrypoint matches."""
+        self._install_via(_OPENCODE_INSTALLER)
+        base_py = self._installed_orchestrator_pkg() / "base.py"
+        self.assertTrue(base_py.is_file())
+        base_py.write_text("# corrupted\n", encoding="utf-8")
+        ok, label, msg = self._call_stale_check(
+            self._load_opsx_plan(), self.home.name
+        )
+        self.assertFalse(ok, "stale check should detect a stale orchestrator module")
+        self.assertIn("orchestrator", msg.lower())
+
+    def test_detects_orchestrator_module_only_in_installed_copy(self) -> None:
+        """A module present only in the installed copy (deleted from the
+        repo) must be reported stale."""
+        self._install_via(_OPENCODE_INSTALLER)
+        extra = self._installed_orchestrator_pkg() / "_extra_not_in_repo.py"
+        extra.write_text("# leftover\n", encoding="utf-8")
+        ok, label, msg = self._call_stale_check(
+            self._load_opsx_plan(), self.home.name
+        )
+        self.assertFalse(
+            ok, "stale check should detect a module only present in the installed copy"
+        )
+        self.assertIn("orchestrator", msg.lower())
 
 
 class WatcherBehaviorTests(unittest.TestCase):
@@ -908,6 +988,77 @@ class WatcherBehaviorTests(unittest.TestCase):
             self.assertIn("log1 output AAA", out)
         finally:
             self._stop_watcher(proc)
+
+
+class CleanHomeReportDashboardTests(unittest.TestCase):
+    """A global install from a clean HOME must run report/dashboard using
+    only the installed lib.orchestrator package, never the repo checkout."""
+
+    def setUp(self) -> None:
+        self.home = tempfile.TemporaryDirectory()
+        self.target_repo = tempfile.TemporaryDirectory()
+        env = {**_model_env(), "HOME": self.home.name}
+        _run_installer(_OPENCODE_INSTALLER, Path(self.home.name), env)
+
+        repo = Path(self.target_repo.name)
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-c", "user.email=test@example.invalid",
+             "-c", "user.name=Test User", "commit", "-m", "init", "--allow-empty"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        plan_dir = repo / ".opsx-plan"
+        plan_dir.mkdir(parents=True)
+        (plan_dir / "clean-home-plan.toml").write_text(
+            '[plan]\nname = "clean-home-plan"\nadapter = "opencode"\n\n'
+            '[[changes]]\nid = "ch-only"\nphase = 1\n',
+            encoding="utf-8",
+        )
+        (plan_dir / "telemetry").mkdir()
+        (plan_dir / "telemetry" / "clean-home-plan.jsonl").write_text("", encoding="utf-8")
+        (plan_dir / "clean-home-plan.state.json").write_text(
+            '{"plan": "clean-home-plan", "approvals": [], '
+            '"changes": {"ch-only": {"status": "pending", "round": 0, "phase": "pending"}}}',
+            encoding="utf-8",
+        )
+
+    def tearDown(self) -> None:
+        self.home.cleanup()
+        self.target_repo.cleanup()
+
+    def _run_installed(self, *args: str) -> subprocess.CompletedProcess:
+        installed = Path(self.home.name) / ".local" / "bin" / "opsx-plan"
+        # Clean environment: no PYTHONPATH pointing at the repo checkout,
+        # and cwd outside the checkout, so any accidental import of the
+        # checkout's lib/ would only succeed via the installer's own
+        # sys.path bootstrap of the installed copy.
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        env["HOME"] = self.home.name
+        return subprocess.run(
+            [str(installed), "--repo", self.target_repo.name, *args],
+            cwd=self.home.name,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_installed_report_runs_without_repo_checkout(self) -> None:
+        proc = self._run_installed(
+            "report", ".opsx-plan/clean-home-plan.toml", "--json"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("clean-home-plan", proc.stdout)
+
+    def test_installed_dashboard_runs_without_repo_checkout(self) -> None:
+        proc = self._run_installed(
+            "dashboard", ".opsx-plan/clean-home-plan.toml"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        html_path = (
+            Path(self.target_repo.name) / ".opsx-plan" / "dashboards"
+            / "clean-home-plan.html"
+        )
+        self.assertTrue(html_path.is_file())
 
 
 if __name__ == "__main__":

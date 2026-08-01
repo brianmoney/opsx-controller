@@ -18,9 +18,10 @@ install_orchestrator() {
   rm -rf "$runtime_dir/lib" "$runtime_dir/samples"
   mkdir -p "$runtime_dir/lib" "$runtime_dir/samples"
 
-  cp -R "$repo_root/lib/metrics"   "$runtime_dir/lib/"
-  cp -R "$repo_root/lib/pricing"   "$runtime_dir/lib/"
-  cp -R "$repo_root/lib/models"    "$runtime_dir/lib/"
+  cp -R "$repo_root/lib/metrics"      "$runtime_dir/lib/"
+  cp -R "$repo_root/lib/pricing"      "$runtime_dir/lib/"
+  cp -R "$repo_root/lib/models"       "$runtime_dir/lib/"
+  cp -R "$repo_root/lib/orchestrator" "$runtime_dir/lib/"
   install -m 0644 \
     "$repo_root/orchestrator/samples/sample-plan.md" \
     "$repo_root/orchestrator/samples/sample-plan.toml" \

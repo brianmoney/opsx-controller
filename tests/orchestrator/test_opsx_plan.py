@@ -358,14 +358,14 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
 
         result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
 
-        self.assertEqual(result, self.opsx_plan.DONE)
+        self.assertEqual(result, self.opsx_plan.base.DONE)
         self.assertEqual([stage for stage, _, _ in calls], ["implement", "review", "archive"])
         self.assertIn(f"CHANGE: {self.cid}", inputs[0])
         self.assertIn("ROUND: 1", inputs[0])
 
         record = self.opsx_plan.rec(self.state, self.cid)
         self.assertEqual(record["phase"], "done")
-        self.assertEqual(record["status"], self.opsx_plan.DONE)
+        self.assertEqual(record["status"], self.opsx_plan.base.DONE)
         self.assertEqual(record["archive"]["status"], "passed")
         self.assertEqual(record["last_stage"]["name"], "archive")
         self.assertTrue(Path(record["last_stage"]["log_path"]).is_file())
@@ -392,7 +392,7 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
         self.assertEqual(result, "failed")
         record = self.opsx_plan.rec(self.state, self.cid)
         self.assertEqual(record["last_result"], "subagent_output_invalid")
-        self.assertEqual(record["status"], self.opsx_plan.FAILED)
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
         self.assertIn("output invalid", record["reason"])
 
     def test_transcript_log_with_final_json_line_is_accepted(self) -> None:
@@ -432,7 +432,7 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
 
         result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
 
-        self.assertEqual(result, self.opsx_plan.DONE)
+        self.assertEqual(result, self.opsx_plan.base.DONE)
         self.assertEqual([stage for stage, _, _ in calls], ["implement", "review", "archive"])
 
     def test_archive_success_is_rejected_when_tracked_tree_stays_dirty(self) -> None:
@@ -485,7 +485,7 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
 
         self.assertEqual(result, "stop")
         record = self.opsx_plan.rec(self.state, self.cid)
-        self.assertEqual(record["status"], self.opsx_plan.FAILED)
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
         self.assertEqual(record["archive"]["status"], "failed")
         self.assertEqual(record["last_result"], "post_archive_dirty_tracked")
         self.assertIn("post-archive tracked worktree is dirty", record["reason"])
@@ -548,9 +548,9 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
 
         result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
 
-        self.assertEqual(result, self.opsx_plan.DONE)
+        self.assertEqual(result, self.opsx_plan.base.DONE)
         record = self.opsx_plan.rec(self.state, self.cid)
-        self.assertEqual(record["status"], self.opsx_plan.DONE)
+        self.assertEqual(record["status"], self.opsx_plan.base.DONE)
         self.assertEqual(record["archive"]["status"], "passed")
         self.assertEqual(record["archive"]["commit"], "")
 
@@ -562,7 +562,7 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
         fresh_state = {"plan": self.plan_name, "approvals": [], "changes": {}}
         self.opsx_plan.reconcile(self.repo, self.cfg, fresh_state)
         fresh_record = self.opsx_plan.rec(fresh_state, self.cid)
-        self.assertEqual(fresh_record["status"], self.opsx_plan.DONE)
+        self.assertEqual(fresh_record["status"], self.opsx_plan.base.DONE)
 
     def test_reconcile_keeps_done_change_when_newer_archive_prefix_commit_exists(self) -> None:
         self.stage_runner(
@@ -611,7 +611,7 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
         )
 
         result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-        self.assertEqual(result, self.opsx_plan.DONE)
+        self.assertEqual(result, self.opsx_plan.base.DONE)
 
         archived_tasks = (
             self.repo
@@ -640,21 +640,21 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
         self.opsx_plan.reconcile(self.repo, self.cfg, self.state)
 
         record = self.opsx_plan.rec(self.state, self.cid)
-        self.assertEqual(record["status"], self.opsx_plan.DONE)
+        self.assertEqual(record["status"], self.opsx_plan.base.DONE)
         self.assertEqual(record["phase"], "done")
         ok, why = self.opsx_plan.verify_direct_archive_done(self.repo, self.cid, record)
         self.assertTrue(ok, why)
 
     def test_reconcile_recovers_interrupted_review_from_plan_state(self) -> None:
         record = self.opsx_plan.rec(self.state, self.cid)
-        record["status"] = self.opsx_plan.RUNNING
+        record["status"] = self.opsx_plan.base.RUNNING
         record["phase"] = "review"
         record["round"] = 2
 
         self.opsx_plan.reconcile(self.repo, self.cfg, self.state)
 
         record = self.opsx_plan.rec(self.state, self.cid)
-        self.assertEqual(record["status"], self.opsx_plan.PENDING)
+        self.assertEqual(record["status"], self.opsx_plan.base.PENDING)
         self.assertEqual(record["phase"], "review")
         self.assertEqual(record["round"], 2)
 
@@ -734,7 +734,7 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
 
         result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
 
-        self.assertEqual(result, self.opsx_plan.DONE)
+        self.assertEqual(result, self.opsx_plan.base.DONE)
         self.assertEqual(
             [stage for stage, _, _ in calls],
             ["implement", "review", "implement", "review", "archive"],
@@ -783,7 +783,7 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
 
         self.assertEqual(result, "stop")
         record = self.opsx_plan.rec(self.state, self.cid)
-        self.assertEqual(record["status"], self.opsx_plan.FAILED)
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
         self.assertEqual(record["last_result"], "max_rounds_reached")
         self.assertIn("retry budget exhausted", record["reason"])
 
@@ -840,7 +840,7 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
 
         self.assertEqual(result, "stop")
         record = self.opsx_plan.rec(self.state, self.cid)
-        self.assertEqual(record["status"], self.opsx_plan.FAILED)
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
         self.assertEqual(record["last_result"], "no_progress")
         self.assertEqual(record["no_progress_streak"], 2)
 
@@ -893,7 +893,7 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
 
         self.assertEqual(result, "stop")
         record = self.opsx_plan.rec(self.state, self.cid)
-        self.assertEqual(record["status"], self.opsx_plan.FAILED)
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
         self.assertEqual(record["archive"]["status"], "failed")
         self.assertIn("still exists", record["reason"])
 
@@ -948,7 +948,7 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
 
         self.assertEqual(result, "stop")
         record = self.opsx_plan.rec(self.state, self.cid)
-        self.assertEqual(record["status"], self.opsx_plan.FAILED)
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
         self.assertEqual(record["last_result"], "post_archive_check_failed")
         self.assertIn("post-archive", record["reason"])
 
@@ -1041,7 +1041,7 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
 
         result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
 
-        self.assertEqual(result, self.opsx_plan.DONE)
+        self.assertEqual(result, self.opsx_plan.base.DONE)
         # The retry implementer (round 2) must receive the handoff.
         retry_input = inputs[2]  # third stage dispatch (round-2 implement)
         self.assertIn("LATEST_FIX_PROMPT:", retry_input)
@@ -1143,12 +1143,12 @@ class SingleChangeConfigTests(unittest.TestCase):
         self.assertTrue(cfg["require_clean_tracked"])
         self.assertFalse(cfg["review_created"])
         self.assertTrue(
-            self.opsx_plan.is_direct_mode(cfg),
+            self.opsx_plan.planref.is_direct_mode(cfg),
             "single-change config must route through direct workers",
         )
 
     def test_build_config_fails_for_missing_change_dir(self) -> None:
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
             self.opsx_plan.build_single_change_config(self.repo, "no-such-change")
         self.assertIn("does not exist", str(ctx.exception))
 
@@ -1157,7 +1157,7 @@ class SingleChangeConfigTests(unittest.TestCase):
         cdir.mkdir(parents=True)
         (cdir / "proposal.md").write_text("## Why\n", encoding="utf-8")
 
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
             self.opsx_plan.build_single_change_config(self.repo, "missing-tasks")
         self.assertIn("missing required artifacts", str(ctx.exception))
 
@@ -1500,14 +1500,14 @@ class SingleChangeRunnerTests(unittest.TestCase):
 
         result = self.opsx_plan.run_direct_change(self.repo, cfg, state, self.cid)
 
-        self.assertEqual(result, self.opsx_plan.DONE)
+        self.assertEqual(result, self.opsx_plan.base.DONE)
         self.assertEqual(
             [stage for stage, _, _ in calls],
             ["implement", "review", "archive"],
         )
         record = self.opsx_plan.rec(state, self.cid)
         self.assertEqual(record["phase"], "done")
-        self.assertEqual(record["status"], self.opsx_plan.DONE)
+        self.assertEqual(record["status"], self.opsx_plan.base.DONE)
         self.assertEqual(record["archive"]["status"], "passed")
 
     def test_single_change_review_failure_retries_implement(self) -> None:
@@ -1590,7 +1590,7 @@ class SingleChangeRunnerTests(unittest.TestCase):
 
         result = self.opsx_plan.run_direct_change(self.repo, cfg, state, self.cid)
 
-        self.assertEqual(result, self.opsx_plan.DONE)
+        self.assertEqual(result, self.opsx_plan.base.DONE)
         self.assertEqual(
             [stage for stage, _, _ in calls],
             ["implement", "review", "implement", "review", "archive"],
@@ -2288,7 +2288,7 @@ class MainDispatchTests(unittest.TestCase):
             self.assertIsNone(budget_deadline)
             self.assertEqual(budget_usd, 0.0)
             calls.append((repo, cfg["name"], cid))
-            return self.opsx_plan.DONE
+            return self.opsx_plan.base.DONE
 
         with mock.patch.object(
             self.opsx_plan, "run_direct_change", side_effect=fake_run_direct_change
@@ -2323,7 +2323,7 @@ class MainDispatchTests(unittest.TestCase):
             self.opsx_plan.set_status(
                 state,
                 cid,
-                self.opsx_plan.FAILED,
+                self.opsx_plan.base.FAILED,
                 f"could not spawn implement: {cfg['implement_invoke']}",
             )
             return "spawn_error"
@@ -2344,11 +2344,11 @@ class MainDispatchTests(unittest.TestCase):
         self.assertIn("could not start direct worker dispatch", stderr.getvalue())
         self.assertIn(f"openspec/changes/{self.cid}", stderr.getvalue())
         self.assertIn(
-            self.opsx_plan.ADAPTER_DEFAULTS["opencode"]["implement_invoke"],
+            self.opsx_plan.base.ADAPTER_DEFAULTS["opencode"]["implement_invoke"],
             stderr.getvalue(),
         )
         self.assertNotIn(
-            self.opsx_plan.ADAPTER_DEFAULTS["opencode"]["invoke"],
+            self.opsx_plan.base.ADAPTER_DEFAULTS["opencode"]["invoke"],
             stderr.getvalue(),
         )
 
@@ -2419,7 +2419,7 @@ class OpsxDriveCompatibilityTests(unittest.TestCase):
     def test_opsx_plan_routes_opencode_through_direct_workers_not_opsx_drive(self) -> None:
         self.opsx_plan = load_opsx_plan()
 
-        defaults = self.opsx_plan.ADAPTER_DEFAULTS["opencode"]
+        defaults = self.opsx_plan.base.ADAPTER_DEFAULTS["opencode"]
         self.assertIn(
             "/opsx-drive", defaults.get("invoke", ""),
             "ADAPTER_DEFAULTS must preserve opsx-drive invoke for legacy surface",
@@ -2427,7 +2427,7 @@ class OpsxDriveCompatibilityTests(unittest.TestCase):
 
         cfg = {"adapter": "opencode", **defaults}
         self.assertTrue(
-            self.opsx_plan.is_direct_mode(cfg),
+            self.opsx_plan.planref.is_direct_mode(cfg),
             "default OpenCode config must route through direct workers, not /opsx-drive",
         )
 
@@ -2437,10 +2437,10 @@ class IsDirectModeGateTests(unittest.TestCase):
         self.opsx_plan = load_opsx_plan()
 
     def test_opencode_plan_takes_direct_path_with_no_manifest_change(self) -> None:
-        defaults = self.opsx_plan.ADAPTER_DEFAULTS["opencode"]
+        defaults = self.opsx_plan.base.ADAPTER_DEFAULTS["opencode"]
         cfg = {"adapter": "opencode", **defaults}
         self.assertTrue(
-            self.opsx_plan.is_direct_mode(cfg),
+            self.opsx_plan.planref.is_direct_mode(cfg),
             "OpenCode plan must still take the direct path unchanged",
         )
 
@@ -2452,7 +2452,7 @@ class IsDirectModeGateTests(unittest.TestCase):
             "archive_invoke": "",
         }
         self.assertFalse(
-            self.opsx_plan.is_direct_mode(cfg),
+            self.opsx_plan.planref.is_direct_mode(cfg),
             "a plan missing one of the three stage invokes must not take the direct path",
         )
 
@@ -2464,7 +2464,7 @@ class IsDirectModeGateTests(unittest.TestCase):
             "archive_invoke": "codex exec --agent opsx-archiver",
         }
         self.assertTrue(
-            self.opsx_plan.is_direct_mode(cfg),
+            self.opsx_plan.planref.is_direct_mode(cfg),
             "the gate must be configuration-driven, not conditioned on adapter identity",
         )
 
@@ -2489,7 +2489,7 @@ class ClaudeCodeAdapterDefaultsTests(unittest.TestCase):
             '[plan]\nname = "test"\nadapter = "claude-code"\n\n'
             '[[changes]]\nid = "c1"\n',
         )
-        cfg = self.opsx_plan.load_plan(plan)
+        cfg = self.opsx_plan.planref.load_plan(plan)
 
         for stage, env_var in (
             ("implement", "OPSX_IMPLEMENTER_MODEL"),
@@ -2504,19 +2504,19 @@ class ClaudeCodeAdapterDefaultsTests(unittest.TestCase):
             self.assertIn("--output-format json", invoke)
 
         self.assertTrue(
-            self.opsx_plan.is_direct_mode(cfg),
+            self.opsx_plan.planref.is_direct_mode(cfg),
             "claude-code plan with no invoke overrides must resolve to the direct path",
         )
 
     def test_single_overridden_stage_invoke_is_honored_others_fall_back(self) -> None:
-        defaults = self.opsx_plan.ADAPTER_DEFAULTS["claude-code"]
+        defaults = self.opsx_plan.base.ADAPTER_DEFAULTS["claude-code"]
         plan = self._write_plan(
             "plan.toml",
             '[plan]\nname = "test"\nadapter = "claude-code"\n'
             'review_invoke = "claude -p --agent custom-reviewer --output-format json"\n\n'
             '[[changes]]\nid = "c1"\n',
         )
-        cfg = self.opsx_plan.load_plan(plan)
+        cfg = self.opsx_plan.planref.load_plan(plan)
 
         self.assertEqual(
             cfg["review_invoke"],
@@ -2524,7 +2524,7 @@ class ClaudeCodeAdapterDefaultsTests(unittest.TestCase):
         )
         self.assertEqual(cfg["implement_invoke"], defaults["implement_invoke"])
         self.assertEqual(cfg["archive_invoke"], defaults["archive_invoke"])
-        self.assertTrue(self.opsx_plan.is_direct_mode(cfg))
+        self.assertTrue(self.opsx_plan.planref.is_direct_mode(cfg))
 
 
 class ModelResolutionWiringTests(unittest.TestCase):
@@ -2582,7 +2582,7 @@ class ModelResolutionWiringTests(unittest.TestCase):
             """
         )
         plan = self._write_plan("plan.toml", "opencode")
-        cfg = self.opsx_plan.load_plan(plan, repo=self.repo)
+        cfg = self.opsx_plan.planref.load_plan(plan, repo=self.repo)
 
         self.assertIn("models", cfg)
         for role in self.opsx_plan.ROLES:
@@ -2602,8 +2602,8 @@ class ModelResolutionWiringTests(unittest.TestCase):
         opencode_plan = self._write_plan("opencode.toml", "opencode")
         claude_plan = self._write_plan("claude.toml", "claude-code")
 
-        opencode_cfg = self.opsx_plan.load_plan(opencode_plan, repo=self.repo)
-        claude_cfg = self.opsx_plan.load_plan(claude_plan, repo=self.repo)
+        opencode_cfg = self.opsx_plan.planref.load_plan(opencode_plan, repo=self.repo)
+        claude_cfg = self.opsx_plan.planref.load_plan(claude_plan, repo=self.repo)
 
         self.assertEqual(opencode_cfg["models"]["implementer"].model, "deepseek/deepseek-v4-pro")
         self.assertEqual(claude_cfg["models"]["implementer"].model, "claude-sonnet-5")
@@ -2617,8 +2617,8 @@ class ModelResolutionWiringTests(unittest.TestCase):
             encoding="utf-8",
         )
         logs: list[str] = []
-        with mock.patch.object(self.opsx_plan, "log", side_effect=logs.append):
-            self.opsx_plan.load_plan(plan, repo=self.repo)
+        with mock.patch.object(self.opsx_plan.base, "log", side_effect=logs.append):
+            self.opsx_plan.planref.load_plan(plan, repo=self.repo)
 
         deprecation_logs = [m for m in logs if "deprecated" in m.lower()]
         self.assertTrue(deprecation_logs, f"expected a deprecation warning, got: {logs}")
@@ -2627,8 +2627,8 @@ class ModelResolutionWiringTests(unittest.TestCase):
     def test_direct_dispatch_plan_emits_no_deprecation_warning(self) -> None:
         plan = self._write_plan("direct.toml", "claude-code")
         logs: list[str] = []
-        with mock.patch.object(self.opsx_plan, "log", side_effect=logs.append):
-            self.opsx_plan.load_plan(plan, repo=self.repo)
+        with mock.patch.object(self.opsx_plan.base, "log", side_effect=logs.append):
+            self.opsx_plan.planref.load_plan(plan, repo=self.repo)
 
         deprecation_logs = [m for m in logs if "deprecated" in m.lower()]
         self.assertEqual(deprecation_logs, [])
@@ -2636,7 +2636,7 @@ class ModelResolutionWiringTests(unittest.TestCase):
     def test_escalate_after_review_fails_defaults_to_zero(self) -> None:
         """2.6: absent key → 0"""
         plan = self._write_plan("plan.toml", "opencode")
-        cfg = self.opsx_plan.load_plan(plan, repo=self.repo)
+        cfg = self.opsx_plan.planref.load_plan(plan, repo=self.repo)
         self.assertEqual(cfg["escalate_after_review_fails"], 0)
 
     def test_escalate_after_review_fails_negative_value_raises(self) -> None:
@@ -2648,14 +2648,14 @@ class ModelResolutionWiringTests(unittest.TestCase):
             '[[changes]]\nid = "c1"\n',
             encoding="utf-8",
         )
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
-            self.opsx_plan.load_plan(plan, repo=self.repo)
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
+            self.opsx_plan.planref.load_plan(plan, repo=self.repo)
         self.assertIn("escalate_after_review_fails", str(ctx.exception))
 
     def test_finding_recurrence_limit_defaults_to_zero(self) -> None:
         """4.1: absent key -> 0 (recurrence halting disabled)"""
         plan = self._write_plan("plan.toml", "opencode")
-        cfg = self.opsx_plan.load_plan(plan, repo=self.repo)
+        cfg = self.opsx_plan.planref.load_plan(plan, repo=self.repo)
         self.assertEqual(cfg["finding_recurrence_limit"], 0)
 
     def test_finding_recurrence_limit_negative_value_raises(self) -> None:
@@ -2667,8 +2667,8 @@ class ModelResolutionWiringTests(unittest.TestCase):
             '[[changes]]\nid = "c1"\n',
             encoding="utf-8",
         )
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
-            self.opsx_plan.load_plan(plan, repo=self.repo)
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
+            self.opsx_plan.planref.load_plan(plan, repo=self.repo)
         self.assertIn("finding_recurrence_limit", str(ctx.exception))
 
     def test_apply_model_env_succeeds_with_unresolved_escalation_and_threshold_zero(self) -> None:
@@ -2684,7 +2684,7 @@ class ModelResolutionWiringTests(unittest.TestCase):
             """
         )
         plan = self._write_plan("plan.toml", "opencode")
-        cfg = self.opsx_plan.load_plan(plan, repo=self.repo)
+        cfg = self.opsx_plan.planref.load_plan(plan, repo=self.repo)
         # Threshold 0, escalation unresolved — must not raise.
         models = cfg.get("models", {})
         self.assertIsNone(models["implementer_escalation"].model,
@@ -2710,8 +2710,8 @@ class ModelResolutionWiringTests(unittest.TestCase):
             '[[changes]]\nid = "c1"\n',
             encoding="utf-8",
         )
-        cfg = self.opsx_plan.load_plan(plan_path, repo=self.repo)
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+        cfg = self.opsx_plan.planref.load_plan(plan_path, repo=self.repo)
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
             self.opsx_plan.apply_model_env(cfg)
         self.assertIn("implementer_escalation", str(ctx.exception))
         self.assertIn("unresolved", str(ctx.exception).lower())
@@ -2729,7 +2729,7 @@ class ModelResolutionWiringTests(unittest.TestCase):
             """
         )
         plan = self._write_plan("plan.toml", "opencode")
-        cfg = self.opsx_plan.load_plan(plan, repo=self.repo)
+        cfg = self.opsx_plan.planref.load_plan(plan, repo=self.repo)
         self.assertEqual(cfg["escalate_after_review_fails"], 0)
         self.opsx_plan.apply_model_env(cfg)
         self.assertEqual(
@@ -2755,7 +2755,7 @@ class ModelResolutionWiringTests(unittest.TestCase):
         # Resolve models while escalation env is absent so the role
         # lands as unresolved in cfg["models"].
         os.environ.pop("OPSX_IMPLEMENTER_ESCALATION_MODEL", None)
-        cfg = self.opsx_plan.load_plan(plan, repo=self.repo)
+        cfg = self.opsx_plan.planref.load_plan(plan, repo=self.repo)
         # Now simulate a stale leftover from a prior apply_model_env call
         # on a different config that *did* have an escalation model.
         os.environ["OPSX_IMPLEMENTER_ESCALATION_MODEL"] = "stale/leftover-model"
@@ -4164,11 +4164,11 @@ class DirectStageTelemetryTests(unittest.TestCase):
 
         result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
 
-        self.assertEqual(result, self.opsx_plan.DONE)
+        self.assertEqual(result, self.opsx_plan.base.DONE)
         record = self.opsx_plan.rec(self.state, self.cid)
         self.assertEqual(record["phase"], "done")
         self.assertEqual(record["round"], 2)
-        self.assertEqual(record["status"], self.opsx_plan.DONE)
+        self.assertEqual(record["status"], self.opsx_plan.base.DONE)
         self.assertEqual(record["archive"]["status"], "passed")
 
         # Verify telemetry was written for all stages
@@ -4508,12 +4508,12 @@ class DirectStageTelemetryTests(unittest.TestCase):
 
         with mock.patch.object(
             self.opsx_plan, "write_telemetry_record", side_effect=OSError("disk full")
-        ), mock.patch.object(self.opsx_plan, "log", side_effect=capture_log):
+        ), mock.patch.object(self.opsx_plan.base, "log", side_effect=capture_log):
             self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
 
         # Stage must still advance despite telemetry write failure
         record = self.opsx_plan.rec(self.state, self.cid)
-        self.assertEqual(record["status"], self.opsx_plan.FAILED)
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
 
         # A warning must have been logged
         warning_msgs = [msg for msg in log_calls if "warning" in msg.lower()]
@@ -4855,7 +4855,7 @@ class DirectStageTelemetryTests(unittest.TestCase):
         )
 
         result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-        self.assertEqual(result, self.opsx_plan.DONE)
+        self.assertEqual(result, self.opsx_plan.base.DONE)
         self._assert_worker_state_has_latest_telemetry_uid()
 
     def test_terminal_no_progress_persists_telemetry_uid_to_worker_state(self) -> None:
@@ -5192,21 +5192,21 @@ class CompileTests(unittest.TestCase):
     # -- resolve / validation helpers (already covered by earlier tasks) --
 
     def test_resolve_compile_source_rejects_missing_file(self) -> None:
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
             self.opsx_plan.resolve_compile_source(self.repo, "nonexistent.md")
         self.assertIn("not found", str(ctx.exception))
 
     def test_resolve_compile_source_rejects_non_md_extension(self) -> None:
         p = self.repo / "plan.txt"
         p.write_text("text", encoding="utf-8")
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
             self.opsx_plan.resolve_compile_source(self.repo, "plan.txt")
         self.assertIn("must be a markdown file", str(ctx.exception))
 
     def test_resolve_compile_output_refuses_existing_without_force(self) -> None:
         p = self.repo / "out.toml"
         p.write_text("existing", encoding="utf-8")
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
             self.opsx_plan.resolve_compile_output(self.repo, "out.toml", force=False)
         self.assertIn("exists", str(ctx.exception))
         self.assertIn("--force", str(ctx.exception))
@@ -5219,7 +5219,7 @@ class CompileTests(unittest.TestCase):
 
     def test_check_controller_model_fails_when_unset(self) -> None:
         self._clear_model()
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
             self.opsx_plan.check_controller_model()
         self.assertIn("controller model", str(ctx.exception))
 
@@ -5308,7 +5308,7 @@ class CompileTests(unittest.TestCase):
         out = self.repo / "out.toml"
         args = argparse.Namespace(repo=str(self.repo), source="plan.md",
                                   output=str(out), force=False)
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
             self.opsx_plan.cmd_compile(args)
         self.assertIn("controller model", str(ctx.exception))
 
@@ -5319,7 +5319,7 @@ class CompileTests(unittest.TestCase):
         out.write_text("existing", encoding="utf-8")
         args = argparse.Namespace(repo=str(self.repo), source="plan.md",
                                   output=str(out), force=False)
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
             self.opsx_plan.cmd_compile(args)
         self.assertIn("exists", str(ctx.exception))
 
@@ -5328,7 +5328,7 @@ class CompileTests(unittest.TestCase):
         out = self.repo / "out.toml"
         args = argparse.Namespace(repo=str(self.repo), source="missing.md",
                                   output=str(out), force=False)
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
             self.opsx_plan.cmd_compile(args)
         self.assertIn("not found", str(ctx.exception))
 
@@ -5403,7 +5403,7 @@ class CompileTests(unittest.TestCase):
             out = self.repo / "out.toml"
             args = argparse.Namespace(repo=str(self.repo), source="plan.md",
                                       output=str(out), force=False)
-            with self.assertRaises(self.opsx_plan.PlanError):
+            with self.assertRaises(self.opsx_plan.base.PlanError):
                 self.opsx_plan.cmd_compile(args)
             self.assertFalse(out.is_file())
         finally:
@@ -5422,7 +5422,7 @@ class CompileTests(unittest.TestCase):
             out = self.repo / "out.toml"
             args = argparse.Namespace(repo=str(self.repo), source="plan.md",
                                       output=str(out), force=False)
-            with self.assertRaises(self.opsx_plan.PlanError):
+            with self.assertRaises(self.opsx_plan.base.PlanError):
                 self.opsx_plan.cmd_compile(args)
             self.assertFalse(out.is_file())
         finally:
@@ -5443,7 +5443,7 @@ class CompileTests(unittest.TestCase):
             out = self.repo / "out.toml"
             args = argparse.Namespace(repo=str(self.repo), source="plan.md",
                                       output=str(out), force=False)
-            with self.assertRaises(self.opsx_plan.PlanError):
+            with self.assertRaises(self.opsx_plan.base.PlanError):
                 self.opsx_plan.cmd_compile(args)
             self.assertFalse(out.is_file())
         finally:
@@ -5468,7 +5468,7 @@ class CompileTests(unittest.TestCase):
             out = self.repo / "out.toml"
             args = argparse.Namespace(repo=str(self.repo), source="plan.md",
                                       output=str(out), force=False)
-            with self.assertRaises(self.opsx_plan.PlanError):
+            with self.assertRaises(self.opsx_plan.base.PlanError):
                 self.opsx_plan.cmd_compile(args)
             self.assertFalse(out.is_file())
         finally:
@@ -5493,7 +5493,7 @@ class CompileTests(unittest.TestCase):
             out = self.repo / "out.toml"
             args = argparse.Namespace(repo=str(self.repo), source="plan.md",
                                       output=str(out), force=False)
-            with self.assertRaises(self.opsx_plan.PlanError):
+            with self.assertRaises(self.opsx_plan.base.PlanError):
                 self.opsx_plan.cmd_compile(args)
             self.assertFalse(out.is_file())
         finally:
@@ -5515,7 +5515,7 @@ class CompileTests(unittest.TestCase):
             self.opsx_plan.run_compile_client = fake_run
             args = argparse.Namespace(repo=str(self.repo), source="plan.md",
                                       output=str(out), force=True)
-            with self.assertRaises(self.opsx_plan.PlanError):
+            with self.assertRaises(self.opsx_plan.base.PlanError):
                 self.opsx_plan.cmd_compile(args)
             self.assertEqual(out.read_text(encoding="utf-8"), "original content")
         finally:
@@ -5542,7 +5542,7 @@ class CompileTests(unittest.TestCase):
                 repo=str(self.repo), source="plan.md",
                 output=str(out), force=True, adapter="opencode",
             )
-            with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
                 self.opsx_plan.cmd_compile(args)
             self.assertIn("[plan]", str(ctx.exception))
             self.assertIn("table", str(ctx.exception))
@@ -5571,7 +5571,7 @@ class CompileTests(unittest.TestCase):
                 repo=str(self.repo), source="plan.md",
                 output=str(out), force=True, adapter="opencode",
             )
-            with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
                 self.opsx_plan.cmd_compile(args)
             self.assertIn("[[changes]]", str(ctx.exception))
             self.assertIn("table", str(ctx.exception))
@@ -5593,11 +5593,11 @@ class CompileTests(unittest.TestCase):
         self.assertEqual(result, output.strip())
 
     def test_extract_toml_rejects_empty(self) -> None:
-        with self.assertRaises(self.opsx_plan.PlanError):
+        with self.assertRaises(self.opsx_plan.base.PlanError):
             self.opsx_plan.extract_toml("   ")
 
     def test_extract_toml_rejects_no_toml(self) -> None:
-        with self.assertRaises(self.opsx_plan.PlanError):
+        with self.assertRaises(self.opsx_plan.base.PlanError):
             self.opsx_plan.extract_toml("just some prose, no brackets")
 
     def test_extract_toml_rejects_multiple_fenced_blocks(self) -> None:
@@ -5605,19 +5605,19 @@ class CompileTests(unittest.TestCase):
             '```toml\n[plan]\nname = "x"\n```\n'
             '```toml\n[plan]\nname = "y"\n```\n'
         )
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
             self.opsx_plan.extract_toml(output)
         self.assertIn("multiple fenced", str(ctx.exception))
 
     def test_extract_toml_rejects_prose_before_fenced_block(self) -> None:
         output = "Here is the compiled plan:\n\n```toml\n[plan]\nname = \"x\"\n```\n"
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
             self.opsx_plan.extract_toml(output)
         self.assertIn("extra content found around", str(ctx.exception))
 
     def test_extract_toml_rejects_prose_after_fenced_block(self) -> None:
         output = "```toml\n[plan]\nname = \"x\"\n```\n\nLet me know if you need changes."
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
             self.opsx_plan.extract_toml(output)
         self.assertIn("extra content found around", str(ctx.exception))
 
@@ -5680,7 +5680,7 @@ class CompileTests(unittest.TestCase):
             raise FileNotFoundError("no opencode")
 
         with mock.patch("subprocess.run", side_effect=fake_run):
-            with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
                 self.opsx_plan.run_compile_client(self.repo, "opencode", "m", "prompt")
             self.assertIn("could not spawn", str(ctx.exception))
 
@@ -5721,7 +5721,7 @@ class CompileTests(unittest.TestCase):
         fake_result.stderr = "some error"
 
         with mock.patch("subprocess.run", return_value=fake_result):
-            with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
                 self.opsx_plan.run_compile_client(self.repo, "opencode", "m", "prompt")
             self.assertIn("exited with code 1", str(ctx.exception))
 
@@ -5823,7 +5823,7 @@ class CompileTests(unittest.TestCase):
             args = argparse.Namespace(repo=str(self.repo), source="plan.md",
                                       output=str(out), force=False,
                                       adapter="claude-code")
-            with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
                 self.opsx_plan.cmd_compile(args)
             self.assertIn("adapter", str(ctx.exception).lower())
             self.assertTrue(invoked)
@@ -5869,7 +5869,7 @@ class CompileTests(unittest.TestCase):
         self.assertIn("compile this", argv)
 
     def test_build_argv_rejects_unsupported_codex(self) -> None:
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
             self.opsx_plan._build_compile_argv("codex-cli", "m", "prompt")
         self.assertIn("not supported", str(ctx.exception))
 
@@ -5880,7 +5880,7 @@ class CompileTests(unittest.TestCase):
         rejected for the claude-code adapter before any process spawn."""
         os.environ["OPSX_CONTROLLER_MODEL"] = "anthropic/claude-sonnet-5"
         try:
-            with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
                 self.opsx_plan.check_controller_model(adapter="claude-code")
             self.assertIn("not valid", str(ctx.exception))
             self.assertIn("claude-code", str(ctx.exception))
@@ -5893,7 +5893,7 @@ class CompileTests(unittest.TestCase):
         the opencode adapter."""
         os.environ["OPSX_CONTROLLER_MODEL"] = "sonnet-direct"
         try:
-            with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
                 self.opsx_plan.check_controller_model(adapter="opencode")
             self.assertIn("not valid", str(ctx.exception))
             self.assertIn("opencode", str(ctx.exception))
@@ -5925,7 +5925,7 @@ class CompileTests(unittest.TestCase):
             raise subprocess.TimeoutExpired(args, kwargs.get("timeout", 60))
 
         with mock.patch("subprocess.run", side_effect=fake_run):
-            with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
                 self.opsx_plan.run_compile_client(self.repo, "claude-code",
                                                    "m", "prompt")
             self.assertIn("timed out", str(ctx.exception).lower())
@@ -5976,12 +5976,12 @@ class CompileTests(unittest.TestCase):
 
     def test_extract_toml_claude_plain_rejected_without_envelope(self) -> None:
         """Claude plain text without TOML content is rejected with named client."""
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
             self.opsx_plan.extract_toml("here is some prose", adapter="claude-code")
         self.assertIn("claude", str(ctx.exception).lower())
 
     def test_extract_toml_empty_opencode_mentions_opencode(self) -> None:
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
             self.opsx_plan.extract_toml("", adapter="opencode")
         self.assertIn("opencode", str(ctx.exception).lower())
 
@@ -6009,7 +6009,7 @@ class CompileTests(unittest.TestCase):
         """Claude envelope whose result is not a string falls through to
         standard extraction (e.g. result is a dict)."""
         output = '{"result": {"status": "ok"}}'
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
             self.opsx_plan.extract_toml(output, adapter="claude-code")
         self.assertIn("claude", str(ctx.exception).lower())
 
@@ -6018,14 +6018,14 @@ class CompileTests(unittest.TestCase):
         without crashing the extractor."""
         # Malformed JSON that starts with `{` but is not parseable.
         output = '{"result": unfinished'
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
             self.opsx_plan.extract_toml(output, adapter="claude-code")
         self.assertIn("claude", str(ctx.exception).lower())
 
     def test_extract_toml_claude_envelope_result_empty_string(self) -> None:
         """Claude envelope with empty result string is treated as no TOML."""
         output = '{"result": ""}'
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
             self.opsx_plan.extract_toml(output, adapter="claude-code")
         self.assertIn("claude", str(ctx.exception).lower())
 
@@ -6039,7 +6039,7 @@ class CompileTests(unittest.TestCase):
             raise FileNotFoundError("no claude")
 
         with mock.patch("subprocess.run", side_effect=fake_run):
-            with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
                 self.opsx_plan.run_compile_client(
                     self.repo, "claude-code", "m", "prompt"
                 )
@@ -6055,7 +6055,7 @@ class CompileTests(unittest.TestCase):
         fake_result.stderr = "Claude error: model not configured"
 
         with mock.patch("subprocess.run", return_value=fake_result):
-            with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
                 self.opsx_plan.run_compile_client(
                     self.repo, "claude-code", "m", "prompt"
                 )
@@ -6157,7 +6157,7 @@ class CompileTests(unittest.TestCase):
                 repo=str(self.repo), source="plan.md",
                 output=str(out), force=False, adapter="claude-code",
             )
-            with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
                 self.opsx_plan.cmd_compile(args)
             self.assertIn("claude", str(ctx.exception).lower())
             self.assertIn("TOML", str(ctx.exception))
@@ -6200,7 +6200,7 @@ class CompileTests(unittest.TestCase):
             content = default_out.read_text(encoding="utf-8")
             self.assertIn("c1", content)
             # Auto-activation: active-plan pointer must reference the compiled plan
-            active = self.opsx_plan.read_active_plan(self.repo)
+            active = self.opsx_plan.planref.read_active_plan(self.repo)
             self.assertEqual(
                 active, "openspec/plans/my-plan.toml",
                 "compile without -o must auto-activate the output plan",
@@ -7647,9 +7647,9 @@ class DirectStageUsageIntegrationTests(unittest.TestCase):
         tmp_catalog.write(catalog_toml)
         tmp_catalog.close()
         catalog_path = Path(tmp_catalog.name)
-        saved_catalog = self.opsx_plan._cost_catalog
+        saved_catalog = self.opsx_plan.cost_mod._cost_catalog
         try:
-            self.opsx_plan._cost_catalog = (
+            self.opsx_plan.cost_mod._cost_catalog = (
                 PricingCatalog(catalog_path=catalog_path),
                 UnresolvedPrice,
             )
@@ -7760,7 +7760,7 @@ class DirectStageUsageIntegrationTests(unittest.TestCase):
             self.assertEqual(c["pricing_catalog_version"], "1.0.0")
             self.assertIsNotNone(c["price_snapshot"])
         finally:
-            self.opsx_plan._cost_catalog = saved_catalog
+            self.opsx_plan.cost_mod._cost_catalog = saved_catalog
             catalog_path.unlink(missing_ok=True)
 
     # -- Claude Code envelope -> telemetry integration (task 5.5) -----------
@@ -7800,9 +7800,9 @@ class DirectStageUsageIntegrationTests(unittest.TestCase):
         tmp_catalog.write(catalog_toml)
         tmp_catalog.close()
         catalog_path = Path(tmp_catalog.name)
-        saved_catalog = self.opsx_plan._cost_catalog
+        saved_catalog = self.opsx_plan.cost_mod._cost_catalog
         try:
-            self.opsx_plan._cost_catalog = (
+            self.opsx_plan.cost_mod._cost_catalog = (
                 PricingCatalog(catalog_path=catalog_path),
                 UnresolvedPrice,
             )
@@ -7899,2802 +7899,8 @@ class DirectStageUsageIntegrationTests(unittest.TestCase):
             result = aggregate(self.repo, self.plan_name, None)
             self.assertEqual(result.plan_metrics.plan_name, self.plan_name)
         finally:
-            self.opsx_plan._cost_catalog = saved_catalog
+            self.opsx_plan.cost_mod._cost_catalog = saved_catalog
             catalog_path.unlink(missing_ok=True)
-
-
-class CostEstimationTests(unittest.TestCase):
-    """Unit tests for cost estimation functions (tasks 5.1-5.8)."""
-
-    def setUp(self) -> None:
-        self.opsx_plan = load_opsx_plan()
-        # Reset module-level catalog so tests can use their own.
-        self.opsx_plan._cost_catalog = None
-        self._saved_denoms = dict(self.opsx_plan.SUBSCRIPTION_DENOMINATORS)
-        self.opsx_plan.SUBSCRIPTION_DENOMINATORS.clear()
-
-    def tearDown(self) -> None:
-        self.opsx_plan._cost_catalog = None
-        self.opsx_plan.SUBSCRIPTION_DENOMINATORS.clear()
-        self.opsx_plan.SUBSCRIPTION_DENOMINATORS.update(self._saved_denoms)
-
-    @staticmethod
-    def _write_catalog(content: str) -> Path:
-        """Write a temporary TOML catalog and return its path."""
-        from textwrap import dedent
-
-        tmp = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".toml", delete=False, encoding="utf-8",
-        )
-        tmp.write(dedent(content))
-        tmp.close()
-        return Path(tmp.name)
-
-    def _set_catalog(self, content: str) -> None:
-        """Replace the module-level catalog with one built from *content*."""
-        from lib.pricing import PricingCatalog, UnresolvedPrice
-
-        catalog_path = self._write_catalog(content)
-        self.opsx_plan._cost_catalog = (PricingCatalog(catalog_path=catalog_path), UnresolvedPrice)
-
-    def _usage(self, **kwargs):
-        """Build a usage dict with defaults for a typical available scenario."""
-        defaults = {
-            "usage_available": True,
-            "input_tokens": None,
-            "output_tokens": None,
-            "cached_input_tokens": None,
-            "reasoning_tokens": None,
-            "total_tokens": None,
-        }
-        defaults.update(kwargs)
-        return defaults
-
-    def _model(self, provider="openai", model_id="gpt-4o"):
-        return {"provider": provider, "model_id": model_id}
-
-    # 5.1
-    def test_per_token_model_with_input_output_produces_estimated(self):
-        self._set_catalog(
-            """\
-            [catalog]
-            version = "1.0.0"
-            updated = "2026-01-01"
-
-            [[entries]]
-            provider = "openai"
-            model_id = "gpt-4o"
-            display_name = "GPT-4o"
-            billing_mode = "per_token"
-            currency = "USD"
-            input_price_per_mtok = 2.0
-            output_price_per_mtok = 8.0
-            effective_date = "2025-01-01"
-            """
-        )
-        usage = self._usage(input_tokens=200000, output_tokens=50000)
-        model = self._model()
-
-        result = self.opsx_plan.estimate_stage_cost(usage, model)
-
-        self.assertEqual(result["status"], "estimated")
-        self.assertEqual(result["pricing_catalog_version"], "1.0.0")
-        self.assertEqual(result["estimated_cost"], 0.8)
-        self.assertIsNone(result["unresolved_reason"])
-        snapshot = result["price_snapshot"]
-        self.assertIsNotNone(snapshot)
-        self.assertEqual(snapshot["provider"], "openai")
-        self.assertEqual(snapshot["model_id"], "gpt-4o")
-        self.assertEqual(snapshot["billing_mode"], "per_token")
-        self.assertEqual(snapshot["input_price_per_mtok"], 2.0)
-        self.assertEqual(snapshot["output_price_per_mtok"], 8.0)
-
-    # 5.2
-    def test_cached_input_tokens_contribute_to_estimate(self):
-        self._set_catalog(
-            """\
-            [catalog]
-            version = "1.0.0"
-            updated = "2026-01-01"
-
-            [[entries]]
-            provider = "openai"
-            model_id = "gpt-4o"
-            display_name = "GPT-4o"
-            billing_mode = "per_token"
-            currency = "USD"
-            input_price_per_mtok = 2.50
-            output_price_per_mtok = 10.00
-            cached_input_price_per_mtok = 1.25
-            effective_date = "2025-01-01"
-            """
-        )
-        # 100000 cached input tokens at $1.25/mtok = $0.125
-        usage = self._usage(cached_input_tokens=100000)
-        model = self._model()
-
-        result = self.opsx_plan.estimate_stage_cost(usage, model)
-
-        self.assertEqual(result["status"], "estimated")
-        self.assertEqual(result["estimated_cost"], 0.125)
-        snapshot = result["price_snapshot"]
-        self.assertEqual(snapshot["cached_input_price_per_mtok"], 1.25)
-
-    # 5.3
-    def test_usage_unavailable_produces_unresolved(self):
-        usage = self._usage(usage_available=False)
-        model = self._model()
-
-        result = self.opsx_plan.estimate_stage_cost(usage, model)
-
-        self.assertEqual(result["status"], "unresolved")
-        self.assertEqual(result["unresolved_reason"], "usage unavailable")
-        self.assertIsNone(result["estimated_cost"])
-        self.assertIsNone(result["price_snapshot"])
-
-    # 5.4
-    def test_missing_model_identity_produces_unresolved(self):
-        self._set_catalog(
-            """\
-            [catalog]
-            version = "1.0.0"
-            updated = "2026-01-01"
-            [[entries]]
-            provider = "openai"
-            model_id = "gpt-4o"
-            display_name = "GPT-4o"
-            billing_mode = "per_token"
-            currency = "USD"
-            input_price_per_mtok = 2.0
-            effective_date = "2025-01-01"
-            """
-        )
-        usage = self._usage(input_tokens=100)
-
-        for model in (
-            {"provider": "", "model_id": ""},
-            {"provider": None, "model_id": None},
-            {"provider": "openai", "model_id": ""},
-            {"provider": "", "model_id": "gpt-4o"},
-        ):
-            with self.subTest(model=model):
-                result = self.opsx_plan.estimate_stage_cost(usage, model)
-                self.assertEqual(result["status"], "unresolved")
-                self.assertEqual(
-                    result["unresolved_reason"], "model identity unavailable",
-                )
-
-    # 5.5
-    def test_unknown_model_pricing_produces_unresolved(self):
-        self._set_catalog(
-            """\
-            [catalog]
-            version = "1.0.0"
-            updated = "2026-01-01"
-            [[entries]]
-            provider = "openai"
-            model_id = "gpt-4o"
-            display_name = "GPT-4o"
-            billing_mode = "per_token"
-            currency = "USD"
-            input_price_per_mtok = 2.0
-            effective_date = "2025-01-01"
-            """
-        )
-        usage = self._usage(input_tokens=100)
-
-        # Unknown model
-        result = self.opsx_plan.estimate_stage_cost(
-            usage, {"provider": "openai", "model_id": "gpt-99"},
-        )
-        self.assertEqual(result["status"], "unresolved")
-        self.assertIn("unknown model", result["unresolved_reason"])
-
-        # Unknown provider
-        result = self.opsx_plan.estimate_stage_cost(
-            usage, {"provider": "nobody", "model_id": "model"},
-        )
-        self.assertEqual(result["status"], "unresolved")
-        self.assertIn("unknown provider", result["unresolved_reason"])
-
-    # 5.6
-    def test_token_category_positive_usage_unpriced_produces_unresolved(self):
-        self._set_catalog(
-            """\
-            [catalog]
-            version = "1.0.0"
-            updated = "2026-01-01"
-            [[entries]]
-            provider = "openai"
-            model_id = "gpt-4o"
-            display_name = "GPT-4o"
-            billing_mode = "per_token"
-            currency = "USD"
-            input_price_per_mtok = 2.0
-            effective_date = "2025-01-01"
-            """
-        )
-        # reasoning_tokens has positive usage but no reasoning_rate in catalog
-        usage = self._usage(reasoning_tokens=1000)
-        model = self._model()
-
-        result = self.opsx_plan.estimate_stage_cost(usage, model)
-
-        self.assertEqual(result["status"], "unresolved")
-        self.assertIn("missing rate for observed token category", result["unresolved_reason"])
-        self.assertIn("reasoning_tokens", result["unresolved_reason"])
-
-    # 5.7
-    def test_subscription_with_valid_denominator_produces_estimated(self):
-        self._set_catalog(
-            """\
-            [catalog]
-            version = "1.0.0"
-            updated = "2026-01-01"
-            [[entries]]
-            provider = "github"
-            model_id = "copilot"
-            display_name = "GitHub Copilot"
-            billing_mode = "subscription"
-            currency = "USD"
-            subscription_period = "monthly"
-            subscription_price = 10.0
-            effective_date = "2025-01-01"
-            """
-        )
-        # usage.total_tokens = 100000, denominator = 50000000
-        # expected cost = 10.0 * (100000 / 50000000) = 0.02
-        usage = self._usage(total_tokens=100000)
-        model = self._model("github", "copilot")
-        denoms = {"github": {"copilot": 50000000.0}}
-
-        result = self.opsx_plan.estimate_stage_cost(usage, model, denoms)
-
-        self.assertEqual(result["status"], "estimated")
-        self.assertEqual(result["estimated_cost"], 0.02)
-        snapshot = result["price_snapshot"]
-        self.assertIsNotNone(snapshot)
-        self.assertEqual(snapshot["billing_mode"], "subscription")
-        self.assertEqual(snapshot["subscription_price"], 10.0)
-        self.assertEqual(snapshot["usage_denominator_units"], 50000000)
-        self.assertEqual(snapshot["usage_denominator_source"], "config")
-
-    # 5.8
-    def test_subscription_without_denominator_produces_unresolved(self):
-        self._set_catalog(
-            """\
-            [catalog]
-            version = "1.0.0"
-            updated = "2026-01-01"
-            [[entries]]
-            provider = "github"
-            model_id = "copilot"
-            display_name = "GitHub Copilot"
-            billing_mode = "subscription"
-            currency = "USD"
-            subscription_period = "monthly"
-            subscription_price = 10.0
-            effective_date = "2025-01-01"
-            """
-        )
-        usage = self._usage(total_tokens=100000)
-        model = self._model("github", "copilot")
-
-        result = self.opsx_plan.estimate_stage_cost(usage, model)
-
-        self.assertEqual(result["status"], "unresolved")
-        self.assertEqual(
-            result["unresolved_reason"], "missing subscription denominator",
-        )
-        self.assertIsNone(result["estimated_cost"])
-
-    def test_subscription_uses_total_tokens_from_categories_when_total_is_null(self):
-        self._set_catalog(
-            """\
-            [catalog]
-            version = "1.0.0"
-            updated = "2026-01-01"
-            [[entries]]
-            provider = "github"
-            model_id = "copilot"
-            display_name = "GitHub Copilot"
-            billing_mode = "subscription"
-            currency = "USD"
-            subscription_period = "monthly"
-            subscription_price = 10.0
-            effective_date = "2025-01-01"
-            """
-        )
-        # total_tokens is None, but input + output = 200000
-        usage = self._usage(total_tokens=None, input_tokens=150000, output_tokens=50000)
-        model = self._model("github", "copilot")
-        denoms = {"github": {"copilot": 50000000.0}}
-
-        result = self.opsx_plan.estimate_stage_cost(usage, model, denoms)
-
-        self.assertEqual(result["status"], "estimated")
-        # 10.0 * (200000 / 50000000) = 0.04
-        self.assertEqual(result["estimated_cost"], 0.04)
-
-    def test_module_level_denominators_are_used(self):
-        self._set_catalog(
-            """\
-            [catalog]
-            version = "1.0.0"
-            updated = "2026-01-01"
-            [[entries]]
-            provider = "github"
-            model_id = "copilot"
-            display_name = "GitHub Copilot"
-            billing_mode = "subscription"
-            currency = "USD"
-            subscription_period = "monthly"
-            subscription_price = 10.0
-            effective_date = "2025-01-01"
-            """
-        )
-        usage = self._usage(total_tokens=100000)
-        model = self._model("github", "copilot")
-        self.opsx_plan.SUBSCRIPTION_DENOMINATORS["github"] = {"copilot": 50000000.0}
-
-        result = self.opsx_plan.estimate_stage_cost(usage, model)
-
-        self.assertEqual(result["status"], "estimated")
-        self.assertEqual(result["estimated_cost"], 0.02)
-
-    def test_invalid_denominator_produces_unresolved(self):
-        self._set_catalog(
-            """\
-            [catalog]
-            version = "1.0.0"
-            updated = "2026-01-01"
-            [[entries]]
-            provider = "github"
-            model_id = "copilot"
-            display_name = "GitHub Copilot"
-            billing_mode = "subscription"
-            currency = "USD"
-            subscription_period = "monthly"
-            subscription_price = 10.0
-            effective_date = "2025-01-01"
-            """
-        )
-        usage = self._usage(total_tokens=100000)
-        model = self._model("github", "copilot")
-
-        for bad_denom in (-1, 0):
-            with self.subTest(denom=bad_denom):
-                denoms = {"github": {"copilot": float(bad_denom)}}
-                result = self.opsx_plan.estimate_stage_cost(usage, model, denoms)
-                self.assertEqual(result["status"], "unresolved")
-                self.assertEqual(
-                    result["unresolved_reason"], "invalid subscription denominator",
-                )
-
-    def test_non_numeric_and_nan_denominator_produce_unresolved(self):
-        """Regression: non-numeric and NaN denominator values must produce
-        unresolved status instead of crashing or producing NaN costs."""
-        self._set_catalog(
-            """\
-            [catalog]
-            version = "1.0.0"
-            updated = "2026-01-01"
-            [[entries]]
-            provider = "github"
-            model_id = "copilot"
-            display_name = "GitHub Copilot"
-            billing_mode = "subscription"
-            currency = "USD"
-            subscription_period = "monthly"
-            subscription_price = 10.0
-            effective_date = "2025-01-01"
-            """
-        )
-        usage = self._usage(total_tokens=100000)
-        model = self._model("github", "copilot")
-
-        # Non-numeric string values should not crash or fall back to
-        # "unavailable" — they should produce "unresolved" with a clear
-        # reason.
-        for bad_denom in ("not-a-number", "invalid", ""):
-            with self.subTest(denom=bad_denom):
-                denoms = {"github": {"copilot": bad_denom}}
-                result = self.opsx_plan.estimate_stage_cost(usage, model, denoms)
-                self.assertEqual(result["status"], "unresolved")
-                self.assertEqual(
-                    result["unresolved_reason"], "invalid subscription denominator",
-                )
-
-        # NaN values (float('nan')) must also produce "unresolved" — they are
-        # not usable numbers even though isinstance checks pass.
-        denoms = {"github": {"copilot": float("nan")}}
-        result = self.opsx_plan.estimate_stage_cost(usage, model, denoms)
-        self.assertEqual(result["status"], "unresolved")
-        self.assertEqual(
-            result["unresolved_reason"], "invalid subscription denominator",
-        )
-
-    def test_zero_token_count_contributes_zero_cost(self):
-        self._set_catalog(
-            """\
-            [catalog]
-            version = "1.0.0"
-            updated = "2026-01-01"
-            [[entries]]
-            provider = "openai"
-            model_id = "gpt-4o"
-            display_name = "GPT-4o"
-            billing_mode = "per_token"
-            currency = "USD"
-            input_price_per_mtok = 2.0
-            output_price_per_mtok = 8.0
-            effective_date = "2025-01-01"
-            """
-        )
-        usage = self._usage(input_tokens=0, output_tokens=0)
-        model = self._model()
-
-        result = self.opsx_plan.estimate_stage_cost(usage, model)
-
-        self.assertEqual(result["status"], "estimated")
-        self.assertEqual(result["estimated_cost"], 0.0)
-
-    def test_null_token_count_does_not_contribute(self):
-        self._set_catalog(
-            """\
-            [catalog]
-            version = "1.0.0"
-            updated = "2026-01-01"
-            [[entries]]
-            provider = "openai"
-            model_id = "gpt-4o"
-            display_name = "GPT-4o"
-            billing_mode = "per_token"
-            currency = "USD"
-            input_price_per_mtok = 2.0
-            output_price_per_mtok = 8.0
-            effective_date = "2025-01-01"
-            """
-        )
-        # Only input tokens present; output is null
-        usage = self._usage(input_tokens=100000, output_tokens=None)
-        model = self._model()
-
-        result = self.opsx_plan.estimate_stage_cost(usage, model)
-
-        self.assertEqual(result["status"], "estimated")
-        self.assertEqual(result["estimated_cost"], 0.2)  # 100000/1e6 * 2.0
-
-    def test_price_snapshot_per_token_includes_all_rates(self):
-        self._set_catalog(
-            """\
-            [catalog]
-            version = "1.2.3"
-            updated = "2026-01-01"
-            [[entries]]
-            provider = "openai"
-            model_id = "o3"
-            display_name = "o3"
-            billing_mode = "per_token"
-            currency = "USD"
-            input_price_per_mtok = 10.0
-            output_price_per_mtok = 40.0
-            cached_input_price_per_mtok = 2.5
-            reasoning_price_per_mtok = 20.0
-            effective_date = "2025-01-01"
-            """
-        )
-        usage = self._usage(input_tokens=10000, output_tokens=5000,
-                            cached_input_tokens=2000, reasoning_tokens=1000)
-        model = self._model("openai", "o3")
-
-        result = self.opsx_plan.estimate_stage_cost(usage, model)
-
-        self.assertEqual(result["status"], "estimated")
-        snapshot = result["price_snapshot"]
-        self.assertEqual(snapshot["catalog_version"], "1.2.3")
-        self.assertEqual(snapshot["input_price_per_mtok"], 10.0)
-        self.assertEqual(snapshot["output_price_per_mtok"], 40.0)
-        self.assertEqual(snapshot["cached_input_price_per_mtok"], 2.5)
-        self.assertEqual(snapshot["reasoning_price_per_mtok"], 20.0)
-        self.assertEqual(snapshot["display_name"], "o3")
-        self.assertNotIn("subscription_price", snapshot)
-
-    def test_empty_catalog_produces_unresolved(self):
-        self._set_catalog(
-            """\
-            [catalog]
-            version = "1.0.0"
-            updated = "2026-01-01"
-            """
-        )
-        usage = self._usage(input_tokens=100)
-        model = self._model()
-
-        result = self.opsx_plan.estimate_stage_cost(usage, model)
-
-        self.assertEqual(result["status"], "unresolved")
-        self.assertEqual(result["unresolved_reason"], "empty catalog")
-
-    def test_cost_estimation_does_not_crash_on_uninitialized_catalog(self):
-        """When the catalog fails to load, estimation returns unresolved."""
-        self.opsx_plan._cost_catalog = False  # sentinel for failed init
-        usage = self._usage(input_tokens=100)
-        model = self._model()
-
-        result = self.opsx_plan.estimate_stage_cost(usage, model)
-
-        self.assertEqual(result["status"], "unresolved")
-        self.assertEqual(
-            result["unresolved_reason"], "pricing catalog failed to load",
-        )
-
-    def test_cli_path_regression_repo_arg_loads_real_catalog(self):
-        """CLI-path regression: when repo is passed, the installed
-        opsx-plan/opsx-run can discover lib.pricing and load the real
-        catalog for cost estimation."""
-        import sys
-
-        self.opsx_plan._cost_catalog = None
-        actual_repo = Path(__file__).resolve().parents[2]
-        usage = self._usage(input_tokens=100000, output_tokens=50000)
-        model = self._model("openai", "gpt-4o")
-
-        # Cold-start lib.pricing: earlier tests may have imported
-        # lib.pricing (e.g. via _set_catalog), which caches it in
-        # sys.modules and masks the CLI-path regression.  Pop every
-        # key rooted at 'lib' so the next import is a true cold load.
-        saved_lib_modules = {
-            k: v for k, v in sys.modules.items()
-            if k == "lib" or k.startswith("lib.")
-        }
-        for k in saved_lib_modules:
-            del sys.modules[k]
-
-        # Temporarily remove the repo root from sys.path to simulate
-        # the installed CLI environment where only the script directory
-        # is on the path.
-        repo_str = str(actual_repo)
-        removed: list[str] = []
-        while repo_str in sys.path:
-            sys.path.remove(repo_str)
-            removed.append(repo_str)
-
-        try:
-            result = self.opsx_plan.estimate_stage_cost(usage, model,
-                                                         repo=actual_repo)
-        finally:
-            # Restore whatever we removed.
-            for p in removed:
-                if p not in sys.path:
-                    sys.path.insert(0, p)
-            # Restore saved lib modules so later tests are not affected.
-            for k, v in saved_lib_modules.items():
-                sys.modules[k] = v
-
-        self.assertEqual(result["status"], "estimated",
-                         f"expected estimated, got {result}")
-        self.assertEqual(result["pricing_catalog_version"], "1.3.0")
-        # input 100k * 2.50/mtok + output 50k * 10.00/mtok
-        # = 0.25 + 0.50 = 0.75
-        self.assertEqual(result["estimated_cost"], 0.75)
-        self.assertIsNotNone(result["price_snapshot"])
-
-
-class ReportCommandTests(unittest.TestCase):
-    """Tests for ``opsx-plan report``: table output, JSON output, filters,
-    edge cases, and idempotency (tasks 7.1–7.14)."""
-
-    def setUp(self) -> None:
-        self.opsx_plan = load_opsx_plan()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.repo = Path(self.tmp.name)
-        git(self.repo, "init")
-        git(
-            self.repo,
-            "-c", "user.email=test@example.invalid",
-            "-c", "user.name=Test User",
-            "commit", "-m", "init", "--allow-empty",
-        )
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-
-    # -- telemetry / state / plan helpers -------------------------------------
-
-    @staticmethod
-    def _build_record(*, stage: str, change_id: str, run_id: str = "run-001",
-                      plan_name: str = "test-plan", round_num: int = 1,
-                      status: str = "completed",
-                      duration_ms: int = 5000,
-                      input_tokens: int = 10000,
-                      output_tokens: int = 2000,
-                      cost_status: str = "estimated",
-                      estimated_cost: float = 0.05,
-                      provider: str = "openai",
-                      model_id: str = "gpt-4o",
-                      verdict: str | None = None,
-                      critical: int = 0, warning: int = 0, note: int = 0,
-                      stage_status: str | None = None,
-                      started_at: str = "2026-07-01T10:00:00Z",
-                      ) -> dict:
-        """Build a single telemetry JSONL record dict."""
-        import uuid as _uuid_module
-        rec: dict = {
-            "uid": str(_uuid_module.uuid4()),
-            "schema_version": 1,
-            "plan_name": plan_name,
-            "run_id": run_id,
-            "change_id": change_id,
-            "stage": stage,
-            "round": round_num,
-            "status": status,
-            "started_at": started_at,
-            "ended_at": "2026-07-01T10:00:05Z",
-            "duration_ms": duration_ms,
-            "usage": {
-                "usage_available": True,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "cached_input_tokens": None,
-                "reasoning_tokens": None,
-                "total_tokens": input_tokens + output_tokens if input_tokens is not None and output_tokens is not None else None,
-                "usage_source": "worker_json",
-            },
-            "cost": {
-                "status": cost_status,
-                "estimated_cost": estimated_cost,
-                "pricing_catalog_version": "1.0.0" if cost_status == "estimated" else None,
-                "price_snapshot": None,
-                "unresolved_reason": None if cost_status == "estimated" else "unresolved reason",
-            },
-            "model": {
-                "provider": provider,
-                "model_id": model_id,
-                "model_alias": None,
-            },
-            "result": {
-                "stage_status": stage_status or ("completed" if status == "completed" else None),
-                "verdict": verdict,
-                "critical_count": critical,
-                "warning_count": warning,
-                "note_count": note,
-            },
-        }
-        return rec
-
-    def _write_telemetry(self, plan_name: str, records: list[dict]) -> None:
-        """Write records to .opsx-plan/telemetry/<plan_name>.jsonl."""
-        tele_dir = self.repo / ".opsx-plan" / "telemetry"
-        tele_dir.mkdir(parents=True, exist_ok=True)
-        jsonl = tele_dir / f"{plan_name}.jsonl"
-        lines = "\n".join(json.dumps(r, sort_keys=True, ensure_ascii=True)
-                          for r in records) + "\n"
-        jsonl.write_text(lines, encoding="utf-8")
-
-    def _write_state(self, plan_name: str, state: dict) -> None:
-        """Write plan state to .opsx-plan/<plan_name>.state.json."""
-        state_dir = self.repo / ".opsx-plan"
-        state_dir.mkdir(parents=True, exist_ok=True)
-        p = state_dir / f"{plan_name}.state.json"
-        p.write_text(json.dumps(state, sort_keys=True, ensure_ascii=True), encoding="utf-8")
-
-    def _write_plan_toml(self, name: str = "test-plan", changes: list[str] | None = None) -> Path:
-        """Write a minimal plan TOML and return its path."""
-        if changes is None:
-            changes = ["ch-single"]
-        change_entries = "\n".join(
-            f"[[changes]]\nid = \"{c}\"\n" for c in changes
-        )
-        content = (
-            f'[plan]\nname = "{name}"\nadapter = "opencode"\n'
-            f'timeout_minutes = 1\nmax_rounds = 5\n'
-            f'require_clean_tracked = false\n'
-            f"{change_entries}\n"
-        )
-        p = self.repo / f"{name}.toml"
-        p.write_text(content, encoding="utf-8")
-        return p
-
-    def _report_args(self, plan_path: str | Path, **kw) -> argparse.Namespace:
-        """Build an argparse.Namespace for cmd_report."""
-        return argparse.Namespace(
-            repo=str(self.repo),
-            plan=str(plan_path),
-            json=kw.get("json", False),
-            change=kw.get("change"),
-            run_id=kw.get("run_id"),
-            stage=kw.get("stage"),
-            model=kw.get("model"),
-        )
-
-    def _run_report(self, **kw) -> tuple[int, str, str]:
-        """Run cmd_report, return (rc, stdout, stderr)."""
-        plan_path = kw.pop("plan_path", self._write_plan_toml())
-        import sys as _sys
-        saved_path = list(_sys.path)
-        try:
-            args = self._report_args(plan_path, **kw)
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-            with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
-                rc = self.opsx_plan.cmd_report(args)
-            return rc, stdout.getvalue(), stderr.getvalue()
-        finally:
-            _sys.path[:] = saved_path
-
-    # -- 7.1 table output for completed single-change plan with estimated costs
-
-    def test_table_output_single_change_estimated_costs(self) -> None:
-        plan_name = "single-plan"
-        cid = "ch-single"
-        plan_path = self._write_plan_toml(plan_name, [cid])
-
-        records = [
-            self._build_record(
-                stage="implement", change_id=cid, plan_name=plan_name,
-                duration_ms=120000, input_tokens=50000, output_tokens=10000,
-                estimated_cost=0.25, cost_status="estimated",
-            ),
-            self._build_record(
-                stage="review", change_id=cid, plan_name=plan_name,
-                duration_ms=30000, input_tokens=20000, output_tokens=5000,
-                estimated_cost=0.10, cost_status="estimated",
-                verdict="pass",
-            ),
-            self._build_record(
-                stage="archive", change_id=cid, plan_name=plan_name,
-                duration_ms=10000, input_tokens=8000, output_tokens=2000,
-                estimated_cost=0.04, cost_status="estimated",
-            ),
-        ]
-        self._write_telemetry(plan_name, records)
-        self._write_state(plan_name, {
-            "plan": plan_name, "approvals": [],
-            "changes": {
-                cid: {"status": "done", "round": 1, "phase": "done"},
-            },
-        })
-
-        rc, stdout, stderr = self._run_report(
-            plan_path=plan_path, plan_name=plan_name,
-        )
-        self.assertEqual(rc, 0)
-        # Plan summary
-        self.assertIn("=== Plan Summary ===", stdout)
-        self.assertIn(plan_name, stdout)
-        self.assertIn("1 completed", stdout)
-        # Per-change table
-        self.assertIn("=== Per-Change Metrics ===", stdout)
-        self.assertIn(cid, stdout)
-        self.assertIn("completed", stdout)
-        # Plan summary shows total cost
-        self.assertIn("$0.39", stdout)
-        # Stage aggregates
-        self.assertIn("=== Stage Aggregates ===", stdout)
-        # Model leaderboard
-        self.assertIn("=== Model Leaderboard ===", stdout)
-        self.assertIn("openai:gpt-4o", stdout)
-
-    # -- 7.2 table output for multi-change plan (mixed cost statuses)
-
-    def test_table_output_multi_change_mixed_costs(self) -> None:
-        plan_name = "multi-plan"
-        cids = ["ch-alpha", "ch-beta"]
-        plan_path = self._write_plan_toml(plan_name, cids)
-
-        records: list[dict] = []
-        for cid in cids:
-            cost_status = "estimated" if cid == "ch-alpha" else "unresolved"
-            records.append(self._build_record(
-                stage="implement", change_id=cid, plan_name=plan_name,
-                duration_ms=60000, input_tokens=30000, output_tokens=6000,
-                estimated_cost=0.15 if cost_status == "estimated" else None,
-                cost_status=cost_status,
-            ))
-            records.append(self._build_record(
-                stage="review", change_id=cid, plan_name=plan_name,
-                duration_ms=20000, input_tokens=15000, output_tokens=3000,
-                estimated_cost=0.08 if cost_status == "estimated" else None,
-                cost_status=cost_status, verdict="pass",
-            ))
-            records.append(self._build_record(
-                stage="archive", change_id=cid, plan_name=plan_name,
-                duration_ms=8000, input_tokens=5000, output_tokens=1000,
-                estimated_cost=0.02 if cost_status == "estimated" else None,
-                cost_status=cost_status,
-            ))
-        self._write_telemetry(plan_name, records)
-        self._write_state(plan_name, {
-            "plan": plan_name, "approvals": [],
-            "changes": {
-                cid: {"status": "done", "round": 1, "phase": "done"}
-                for cid in cids
-            },
-        })
-
-        rc, stdout, stderr = self._run_report(
-            plan_path=plan_path, plan_name=plan_name,
-        )
-        self.assertEqual(rc, 0)
-        self.assertIn("2 completed", stdout)
-        self.assertIn("ch-alpha", stdout)
-        self.assertIn("ch-beta", stdout)
-        # One change has estimated costs
-        self.assertIn("estimated", stdout)
-        # The other has unresolved cost
-        self.assertIn("unresolved", stdout)
-
-    # -- 7.3 table output for failed plan with max-rounds and review failures
-
-    def test_table_output_failed_plan(self) -> None:
-        plan_name = "fail-plan"
-        cid = "ch-fail"
-        plan_path = self._write_plan_toml(plan_name, [cid])
-
-        records = [
-            self._build_record(
-                stage="implement", change_id=cid, plan_name=plan_name,
-                duration_ms=90000, cost_status="unresolved",
-                round_num=1,
-            ),
-            self._build_record(
-                stage="review", change_id=cid, plan_name=plan_name,
-                duration_ms=25000, cost_status="unresolved",
-                verdict="fail", critical=1, round_num=1,
-            ),
-            self._build_record(
-                stage="implement", change_id=cid, plan_name=plan_name,
-                duration_ms=90000, cost_status="unresolved",
-                round_num=2,
-            ),
-            self._build_record(
-                stage="review", change_id=cid, plan_name=plan_name,
-                duration_ms=25000, cost_status="unresolved",
-                verdict="fail", critical=1, round_num=2,
-            ),
-        ]
-        self._write_telemetry(plan_name, records)
-        self._write_state(plan_name, {
-            "plan": plan_name, "approvals": [],
-            "changes": {
-                cid: {
-                    "status": "failed", "round": 2, "phase": "implement",
-                    "max_rounds": 2, "no_progress_streak": 1,
-                },
-            },
-        })
-
-        rc, stdout, stderr = self._run_report(
-            plan_path=plan_path, plan_name=plan_name,
-        )
-        self.assertEqual(rc, 0)
-        self.assertIn("1 failed", stdout)
-        self.assertIn("failed", stdout)
-        self.assertIn("2", stdout)  # total rounds
-        self.assertIn("2", stdout)  # review failures
-        # no_progress should show "yes" in table output (formatted by _fmt_bool)
-        self.assertIn("yes", stdout)
-        # max_rounds_exceeded
-        self.assertIn("yes", stdout)
-
-    # -- 7.4 JSON output structure and stability
-
-    def test_json_byte_identical_across_two_runs(self) -> None:
-        plan_name = "stable-plan"
-        cid = "ch-stable"
-        plan_path = self._write_plan_toml(plan_name, [cid])
-
-        records = [
-            self._build_record(
-                stage="implement", change_id=cid, plan_name=plan_name,
-                duration_ms=60000, estimated_cost=0.20,
-            ),
-            self._build_record(
-                stage="review", change_id=cid, plan_name=plan_name,
-                duration_ms=20000, estimated_cost=0.08,
-                verdict="pass",
-            ),
-            self._build_record(
-                stage="archive", change_id=cid, plan_name=plan_name,
-                duration_ms=8000, estimated_cost=0.03,
-            ),
-        ]
-        self._write_telemetry(plan_name, records)
-        self._write_state(plan_name, {
-            "plan": plan_name, "approvals": [],
-            "changes": {
-                cid: {"status": "done", "round": 1, "phase": "done"},
-            },
-        })
-
-        rc1, stdout1, _ = self._run_report(
-            plan_path=plan_path, plan_name=plan_name, json=True,
-        )
-        rc2, stdout2, _ = self._run_report(
-            plan_path=plan_path, plan_name=plan_name, json=True,
-        )
-        self.assertEqual(rc1, 0)
-        self.assertEqual(rc2, 0)
-        self.assertEqual(stdout1, stdout2)
-
-    # -- 7.5 JSON output matches aggregation dataclass fields
-
-    def test_json_structure_matches_dataclasses(self) -> None:
-        plan_name = "struct-plan"
-        cid = "ch-struct"
-        plan_path = self._write_plan_toml(plan_name, [cid])
-
-        records = [
-            self._build_record(
-                stage="implement", change_id=cid, plan_name=plan_name,
-                estimated_cost=0.30,
-            ),
-            self._build_record(
-                stage="review", change_id=cid, plan_name=plan_name,
-                estimated_cost=0.10, verdict="pass",
-            ),
-            self._build_record(
-                stage="archive", change_id=cid, plan_name=plan_name,
-                estimated_cost=0.05,
-            ),
-        ]
-        self._write_telemetry(plan_name, records)
-        self._write_state(plan_name, {
-            "plan": plan_name, "approvals": [],
-            "changes": {
-                cid: {"status": "done", "round": 1, "phase": "done"},
-            },
-        })
-
-        rc, stdout, _ = self._run_report(
-            plan_path=plan_path, plan_name=plan_name, json=True,
-        )
-        self.assertEqual(rc, 0)
-        data = json.loads(stdout)
-        # Top-level keys
-        for key in ("command", "plan_name", "run_id", "filters",
-                     "plan_metrics", "change_metrics",
-                     "stage_aggregates", "model_leaderboard", "warnings"):
-            self.assertIn(key, data, f"Missing top-level key: {key}")
-
-        # PlanMetrics keys
-        pm = data["plan_metrics"]
-        for key in ("plan_name", "run_id", "total_changes", "completed_changes",
-                     "failed_changes", "blocked_changes", "incomplete_changes",
-                     "completion_rate", "success_rate", "total_duration_ms",
-                     "total_tokens", "total_estimated_cost",
-                     "estimated_cost_changes", "unresolved_cost_changes",
-                     "unknown_cost_changes"):
-            self.assertIn(key, pm, f"Missing plan_metrics key: {key}")
-
-        # ChangeMetrics keys
-        self.assertGreaterEqual(len(data["change_metrics"]), 1)
-        cm = data["change_metrics"][0]
-        for key in ("change_id", "status", "total_rounds", "duration_ms",
-                     "tokens", "estimated_cost", "cost_status",
-                     "first_pass_review", "review_failures", "no_progress",
-                     "max_rounds_exceeded", "archive_failed", "fast_check_failed"):
-            self.assertIn(key, cm, f"Missing change_metrics key: {key}")
-
-        # StageAggregates keys
-        sa = data["stage_aggregates"]
-        for key in ("average_rounds", "median_rounds",
-                     "average_duration_implement", "average_duration_review",
-                     "average_duration_archive", "review_failure_rate",
-                     "average_tokens_per_change", "average_cost_per_change"):
-            self.assertIn(key, sa, f"Missing stage_aggregates key: {key}")
-
-        # ModelLeaderboardEntry keys on at least one entry
-        self.assertGreater(len(data["model_leaderboard"]), 0,
-                           "Leaderboard must not be empty for a completed change")
-        ml = data["model_leaderboard"][0]
-        for key in ("implementer_model", "reviewer_model", "archiver_model",
-                     "change_count", "success_rate", "first_pass_rate",
-                     "average_rounds", "average_duration_ms",
-                     "average_tokens", "average_cost"):
-            self.assertIn(key, ml, f"Missing model_leaderboard key: {key}")
-        # No entry may be a partial-role row — every entry must have all
-        # three role models populated.
-        for entry in data["model_leaderboard"]:
-            self.assertIsNotNone(entry.get("implementer_model"),
-                                 f"Partial-role leaderboard entry (missing implementer_model): {entry}")
-            self.assertIsNotNone(entry.get("reviewer_model"),
-                                 f"Partial-role leaderboard entry (missing reviewer_model): {entry}")
-            self.assertIsNotNone(entry.get("archiver_model"),
-                                 f"Partial-role leaderboard entry (missing archiver_model): {entry}")
-
-    # -- 7.6 --change filter
-
-    def test_change_filter(self) -> None:
-        plan_name = "filter-change-plan"
-        cids = ["ch-one", "ch-two"]
-        plan_path = self._write_plan_toml(plan_name, cids)
-
-        records: list[dict] = []
-        for cid in cids:
-            records.append(self._build_record(
-                stage="implement", change_id=cid, plan_name=plan_name,
-                duration_ms=60000, estimated_cost=0.15,
-            ))
-            records.append(self._build_record(
-                stage="review", change_id=cid, plan_name=plan_name,
-                duration_ms=20000, estimated_cost=0.08,
-                verdict="pass",
-            ))
-            records.append(self._build_record(
-                stage="archive", change_id=cid, plan_name=plan_name,
-                duration_ms=8000, estimated_cost=0.03,
-            ))
-        self._write_telemetry(plan_name, records)
-        self._write_state(plan_name, {
-            "plan": plan_name, "approvals": [],
-            "changes": {
-                cid: {"status": "done", "round": 1, "phase": "done"}
-                for cid in cids
-            },
-        })
-
-        # Without filter, both changes appear
-        rc_full, stdout_full, _ = self._run_report(
-            plan_path=plan_path, plan_name=plan_name,
-        )
-        self.assertEqual(rc_full, 0)
-        self.assertIn("ch-one", stdout_full)
-        self.assertIn("ch-two", stdout_full)
-
-        # With --change filter, only ch-one appears in per-change table
-        rc, stdout, _ = self._run_report(
-            plan_path=plan_path, plan_name=plan_name,
-            change="ch-one",
-        )
-        self.assertEqual(rc, 0)
-        self.assertIn("ch-one", stdout)
-        self.assertNotIn("ch-two", stdout)
-
-        # JSON with --change filter
-        rc_json, stdout_json, _ = self._run_report(
-            plan_path=plan_path, plan_name=plan_name,
-            change="ch-one", json=True,
-        )
-        self.assertEqual(rc_json, 0)
-        data = json.loads(stdout_json)
-        change_ids = [c["change_id"] for c in data["change_metrics"]]
-        self.assertEqual(change_ids, ["ch-one"])
-        self.assertEqual(data["filters"]["change"], "ch-one")
-
-    # -- 7.7 --run-id filter
-
-    def test_run_id_filter(self) -> None:
-        plan_name = "multi-run-plan"
-        cid = "ch-run"
-        plan_path = self._write_plan_toml(plan_name, [cid])
-
-        run_a_records = [
-            self._build_record(
-                stage="implement", change_id=cid, plan_name=plan_name,
-                run_id="run-A", estimated_cost=0.10,
-            ),
-            self._build_record(
-                stage="review", change_id=cid, plan_name=plan_name,
-                run_id="run-A", estimated_cost=0.05, verdict="pass",
-            ),
-            self._build_record(
-                stage="archive", change_id=cid, plan_name=plan_name,
-                run_id="run-A", estimated_cost=0.02,
-            ),
-        ]
-        run_b_records = [
-            self._build_record(
-                stage="implement", change_id=cid, plan_name=plan_name,
-                run_id="run-B", estimated_cost=0.30,
-                started_at="2026-07-02T10:00:00Z",  # later start
-            ),
-            self._build_record(
-                stage="review", change_id=cid, plan_name=plan_name,
-                run_id="run-B", estimated_cost=0.12, verdict="pass",
-                started_at="2026-07-02T10:01:00Z",
-            ),
-            self._build_record(
-                stage="archive", change_id=cid, plan_name=plan_name,
-                run_id="run-B", estimated_cost=0.06,
-                started_at="2026-07-02T10:02:00Z",
-            ),
-        ]
-        all_records = run_a_records + run_b_records
-        self._write_telemetry(plan_name, all_records)
-        self._write_state(plan_name, {
-            "plan": plan_name, "approvals": [],
-            "changes": {
-                cid: {"status": "done", "round": 1, "phase": "done"},
-            },
-        })
-
-        # Default (latest): should pick run-B
-        rc, stdout, _ = self._run_report(
-            plan_path=plan_path, plan_name=plan_name,
-        )
-        self.assertEqual(rc, 0)
-        self.assertIn("run-B", stdout)
-
-        # Explicit filter to run-A
-        rc_a, stdout_a, _ = self._run_report(
-            plan_path=plan_path, plan_name=plan_name,
-            run_id="run-A",
-        )
-        self.assertEqual(rc_a, 0)
-        self.assertIn("run-A", stdout_a)
-
-        # JSON with run-id filter
-        rc_json, stdout_json, _ = self._run_report(
-            plan_path=plan_path, plan_name=plan_name,
-            run_id="run-A", json=True,
-        )
-        self.assertEqual(rc_json, 0)
-        data = json.loads(stdout_json)
-        self.assertEqual(data["run_id"], "run-A")
-        self.assertEqual(data["filters"]["run_id"], "run-A")
-
-    # -- 7.8 --model filter
-
-    def test_model_filter(self) -> None:
-        plan_name = "model-filter-plan"
-        cids = ["ch-gpt", "ch-claude"]
-        plan_path = self._write_plan_toml(plan_name, cids)
-
-        records: list[dict] = []
-        # ch-gpt uses openai:gpt-4o
-        records.append(self._build_record(
-            stage="implement", change_id="ch-gpt", plan_name=plan_name,
-            provider="openai", model_id="gpt-4o", estimated_cost=0.15,
-        ))
-        records.append(self._build_record(
-            stage="review", change_id="ch-gpt", plan_name=plan_name,
-            provider="openai", model_id="gpt-4o", estimated_cost=0.08,
-            verdict="pass",
-        ))
-        records.append(self._build_record(
-            stage="archive", change_id="ch-gpt", plan_name=plan_name,
-            provider="openai", model_id="gpt-4o", estimated_cost=0.03,
-        ))
-        # ch-claude uses anthropic:claude-sonnet
-        records.append(self._build_record(
-            stage="implement", change_id="ch-claude", plan_name=plan_name,
-            provider="anthropic", model_id="claude-sonnet", estimated_cost=0.20,
-        ))
-        records.append(self._build_record(
-            stage="review", change_id="ch-claude", plan_name=plan_name,
-            provider="anthropic", model_id="claude-sonnet", estimated_cost=0.10,
-            verdict="pass",
-        ))
-        records.append(self._build_record(
-            stage="archive", change_id="ch-claude", plan_name=plan_name,
-            provider="anthropic", model_id="claude-sonnet", estimated_cost=0.04,
-        ))
-        self._write_telemetry(plan_name, records)
-        self._write_state(plan_name, {
-            "plan": plan_name, "approvals": [],
-            "changes": {
-                cid: {"status": "done", "round": 1, "phase": "done"}
-                for cid in cids
-            },
-        })
-
-        # Without model filter, both models appear
-        rc_full, stdout_full, _ = self._run_report(
-            plan_path=plan_path, plan_name=plan_name,
-        )
-        self.assertEqual(rc_full, 0)
-        self.assertIn("gpt-4o", stdout_full)
-        self.assertIn("claude-sonnet", stdout_full)
-
-        # Filter by model substring (case-insensitive)
-        rc, stdout, _ = self._run_report(
-            plan_path=plan_path, plan_name=plan_name,
-            model="claude",
-        )
-        self.assertEqual(rc, 0)
-        self.assertIn("claude-sonnet", stdout)
-        self.assertNotIn("gpt-4o", stdout)
-
-    # -- 7.9 --stage filter
-
-    def test_stage_filter(self) -> None:
-        plan_name = "stage-filter-plan"
-        cid = "ch-stage"
-        plan_path = self._write_plan_toml(plan_name, [cid])
-
-        records = [
-            self._build_record(
-                stage="implement", change_id=cid, plan_name=plan_name,
-                estimated_cost=0.15, provider="openai", model_id="gpt-4o",
-            ),
-            self._build_record(
-                stage="review", change_id=cid, plan_name=plan_name,
-                estimated_cost=0.08, verdict="pass",
-                provider="openai", model_id="gpt-4o-mini",
-            ),
-            self._build_record(
-                stage="archive", change_id=cid, plan_name=plan_name,
-                estimated_cost=0.03,
-                provider="openai", model_id="gpt-4o",
-            ),
-        ]
-        self._write_telemetry(plan_name, records)
-        self._write_state(plan_name, {
-            "plan": plan_name, "approvals": [],
-            "changes": {
-                cid: {"status": "done", "round": 1, "phase": "done"},
-            },
-        })
-
-        # Stage filter: implement — leaderboard should only have implement entries
-        rc, stdout, _ = self._run_report(
-            plan_path=plan_path, plan_name=plan_name,
-            stage="implement",
-        )
-        self.assertEqual(rc, 0)
-        self.assertIn("Avg Implement Duration", stdout)
-        self.assertNotIn("Avg Review Duration", stdout)
-        self.assertNotIn("Avg Archive Duration", stdout)
-
-        # Stage filter: review
-        rc_r, stdout_r, _ = self._run_report(
-            plan_path=plan_path, plan_name=plan_name,
-            stage="review",
-        )
-        self.assertEqual(rc_r, 0)
-        self.assertIn("Avg Review Duration", stdout_r)
-        self.assertNotIn("Avg Implement Duration", stdout_r)
-
-        # Invalid stage rejected
-        plan_path2 = self._write_plan_toml("bad-stage-plan", [cid])
-        records2 = [
-            self._build_record(
-                stage="implement", change_id=cid,
-                plan_name="bad-stage-plan", estimated_cost=0.10,
-            ),
-            self._build_record(
-                stage="review", change_id=cid,
-                plan_name="bad-stage-plan", estimated_cost=0.05,
-                verdict="pass",
-            ),
-        ]
-        self._write_telemetry("bad-stage-plan", records2)
-        self._write_state("bad-stage-plan", {
-            "plan": "bad-stage-plan", "approvals": [],
-            "changes": {
-                cid: {"status": "done", "round": 1, "phase": "done"},
-            },
-        })
-        rc_bad, _, stderr_bad = self._run_report(
-            plan_path=plan_path2, stage="invalid",
-        )
-        self.assertEqual(rc_bad, 2)
-        self.assertIn("invalid stage", stderr_bad.lower())
-
-    # -- 7.10 empty telemetry: graceful output with warnings
-
-    def test_empty_telemetry(self) -> None:
-        plan_name = "empty-plan"
-        cid = "ch-empty"
-        plan_path = self._write_plan_toml(plan_name, [cid])
-
-        # No telemetry written; just state with a change
-        self._write_state(plan_name, {
-            "plan": plan_name, "approvals": [],
-            "changes": {
-                cid: {"status": "running", "round": 0, "phase": "implement"},
-            },
-        })
-
-        rc, stdout, _ = self._run_report(
-            plan_path=plan_path, plan_name=plan_name,
-        )
-        self.assertEqual(rc, 0)
-        self.assertIn("=== Plan Summary ===", stdout)
-        self.assertIn(plan_name, stdout)
-        # State has ch-empty registered, so "1 total" with "0 completed"
-        self.assertIn("1 total", stdout)
-        self.assertIn("0 completed", stdout)
-        # Warnings section should mention missing telemetry
-        self.assertIn("=== Warnings", stdout)
-        self.assertIn("telemetry file not found", stdout)
-
-    # -- 7.11 unresolved and unavailable cost rendering
-
-    def test_cost_rendering(self) -> None:
-        # Direct unit tests on _fmt_cost for all cost statuses
-        # estimated with value
-        self.assertEqual(self.opsx_plan._fmt_cost(0.50, "estimated"), "$0.50")
-        # estimated with None value (shouldn't happen in practice but safe)
-        self.assertEqual(self.opsx_plan._fmt_cost(None, "estimated"), "—")
-        # unresolved
-        self.assertEqual(self.opsx_plan._fmt_cost(0.50, "unresolved"), "unresolved")
-        # unavailable
-        self.assertEqual(self.opsx_plan._fmt_cost(None, "unavailable"), "unavailable")
-        # partial
-        self.assertEqual(self.opsx_plan._fmt_cost(0.30, "partial"), "$0.30")
-        # unknown status falls through as —
-        self.assertEqual(self.opsx_plan._fmt_cost(None, "unknown"), "—")
-
-        # Also test via table output: create unresolved change
-        plan_name = "cost-render-plan"
-        cid = "ch-cost"
-        plan_path = self._write_plan_toml(plan_name, [cid])
-        records = [
-            self._build_record(
-                stage="implement", change_id=cid, plan_name=plan_name,
-                cost_status="unresolved", estimated_cost=None,
-                duration_ms=60000,
-            ),
-        ]
-        self._write_telemetry(plan_name, records)
-        self._write_state(plan_name, {
-            "plan": plan_name, "approvals": [],
-            "changes": {
-                cid: {"status": "running", "round": 1, "phase": "implement"},
-            },
-        })
-        rc, stdout, _ = self._run_report(plan_path=plan_path)
-        self.assertEqual(rc, 0)
-        # Table should show "unresolved" in cost columns
-        self.assertIn("unresolved", stdout)
-
-    # -- 7.12 zero estimated cost rendered as "$0.00"
-
-    def test_zero_cost_rendered_as_dollar_zero(self) -> None:
-        self.assertEqual(self.opsx_plan._fmt_cost(0.0, "estimated"), "$0.00")
-        self.assertEqual(self.opsx_plan._fmt_cost(0.0, "partial"), "$0.00")
-
-        # Verify zero-cost appears in table as "$0.00" not "unresolved"
-        plan_name = "zero-cost-plan"
-        cid = "ch-zero"
-        plan_path = self._write_plan_toml(plan_name, [cid])
-        records = [
-            self._build_record(
-                stage="implement", change_id=cid, plan_name=plan_name,
-                estimated_cost=0.0, cost_status="estimated",
-                duration_ms=1000,
-            ),
-        ]
-        self._write_telemetry(plan_name, records)
-        self._write_state(plan_name, {
-            "plan": plan_name, "approvals": [],
-            "changes": {
-                cid: {"status": "running", "round": 1, "phase": "implement"},
-            },
-        })
-        rc, stdout, _ = self._run_report(plan_path=plan_path)
-        self.assertEqual(rc, 0)
-        self.assertIn("$0.00", stdout)
-        # The per-change cost status should be "estimated", not "unresolved"
-        # (plan summary contains "0 unresolved" in the cost breakdown line,
-        # but the per-change status column should show "estimated")
-        lines = [l for l in stdout.splitlines() if "ch-zero" in l]
-        self.assertTrue(any("estimated" in l for l in lines))
-
-    # -- 7.13 long change/model ID truncation in table mode only
-
-    def test_long_id_truncation_in_table(self) -> None:
-        # Unit test _truncate_id
-        self.assertEqual(self.opsx_plan._truncate_id(None), "—")
-        short = "short-id"
-        self.assertEqual(self.opsx_plan._truncate_id(short), short)
-        exact30 = "a" * 30
-        self.assertEqual(self.opsx_plan._truncate_id(exact30), exact30)
-        long31 = "a" * 31
-        truncated = self.opsx_plan._truncate_id(long31)
-        self.assertLess(len(truncated), len(long31))
-        self.assertTrue(truncated.endswith("…"))
-        self.assertEqual(len(truncated), 30)
-
-        # Long ID appears truncated in table output but not in JSON
-        plan_name = "trunc-plan"
-        long_cid = "very-long-change-id-that-exceeds-thirty-chars"
-        plan_path = self._write_plan_toml(plan_name, [long_cid])
-        records = [
-            self._build_record(
-                stage="implement", change_id=long_cid, plan_name=plan_name,
-                estimated_cost=0.10, duration_ms=60000,
-            ),
-            self._build_record(
-                stage="review", change_id=long_cid, plan_name=plan_name,
-                estimated_cost=0.05, verdict="pass",
-            ),
-        ]
-        self._write_telemetry(plan_name, records)
-        self._write_state(plan_name, {
-            "plan": plan_name, "approvals": [],
-            "changes": {
-                long_cid: {"status": "done", "round": 1, "phase": "done"},
-            },
-        })
-
-        # Table mode: truncated
-        rc_table, stdout_table, _ = self._run_report(plan_path=plan_path)
-        self.assertEqual(rc_table, 0)
-        self.assertNotIn(long_cid, stdout_table)  # full ID truncated
-        self.assertIn("…", stdout_table)          # truncation marker
-
-        # JSON mode: full ID preserved
-        rc_json, stdout_json, _ = self._run_report(
-            plan_path=plan_path, json=True,
-        )
-        self.assertEqual(rc_json, 0)
-        data = json.loads(stdout_json)
-        self.assertIn(long_cid, stdout_json)
-        self.assertEqual(data["change_metrics"][0]["change_id"], long_cid)
-
-    # -- 6.5 unknown model identity shows "unknown" in leaderboard output
-
-    def test_unknown_model_identity_shows_unknown_in_leaderboard(self) -> None:
-        """Unknown model identity appears as 'unknown' in leaderboard
-        instead of dropping rows entirely."""
-        plan_name = "unknown-model-plan"
-        cid_known = "ch-known"
-        cid_unknown = "ch-unknown"
-        plan_path = self._write_plan_toml(plan_name, [cid_known, cid_unknown])
-
-        records = [
-            # Change with known model identity
-            self._build_record(
-                stage="implement", change_id=cid_known, plan_name=plan_name,
-                estimated_cost=0.10, provider="openai", model_id="gpt-4o",
-            ),
-            self._build_record(
-                stage="review", change_id=cid_known, plan_name=plan_name,
-                estimated_cost=0.05, verdict="pass",
-                provider="openai", model_id="gpt-4o",
-            ),
-            self._build_record(
-                stage="archive", change_id=cid_known, plan_name=plan_name,
-                estimated_cost=0.04, provider="openai", model_id="gpt-4o",
-            ),
-            # Change with unknown model identity (empty provider/model_id)
-            self._build_record(
-                stage="implement", change_id=cid_unknown, plan_name=plan_name,
-                estimated_cost=0.10, provider="", model_id="",
-            ),
-            self._build_record(
-                stage="review", change_id=cid_unknown, plan_name=plan_name,
-                estimated_cost=0.05, verdict="pass",
-                provider="", model_id="",
-            ),
-            self._build_record(
-                stage="archive", change_id=cid_unknown, plan_name=plan_name,
-                estimated_cost=0.04, provider="", model_id="",
-            ),
-        ]
-        self._write_telemetry(plan_name, records)
-        self._write_state(plan_name, {
-            "plan": plan_name, "approvals": [],
-            "changes": {
-                cid_known: {"status": "done", "round": 1, "phase": "done"},
-                cid_unknown: {"status": "done", "round": 1, "phase": "done"},
-            },
-        })
-
-        # Table mode: "unknown" appears in leaderboard output
-        rc, stdout, _ = self._run_report(plan_path=plan_path)
-        self.assertEqual(rc, 0)
-        self.assertIn("unknown", stdout)
-
-        # JSON mode: model_leaderboard contains entries with "unknown" model
-        rc_json, stdout_json, _ = self._run_report(
-            plan_path=plan_path, json=True,
-        )
-        self.assertEqual(rc_json, 0)
-        data = json.loads(stdout_json)
-
-        unknown_entries = [
-            e for e in data["model_leaderboard"]
-            if e.get("implementer_model") == "unknown"
-            or e.get("reviewer_model") == "unknown"
-            or e.get("archiver_model") == "unknown"
-        ]
-        self.assertGreater(
-            len(unknown_entries), 0,
-            "Leaderboard should contain entries with 'unknown' model",
-        )
-
-    # -- 7.14 report does not modify telemetry or state files
-
-    def test_report_does_not_modify_telemetry_or_state(self) -> None:
-        plan_name = "idempotent-plan"
-        cid = "ch-idem"
-        plan_path = self._write_plan_toml(plan_name, [cid])
-
-        records = [
-            self._build_record(
-                stage="implement", change_id=cid, plan_name=plan_name,
-                estimated_cost=0.20,
-            ),
-            self._build_record(
-                stage="review", change_id=cid, plan_name=plan_name,
-                estimated_cost=0.08, verdict="pass",
-            ),
-            self._build_record(
-                stage="archive", change_id=cid, plan_name=plan_name,
-                estimated_cost=0.04,
-            ),
-        ]
-        self._write_telemetry(plan_name, records)
-        state = {
-            "plan": plan_name, "approvals": [],
-            "changes": {
-                cid: {"status": "done", "round": 1, "phase": "done"},
-            },
-        }
-        self._write_state(plan_name, state)
-
-        # Snapshot file contents before report
-        telemetry_path = self.repo / ".opsx-plan" / "telemetry" / f"{plan_name}.jsonl"
-        state_path = self.repo / ".opsx-plan" / f"{plan_name}.state.json"
-        plan_toml_path = plan_path
-
-        tele_before = telemetry_path.read_text(encoding="utf-8")
-        state_before = state_path.read_text(encoding="utf-8")
-        plan_before = plan_toml_path.read_text(encoding="utf-8")
-
-        # Run table mode report
-        rc, stdout, _ = self._run_report(plan_path=plan_path)
-        self.assertEqual(rc, 0)
-
-        # Run JSON mode report
-        rc2, stdout2, _ = self._run_report(plan_path=plan_path, json=True)
-        self.assertEqual(rc2, 0)
-
-        # Verify files are unchanged
-        self.assertEqual(telemetry_path.read_text(encoding="utf-8"), tele_before,
-                         "telemetry file was modified by report command")
-        self.assertEqual(state_path.read_text(encoding="utf-8"), state_before,
-                         "state file was modified by report command")
-        self.assertEqual(plan_toml_path.read_text(encoding="utf-8"), plan_before,
-                         "plan TOML was modified by report command")
-
-        # Verify report command does not create new files in .opsx-plan
-        opsx_plan_dir = self.repo / ".opsx-plan"
-        opsx_contents = set()
-        for root, dirs, files in os.walk(str(opsx_plan_dir)):
-            for f in files:
-                opsx_contents.add(Path(root) / f)
-        expected = {telemetry_path, state_path}
-        self.assertEqual(opsx_contents, expected,
-                         "report command created unexpected files")
-
-    # -- formatting helpers ---------------------------------------------------
-
-    def test_fmt_duration(self) -> None:
-        self.assertEqual(self.opsx_plan._fmt_duration(None), "—")
-        self.assertEqual(self.opsx_plan._fmt_duration(0), "0m0s")
-        self.assertEqual(self.opsx_plan._fmt_duration(90000), "1m30s")
-        self.assertEqual(self.opsx_plan._fmt_duration(60000), "1m0s")
-        self.assertEqual(self.opsx_plan._fmt_duration(61000), "1m1s")
-        self.assertEqual(self.opsx_plan._fmt_duration(3599999), "59m59s")
-
-    def test_fmt_tokens(self) -> None:
-        self.assertEqual(self.opsx_plan._fmt_tokens(None), "—")
-        self.assertEqual(self.opsx_plan._fmt_tokens(0), "0")
-        self.assertEqual(self.opsx_plan._fmt_tokens(500), "500")
-        self.assertEqual(self.opsx_plan._fmt_tokens(1500), "1.5K")
-        self.assertEqual(self.opsx_plan._fmt_tokens(2_500_000), "2.5M")
-
-    def test_fmt_pct(self) -> None:
-        self.assertEqual(self.opsx_plan._fmt_pct(None), "—")
-        self.assertEqual(self.opsx_plan._fmt_pct(0.0), "0.0%")
-        self.assertEqual(self.opsx_plan._fmt_pct(0.5), "50.0%")
-        self.assertEqual(self.opsx_plan._fmt_pct(1.0), "100.0%")
-        self.assertEqual(self.opsx_plan._fmt_pct(0.333), "33.3%")
-
-    def test_fmt_bool(self) -> None:
-        self.assertEqual(self.opsx_plan._fmt_bool(None), "—")
-        self.assertEqual(self.opsx_plan._fmt_bool(True), "yes")
-        self.assertEqual(self.opsx_plan._fmt_bool(False), "no")
-
-    def test_invalid_stage_rejected(self) -> None:
-        plan_name = "invalid-stage-plan"
-        cid = "ch-invalid-stage"
-        plan_path = self._write_plan_toml(plan_name, [cid])
-        records = [
-            self._build_record(
-                stage="implement", change_id=cid, plan_name=plan_name,
-                estimated_cost=0.10,
-            ),
-        ]
-        self._write_telemetry(plan_name, records)
-        self._write_state(plan_name, {
-            "plan": plan_name, "approvals": [],
-            "changes": {
-                cid: {"status": "running", "round": 1, "phase": "implement"},
-            },
-        })
-        rc, _, stderr = self._run_report(
-            plan_path=plan_path, stage="bogus",
-        )
-        self.assertEqual(rc, 2)
-        self.assertIn("invalid stage", stderr)
-
-
-    # -- regression: triple leaderboard includes failed model combinations -----
-
-    def test_triple_leaderboard_includes_failed_combinations(self) -> None:
-        """The full model-combination (triple) leaderboard must include
-        rows for every model triplet that touched a change — including
-        failed, blocked, and incomplete changes — not only completed ones."""
-        plan_name = "triple-fail-plan"
-        cid = "ch-triple-fail"
-        plan_path = self._write_plan_toml(plan_name, [cid])
-
-        records = [
-            self._build_record(
-                stage="implement", change_id=cid, plan_name=plan_name,
-                provider="openai", model_id="gpt-4o",
-                cost_status="unresolved", estimated_cost=None,
-            ),
-            self._build_record(
-                stage="review", change_id=cid, plan_name=plan_name,
-                provider="openai", model_id="gpt-4o-mini",
-                cost_status="unresolved", estimated_cost=None,
-                verdict="fail", critical=1,
-            ),
-            self._build_record(
-                stage="archive", change_id=cid, plan_name=plan_name,
-                provider="openai", model_id="gpt-4o",
-                cost_status="unresolved", estimated_cost=None,
-            ),
-        ]
-        self._write_telemetry(plan_name, records)
-        self._write_state(plan_name, {
-            "plan": plan_name, "approvals": [],
-            "changes": {
-                cid: {
-                    "status": "failed", "round": 1, "phase": "implement",
-                    "max_rounds": 1, "no_progress_streak": 0,
-                },
-            },
-        })
-
-        # Table mode: the triple leaderboard should contain the model triplet
-        rc, stdout, _ = self._run_report(plan_path=plan_path)
-        self.assertEqual(rc, 0)
-        self.assertIn("=== Model Leaderboard ===", stdout)
-        # The triple row with openai:gpt-4o / openai:gpt-4o-mini / openai:gpt-4o
-        # should be present even though the change failed.
-        self.assertIn("gpt-4o", stdout)
-
-        # JSON mode: the leaderboard must contain an entry for this
-        # (failed) triple combination with change_count >= 1.
-        rc_json, stdout_json, _ = self._run_report(
-            plan_path=plan_path, json=True,
-        )
-        self.assertEqual(rc_json, 0)
-        data = json.loads(stdout_json)
-        self.assertIsNotNone(data.get("model_leaderboard"))
-
-        triple_entries = [
-            e for e in data["model_leaderboard"]
-            if (e.get("implementer_model") and e.get("reviewer_model")
-                and e.get("archiver_model"))
-        ]
-        self.assertGreater(
-            len(triple_entries), 0,
-            "Triple leaderboard must include the failed model combination",
-        )
-        self.assertGreaterEqual(
-            triple_entries[0].get("change_count", 0), 1,
-            "Failed combination must have change_count >= 1",
-        )
-
-    # -- regression: leaderboard has no partial-role rows -------------------
-
-    def test_leaderboard_has_no_partial_role_rows(self) -> None:
-        """Every leaderboard entry must have all three role model fields
-        populated (implementer, reviewer, archiver).  Per-role-only rows
-        (e.g. implementer-only) must never appear."""
-        plan_name = "no-partial-plan"
-        cids = ["ch-alpha", "ch-beta"]
-        plan_path = self._write_plan_toml(plan_name, cids)
-
-        records: list[dict] = []
-        for cid in cids:
-            impl_p, impl_m = ("openai", "gpt-4o") if cid == "ch-alpha" else ("anthropic", "claude-sonnet")
-            rev_p, rev_m = ("openai", "gpt-4o-mini") if cid == "ch-alpha" else ("", "")
-            arch_p, arch_m = ("openai", "gpt-4o") if cid == "ch-alpha" else ("", "")
-
-            records.append(self._build_record(
-                stage="implement", change_id=cid, plan_name=plan_name,
-                provider=impl_p, model_id=impl_m, estimated_cost=0.10,
-            ))
-            records.append(self._build_record(
-                stage="review", change_id=cid, plan_name=plan_name,
-                provider=rev_p, model_id=rev_m, estimated_cost=0.05,
-                verdict="pass",
-            ))
-            records.append(self._build_record(
-                stage="archive", change_id=cid, plan_name=plan_name,
-                provider=arch_p, model_id=arch_m, estimated_cost=0.03,
-            ))
-        self._write_telemetry(plan_name, records)
-        self._write_state(plan_name, {
-            "plan": plan_name, "approvals": [],
-            "changes": {
-                cid: {"status": "done", "round": 1, "phase": "done"}
-                for cid in cids
-            },
-        })
-
-        rc, stdout_json, _ = self._run_report(
-            plan_path=plan_path, plan_name=plan_name, json=True,
-        )
-        self.assertEqual(rc, 0)
-        data = json.loads(stdout_json)
-        self.assertIsNotNone(data.get("model_leaderboard"))
-        self.assertGreater(len(data["model_leaderboard"]), 0,
-                           "Leaderboard must not be empty")
-
-        # Verify complete triple entry exists (ch-alpha has all three roles with known models)
-        complete_entries = [
-            e for e in data["model_leaderboard"]
-            if (e.get("implementer_model") and e.get("implementer_model") != "unknown" and
-                e.get("reviewer_model") and e.get("reviewer_model") != "unknown" and
-                e.get("archiver_model") and e.get("archiver_model") != "unknown")
-        ]
-        self.assertEqual(len(complete_entries), 1,
-                         "Should have exactly one complete triple entry (ch-alpha)")
-        complete = complete_entries[0]
-        self.assertEqual(complete["implementer_model"], "openai:gpt-4o")
-        self.assertEqual(complete["reviewer_model"], "openai:gpt-4o-mini")
-        self.assertEqual(complete["archiver_model"], "openai:gpt-4o")
-
-        # Verify partial entry exists for ch-beta (only implementer known, others marked "unknown")
-        partial_entries = [
-            e for e in data["model_leaderboard"]
-            if e.get("implementer_model") == "anthropic:claude-sonnet"
-        ]
-        self.assertEqual(len(partial_entries), 1,
-                         "Should have exactly one entry for ch-beta (partial with unknown roles)")
-        partial = partial_entries[0]
-        self.assertEqual(partial["implementer_model"], "anthropic:claude-sonnet")
-        self.assertEqual(partial.get("reviewer_model"), "unknown",
-                         "Partial entry should have 'unknown' for unknown reviewer_model")
-        self.assertEqual(partial.get("archiver_model"), "unknown",
-                         "Partial entry should have 'unknown' for unknown archiver_model")
-
-    # -- regression: avg tokens/change displayed even when cost is unresolved
-
-    def test_avg_tokens_present_when_cost_unresolved(self) -> None:
-        """Stage aggregates must still display avg tokens per change even
-        when every change has unresolved cost — tokens are available
-        independently of cost estimation."""
-        plan_name = "tokens-no-cost-plan"
-        cids = ["ch-a", "ch-b"]
-        plan_path = self._write_plan_toml(plan_name, cids)
-
-        records: list[dict] = []
-        for cid in cids:
-            records.append(self._build_record(
-                stage="implement", change_id=cid, plan_name=plan_name,
-                duration_ms=50000, input_tokens=30000, output_tokens=6000,
-                cost_status="unresolved", estimated_cost=None,
-            ))
-            records.append(self._build_record(
-                stage="review", change_id=cid, plan_name=plan_name,
-                duration_ms=20000, input_tokens=15000, output_tokens=3000,
-                cost_status="unresolved", estimated_cost=None,
-                verdict="pass",
-            ))
-            records.append(self._build_record(
-                stage="archive", change_id=cid, plan_name=plan_name,
-                duration_ms=8000, input_tokens=5000, output_tokens=1000,
-                cost_status="unresolved", estimated_cost=None,
-            ))
-        self._write_telemetry(plan_name, records)
-        self._write_state(plan_name, {
-            "plan": plan_name, "approvals": [],
-            "changes": {
-                cid: {"status": "done", "round": 1, "phase": "done"}
-                for cid in cids
-            },
-        })
-
-        rc, stdout, _ = self._run_report(plan_path=plan_path)
-        self.assertEqual(rc, 0)
-        self.assertIn("=== Stage Aggregates ===", stdout)
-        # Avg Tokens / Change should show the K suffix, not "—"
-        self.assertIn("Avg Tokens / Change:", stdout)
-        token_line = next(
-            (l for l in stdout.splitlines()
-             if "Avg Tokens / Change:" in l),
-            "",
-        )
-        self.assertNotIn("—", token_line,
-                         "Avg Tokens / Change must not be '—' when token data is available")
-        self.assertIn("K", token_line,
-                      "Avg Tokens / Change should show a formatted number, not '—'")
-        # Avg Cost / Change should be "—" (no estimated cost)
-        cost_line = next(
-            (l for l in stdout.splitlines()
-             if "Avg Cost / Change:" in l),
-            "",
-        )
-        self.assertIn("—", cost_line,
-                      "Avg Cost / Change should be '—' when no estimated cost exists")
-
-        # JSON: avg_tokens must be a number, avg_cost must be null
-        rc_json, stdout_json, _ = self._run_report(
-            plan_path=plan_path, json=True,
-        )
-        self.assertEqual(rc_json, 0)
-        data = json.loads(stdout_json)
-        sa = data["stage_aggregates"]
-        self.assertIsNotNone(sa.get("average_tokens_per_change"),
-                             "average_tokens_per_change must not be null")
-        self.assertIsNone(sa.get("average_cost_per_change"),
-                          "average_cost_per_change must be null when no estimated costs")
-        self.assertGreater(sa["average_tokens_per_change"], 0)
-
-    # -- regression: all-unresolved plan cost renders as 'unresolved'
-
-    def test_all_unresolved_plan_cost_shows_unresolved(self) -> None:
-        """When every cost record in the plan has status 'unresolved',
-        the plan summary cost line must render as 'unresolved', not '—'."""
-        plan_name = "all-unresolved-plan"
-        cid = "ch-unresolved"
-        plan_path = self._write_plan_toml(plan_name, [cid])
-
-        records = [
-            self._build_record(
-                stage="implement", change_id=cid, plan_name=plan_name,
-                cost_status="unresolved", estimated_cost=None,
-                duration_ms=60000,
-            ),
-            self._build_record(
-                stage="review", change_id=cid, plan_name=plan_name,
-                cost_status="unresolved", estimated_cost=None,
-                duration_ms=30000, verdict="pass",
-            ),
-            self._build_record(
-                stage="archive", change_id=cid, plan_name=plan_name,
-                cost_status="unresolved", estimated_cost=None,
-                duration_ms=10000,
-            ),
-        ]
-        self._write_telemetry(plan_name, records)
-        self._write_state(plan_name, {
-            "plan": plan_name, "approvals": [],
-            "changes": {
-                cid: {"status": "done", "round": 1, "phase": "done"},
-            },
-        })
-
-        rc, stdout, _ = self._run_report(plan_path=plan_path)
-        self.assertEqual(rc, 0)
-        self.assertIn("=== Plan Summary ===", stdout)
-
-        # The cost line should contain "unresolved" not "—"
-        cost_line = next(
-            (l for l in stdout.splitlines() if l.startswith("Cost:")),
-            "",
-        )
-        self.assertIn("unresolved", cost_line,
-                      "All-unresolved plan cost must show 'unresolved', not '—'")
-        self.assertNotIn("$", cost_line,
-                         "All-unresolved plan cost must not show a dollar amount")
-
-
-class DashboardCommandTests(unittest.TestCase):
-    """Tests for ``opsx-plan dashboard`` HTML rendering and CLI behaviour."""
-
-    def setUp(self) -> None:
-        self.opsx_plan = load_opsx_plan()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.repo = Path(self.tmp.name)
-        git(self.repo, "init")
-        git(
-            self.repo,
-            "-c", "user.email=test@example.invalid",
-            "-c", "user.name=Test User",
-            "commit", "-m", "init", "--allow-empty",
-        )
-        self.plan_name = "test-plan"
-        self._set_up_plan_toml()
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-
-    def _set_up_plan_toml(self) -> None:
-        tomldir = self.repo / ".opsx-plan"
-        tomldir.mkdir(parents=True, exist_ok=True)
-        plan_path = tomldir / f"{self.plan_name}.toml"
-        plan_path.write_text(
-            '[plan]\nname = "test-plan"\nadapter = "opencode"\n\n'
-            '[[changes]]\nid = "add-thing"\nphase = 1\n'
-            '[[changes]]\nid = "add-other"\nphase = 1\n',
-            encoding="utf-8",
-        )
-
-    def _plan_toml_path(self) -> str:
-        return str(self.repo / ".opsx-plan" / f"{self.plan_name}.toml")
-
-    def _write_telemetry(self, records: list[dict]) -> None:
-        telemetry_dir = self.repo / ".opsx-plan" / "telemetry"
-        telemetry_dir.mkdir(parents=True, exist_ok=True)
-        jsonl_path = telemetry_dir / f"{self.plan_name}.jsonl"
-        with open(jsonl_path, "w", encoding="utf-8") as fh:
-            for r in records:
-                fh.write(json.dumps(r) + "\n")
-
-    def _write_state(self, state: dict) -> None:
-        state_dir = self.repo / ".opsx-plan"
-        state_dir.mkdir(parents=True, exist_ok=True)
-        state_path = state_dir / f"{self.plan_name}.state.json"
-        with open(state_path, "w", encoding="utf-8") as fh:
-            json.dump(state, fh, indent=2)
-
-    def _make_telemetry_record(
-        self,
-        change_id: str,
-        stage: str,
-        round_num: int = 1,
-        status: str = "completed",
-        started_at: str = "2026-07-01T10:00:00",
-        ended_at: str = "2026-07-01T10:02:00",
-        duration_ms: int = 120000,
-        provider: str = "openai",
-        model_id: str = "gpt-4o",
-        run_id: str = "run-001",
-        input_tokens: int | None = 5000,
-        output_tokens: int | None = 1000,
-        total_tokens: int | None = 6000,
-        cost_status: str = "estimated",
-        estimated_cost: float | None = 0.05,
-    ) -> dict:
-        usage = {
-            "usage_available": True,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "cached_input_tokens": None,
-            "reasoning_tokens": None,
-            "total_tokens": total_tokens,
-            "usage_source": "worker_json",
-        }
-        cost = {
-            "status": cost_status,
-            "pricing_catalog_version": "v1",
-            "price_snapshot": None,
-            "unresolved_reason": None,
-            "estimated_cost": estimated_cost,
-        }
-        return {
-            "schema_version": 1,
-            "uid": f"uid-{change_id}-{stage}-{round_num}",
-            "plan_name": self.plan_name,
-            "run_id": run_id,
-            "change_id": change_id,
-            "stage": stage,
-            "round": round_num,
-            "status": status,
-            "started_at": started_at,
-            "ended_at": ended_at,
-            "duration_ms": duration_ms,
-            "usage": usage,
-            "cost": cost,
-            "model": {
-                "provider": provider,
-                "model_id": model_id,
-                "model_alias": None,
-            },
-            "result": {
-                "stage_status": status,
-                "verdict": "pass" if stage == "review" else None,
-                "critical_count": 0,
-                "warning_count": 0,
-                "note_count": 0,
-            },
-        }
-
-    def _run_dashboard(self, **kwargs) -> str:
-        args = argparse.Namespace(
-            repo=str(self.repo),
-            plan=self._plan_toml_path(),
-            output=kwargs.get("output", None),
-            run_id=kwargs.get("run_id", None),
-            change=kwargs.get("change", None),
-        )
-        out = io.StringIO()
-        with mock.patch("sys.stdout", out):
-            rc = self.opsx_plan.cmd_dashboard(args)
-        return out.getvalue(), rc
-
-    def _read_output(self, output_path: str | None = None) -> str:
-        if output_path is None:
-            output_path = str(
-                self.repo / ".opsx-plan" / "dashboards" / f"{self.plan_name}.html"
-            )
-        return Path(output_path).read_text(encoding="utf-8")
-
-    # -- 8.1: Dashboard HTML structure for a completed single-change plan ---
-
-    def test_dashboard_for_completed_single_change_plan(self) -> None:
-        records = [
-            self._make_telemetry_record("add-thing", "implement", 1,
-                started_at="2026-07-01T10:00:00", ended_at="2026-07-01T10:02:00"),
-            self._make_telemetry_record("add-thing", "review", 1,
-                started_at="2026-07-01T10:02:01", ended_at="2026-07-01T10:03:00"),
-            self._make_telemetry_record("add-thing", "archive", 1,
-                started_at="2026-07-01T10:03:01", ended_at="2026-07-01T10:04:00"),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {
-                "add-thing": {"status": "done", "round": 1, "max_rounds": 5},
-                "add-other": {"status": "pending", "round": 0, "max_rounds": 5},
-            },
-        })
-
-        stdout, rc = self._run_dashboard()
-        self.assertEqual(rc, 0)
-        html = self._read_output()
-
-        self.assertIn("<!DOCTYPE html>", html)
-        self.assertIn("<html", html)
-        self.assertIn("test-plan", html)
-        self.assertIn("add-thing", html)
-        # No failures section should say "No failures"
-        self.assertIn("No failures", html)
-
-    # -- 8.2: Dashboard HTML for multi-change plan ---
-
-    def test_dashboard_for_multi_change_plan(self) -> None:
-        records = [
-            self._make_telemetry_record("add-thing", "implement", 1,
-                started_at="2026-07-01T10:00:00", ended_at="2026-07-01T10:02:00",
-                estimated_cost=0.05, cost_status="estimated"),
-            self._make_telemetry_record("add-thing", "review", 1,
-                started_at="2026-07-01T10:02:01", ended_at="2026-07-01T10:03:00"),
-            self._make_telemetry_record("add-thing", "archive", 1,
-                started_at="2026-07-01T10:03:01", ended_at="2026-07-01T10:04:00"),
-            self._make_telemetry_record("add-other", "implement", 1,
-                started_at="2026-07-01T10:04:01", ended_at="2026-07-01T10:06:00",
-                estimated_cost=None, cost_status="unresolved",
-                input_tokens=None, output_tokens=None, total_tokens=None),
-            self._make_telemetry_record("add-other", "review", 1,
-                started_at="2026-07-01T10:06:01", ended_at="2026-07-01T10:07:00"),
-            self._make_telemetry_record("add-other", "archive", 1,
-                started_at="2026-07-01T10:07:01", ended_at="2026-07-01T10:08:00"),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {
-                "add-thing": {"status": "done", "round": 1, "max_rounds": 5},
-                "add-other": {"status": "done", "round": 1, "max_rounds": 5},
-            },
-        })
-
-        stdout, rc = self._run_dashboard()
-        self.assertEqual(rc, 0)
-        html = self._read_output()
-
-        self.assertIn("add-thing", html)
-        self.assertIn("add-other", html)
-        # Mixed cost: expect both estimated and unresolved in cost breakdown
-        self.assertIn("Estimated", html)
-        self.assertIn("Unresolved", html)
-
-    # -- 8.3: All seven required sections present ---
-
-    def test_dashboard_contains_all_seven_sections(self) -> None:
-        records = [
-            self._make_telemetry_record("add-thing", "implement", 1),
-            self._make_telemetry_record("add-thing", "review", 1),
-            self._make_telemetry_record("add-thing", "archive", 1),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {
-                "add-thing": {"status": "done", "round": 1, "max_rounds": 5},
-                "add-other": {"status": "pending", "round": 0, "max_rounds": 5},
-            },
-        })
-
-        stdout, rc = self._run_dashboard()
-        self.assertEqual(rc, 0)
-        html = self._read_output()
-
-        section_headers = [
-            "Plan Summary",
-            "Model Leaderboard",
-            "Per-Change Details",
-            "Failure Breakdown",
-            "Cost Breakdown",
-            "Rounds Histogram",
-            "Stage Timeline",
-        ]
-        for header in section_headers:
-            self.assertIn(header, html,
-                          f"Dashboard must contain '{header}' section header")
-
-    # -- 8.4: Deterministic output ---
-
-    def test_dashboard_output_is_deterministic(self) -> None:
-        records = [
-            self._make_telemetry_record("add-thing", "implement", 1),
-            self._make_telemetry_record("add-thing", "review", 1),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {
-                "add-thing": {"status": "running", "round": 1, "max_rounds": 5},
-            },
-        })
-
-        out1 = self.repo / ".opsx-plan" / "dashboards" / f"{self.plan_name}.html"
-        out2 = self.repo / ".opsx-plan" / "dashboards" / f"{self.plan_name}-2.html"
-
-        # First run
-        args1 = argparse.Namespace(repo=str(self.repo), plan=self._plan_toml_path(),
-                                    output=str(out1), run_id=None, change=None)
-        self.opsx_plan.cmd_dashboard(args1)
-        html1 = out1.read_text(encoding="utf-8")
-
-        # Second run (different output path)
-        args2 = argparse.Namespace(repo=str(self.repo), plan=self._plan_toml_path(),
-                                    output=str(out2), run_id=None, change=None)
-        self.opsx_plan.cmd_dashboard(args2)
-        html2 = out2.read_text(encoding="utf-8")
-
-        self.assertEqual(html1, html2,
-                         "Same telemetry + state must produce byte-identical HTML")
-
-    # -- 8.5: Resolved cost renders as $X.XX ---
-
-    def test_dashboard_resolved_cost_renders_dollar_amount(self) -> None:
-        records = [
-            self._make_telemetry_record("add-thing", "implement", 1,
-                estimated_cost=1.23, cost_status="estimated"),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {"add-thing": {"status": "running", "round": 1, "max_rounds": 5}},
-        })
-
-        stdout, rc = self._run_dashboard()
-        self.assertEqual(rc, 0)
-        html = self._read_output()
-
-        self.assertIn("$1.23", html)
-        self.assertIn("cost-estimated", html)
-
-    # -- 8.6: Unresolved cost renders with amber styling ---
-
-    def test_dashboard_unresolved_cost_has_amber_styling(self) -> None:
-        records = [
-            self._make_telemetry_record("add-thing", "implement", 1,
-                estimated_cost=None, cost_status="unresolved",
-                input_tokens=None, output_tokens=None, total_tokens=None),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {"add-thing": {"status": "running", "round": 1, "max_rounds": 5}},
-        })
-
-        stdout, rc = self._run_dashboard()
-        self.assertEqual(rc, 0)
-        html = self._read_output()
-
-        self.assertIn("cost-unresolved", html,
-                      "Unresolved cost must have cost-unresolved CSS class")
-        self.assertIn("unresolved", html.lower())
-
-    # -- 8.7: Zero estimated cost renders as $0.00 ---
-
-    def test_dashboard_zero_estimated_cost_renders_as_zero(self) -> None:
-        records = [
-            self._make_telemetry_record("add-thing", "implement", 1,
-                estimated_cost=0.0, cost_status="estimated"),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {"add-thing": {"status": "running", "round": 1, "max_rounds": 5}},
-        })
-
-        stdout, rc = self._run_dashboard()
-        self.assertEqual(rc, 0)
-        html = self._read_output()
-
-        self.assertIn("$0.00", html)
-        self.assertIn("cost-estimated", html)
-
-    # -- 8.8: --run-id selects correct run ---
-
-    def test_dashboard_run_id_filter_selects_correct_run(self) -> None:
-        records = [
-            self._make_telemetry_record("add-thing", "implement", 1,
-                run_id="run-a", started_at="2026-07-01T10:00:00",
-                ended_at="2026-07-01T10:02:00"),
-            self._make_telemetry_record("add-thing", "implement", 1,
-                run_id="run-b", started_at="2026-07-02T10:00:00",
-                ended_at="2026-07-02T10:02:00"),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "run_id": "run-b",
-            "changes": {"add-thing": {"status": "running", "round": 1, "max_rounds": 5}},
-        })
-
-        stdout, rc = self._run_dashboard(run_id="run-a")
-        self.assertEqual(rc, 0)
-        html = self._read_output()
-
-        # Only run-a records should appear; the run_id field in plan summary
-        # should reflect run-a, not run-b
-        self.assertNotIn("run-b", html)
-
-    # -- 8.9: --change filter narrows output ---
-
-    def test_dashboard_change_filter_narrows_output(self) -> None:
-        records = [
-            self._make_telemetry_record("add-thing", "implement", 1),
-            self._make_telemetry_record("add-other", "implement", 1,
-                started_at="2026-07-01T11:00:00", ended_at="2026-07-01T11:02:00"),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {
-                "add-thing": {"status": "running", "round": 1, "max_rounds": 5},
-                "add-other": {"status": "running", "round": 1, "max_rounds": 5},
-            },
-        })
-
-        stdout, rc = self._run_dashboard(change="add-thing")
-        self.assertEqual(rc, 0)
-        html = self._read_output()
-
-        # Plan summary should still show total_changes
-        # Per-change table should only show add-thing
-        # Leaderboard should be scoped
-
-        # Filter annotation
-        self.assertIn("filter-annotation", html.lower() if html.lower() != html else html)
-
-    # -- 8.10: --output writes to specified path ---
-
-    def test_dashboard_custom_output_path(self) -> None:
-        records = [
-            self._make_telemetry_record("add-thing", "implement", 1),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {"add-thing": {"status": "running", "round": 1, "max_rounds": 5}},
-        })
-
-        custom_path = str(self.repo / "custom-dashboard.html")
-        stdout, rc = self._run_dashboard(output=custom_path)
-        self.assertEqual(rc, 0)
-        html = self._read_output(custom_path)
-
-        self.assertIn("<!DOCTYPE html>", html)
-        self.assertTrue(Path(custom_path).is_file())
-
-    # -- 8.11: Default output writes to .opsx-plan/dashboards/<plan>.html ---
-
-    def test_dashboard_default_output_path(self) -> None:
-        records = [
-            self._make_telemetry_record("add-thing", "implement", 1),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {"add-thing": {"status": "running", "round": 1, "max_rounds": 5}},
-        })
-
-        stdout, rc = self._run_dashboard()
-        self.assertEqual(rc, 0)
-
-        default_path = self.repo / ".opsx-plan" / "dashboards" / f"{self.plan_name}.html"
-        self.assertTrue(default_path.is_file(),
-                         f"Default output not at {default_path}")
-
-        html = default_path.read_text(encoding="utf-8")
-        self.assertIn("<!DOCTYPE html>", html)
-
-    # -- 8.12: Empty telemetry renders valid HTML with "no data" ---
-
-    def test_dashboard_empty_telemetry_produces_valid_html(self) -> None:
-        self._write_telemetry([])
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {},
-        })
-
-        stdout, rc = self._run_dashboard()
-        self.assertEqual(rc, 0)
-        html = self._read_output()
-
-        self.assertIn("<!DOCTYPE html>", html)
-        self.assertIn("<html", html)
-        self.assertIn("test-plan", html)
-        self.assertIn("No telemetry records found", html)
-
-    # -- 8.13: Dashboard does not modify telemetry or state ---
-
-    def test_dashboard_does_not_modify_source_files(self) -> None:
-        records = [
-            self._make_telemetry_record("add-thing", "implement", 1),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {"add-thing": {"status": "running", "round": 1, "max_rounds": 5}},
-        })
-
-        telemetry_path = self.repo / ".opsx-plan" / "telemetry" / f"{self.plan_name}.jsonl"
-        state_path = self.repo / ".opsx-plan" / f"{self.plan_name}.state.json"
-
-        telemetry_before = telemetry_path.read_text(encoding="utf-8")
-        state_before = state_path.read_text(encoding="utf-8")
-
-        stdout, rc = self._run_dashboard()
-        self.assertEqual(rc, 0)
-
-        telemetry_after = telemetry_path.read_text(encoding="utf-8")
-        state_after = state_path.read_text(encoding="utf-8")
-
-        self.assertEqual(telemetry_before, telemetry_after,
-                         "Telemetry file MUST NOT be modified by dashboard")
-        self.assertEqual(state_before, state_after,
-                         "State file MUST NOT be modified by dashboard")
-
-    # -- 8.14: HTML is self-contained (no external references) ---
-
-    def test_dashboard_html_is_self_contained(self) -> None:
-        records = [
-            self._make_telemetry_record("add-thing", "implement", 1),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {"add-thing": {"status": "running", "round": 1, "max_rounds": 5}},
-        })
-
-        stdout, rc = self._run_dashboard()
-        self.assertEqual(rc, 0)
-        html = self._read_output()
-
-        # No external references: no http:// or https://
-        self.assertNotIn("http://", html)
-        self.assertNotIn("https://", html)
-        # No <link> elements
-        self.assertNotIn("<link ", html.lower())
-        # No <script> with src
-        self.assertNotIn("<script src", html.lower())
-
-    # -- 8.15: Stage timeline entries sorted by started_at ---
-
-    def test_dashboard_timeline_sorted_by_started_at(self) -> None:
-        records = [
-            self._make_telemetry_record("add-thing", "archive", 1,
-                started_at="2026-07-01T10:03:00", ended_at="2026-07-01T10:04:00"),
-            self._make_telemetry_record("add-thing", "implement", 1,
-                started_at="2026-07-01T10:01:00", ended_at="2026-07-01T10:02:00"),
-            self._make_telemetry_record("add-thing", "review", 1,
-                started_at="2026-07-01T10:02:00", ended_at="2026-07-01T10:03:00"),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {"add-thing": {"status": "done", "round": 1, "max_rounds": 5}},
-        })
-
-        stdout, rc = self._run_dashboard()
-        self.assertEqual(rc, 0)
-        html = self._read_output()
-
-        # Implement should appear before review, before archive in timeline
-        impl_pos = html.index("implement")
-        rev_pos = html.index("review")
-        arch_pos = html.index("archive")
-        self.assertLess(impl_pos, rev_pos,
-                        "Implement should appear before review in timeline")
-        self.assertLess(rev_pos, arch_pos,
-                        "Review should appear before archive in timeline")
-
-    # -- 8.16: Failed plan failure breakdown lists failed changes ---
-
-    def test_dashboard_failure_breakdown_lists_failed_changes(self) -> None:
-        records = [
-            self._make_telemetry_record("add-thing", "implement", 1,
-                status="failed"),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {"add-thing": {"status": "failed", "round": 1, "max_rounds": 5}},
-        })
-
-        stdout, rc = self._run_dashboard()
-        self.assertEqual(rc, 0)
-        html = self._read_output()
-
-        # Should NOT contain "No failures" since there is a failed change
-        self.assertNotIn("No failures", html)
-
-    # -- 8.17: Rounds histogram shows distribution for completed changes ---
-
-    def test_dashboard_histogram_for_completed_changes(self) -> None:
-        records = [
-            self._make_telemetry_record("add-thing", "implement", 1),
-            self._make_telemetry_record("add-thing", "review", 1),
-            self._make_telemetry_record("add-thing", "archive", 1),
-            self._make_telemetry_record("add-other", "implement", 1),
-            self._make_telemetry_record("add-other", "review", 1,
-                started_at="2026-07-01T10:02:01", ended_at="2026-07-01T10:03:00"),
-            self._make_telemetry_record("add-other", "archive", 1,
-                started_at="2026-07-01T10:03:01", ended_at="2026-07-01T10:04:00"),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {
-                "add-thing": {"status": "done", "round": 1, "max_rounds": 5},
-                "add-other": {"status": "done", "round": 1, "max_rounds": 5},
-            },
-        })
-
-        stdout, rc = self._run_dashboard()
-        self.assertEqual(rc, 0)
-        html = self._read_output()
-
-        # Histogram should be present
-        self.assertIn("histogram", html.lower())
-
-    # -- HTML escaping ---
-
-    def test_dashboard_escapes_special_characters_in_plan_name(self) -> None:
-        self._write_telemetry([])
-        self._write_state({"plan": "test-plan", "changes": {}})
-
-        # Override plan TOML with a plan name containing HTML
-        plan_path = self.repo / ".opsx-plan" / f"{self.plan_name}.toml"
-        script_name = "test <script>alert(1)</script>"
-        plan_path.write_text(
-            f'[plan]\nname = "{script_name}"\nadapter = "opencode"\n\n'
-            '[[changes]]\nid = "add-thing"\nphase = 1\n',
-            encoding="utf-8",
-        )
-
-        out = io.StringIO()
-        args = argparse.Namespace(
-            repo=str(self.repo), plan=self._plan_toml_path(),
-            output=None, run_id=None, change=None,
-        )
-        with mock.patch("sys.stdout", out):
-            rc = self.opsx_plan.cmd_dashboard(args)
-
-        self.assertEqual(rc, 0)
-
-        # Output goes to the dashboard directory with the plan name from TOML
-        output_path = self.repo / ".opsx-plan" / "dashboards" / f"{script_name}.html"
-        self.assertTrue(output_path.is_file(),
-                         f"Expected dashboard at {output_path}")
-        html = output_path.read_text(encoding="utf-8")
-
-        self.assertNotIn("<script>alert", html)
-        self.assertIn("&lt;script&gt;", html)
-
-    # -- AggregationError handling ---
-
-    def test_dashboard_handles_aggregation_error(self) -> None:
-        stderr = io.StringIO()
-
-        from lib.metrics.aggregator import AggregationError
-
-        def fake_aggregate(*args, **kwargs):
-            raise AggregationError("test aggregation failure")
-
-        args = argparse.Namespace(
-            repo=str(self.repo),
-            plan=self._plan_toml_path(),
-            output=None, run_id=None, change=None,
-        )
-        with mock.patch(
-            "lib.metrics.aggregator.aggregate", side_effect=fake_aggregate
-        ), mock.patch("sys.stderr", stderr):
-            rc = self.opsx_plan.cmd_dashboard(args)
-        self.assertEqual(rc, 2)
-        self.assertIn("test aggregation failure", stderr.getvalue())
-
-    # -- Output directory auto-created ---
-
-    def test_dashboard_creates_output_directory(self) -> None:
-        records = [
-            self._make_telemetry_record("add-thing", "implement", 1),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {"add-thing": {"status": "running", "round": 1, "max_rounds": 5}},
-        })
-
-        dashboards_dir = self.repo / ".opsx-plan" / "dashboards"
-        if dashboards_dir.exists():
-            import shutil
-            shutil.rmtree(dashboards_dir)
-
-        stdout, rc = self._run_dashboard()
-        self.assertEqual(rc, 0)
-        self.assertTrue(dashboards_dir.is_dir(),
-                        "Dashboard directory should be auto-created")
-
-    # -- Unknown model identity shows "unknown" ---
-
-    def test_dashboard_unknown_model_shown_as_unknown(self) -> None:
-        records = [
-            self._make_telemetry_record("add-thing", "implement", 1,
-                provider="", model_id=""),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {"add-thing": {"status": "running", "round": 1, "max_rounds": 5}},
-        })
-
-        stdout, rc = self._run_dashboard()
-        self.assertEqual(rc, 0)
-        html = self._read_output()
-
-        self.assertIn("unknown", html.lower())
-
-    # -- Stage status badges ---
-
-    def test_dashboard_stage_status_badges_color_coded(self) -> None:
-        records = [
-            self._make_telemetry_record("add-thing", "implement", 1, status="completed"),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {"add-thing": {"status": "running", "round": 1, "max_rounds": 5}},
-        })
-
-        stdout, rc = self._run_dashboard()
-        self.assertEqual(rc, 0)
-        html = self._read_output()
-
-        self.assertIn("badge-green", html)
-
-    # -- Per-change status badges ---
-
-    def test_dashboard_change_status_badges_color_coded(self) -> None:
-        records = [
-            self._make_telemetry_record("add-thing", "implement", 1, status="completed"),
-            self._make_telemetry_record("add-thing", "review", 1),
-            self._make_telemetry_record("add-thing", "archive", 1),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {"add-thing": {"status": "done", "round": 1, "max_rounds": 5}},
-        })
-
-        stdout, rc = self._run_dashboard()
-        self.assertEqual(rc, 0)
-        html = self._read_output()
-
-        self.assertIn("badge-green", html)
-
-    # -- Regression: leaderboard sorted by success_rate descending ---
-
-    def test_dashboard_leaderboard_sorted_by_success_rate_descending(self) -> None:
-        """Leaderboard rows must appear in descending success_rate order."""
-        records = [
-            # "doomed" model fails (success_rate 0.0)
-            self._make_telemetry_record("doomed", "implement", 1,
-                model_id="low-model", started_at="2026-07-01T10:00:00",
-                ended_at="2026-07-01T10:02:00"),
-            self._make_telemetry_record("doomed", "review", 1,
-                model_id="low-model", started_at="2026-07-01T10:02:01",
-                ended_at="2026-07-01T10:03:00"),
-            # "shining" model succeeds (success_rate 1.0)
-            self._make_telemetry_record("shining", "implement", 1,
-                model_id="high-model", started_at="2026-07-01T10:04:00",
-                ended_at="2026-07-01T10:06:00"),
-            self._make_telemetry_record("shining", "review", 1,
-                model_id="high-model", started_at="2026-07-01T10:06:01",
-                ended_at="2026-07-01T10:07:00"),
-            self._make_telemetry_record("shining", "archive", 1,
-                model_id="high-model", started_at="2026-07-01T10:07:01",
-                ended_at="2026-07-01T10:08:00"),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {
-                "doomed": {"status": "failed", "round": 1, "max_rounds": 5},
-                "shining": {"status": "done", "round": 1, "max_rounds": 5},
-            },
-        })
-
-        stdout, rc = self._run_dashboard()
-        self.assertEqual(rc, 0)
-        html = self._read_output()
-
-        # Find both model names in the leaderboard HTML
-        high_pos = html.find("high-model")
-        low_pos = html.find("low-model")
-        self.assertGreater(high_pos, 0, "high-model must appear in leaderboard")
-        self.assertGreater(low_pos, 0, "low-model must appear in leaderboard")
-        self.assertLess(high_pos, low_pos,
-                        "high-model (success_rate 1.0) must appear before "
-                        "low-model (success_rate 0.0) in sorted leaderboard")
-
-    # -- Regression: Avg Rnds <td> markup is well-formed ---
-
-    def test_dashboard_leaderboard_avg_rnds_valid_markup(self) -> None:
-        """Avg Rnds cells must emit valid <td>...</td> markup."""
-        records = [
-            self._make_telemetry_record("add-thing", "implement", 1,
-                model_id="test-model"),
-            self._make_telemetry_record("add-thing", "review", 1,
-                model_id="test-model"),
-            self._make_telemetry_record("add-thing", "archive", 1,
-                model_id="test-model"),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {
-                "add-thing": {"status": "done", "round": 1, "max_rounds": 5},
-            },
-        })
-
-        stdout, rc = self._run_dashboard()
-        self.assertEqual(rc, 0)
-        html = self._read_output()
-
-        # Extract leaderboard section
-        lb_start = html.find('<section class="leaderboard">')
-        lb_end = html.find('</section>', lb_start)
-        leaderboard_html = html[lb_start:lb_end + len('</section>')]
-
-        # Every <td must be paired with a </td> in the leaderboard table body
-        tbody_start = leaderboard_html.find("<tbody>")
-        tbody_end = leaderboard_html.find("</tbody>")
-        if tbody_start != -1 and tbody_end != -1:
-            tbody = leaderboard_html[tbody_start:tbody_end + len("</tbody>")]
-            open_tds = tbody.count("<td") - tbody.count("</td")
-            self.assertEqual(open_tds, 0,
-                             "All <td> tags must be closed in leaderboard tbody")
-
-        # Null-value span for missing avg_rounds should still be inside a proper <td>
-        # The avg_rounds column header must exist
-        self.assertIn("Avg Rnds", html)
-
-    # -- Regression: plan-summary null metrics must not contain escaped span markup ---
-
-    def test_dashboard_plan_summary_null_metrics_render_gray_span(self) -> None:
-        """Plan summary null metrics must render as gray .null-value spans."""
-        records = [
-            self._make_telemetry_record("add-thing", "implement", 1,
-                input_tokens=None, output_tokens=None, total_tokens=None,
-                estimated_cost=None, cost_status="unavailable"),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {
-                "add-thing": {"status": "running", "round": 1, "max_rounds": 5},
-            },
-        })
-
-        stdout, rc = self._run_dashboard()
-        self.assertEqual(rc, 0)
-        html = self._read_output()
-
-        # The plan summary must NOT contain escaped span tags
-        self.assertNotIn("&lt;span", html,
-                         "Plan summary must not render escaped span markup")
-        # The plan summary should contain the styled null-value span
-        self.assertIn('<span class="null-value">—</span>', html,
-                      "Plan summary must render null metrics as gray .null-value spans")
-
-    # -- Regression: plan-summary Total Cost with resolved cost ---
-
-    def test_dashboard_plan_summary_total_cost_resolved_green(self) -> None:
-        """Plan-summary Total Cost must render with green .cost-estimated
-        span when all costs are fully resolved."""
-        records = [
-            self._make_telemetry_record("add-thing", "implement", 1,
-                estimated_cost=1.23, cost_status="estimated"),
-            self._make_telemetry_record("add-thing", "review", 1,
-                estimated_cost=0.50, cost_status="estimated"),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {
-                "add-thing": {"status": "done", "round": 1, "max_rounds": 5},
-            },
-        })
-
-        stdout, rc = self._run_dashboard()
-        self.assertEqual(rc, 0)
-        html = self._read_output()
-
-        # The Total Cost row in plan-summary should use cost-estimated class
-        self.assertIn(
-            '<span class="cost-estimated">$1.73</span>',
-            html,
-            "Plan-summary Total Cost must render resolved cost with green "
-            ".cost-estimated span",
-        )
-
-    def test_dashboard_plan_summary_total_cost_unresolved_amber(self) -> None:
-        """Plan-summary Total Cost must render with amber .cost-unresolved
-        span when costs are unresolved."""
-        records = [
-            self._make_telemetry_record("add-thing", "implement", 1,
-                estimated_cost=None, cost_status="unresolved",
-                input_tokens=None, output_tokens=None, total_tokens=None),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {
-                "add-thing": {"status": "running", "round": 1, "max_rounds": 5},
-            },
-        })
-
-        stdout, rc = self._run_dashboard()
-        self.assertEqual(rc, 0)
-        html = self._read_output()
-
-        # The Total Cost row should contain the unresolved span
-        self.assertIn(
-            '<span class="cost-unresolved">(unresolved)</span>',
-            html,
-            "Plan-summary Total Cost must render unresolved cost with amber "
-            ".cost-unresolved span",
-        )
-
-    def test_dashboard_plan_summary_total_cost_missing_gray(self) -> None:
-        """Plan-summary Total Cost must render with gray .cost-missing
-        span when no cost data is available."""
-        records = [
-            self._make_telemetry_record("add-thing", "implement", 1,
-                estimated_cost=None, cost_status="unavailable",
-                input_tokens=None, output_tokens=None, total_tokens=None),
-        ]
-        self._write_telemetry(records)
-        self._write_state({
-            "plan": self.plan_name,
-            "changes": {
-                "add-thing": {"status": "running", "round": 1, "max_rounds": 5},
-            },
-        })
-
-        stdout, rc = self._run_dashboard()
-        self.assertEqual(rc, 0)
-        html = self._read_output()
-
-        # The Total Cost row should contain the missing/null span
-        self.assertIn(
-            '<span class="cost-missing">—</span>',
-            html,
-            "Plan-summary Total Cost must render missing cost with gray "
-            ".cost-missing span",
-        )
 
 
 class ActivePlanResolutionTests(unittest.TestCase):
@@ -10754,32 +7960,32 @@ class ActivePlanResolutionTests(unittest.TestCase):
     # ── 5.1: resolve_plan precedence branches ───────────────────────────
 
     def test_resolve_plan_returns_explicit_argument(self) -> None:
-        result = self.opsx_plan.resolve_plan(self.repo, "explicit-plan.toml")
+        result = self.opsx_plan.planref.resolve_plan(self.repo, "explicit-plan.toml")
         self.assertEqual(result, "explicit-plan.toml")
 
     def test_resolve_plan_falls_back_to_env_var(self) -> None:
         os.environ["OPSX_PLAN"] = "env-plan.toml"
-        result = self.opsx_plan.resolve_plan(self.repo, None)
+        result = self.opsx_plan.planref.resolve_plan(self.repo, None)
         self.assertEqual(result, "env-plan.toml")
 
     def test_resolve_plan_falls_back_to_pointer_file(self) -> None:
         self._write_plan_toml("my-plan.toml")
         self.opsx_plan.write_active_plan(self.repo, "my-plan.toml")
         os.environ.pop("OPSX_PLAN", None)
-        result = self.opsx_plan.resolve_plan(self.repo, None)
+        result = self.opsx_plan.planref.resolve_plan(self.repo, None)
         self.assertEqual(result, "my-plan.toml")
 
     def test_resolve_plan_raises_when_nothing_set(self) -> None:
         os.environ.pop("OPSX_PLAN", None)
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
-            self.opsx_plan.resolve_plan(self.repo, None)
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
+            self.opsx_plan.planref.resolve_plan(self.repo, None)
         self.assertIn("no plan specified", str(ctx.exception).lower())
 
     def test_resolve_plan_raises_on_stale_pointer(self) -> None:
         self.opsx_plan.write_active_plan(self.repo, "deleted-plan.toml")
         os.environ.pop("OPSX_PLAN", None)
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
-            self.opsx_plan.resolve_plan(self.repo, None)
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
+            self.opsx_plan.planref.resolve_plan(self.repo, None)
         self.assertIn("active plan pointer references missing file", str(ctx.exception))
         self.assertIn("deleted-plan.toml", str(ctx.exception))
         self.assertIn("opsx-plan use", str(ctx.exception))
@@ -10790,14 +7996,14 @@ class ActivePlanResolutionTests(unittest.TestCase):
         self._write_plan_toml("my-plan.toml")
         self.opsx_plan.write_active_plan(self.repo, "my-plan.toml")
         os.environ.pop("OPSX_PLAN", None)
-        result = self.opsx_plan.resolve_plan(self.repo, "override.toml")
+        result = self.opsx_plan.planref.resolve_plan(self.repo, "override.toml")
         self.assertEqual(result, "override.toml")
 
     def test_resolve_plan_env_overrides_pointer(self) -> None:
         self._write_plan_toml("my-plan.toml")
         self.opsx_plan.write_active_plan(self.repo, "my-plan.toml")
         os.environ["OPSX_PLAN"] = "env-plan.toml"
-        result = self.opsx_plan.resolve_plan(self.repo, None)
+        result = self.opsx_plan.planref.resolve_plan(self.repo, None)
         self.assertEqual(result, "env-plan.toml")
 
     # ── 5.3: use, compile activation, run activation, status, stale ─────
@@ -10807,14 +8013,14 @@ class ActivePlanResolutionTests(unittest.TestCase):
         args = argparse.Namespace(repo=str(self.repo), plan="my-plan.toml")
         rc = self.opsx_plan.cmd_use(args)
         self.assertEqual(rc, 0)
-        pointer = self.opsx_plan.read_active_plan(self.repo)
+        pointer = self.opsx_plan.planref.read_active_plan(self.repo)
         self.assertEqual(pointer, "my-plan.toml")
 
     def test_cmd_use_rejects_nonexistent_plan(self) -> None:
         args = argparse.Namespace(repo=str(self.repo), plan="missing.toml")
         rc = self.opsx_plan.cmd_use(args)
         self.assertEqual(rc, 2)
-        self.assertIsNone(self.opsx_plan.read_active_plan(self.repo))
+        self.assertIsNone(self.opsx_plan.planref.read_active_plan(self.repo))
 
     def test_cmd_use_rejects_invalid_toml(self) -> None:
         p = self.repo / "bad.toml"
@@ -10822,7 +8028,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
         args = argparse.Namespace(repo=str(self.repo), plan="bad.toml")
         rc = self.opsx_plan.cmd_use(args)
         self.assertEqual(rc, 2)
-        self.assertIsNone(self.opsx_plan.read_active_plan(self.repo))
+        self.assertIsNone(self.opsx_plan.planref.read_active_plan(self.repo))
 
     def test_cmd_use_rejects_plan_outside_repo(self) -> None:
         # Create a plan outside the repo
@@ -10836,7 +8042,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
             args = argparse.Namespace(repo=str(self.repo), plan=str(outside))
             rc = self.opsx_plan.cmd_use(args)
             self.assertEqual(rc, 2)
-            self.assertIsNone(self.opsx_plan.read_active_plan(self.repo))
+            self.assertIsNone(self.opsx_plan.planref.read_active_plan(self.repo))
         finally:
             outside.unlink(missing_ok=True)
 
@@ -10856,7 +8062,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
                                       output=str(out), force=False)
             rc = self.opsx_plan.cmd_compile(args)
             self.assertEqual(rc, 0)
-            pointer = self.opsx_plan.read_active_plan(self.repo)
+            pointer = self.opsx_plan.planref.read_active_plan(self.repo)
             self.assertIsNotNone(pointer)
             self.assertEqual(Path(pointer), Path("out.toml"))
         finally:
@@ -10873,7 +8079,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
         os.environ["OPSX_CONTROLLER_MODEL"] = "test-model"
 
         def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None, budget_usd=0.0):
-            return self.opsx_plan.DONE
+            return self.opsx_plan.base.DONE
 
         original = self.opsx_plan.run_direct_change
         try:
@@ -10886,7 +8092,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
             rc = self.opsx_plan.cmd_run(args)
             # cmd_run returns 0 on success
             self.assertEqual(rc, 0)
-            pointer = self.opsx_plan.read_active_plan(self.repo)
+            pointer = self.opsx_plan.planref.read_active_plan(self.repo)
             self.assertEqual(pointer, "my-plan.toml")
         finally:
             self.opsx_plan.run_direct_change = original
@@ -10914,7 +8120,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
 
         def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None, budget_usd=0.0):
             seen.update(cfg)
-            return self.opsx_plan.DONE
+            return self.opsx_plan.base.DONE
 
         original = self.opsx_plan.run_direct_change
         try:
@@ -10947,13 +8153,13 @@ class ActivePlanResolutionTests(unittest.TestCase):
         )
 
         # Ensure no pointer exists before the call
-        self.assertIsNone(self.opsx_plan.read_active_plan(self.repo))
+        self.assertIsNone(self.opsx_plan.planref.read_active_plan(self.repo))
 
-        with self.assertRaises(self.opsx_plan.PlanError):
+        with self.assertRaises(self.opsx_plan.base.PlanError):
             self.opsx_plan.cmd_run(args)
 
         # Pointer must still be absent
-        self.assertIsNone(self.opsx_plan.read_active_plan(self.repo))
+        self.assertIsNone(self.opsx_plan.planref.read_active_plan(self.repo))
 
     def test_status_shows_active_plan_in_header(self) -> None:
         plan = self._write_plan_toml("my-plan.toml")
@@ -10962,7 +8168,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
         stdout = io.StringIO()
 
         def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None, budget_usd=0.0):
-            return self.opsx_plan.DONE
+            return self.opsx_plan.base.DONE
 
         original = self.opsx_plan.run_direct_change
         try:
@@ -10983,7 +8189,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
         stdout = io.StringIO()
 
         def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None, budget_usd=0.0):
-            return self.opsx_plan.DONE
+            return self.opsx_plan.base.DONE
 
         original = self.opsx_plan.run_direct_change
         try:
@@ -11001,23 +8207,23 @@ class ActivePlanResolutionTests(unittest.TestCase):
         """A stale pointer error must tell the user to run 'opsx-plan use'."""
         self.opsx_plan.write_active_plan(self.repo, "deleted.toml")
         os.environ.pop("OPSX_PLAN", None)
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
-            self.opsx_plan.resolve_plan(self.repo, None)
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
+            self.opsx_plan.planref.resolve_plan(self.repo, None)
         self.assertIn("opsx-plan use", str(ctx.exception))
 
     def test_write_and_read_active_plan_roundtrip(self) -> None:
-        self.assertIsNone(self.opsx_plan.read_active_plan(self.repo))
+        self.assertIsNone(self.opsx_plan.planref.read_active_plan(self.repo))
         self.opsx_plan.write_active_plan(self.repo, "some/plan.toml")
-        self.assertEqual(self.opsx_plan.read_active_plan(self.repo), "some/plan.toml")
+        self.assertEqual(self.opsx_plan.planref.read_active_plan(self.repo), "some/plan.toml")
         # Overwrite
         self.opsx_plan.write_active_plan(self.repo, "other.toml")
-        self.assertEqual(self.opsx_plan.read_active_plan(self.repo), "other.toml")
+        self.assertEqual(self.opsx_plan.planref.read_active_plan(self.repo), "other.toml")
 
     def test_read_active_plan_returns_none_for_empty_file(self) -> None:
-        pp = self.opsx_plan.active_plan_pointer_path(self.repo)
+        pp = self.opsx_plan.planref.active_plan_pointer_path(self.repo)
         pp.parent.mkdir(parents=True, exist_ok=True)
         pp.write_text("   \n", encoding="utf-8")
-        self.assertIsNone(self.opsx_plan.read_active_plan(self.repo))
+        self.assertIsNone(self.opsx_plan.planref.read_active_plan(self.repo))
 
     def test_validate_active_plan_succeeds_for_valid_plan(self) -> None:
         self._write_plan_toml("my-plan.toml")
@@ -11025,7 +8231,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
         self.assertTrue(result.is_file())
 
     def test_validate_active_plan_raises_for_missing_file(self) -> None:
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
             self.opsx_plan.validate_active_plan(self.repo, "missing.toml")
         self.assertIn("does not exist", str(ctx.exception))
         self.assertIn("missing.toml", str(ctx.exception))
@@ -11034,14 +8240,14 @@ class ActivePlanResolutionTests(unittest.TestCase):
 
     def test_resolve_plan_path_relative_resolves_against_repo(self) -> None:
         self._write_plan_toml("rel/plan.toml")
-        result = self.opsx_plan._resolve_plan_path(self.repo, "rel/plan.toml")
+        result = self.opsx_plan.planref._resolve_plan_path(self.repo, "rel/plan.toml")
         expected = (self.repo / "rel" / "plan.toml").resolve()
         self.assertEqual(result, expected)
 
     def test_resolve_plan_path_absolute_stays_absolute(self) -> None:
         self._write_plan_toml("some/plan.toml")
         abs_path = str((self.repo / "some" / "plan.toml").resolve())
-        result = self.opsx_plan._resolve_plan_path(self.repo, abs_path)
+        result = self.opsx_plan.planref._resolve_plan_path(self.repo, abs_path)
         self.assertEqual(result, Path(abs_path).resolve())
 
     # ── 5.5: status shows inspected path from OPSX_PLAN ─────────────────
@@ -11055,7 +8261,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
         stdout = io.StringIO()
 
         def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None, budget_usd=0.0):
-            return self.opsx_plan.DONE
+            return self.opsx_plan.base.DONE
 
         original = self.opsx_plan.run_direct_change
         try:
@@ -11077,7 +8283,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
         stdout = io.StringIO()
 
         def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None, budget_usd=0.0):
-            return self.opsx_plan.DONE
+            return self.opsx_plan.base.DONE
 
         original = self.opsx_plan.run_direct_change
         try:
@@ -11201,7 +8407,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
         os.environ["OPSX_CONTROLLER_MODEL"] = "test-model"
 
         def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None, budget_usd=0.0):
-            return self.opsx_plan.DONE
+            return self.opsx_plan.base.DONE
 
         original = self.opsx_plan.run_direct_change
         try:
@@ -11284,7 +8490,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
             change=None, run_id=None, stage=None, model=None,
         )
         with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
-            rc = self.opsx_plan.cmd_report(args)
+            rc = self.opsx_plan.report.cmd_report(args)
         self.assertEqual(rc, 0)
         self.assertIn("test-plan", stdout.getvalue())
 
@@ -11355,7 +8561,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
             output=None, run_id=None, change=None,
         )
         with mock.patch("sys.stdout", stdout):
-            rc = self.opsx_plan.cmd_dashboard(args)
+            rc = self.opsx_plan.dashboard.cmd_dashboard(args)
         self.assertEqual(rc, 0)
         self.assertIn("Dashboard written to:", stdout.getvalue())
 
@@ -11607,7 +8813,7 @@ class SpendBudgetTests(unittest.TestCase):
         record = self.opsx_plan.rec(self.state, self.cid)
         self.assertEqual(record["last_result"], "spend_budget_exhausted")
         # Status must be PENDING (resumable), not FAILED
-        self.assertEqual(record["status"], self.opsx_plan.PENDING)
+        self.assertEqual(record["status"], self.opsx_plan.base.PENDING)
         self.assertIn("spend budget exhausted", record["reason"])
         self.assertIn("resolved", record["reason"])
         self.assertIn("unresolved", record["reason"])
@@ -11715,9 +8921,9 @@ class SpendBudgetTests(unittest.TestCase):
         finally:
             self.opsx_plan.compute_run_spend = original_compute
 
-        self.assertEqual(result, self.opsx_plan.DONE)
+        self.assertEqual(result, self.opsx_plan.base.DONE)
         record = self.opsx_plan.rec(self.state, self.cid)
-        self.assertEqual(record["status"], self.opsx_plan.DONE)
+        self.assertEqual(record["status"], self.opsx_plan.base.DONE)
 
     def test_no_spend_check_when_budget_usd_is_zero(self) -> None:
         """budget_usd=0 (default/omitted) must not trigger spend checks."""
@@ -12212,7 +9418,7 @@ class DoctorPreflightTests(unittest.TestCase):
         def capture_log(msg: str) -> None:
             logs.append(msg)
 
-        with mock.patch.object(self.opsx_plan, "log", side_effect=capture_log):
+        with mock.patch.object(self.opsx_plan.base, "log", side_effect=capture_log):
             result = self.opsx_plan.run_preflight_warnings(self.repo, None)
         self.assertIsNone(result)
         # At least one warning about dirty tree should appear
@@ -12647,10 +9853,10 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
         plan = self._plan_with_gated_changes()
         self._activate_plan(str(plan.relative_to(self.repo)))
         state = self.opsx_plan.load_state(self.repo, "test-plan")
-        self.opsx_plan.set_status(state, "gated-a", self.opsx_plan.FAILED, "test failure")
-        self.opsx_plan.set_status(state, "gated-b", self.opsx_plan.FAILED, "another failure")
+        self.opsx_plan.set_status(state, "gated-a", self.opsx_plan.base.FAILED, "test failure")
+        self.opsx_plan.set_status(state, "gated-b", self.opsx_plan.base.FAILED, "another failure")
         # no-gate stays done
-        self.opsx_plan.set_status(state, "no-gate", self.opsx_plan.DONE, "already done")
+        self.opsx_plan.set_status(state, "no-gate", self.opsx_plan.base.DONE, "already done")
         self.opsx_plan.save_state(self.repo, "test-plan", state)
 
         stdout = io.StringIO()
@@ -12666,9 +9872,9 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
         self.assertIn("Reset: gated-a, gated-b", stdout.getvalue())
 
         state = self.opsx_plan.load_state(self.repo, "test-plan")
-        self.assertEqual(state["changes"]["gated-a"]["status"], self.opsx_plan.PENDING)
-        self.assertEqual(state["changes"]["gated-b"]["status"], self.opsx_plan.PENDING)
-        self.assertEqual(state["changes"]["no-gate"]["status"], self.opsx_plan.DONE)
+        self.assertEqual(state["changes"]["gated-a"]["status"], self.opsx_plan.base.PENDING)
+        self.assertEqual(state["changes"]["gated-b"]["status"], self.opsx_plan.base.PENDING)
+        self.assertEqual(state["changes"]["no-gate"]["status"], self.opsx_plan.base.DONE)
 
     def test_reset_failed_reports_empty_set(self) -> None:
         plan = self._plan_with_gated_changes()
@@ -12691,7 +9897,7 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
         self._activate_plan(str(plan.relative_to(self.repo)))
         state = self.opsx_plan.load_state(self.repo, "test-plan")
         # Only gated-a failed, gated-b is awaiting approval
-        self.opsx_plan.set_status(state, "gated-a", self.opsx_plan.FAILED, "test failure")
+        self.opsx_plan.set_status(state, "gated-a", self.opsx_plan.base.FAILED, "test failure")
         self.opsx_plan.save_state(self.repo, "test-plan", state)
 
         stdout = io.StringIO()
@@ -12708,7 +9914,7 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
         self.assertNotIn("gated-b", stdout.getvalue())
 
         state = self.opsx_plan.load_state(self.repo, "test-plan")
-        self.assertEqual(state["changes"]["gated-a"]["status"], self.opsx_plan.PENDING)
+        self.assertEqual(state["changes"]["gated-a"]["status"], self.opsx_plan.base.PENDING)
         # gated-b was awaiting_approval, its state shouldn't be fully replaced
         self.assertNotEqual(
             state["changes"]["gated-b"].get("reason", ""),
@@ -12718,7 +9924,7 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
     def test_status_shows_approve_guidance_for_awaiting_approval(self) -> None:
         plan = self._plan_with_gated_changes()
         self._activate_plan(str(plan.relative_to(self.repo)))
-        cfg = self.opsx_plan.load_plan(plan)
+        cfg = self.opsx_plan.planref.load_plan(plan)
         state = self.opsx_plan.load_state(self.repo, "test-plan")
 
         import io as _io
@@ -12733,10 +9939,10 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
     def test_status_shows_reset_guidance_for_failed_changes(self) -> None:
         plan = self._plan_with_gated_changes()
         self._activate_plan(str(plan.relative_to(self.repo)))
-        cfg = self.opsx_plan.load_plan(plan)
+        cfg = self.opsx_plan.planref.load_plan(plan)
         state = self.opsx_plan.load_state(self.repo, "test-plan")
-        self.opsx_plan.set_status(state, "gated-a", self.opsx_plan.FAILED, "test failure")
-        self.opsx_plan.set_status(state, "gated-b", self.opsx_plan.FAILED, "another failure")
+        self.opsx_plan.set_status(state, "gated-a", self.opsx_plan.base.FAILED, "test failure")
+        self.opsx_plan.set_status(state, "gated-b", self.opsx_plan.base.FAILED, "another failure")
         self.opsx_plan.save_state(self.repo, "test-plan", state)
 
         import io as _io
@@ -12751,7 +9957,7 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
     def test_status_uses_long_form_when_explicit_plan_differs(self) -> None:
         plan = self._plan_with_gated_changes()
         # Don't activate; provide explicit plan path
-        cfg = self.opsx_plan.load_plan(plan)
+        cfg = self.opsx_plan.planref.load_plan(plan)
         state = self.opsx_plan.load_state(self.repo, "test-plan")
 
         import io as _io
@@ -12783,7 +9989,7 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
         plan = self._plan_with_gated_changes()
         self._activate_plan(str(plan.relative_to(self.repo)))
         state = self.opsx_plan.load_state(self.repo, "test-plan")
-        self.opsx_plan.set_status(state, "gated-a", self.opsx_plan.FAILED, "test failure")
+        self.opsx_plan.set_status(state, "gated-a", self.opsx_plan.base.FAILED, "test failure")
         # Ensure gated-b has a record in state (needed after save/load roundtrip)
         self.opsx_plan.rec(state, "gated-b")
         self.opsx_plan.save_state(self.repo, "test-plan", state)
@@ -12798,8 +10004,8 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
         self.assertEqual(rc, 0)
 
         state = self.opsx_plan.load_state(self.repo, "test-plan")
-        self.assertEqual(state["changes"]["gated-a"]["status"], self.opsx_plan.PENDING)
-        self.assertEqual(state["changes"]["gated-b"]["status"], self.opsx_plan.PENDING)
+        self.assertEqual(state["changes"]["gated-a"]["status"], self.opsx_plan.base.PENDING)
+        self.assertEqual(state["changes"]["gated-b"]["status"], self.opsx_plan.base.PENDING)
 
     def test_approve_rejects_without_changes_when_not_all(self) -> None:
         plan = self._plan_with_gated_changes()
@@ -12820,7 +10026,7 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
     def test_status_guidance_includes_accept_for_awaiting_acceptance(self) -> None:
         plan = self._plan_with_created_changes()
         self._activate_plan(str(plan.relative_to(self.repo)))
-        cfg = self.opsx_plan.load_plan(plan)
+        cfg = self.opsx_plan.planref.load_plan(plan)
         state = self.opsx_plan.load_state(self.repo, "test-plan")
         for cid in ("created-a", "created-b"):
             r = self.opsx_plan.rec(state, cid)
@@ -12937,7 +10143,7 @@ class LogsCommandTests(unittest.TestCase):
             "round": 1,
             "outcome": "exited",
             "log_path": str(log),
-            "updated_at": self.opsx_plan.utcnow(),
+            "updated_at": self.opsx_plan.base.utcnow(),
         }
         self.opsx_plan.save_state(self.repo, self.plan_name, state)
 
@@ -12958,7 +10164,7 @@ class LogsCommandTests(unittest.TestCase):
             "round": 1,
             "outcome": "exited",
             "log_path": str(log),
-            "updated_at": self.opsx_plan.utcnow(),
+            "updated_at": self.opsx_plan.base.utcnow(),
         }
         self.opsx_plan.save_state(self.repo, self.plan_name, state)
 
@@ -12987,7 +10193,7 @@ class LogsCommandTests(unittest.TestCase):
             "round": 1,
             "outcome": "exited",
             "log_path": str(older_log),
-            "updated_at": self.opsx_plan.utcnow(),
+            "updated_at": self.opsx_plan.base.utcnow(),
         }
 
         # Newer change inserted second but has a higher round (newer)
@@ -12997,7 +10203,7 @@ class LogsCommandTests(unittest.TestCase):
             "round": 2,
             "outcome": "exited",
             "log_path": str(newer_log),
-            "updated_at": self.opsx_plan.utcnow(),
+            "updated_at": self.opsx_plan.base.utcnow(),
         }
 
         self.opsx_plan.save_state(self.repo, self.plan_name, state)
@@ -13039,7 +10245,7 @@ class LogsCommandTests(unittest.TestCase):
             "round": 1,
             "outcome": "exited",
             "log_path": str(plan_log),
-            "updated_at": self.opsx_plan.utcnow(),
+            "updated_at": self.opsx_plan.base.utcnow(),
         }
 
         # Record last_stage for a foreign change not in the plan
@@ -13049,7 +10255,7 @@ class LogsCommandTests(unittest.TestCase):
             "round": 1,
             "outcome": "exited",
             "log_path": str(foreign_log),
-            "updated_at": self.opsx_plan.utcnow(),
+            "updated_at": self.opsx_plan.base.utcnow(),
         }
 
         self.opsx_plan.save_state(self.repo, self.plan_name, state)
@@ -13075,7 +10281,7 @@ class LogsCommandTests(unittest.TestCase):
             "round": 1,
             "outcome": "exited",
             "log_path": str(foreign_log),
-            "updated_at": self.opsx_plan.utcnow(),
+            "updated_at": self.opsx_plan.base.utcnow(),
         }
         self.opsx_plan.save_state(self.repo, self.plan_name, state)
 
@@ -13158,7 +10364,7 @@ class LogsCommandTests(unittest.TestCase):
             "round": 1,
             "outcome": "exited",
             "log_path": str(log),
-            "updated_at": self.opsx_plan.utcnow(),
+            "updated_at": self.opsx_plan.base.utcnow(),
         }
         self.opsx_plan.save_state(self.repo, self.plan_name, state)
 
@@ -13301,7 +10507,7 @@ class LogsCommandTests(unittest.TestCase):
             "round": 1,
             "outcome": "exited",
             "log_path": str(log),
-            "updated_at": self.opsx_plan.utcnow(),
+            "updated_at": self.opsx_plan.base.utcnow(),
         }
         self.opsx_plan.save_state(self.repo, self.plan_name, state)
 
@@ -13403,14 +10609,14 @@ class GitDeliveryConfigParsingTests(unittest.TestCase):
         self.opsx_plan = load_opsx_plan()
 
     def test_default_disabled(self) -> None:
-        cfg = self.opsx_plan._parse_git_delivery_config({})
+        cfg = self.opsx_plan.planref._parse_git_delivery_config({})
         self.assertFalse(cfg["enabled"])
         self.assertEqual(cfg["branch"], "")
         self.assertEqual(cfg["base_ref"], "")
         self.assertFalse(cfg["create_pull_request"])
 
     def test_enabled_with_explicit_branch_and_base(self) -> None:
-        cfg = self.opsx_plan._parse_git_delivery_config({
+        cfg = self.opsx_plan.planref._parse_git_delivery_config({
             "enabled": True,
             "branch": "opsx/custom",
             "base_ref": "release/next",
@@ -13420,19 +10626,19 @@ class GitDeliveryConfigParsingTests(unittest.TestCase):
         self.assertEqual(cfg["base_ref"], "release/next")
 
     def test_create_pull_request_requires_enabled(self) -> None:
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
-            self.opsx_plan._parse_git_delivery_config({
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
+            self.opsx_plan.planref._parse_git_delivery_config({
                 "enabled": False,
                 "create_pull_request": True,
             })
         self.assertIn("requires", str(ctx.exception))
 
     def test_non_bool_enabled_treated_as_false(self) -> None:
-        cfg = self.opsx_plan._parse_git_delivery_config({"enabled": "yes"})
+        cfg = self.opsx_plan.planref._parse_git_delivery_config({"enabled": "yes"})
         self.assertFalse(cfg["enabled"])
 
     def test_empty_string_branch_and_base_normalized(self) -> None:
-        cfg = self.opsx_plan._parse_git_delivery_config({
+        cfg = self.opsx_plan.planref._parse_git_delivery_config({
             "enabled": True,
             "branch": "  ",
             "base_ref": "  ",
@@ -13716,7 +10922,7 @@ class GitDeliveryCmdRunIntegrationTests(unittest.TestCase):
             writes.append(rel)
 
         def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None, budget_usd=0.0):
-            return self.opsx_plan.DONE
+            return self.opsx_plan.base.DONE
 
         def fake_reconcile(repo, cfg, state):
             pass
@@ -13751,7 +10957,7 @@ class GitDeliveryCmdRunIntegrationTests(unittest.TestCase):
 
     def test_cmd_run_with_no_branch_skips_creation(self) -> None:
         def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None, budget_usd=0.0):
-            return self.opsx_plan.DONE
+            return self.opsx_plan.base.DONE
 
         def fake_reconcile(repo, cfg, state):
             pass
@@ -13943,7 +11149,7 @@ class GitDeliveryDefaultOffTests(unittest.TestCase):
         )
         self.cfg = {
             "name": "default-off-plan",
-            "git_delivery": self.opsx_plan._parse_git_delivery_config({}),
+            "git_delivery": self.opsx_plan.planref._parse_git_delivery_config({}),
         }
         self.state = {"plan": "default-off-plan", "approvals": [], "changes": {},
                        "git_delivery": self.opsx_plan._default_git_delivery_state()}
@@ -14858,7 +12064,7 @@ class RunEventNotificationTests(unittest.TestCase):
 
         result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
 
-        self.assertEqual(result, self.opsx_plan.DONE)
+        self.assertEqual(result, self.opsx_plan.base.DONE)
         done_events = [c for c in self._notification_calls if c[0] == "change_done"]
         self.assertEqual(len(done_events), 1, f"expected 1 change_done, got {self._notification_calls}")
         self.assertEqual(done_events[0][1], self.cid)
@@ -15120,9 +12326,9 @@ class RunEventNotificationTests(unittest.TestCase):
         # Should still complete successfully despite notification hook failure
         result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
 
-        self.assertEqual(result, self.opsx_plan.DONE)
+        self.assertEqual(result, self.opsx_plan.base.DONE)
         record = self.opsx_plan.rec(self.state, self.cid)
-        self.assertEqual(record["status"], self.opsx_plan.DONE)
+        self.assertEqual(record["status"], self.opsx_plan.base.DONE)
 
     def test_notify_cmd_not_set_preserves_behavior(self) -> None:
         self.cfg["notify_cmd"] = ""
@@ -15171,9 +12377,9 @@ class RunEventNotificationTests(unittest.TestCase):
 
         result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
 
-        self.assertEqual(result, self.opsx_plan.DONE)
+        self.assertEqual(result, self.opsx_plan.base.DONE)
         record = self.opsx_plan.rec(self.state, self.cid)
-        self.assertEqual(record["status"], self.opsx_plan.DONE)
+        self.assertEqual(record["status"], self.opsx_plan.base.DONE)
 
     def test_build_notification_payload_has_required_fields(self) -> None:
         payload_json = self.opsx_plan._build_notification_payload(
@@ -15223,7 +12429,7 @@ class RunEventNotificationTests(unittest.TestCase):
             "notified_events": {},
             "changes": {
                 self.cid: {
-                    "status": self.opsx_plan.PENDING,
+                    "status": self.opsx_plan.base.PENDING,
                     "phase": "implement",
                     "round": 1,
                     "max_rounds": 2,
@@ -15302,7 +12508,7 @@ class RunEventNotificationTests(unittest.TestCase):
             "notified_events": {},
             "changes": {
                 self.cid: {
-                    "status": self.opsx_plan.DONE,
+                    "status": self.opsx_plan.base.DONE,
                     "phase": "done",
                     "round": 1,
                     "max_rounds": 2,
@@ -15389,7 +12595,7 @@ class RunEventNotificationTests(unittest.TestCase):
             "notified_events": {},
             "changes": {
                 self.cid: {
-                    "status": self.opsx_plan.DONE,
+                    "status": self.opsx_plan.base.DONE,
                     "phase": "done",
                     "round": 1,
                     "max_rounds": 2,
@@ -15519,7 +12725,7 @@ class RunEventNotificationTests(unittest.TestCase):
             calls.append((event_type, change_id, summary))
 
         def fake_run_direct(repo, cfg, state, cid, budget_deadline=None, budget_usd=0.0):
-            return self.opsx_plan.DONE
+            return self.opsx_plan.base.DONE
 
         with mock.patch.object(self.opsx_plan, "_try_notify", side_effect=capture_notify), \
              mock.patch.object(self.opsx_plan, "run_direct_change", side_effect=fake_run_direct):
@@ -15569,7 +12775,7 @@ class RunEventNotificationTests(unittest.TestCase):
             },
             "changes": {
                 self.cid: {
-                    "status": self.opsx_plan.DONE,
+                    "status": self.opsx_plan.base.DONE,
                     "phase": "done",
                     "round": 1,
                     "max_rounds": 2,
@@ -15659,7 +12865,7 @@ class RunEventNotificationTests(unittest.TestCase):
             },
             "changes": {
                 self.cid: {
-                    "status": self.opsx_plan.DONE,
+                    "status": self.opsx_plan.base.DONE,
                     "phase": "done",
                     "round": 1,
                     "max_rounds": 2,
@@ -15754,12 +12960,12 @@ class SingleChangeManifestTests(unittest.TestCase):
         cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
         self.opsx_plan.write_single_change_manifest(self.repo, self.cid, cfg)
 
-        manifest_path = self.opsx_plan.single_change_manifest_path(
+        manifest_path = self.opsx_plan.planref.single_change_manifest_path(
             self.repo, self.cid
         )
         self.assertTrue(manifest_path.is_file())
 
-        loaded = self.opsx_plan.load_plan(manifest_path, repo=self.repo)
+        loaded = self.opsx_plan.planref.load_plan(manifest_path, repo=self.repo)
         self.assertEqual(loaded["name"], cfg["name"])
         self.assertEqual(loaded["adapter"], "opencode")
         self.assertFalse(loaded["review_created"],
@@ -15785,7 +12991,7 @@ class SingleChangeManifestTests(unittest.TestCase):
             self.assertIn("tracked worktree is dirty", stderr.getvalue())
 
         # Manifest must NOT have been written
-        manifest_path = self.opsx_plan.single_change_manifest_path(
+        manifest_path = self.opsx_plan.planref.single_change_manifest_path(
             self.repo, self.cid
         )
         self.assertFalse(
@@ -15802,8 +13008,8 @@ class SingleChangeManifestTests(unittest.TestCase):
             self.assertEqual(cid, self.cid)
             r = self.opsx_plan.rec(state, cid)
             r["phase"] = "done"
-            self.opsx_plan.set_status(state, cid, self.opsx_plan.DONE, "done")
-            return self.opsx_plan.DONE
+            self.opsx_plan.set_status(state, cid, self.opsx_plan.base.DONE, "done")
+            return self.opsx_plan.base.DONE
 
         with mock.patch.object(
             self.opsx_plan, "run_direct_change", side_effect=fake_run_dc
@@ -15811,7 +13017,7 @@ class SingleChangeManifestTests(unittest.TestCase):
             rc = self.opsx_plan.cmd_run_one(args)
 
         self.assertEqual(rc, 0)
-        manifest_path = self.opsx_plan.single_change_manifest_path(
+        manifest_path = self.opsx_plan.planref.single_change_manifest_path(
             self.repo, self.cid
         )
         self.assertTrue(
@@ -15826,7 +13032,7 @@ class SingleChangeManifestTests(unittest.TestCase):
 
         # Write a first valid manifest (to create a file on disk).
         self.opsx_plan.write_single_change_manifest(self.repo, self.cid, cfg)
-        manifest_path = self.opsx_plan.single_change_manifest_path(
+        manifest_path = self.opsx_plan.planref.single_change_manifest_path(
             self.repo, self.cid
         )
         self.assertTrue(manifest_path.is_file(), "initial manifest must exist")
@@ -15838,7 +13044,7 @@ class SingleChangeManifestTests(unittest.TestCase):
         tmp_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
         tmp_path.write_text("", encoding="utf-8")
 
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
             self.opsx_plan._compare_configs(
                 divergent_cfg, cfg, tmp_path, manifest_path,
             )
@@ -15863,7 +13069,7 @@ class SingleChangeManifestTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.opsx_plan.write_active_plan(self.repo, "openspec/plans/existing.toml")
-        before = self.opsx_plan.read_active_plan(self.repo)
+        before = self.opsx_plan.planref.read_active_plan(self.repo)
         self.assertEqual(before, "openspec/plans/existing.toml")
 
         args = argparse.Namespace(repo=str(self.repo), change=self.cid)
@@ -15871,8 +13077,8 @@ class SingleChangeManifestTests(unittest.TestCase):
         def fake_run_dc(repo, cfg, state, cid, budget_usd=0.0):
             r = self.opsx_plan.rec(state, cid)
             r["phase"] = "done"
-            self.opsx_plan.set_status(state, cid, self.opsx_plan.DONE, "done")
-            return self.opsx_plan.DONE
+            self.opsx_plan.set_status(state, cid, self.opsx_plan.base.DONE, "done")
+            return self.opsx_plan.base.DONE
 
         with mock.patch.object(
             self.opsx_plan, "run_direct_change", side_effect=fake_run_dc
@@ -15881,7 +13087,7 @@ class SingleChangeManifestTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         # Active pointer must be preserved — unchanged from before the run.
-        after = self.opsx_plan.read_active_plan(self.repo)
+        after = self.opsx_plan.planref.read_active_plan(self.repo)
         self.assertEqual(after, before,
                           "cmd_run_one must preserve the active-plan pointer")
 
@@ -15900,8 +13106,8 @@ class SingleChangeManifestTests(unittest.TestCase):
         cfg["finding_recurrence_limit"] = 3
         # Round-trip through render → load → compare — must not raise.
         self.opsx_plan.write_single_change_manifest(self.repo, self.cid, cfg)
-        reloaded = self.opsx_plan.load_plan(
-            self.opsx_plan.single_change_manifest_path(self.repo, self.cid),
+        reloaded = self.opsx_plan.planref.load_plan(
+            self.opsx_plan.planref.single_change_manifest_path(self.repo, self.cid),
             repo=self.repo,
         )
         self.assertEqual(reloaded["finding_recurrence_limit"], 3)
@@ -16005,7 +13211,7 @@ class ForChangeReportTests(unittest.TestCase):
         cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
         self.opsx_plan.write_single_change_manifest(self.repo, self.cid, cfg)
 
-        plan = self.opsx_plan._resolve_for_change_plan(
+        plan = self.opsx_plan.report._resolve_for_change_plan(
             self.repo, self.cid, None,
         )
         self.assertIsNotNone(plan)
@@ -16014,16 +13220,16 @@ class ForChangeReportTests(unittest.TestCase):
 
     def test_for_change_errors_unknown_id(self):
         """7.6"""
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
-            self.opsx_plan._resolve_for_change_plan(
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
+            self.opsx_plan.report._resolve_for_change_plan(
                 self.repo, "no-such-change", None,
             )
         self.assertIn("no-such-change", str(ctx.exception))
 
     def test_for_change_mutually_exclusive_with_plan(self):
         """7.6"""
-        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
-            self.opsx_plan._resolve_for_change_plan(
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
+            self.opsx_plan.report._resolve_for_change_plan(
                 self.repo, self.cid, "some-plan.toml",
             )
         self.assertIn("mutually exclusive", str(ctx.exception))
@@ -16036,7 +13242,7 @@ class ForChangeReportTests(unittest.TestCase):
         state_file = state_dir / f"run-{self.cid}.state.json"
         state_file.write_text('{"plan": "run-' + self.cid + '"}', encoding="utf-8")
 
-        plan = self.opsx_plan._resolve_for_change_plan(
+        plan = self.opsx_plan.report._resolve_for_change_plan(
             self.repo, self.cid, None,
         )
         self.assertEqual(plan, f"run-{self.cid}")
@@ -16056,7 +13262,7 @@ class ForChangeReportTests(unittest.TestCase):
             for_change=self.cid,
         )
         with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
-            rc = self.opsx_plan.cmd_report(args)
+            rc = self.opsx_plan.report.cmd_report(args)
         self.assertEqual(rc, 0, f"report failed: {stderr.getvalue()}")
         self.assertIn(self.plan_name, stdout.getvalue())
 
@@ -16074,7 +13280,7 @@ class ForChangeReportTests(unittest.TestCase):
             for_change=self.cid,
         )
         with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
-            rc = self.opsx_plan.cmd_report(args)
+            rc = self.opsx_plan.report.cmd_report(args)
         self.assertEqual(rc, 0, f"report fallback failed: {stderr.getvalue()}")
         self.assertIn(self.plan_name, stdout.getvalue())
 
@@ -16093,7 +13299,7 @@ class ForChangeReportTests(unittest.TestCase):
             for_change=self.cid,
         )
         with mock.patch("sys.stderr", stderr):
-            rc = self.opsx_plan.cmd_dashboard(args)
+            rc = self.opsx_plan.dashboard.cmd_dashboard(args)
         self.assertEqual(rc, 0, f"dashboard failed: {stderr.getvalue()}")
         self.assertTrue(output.is_file(), "dashboard HTML must be written")
         content = output.read_text(encoding="utf-8")
@@ -16113,7 +13319,7 @@ class ForChangeReportTests(unittest.TestCase):
             for_change=self.cid,
         )
         with mock.patch("sys.stderr", stderr):
-            rc = self.opsx_plan.cmd_dashboard(args)
+            rc = self.opsx_plan.dashboard.cmd_dashboard(args)
         self.assertEqual(rc, 0, f"dashboard fallback failed: {stderr.getvalue()}")
         self.assertTrue(output.is_file(), "dashboard HTML must be written")
         content = output.read_text(encoding="utf-8")
@@ -16187,7 +13393,7 @@ class ArchivePlanCommandTests(unittest.TestCase):
         rc = self.opsx_plan.cmd_archive_plan(args)
         self.assertEqual(rc, 0)
 
-        self.assertIsNone(self.opsx_plan.read_active_plan(self.repo),
+        self.assertIsNone(self.opsx_plan.planref.read_active_plan(self.repo),
                           "active-plan pointer must be cleared")
 
     def test_archive_refuses_already_archived(self):
@@ -16287,7 +13493,7 @@ class ArchivePlanCommandTests(unittest.TestCase):
 
         # plan-b's active pointer must still be intact
         self.assertEqual(
-            self.opsx_plan.read_active_plan(self.repo), rel_b,
+            self.opsx_plan.planref.read_active_plan(self.repo), rel_b,
             "active-plan pointer referencing a different plan must be preserved",
         )
 
@@ -16358,7 +13564,7 @@ class SamplePlanTests(unittest.TestCase):
         self.assertTrue(toml_path.is_file(), f"sample not found: {toml_path}")
         self.assertTrue(md_path.is_file())
 
-        cfg = self.opsx_plan.load_plan(toml_path)
+        cfg = self.opsx_plan.planref.load_plan(toml_path)
         self.assertEqual(cfg["name"], "sample-implementation-plan")
         self.assertEqual(cfg["adapter"], "opencode")
 
@@ -16600,7 +13806,7 @@ class SamplePlanTests(unittest.TestCase):
 
         def _assert_sample_surface(toml_path, label):
             """Gate: load_plan succeeds and no loader-ignored keys exist."""
-            cfg = self.opsx_plan.load_plan(toml_path)
+            cfg = self.opsx_plan.planref.load_plan(toml_path)
             self.assertEqual(cfg["name"], "sample-implementation-plan",
                              f"{label}: plan name mismatch")
             raw = tomllib.loads(toml_path.read_text(encoding="utf-8"))
@@ -16753,7 +13959,7 @@ class EscalationStateMigrationTests(unittest.TestCase):
             "approvals": [],
             "changes": {
                 "c1": {
-                    "status": self.opsx_plan.DONE,
+                    "status": self.opsx_plan.base.DONE,
                     "phase": "done",
                     "round": 2,
                     "max_rounds": 3,
@@ -16800,7 +14006,7 @@ class EscalationStateMigrationTests(unittest.TestCase):
             "approvals": [],
             "changes": {
                 "c1": {
-                    "status": self.opsx_plan.RUNNING,
+                    "status": self.opsx_plan.base.RUNNING,
                     "phase": "implement",
                     "round": 4,
                     "max_rounds": 5,
@@ -17099,7 +14305,7 @@ class ReviewGateSkipSeverityTests(unittest.TestCase):
             self._cfg(skip_warning=True), self._review("maybe", 0, 0, 0)
         )
         self.assertEqual(record["last_result"], "review_invalid")
-        self.assertEqual(record["status"], self.opsx_plan.FAILED)
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
 
     def test_review_history_records_counts_regardless_of_gate(self) -> None:
         self._apply(self._cfg(skip_warning=True), self._review("fail", 0, 2, 1))
@@ -17285,7 +14491,7 @@ class FindingRecurrenceDetectionTests(unittest.TestCase):
             if round_num == 7:
                 self.assertEqual(action, "stop")
                 self.assertEqual(record["last_result"], "finding_recurrence_exceeded")
-                self.assertEqual(record["status"], self.opsx_plan.FAILED)
+                self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
                 self.assertIn("src/widget.py", record["reason"])
                 self.assertIn("4", record["reason"])
                 self.assertIn("5", record["reason"])
@@ -17307,7 +14513,7 @@ class FindingRecurrenceDetectionTests(unittest.TestCase):
             self.assertEqual(action, "continue")
         record = self.opsx_plan.rec(self.state, self.cid)
         self.assertEqual(record["last_result"], "review_failed")
-        self.assertNotEqual(record["status"], self.opsx_plan.FAILED)
+        self.assertNotEqual(record["status"], self.opsx_plan.base.FAILED)
 
     def test_passing_review_is_unaffected_by_recurrence_history(self) -> None:
         """Ceiling scenario: a locus reaches the ceiling's round count on the

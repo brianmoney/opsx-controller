@@ -300,6 +300,37 @@ revertable. If you later want parallel independent branches, run them in
 separate `git worktree` checkouts with a merge step gated on `fast_checks` —
 that belongs above this script, not inside it.
 
+## Source layout
+
+`orchestrator/opsx-plan.py` is the CLI entrypoint: argument parsing and
+subcommand dispatch. It is not self-contained — the report, dashboard, and
+cost-estimation commands, along with plan location/loading and a handful of
+shared primitives (`log`, `PlanError`, plan status constants), live in the
+importable `lib/orchestrator/` package alongside the existing `lib/metrics`,
+`lib/pricing`, and `lib/models` runtime packages:
+
+- `lib/orchestrator/base.py` — `log`, `utcnow`, `PlanError`, status constants,
+  adapter defaults. Zero dependency on any other orchestrator module.
+- `lib/orchestrator/planref.py` — plan location and loading (`load_plan`,
+  `resolve_plan`, and the rest of the plan-resolution closure). Depends on
+  `base`.
+- `lib/orchestrator/cost.py` — `estimate_stage_cost` and its pricing-catalog
+  helpers. Depends on `base`.
+- `lib/orchestrator/report.py` — `opsx-plan report`'s table/JSON rendering
+  and `cmd_report`. Depends on `base` and `planref`.
+- `lib/orchestrator/dashboard.py` — `opsx-plan dashboard`'s HTML rendering
+  and `cmd_dashboard`. Depends on `base`, `planref`, and `report`.
+
+Modules call across this package through the module object
+(`from lib.orchestrator import base; base.log(...)`), never by importing
+names directly — this keeps `mock.patch.object(module, "name", ...)`
+effective regardless of which module resolves the call. An installed
+`opsx-plan` that predates this layout (has `metrics`/`pricing`/`models` but
+no `orchestrator` package under
+`~/.local/lib/opsx-controller/lib`) exits with a diagnostic naming the
+missing package rather than a bare `ModuleNotFoundError`, and `opsx-plan
+doctor` reports such an installation as stale.
+
 ## Model Efficiency Workflow
 
 See [`core/model-efficiency-workflow.md`](../core/model-efficiency-workflow.md)
