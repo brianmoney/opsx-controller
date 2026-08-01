@@ -5,7 +5,6 @@ rather than trusting a worker or controller exit code.
 """
 from __future__ import annotations
 
-import json
 import shlex
 import subprocess
 from pathlib import Path
@@ -18,16 +17,6 @@ def git(repo: Path, *args: str) -> subprocess.CompletedProcess:
         ["git", *args], cwd=repo, capture_output=True, text=True
     )
 
-
-def read_controller_state(repo: Path, cfg: dict, cid: str) -> dict | None:
-    p = repo / cfg["state_file"].format(change=cid)
-    if not p.exists():
-        return None
-    try:
-        with open(p, encoding="utf-8") as fh:
-            return json.load(fh)
-    except (json.JSONDecodeError, OSError):
-        return {"_malformed": True}
 
 
 def find_archive_dir(repo: Path, cid: str) -> Path | None:
@@ -70,50 +59,6 @@ def archive_dir_ignored(repo: Path) -> bool:
     res = git(repo, "check-ignore", "--no-index", "-q", "openspec/changes/archive/")
     return res.returncode == 0
 
-
-def verify_change_done(repo: Path, cfg: dict, cid: str) -> tuple[bool, str]:
-    """A change is done when OpenSpec has archived it.
-
-    Authoritative evidence (required): the change has left openspec/changes/
-    and now lives under a dated openspec/changes/archive/ directory. That move
-    is exactly what `openspec archive` produces atomically, and is the ground
-    truth of completion.
-
-    Corroborating signals (warn, never veto): an `archive(<id>):` commit
-    reachable from HEAD, and the controller state file agreeing
-    (completed/done/passed). These go stale when a change was archived by hand,
-    squashed into another commit, or recovered after a drive error, so they are
-    surfaced as notes but no longer fail a change that OpenSpec itself archived.
-    """
-    cdir = change_dir(repo, cid)
-    if cdir.exists():
-        return False, f"{cdir.relative_to(repo)} still exists"
-
-    if find_archive_dir(repo, cid) is None:
-        return False, "no dated archive directory found"
-
-    warnings: list[str] = []
-    if not find_archive_commit(repo, cid):
-        warnings.append("no archive(<id>): commit (archived manually or squashed?)")
-
-    cs = read_controller_state(repo, cfg, cid)
-    if cs is not None:
-        if cs.get("_malformed"):
-            warnings.append("controller state file is malformed JSON")
-        else:
-            if cs.get("status") != "completed" or cs.get("phase") != "done":
-                warnings.append(
-                    f"controller state stale: status={cs.get('status')} "
-                    f"phase={cs.get('phase')}"
-                )
-            arch = cs.get("archive", {})
-            if arch.get("status") != "passed" or not arch.get("commit"):
-                warnings.append("controller archive state not passed")
-
-    if warnings:
-        base.log(f"  note: {cid} archived but {'; '.join(warnings)}")
-
-    return True, ""
 
 
 def run_fast_checks(repo: Path, cfg: dict) -> tuple[bool, str]:

@@ -157,6 +157,11 @@ The adapter SHALL provide an install script at `install.sh` supporting three mod
 
 The install script SHALL fail with a usage message when no valid mode is provided.
 
+The Codex adapter SHALL NOT define or install a legacy `invoke` or
+`max_attempts` plan default. Codex plans that do not provide the complete direct
+stage invoke configuration SHALL fail closed with guidance naming
+`implement_invoke`, `review_invoke`, and `archive_invoke`.
+
 #### Scenario: Global install succeeds
 
 - **WHEN** user runs `bash install.sh --global` from the adapter directory
@@ -176,6 +181,11 @@ The install script SHALL fail with a usage message when no valid mode is provide
 
 - **WHEN** user runs `bash install.sh` with no arguments
 - **THEN** script prints usage message and exits with non-zero code
+
+#### Scenario: Codex plan does not fall back to legacy drive mode
+
+- **WHEN** a Codex plan omits any of the three direct stage invoke keys
+- **THEN** the orchestrator refuses the plan and names all three required keys without dispatching a legacy command
 
 ### Requirement: Plugin manifest for marketplace distribution
 

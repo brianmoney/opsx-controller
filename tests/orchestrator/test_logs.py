@@ -94,10 +94,8 @@ class LogsCommandTests(unittest.TestCase):
             "implement_invoke": "opencode run --agent opsx-implementer",
             "review_invoke": "opencode run --agent opsx-reviewer",
             "archive_invoke": "opencode run --agent opsx-archiver",
-            "invoke": 'opencode run "/opsx-plan {change}"',
             "state_file": ".opencode/opsx-controller/{change}.json",
             "timeout_minutes": 1,
-            "max_attempts": 2,
             "max_rounds": 2,
             "no_progress_limit": 2,
             "fast_checks": [],
@@ -111,7 +109,6 @@ class LogsCommandTests(unittest.TestCase):
                     "enabled": True,
                     "pause_before": False,
                     "timeout_minutes": 1,
-                    "max_attempts": 2,
                     "create_invoke": "",
                     "create_max_attempts": 1,
                 }

@@ -111,10 +111,8 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
             "implement_invoke": "opencode run --agent opsx-implementer",
             "review_invoke": "opencode run --agent opsx-reviewer",
             "archive_invoke": "opencode run --agent opsx-archiver",
-            "invoke": 'opencode run "/opsx-plan {change}"',
             "state_file": ".opencode/opsx-controller/{change}.json",
             "timeout_minutes": 1,
-            "max_attempts": 2,
             "max_rounds": 2,
             "no_progress_limit": 2,
             "fast_checks": [],
@@ -128,7 +126,6 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
                     "enabled": True,
                     "pause_before": False,
                     "timeout_minutes": 1,
-                    "max_attempts": 2,
                     "create_invoke": "",
                     "create_max_attempts": 1,
                 }
@@ -2157,10 +2154,6 @@ class MainDispatchTests(unittest.TestCase):
             self.opsx_plan.base.ADAPTER_DEFAULTS["opencode"]["implement_invoke"],
             stderr.getvalue(),
         )
-        self.assertNotIn(
-            self.opsx_plan.base.ADAPTER_DEFAULTS["opencode"]["invoke"],
-            stderr.getvalue(),
-        )
 
     def test_main_rejects_extra_opsx_run_positionals_without_worker_dispatch(self) -> None:
         stderr = io.StringIO()
@@ -2200,23 +2193,40 @@ class MainDispatchTests(unittest.TestCase):
 
 
 class OpsxDriveCompatibilityTests(unittest.TestCase):
-    """The opsx-drive command surface has been removed (remove-legacy-command-surfaces).
-    Verify the orchestrator defaults still reference the legacy invoke pattern
-    so legacy-drive coverage is preserved for adapter fallback testing."""
+    """The opsx-drive command surface has been removed (remove-legacy-drive-mode).
+    Verify the orchestrator defaults no longer reference the legacy invoke pattern
+    and that direct dispatch is the only execution path."""
 
-    def test_opsx_plan_routes_opencode_through_direct_workers_not_opsx_drive(self) -> None:
+    def test_opsx_plan_defaults_have_no_legacy_invoke(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+
+        defaults = self.opsx_plan.base.ADAPTER_DEFAULTS["opencode"]
+        self.assertNotIn(
+            "invoke", defaults,
+            "ADAPTER_DEFAULTS must not contain legacy invoke key after remove-legacy-drive-mode",
+        )
+
+    def test_opsx_plan_defaults_route_through_direct_workers(self) -> None:
         self.opsx_plan = load_opsx_plan()
 
         defaults = self.opsx_plan.base.ADAPTER_DEFAULTS["opencode"]
         self.assertIn(
-            "/opsx-drive", defaults.get("invoke", ""),
-            "ADAPTER_DEFAULTS must preserve opsx-drive invoke for legacy surface",
+            "implement_invoke", defaults,
+            "default OpenCode config must route through direct workers",
+        )
+        self.assertIn(
+            "review_invoke", defaults,
+            "default OpenCode config must have review invoke",
+        )
+        self.assertIn(
+            "archive_invoke", defaults,
+            "default OpenCode config must have archive invoke",
         )
 
         cfg = {"adapter": "opencode", **defaults}
         self.assertTrue(
             self.opsx_plan.planref.is_direct_mode(cfg),
-            "default OpenCode config must route through direct workers, not /opsx-drive",
+            "default OpenCode config must route through direct workers",
         )
 
 
@@ -2232,7 +2242,7 @@ class IsDirectModeGateTests(unittest.TestCase):
             "OpenCode plan must still take the direct path unchanged",
         )
 
-    def test_plan_with_fewer_than_three_invokes_takes_nested_controller_path(self) -> None:
+    def test_plan_missing_a_stage_invoke_is_not_direct_mode(self) -> None:
         cfg = {
             "adapter": "claude-code",
             "implement_invoke": "claude -p --agent opsx-implementer",
@@ -2254,6 +2264,35 @@ class IsDirectModeGateTests(unittest.TestCase):
         self.assertTrue(
             self.opsx_plan.planref.is_direct_mode(cfg),
             "the gate must be configuration-driven, not conditioned on adapter identity",
+        )
+
+    def test_codex_plan_without_stage_invokes_fails_closed_naming_all_three_keys(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            repo = Path(tmp.name)
+            plan = repo / "codex.toml"
+            plan.write_text(
+                '[plan]\nname = "codex-test"\nadapter = "codex-cli"\n\n'
+                '[[changes]]\nid = "c1"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
+                self.opsx_plan.planref.load_plan(plan, repo=repo)
+            self.assertIn("implement_invoke", str(ctx.exception))
+            self.assertIn("review_invoke", str(ctx.exception))
+            self.assertIn("archive_invoke", str(ctx.exception))
+        finally:
+            tmp.cleanup()
+
+    def test_codex_cli_adapter_defaults_have_no_legacy_invoke(self) -> None:
+        codex_defaults = self.opsx_plan.base.ADAPTER_DEFAULTS.get("codex-cli", {})
+        self.assertNotIn(
+            "invoke", codex_defaults,
+            "codex-cli ADAPTER_DEFAULTS must not contain legacy invoke key",
+        )
+        self.assertNotIn(
+            "max_attempts", codex_defaults,
+            "codex-cli ADAPTER_DEFAULTS must not contain legacy max_attempts key",
         )
 
 
@@ -2317,7 +2356,8 @@ class ClaudeCodeAdapterDefaultsTests(unittest.TestCase):
 
 class ModelResolutionWiringTests(unittest.TestCase):
     """7.4, 7.7: load_plan populates cfg["models"] per adapter, and the
-    nested-controller deprecation warning fires only when expected."""
+    incomplete-direct-dispatch guard ensures incomplete configs fail closed
+    with all three required keys named."""
 
     def setUp(self) -> None:
         self.opsx_plan = load_opsx_plan()
@@ -2396,30 +2436,19 @@ class ModelResolutionWiringTests(unittest.TestCase):
         self.assertEqual(opencode_cfg["models"]["implementer"].model, "deepseek/deepseek-v4-pro")
         self.assertEqual(claude_cfg["models"]["implementer"].model, "claude-sonnet-5")
 
-    def test_nested_controller_plan_triggers_deprecation_warning(self) -> None:
-        plan = self.repo / "nested.toml"
+    def test_incomplete_direct_dispatch_fails_closed_with_all_three_keys(self) -> None:
+        plan = self.repo / "incomplete.toml"
         plan.write_text(
-            '[plan]\nname = "nested"\nadapter = "claude-code"\n'
+            '[plan]\nname = "incomplete"\nadapter = "claude-code"\n'
             'implement_invoke = ""\nreview_invoke = ""\narchive_invoke = ""\n\n'
             '[[changes]]\nid = "c1"\n',
             encoding="utf-8",
         )
-        logs: list[str] = []
-        with mock.patch.object(self.opsx_plan.base, "log", side_effect=logs.append):
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
             self.opsx_plan.planref.load_plan(plan, repo=self.repo)
-
-        deprecation_logs = [m for m in logs if "deprecated" in m.lower()]
-        self.assertTrue(deprecation_logs, f"expected a deprecation warning, got: {logs}")
-        self.assertIn("opsx-run", deprecation_logs[0])
-
-    def test_direct_dispatch_plan_emits_no_deprecation_warning(self) -> None:
-        plan = self._write_plan("direct.toml", "claude-code")
-        logs: list[str] = []
-        with mock.patch.object(self.opsx_plan.base, "log", side_effect=logs.append):
-            self.opsx_plan.planref.load_plan(plan, repo=self.repo)
-
-        deprecation_logs = [m for m in logs if "deprecated" in m.lower()]
-        self.assertEqual(deprecation_logs, [])
+        self.assertIn("implement_invoke", str(ctx.exception))
+        self.assertIn("review_invoke", str(ctx.exception))
+        self.assertIn("archive_invoke", str(ctx.exception))
 
     def test_escalate_after_review_fails_defaults_to_zero(self) -> None:
         """2.6: absent key → 0"""
@@ -3858,10 +3887,8 @@ class SpendBudgetTests(unittest.TestCase):
             "implement_invoke": "opencode run --agent opsx-implementer",
             "review_invoke": "opencode run --agent opsx-reviewer",
             "archive_invoke": "opencode run --agent opsx-archiver",
-            "invoke": 'opencode run "/opsx-plan {change}"',
             "state_file": ".opencode/opsx-controller/{change}.json",
             "timeout_minutes": 1,
-            "max_attempts": 2,
             "max_rounds": 5,
             "no_progress_limit": 2,
             "fast_checks": [],
@@ -3875,7 +3902,6 @@ class SpendBudgetTests(unittest.TestCase):
                     "enabled": True,
                     "pause_before": False,
                     "timeout_minutes": 1,
-                    "max_attempts": 2,
                     "create_invoke": "",
                     "create_max_attempts": 1,
                 }
@@ -4759,10 +4785,8 @@ class RunEventNotificationTests(unittest.TestCase):
             "implement_invoke": "opencode run --agent opsx-implementer",
             "review_invoke": "opencode run --agent opsx-reviewer",
             "archive_invoke": "opencode run --agent opsx-archiver",
-            "invoke": 'opencode run "/opsx-plan {change}"',
             "state_file": ".opencode/opsx-controller/{change}.json",
             "timeout_minutes": 1,
-            "max_attempts": 2,
             "max_rounds": 2,
             "no_progress_limit": 2,
             "fast_checks": [],
@@ -4777,7 +4801,6 @@ class RunEventNotificationTests(unittest.TestCase):
                     "enabled": True,
                     "pause_before": False,
                     "timeout_minutes": 1,
-                    "max_attempts": 2,
                     "create_invoke": "",
                     "create_max_attempts": 1,
                 }

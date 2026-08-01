@@ -8,7 +8,17 @@ per-phase state and logs instead of delegating to a nested controller.
 
 ### Requirement: `opsx-plan` directly dispatches OpenCode phase workers
 
-For plan runs where all three of `implement_invoke`, `review_invoke`, and `archive_invoke` are configured, `opsx-plan` SHALL execute each ready accepted change as a sequence of bounded implement, review, and archive worker invocations instead of launching `/opsx-drive` as a nested controller. Direct dispatch SHALL be determined by this configuration alone and SHALL NOT be conditioned on adapter identity. The OpenCode adapter defaults supply all three invokes, so OpenCode plan runs take this path without manifest changes.
+For plan runs where all three of `implement_invoke`, `review_invoke`, and
+`archive_invoke` are configured, `opsx-plan` SHALL execute each ready accepted
+change as a sequence of bounded implement, review, and archive worker
+invocations instead of launching `/opsx-drive` as a nested controller. Direct
+dispatch SHALL be determined by this configuration alone and SHALL NOT be
+conditioned on adapter identity. The OpenCode adapter defaults supply all three
+invokes, so OpenCode plan runs take this path without manifest changes.
+
+The orchestrator SHALL reject a plan before dispatch when any direct stage
+invoke is missing. The error SHALL name all three required keys so the operator
+can correct the manifest without relying on a deprecated fallback.
 
 The OpenCode adapter SHALL expose the supported plan-level command and worker
 surfaces without installing the removed legacy commands or nested controller
@@ -24,9 +34,9 @@ The orchestrator SHALL:
 - **WHEN** a ready accepted change is selected in an OpenCode-backed plan run
 - **THEN** `opsx-plan` dispatches implement, then review, then archive as separate worker invocations without calling `/opsx-drive`
 
-#### Scenario: Plan without a full set of stage invokes uses the nested controller
+#### Scenario: Incomplete direct configuration fails closed
 - **WHEN** a ready accepted change is selected in a plan that configures fewer than all three stage invokes
-- **THEN** `opsx-plan` launches the configured `invoke` command as a nested controller instead of dispatching phase workers
+- **THEN** `opsx-plan` refuses to dispatch and reports all three required keys in its configuration error
 
 #### Scenario: Reinstall removes legacy OpenCode files
 

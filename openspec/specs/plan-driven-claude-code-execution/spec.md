@@ -43,7 +43,9 @@ agents, and plan-level support files.
 
 ### Requirement: The `claude-code` adapter supplies direct stage invoke defaults
 
-`ADAPTER_DEFAULTS` for `claude-code` SHALL provide `implement_invoke`, `review_invoke`, and `archive_invoke` in addition to `invoke` and `state_file`.
+`ADAPTER_DEFAULTS` for `claude-code` SHALL provide
+`implement_invoke`, `review_invoke`, and `archive_invoke` and SHALL NOT provide
+the legacy `invoke` fallback.
 
 Each default SHALL invoke the Claude Code CLI in print mode against the corresponding installed worker agent (`opsx-implementer`, `opsx-reviewer`, `opsx-archiver`), select the stage model from the corresponding `OPSX_*_MODEL` environment variable, and request a machine-readable result envelope.
 
@@ -55,6 +57,11 @@ Each default SHALL be overridable in the plan `[plan]` table.
 
 - **WHEN** a plan sets `adapter = "claude-code"` and configures no stage invokes
 - **THEN** the plan resolves all three stage invokes from adapter defaults and takes the direct dispatch path
+
+#### Scenario: Legacy invoke configuration is not a fallback
+
+- **WHEN** a Claude Code plan provides an `invoke` value without a complete set of direct stage invokes
+- **THEN** the plan fails closed and reports the missing direct stage keys instead of launching the legacy command
 
 #### Scenario: Stage model is the Claude Code value, not a shared one
 

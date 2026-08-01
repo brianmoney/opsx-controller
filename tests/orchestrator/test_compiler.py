@@ -668,11 +668,11 @@ class CompileTests(unittest.TestCase):
 
     def test_build_schema_guidance_includes_load_plan_fields(self) -> None:
         guidance = compiler_mod.build_schema_guidance()
-        for field in ("name", "adapter", "invoke", "implement_invoke",
+        for field in ("name", "adapter", "implement_invoke",
                        "review_invoke", "archive_invoke", "timeout_minutes",
                        "max_rounds", "no_progress_limit", "fast_checks",
                        "plan_doc", "create_invoke", "pause_before", "depends_on",
-                       "enabled", "phase", "id", "max_attempts", "review_created"):
+                       "enabled", "phase", "id", "review_created"):
             self.assertIn(field, guidance,
                           f"schema guidance must mention field '{field}' consumed by load_plan()")
 
@@ -691,7 +691,7 @@ class CompileTests(unittest.TestCase):
             plan = parsed.get("plan", {})
             self.assertEqual(plan.get("adapter"), adapter,
                              f"{adapter}: adapter field must match")
-            for key in ("invoke", "state_file", "implement_invoke",
+            for key in ("state_file", "implement_invoke",
                          "review_invoke", "archive_invoke"):
                 self.assertIn(key, plan,
                               f"{adapter}: [plan] must include '{key}'")
@@ -1273,9 +1273,9 @@ class SamplePlanTests(unittest.TestCase):
         # The loader silently drops unknown keys — we assert the sample carries
         # no keys the loader ignores
         known_plan_keys = {
-            "name", "adapter", "invoke", "state_file",
+            "name", "adapter", "state_file",
             "implement_invoke", "review_invoke", "archive_invoke",
-            "timeout_minutes", "max_attempts", "max_rounds", "no_progress_limit",
+            "timeout_minutes", "max_rounds", "no_progress_limit",
             "escalate_after_review_fails", "finding_recurrence_limit",
             "fast_checks", "check_timeout_minutes", "require_clean_tracked",
             "skip_warning", "skip_suggestion",
@@ -1297,7 +1297,7 @@ class SamplePlanTests(unittest.TestCase):
 
         known_change_keys = {
             "id", "phase", "depends_on", "pause_before", "enabled",
-            "timeout_minutes", "max_attempts", "create_invoke", "create_max_attempts",
+            "timeout_minutes", "create_invoke", "create_max_attempts",
         }
         all_change_keys: set[str] = set()
         for change in raw["changes"]:
@@ -1445,9 +1445,9 @@ class SamplePlanTests(unittest.TestCase):
         checkout_md = checkout_dir / "sample-plan.md"
 
         known_plan_keys = {
-            "name", "adapter", "invoke", "state_file",
+            "name", "adapter", "state_file",
             "implement_invoke", "review_invoke", "archive_invoke",
-            "timeout_minutes", "max_attempts", "max_rounds",
+            "timeout_minutes", "max_rounds",
             "no_progress_limit", "escalate_after_review_fails",
             "finding_recurrence_limit",
             "fast_checks", "check_timeout_minutes",

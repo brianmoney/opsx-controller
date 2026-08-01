@@ -18,6 +18,10 @@ diagnostics, and compile log messages. The compiler SHALL require the generated
 `[plan].adapter` value to match the selected adapter through its existing
 manifest validation path.
 
+Generated manifest guidance SHALL describe only the direct-dispatch
+configuration keys `implement_invoke`, `review_invoke`, and `archive_invoke`.
+It SHALL NOT document or generate the retired `invoke` or `max_attempts` keys.
+
 #### Scenario: Claude Code compiles a plan
 
 - **WHEN** an operator runs `opsx-plan compile --adapter claude-code plan.md -o plan.toml` with a resolvable Claude controller model
@@ -27,6 +31,11 @@ manifest validation path.
 
 - **WHEN** an operator runs `opsx-plan compile plan.md -o plan.toml` without `--adapter`
 - **THEN** the orchestrator selects `opencode` and retains the existing OpenCode compile behavior
+
+#### Scenario: Compile guidance excludes legacy drive keys
+
+- **WHEN** the compiler builds schema guidance or a sample manifest for a plan
+- **THEN** the guidance contains the three direct stage invoke keys and contains neither `invoke` nor `max_attempts`
 
 ### Requirement: Supported compile clients use adapter-specific controller models
 

@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """opsx-plan: deterministic plan-level orchestrator for OpenSpec changes.
 
-Iterates a TOML plan manifest of OpenSpec changes (a DAG). Depending on the
-adapter, it either invokes a legacy single-command controller or owns the
+Iterates a TOML plan manifest of OpenSpec changes (a DAG). Owns the
 implement/review/archive phase loop directly, verifies completion from ground
 truth, and gates progress on configurable fast checks.
 
@@ -194,13 +193,11 @@ def build_single_change_config(repo: Path, change_id: str) -> dict:
     cfg = {
         "name": plan_name,
         "adapter": "opencode",
-        "invoke": defaults["invoke"],
         "state_file": defaults["state_file"],
         "implement_invoke": defaults["implement_invoke"],
         "review_invoke": defaults["review_invoke"],
         "archive_invoke": defaults["archive_invoke"],
         "timeout_minutes": 90,
-        "max_attempts": 2,
         "max_rounds": 5,
         "no_progress_limit": 2,
         "fast_checks": [],
@@ -228,7 +225,6 @@ def build_single_change_config(repo: Path, change_id: str) -> dict:
             "pause_before": False,
             "enabled": True,
             "timeout_minutes": 90,
-            "max_attempts": 2,
             "create_invoke": "",
             "create_max_attempts": 2,
         }
@@ -263,7 +259,6 @@ def render_single_change_manifest(cfg: dict) -> str:
     plan_str_fields = {
         "name": cfg.get("name", ""),
         "adapter": cfg.get("adapter", "opencode"),
-        "invoke": cfg.get("invoke", ""),
         "state_file": cfg.get("state_file", ""),
         "implement_invoke": cfg.get("implement_invoke", ""),
         "review_invoke": cfg.get("review_invoke", ""),
@@ -278,7 +273,6 @@ def render_single_change_manifest(cfg: dict) -> str:
 
     # Numeric plan-level fields — use float/int to match load_plan coercion.
     lines.append(f"timeout_minutes = {float(cfg.get('timeout_minutes', 90))}")
-    lines.append(f"max_attempts = {int(cfg.get('max_attempts', 2))}")
     lines.append(f"max_rounds = {int(cfg.get('max_rounds', 5))}")
     lines.append(f"no_progress_limit = {int(cfg.get('no_progress_limit', 2))}")
     lines.append(f"escalate_after_review_fails = {int(cfg.get('escalate_after_review_fails', 0))}")
@@ -328,7 +322,6 @@ def render_single_change_manifest(cfg: dict) -> str:
         lines.append(f"pause_before = {_toml_bool(c.get('pause_before', False))}")
         lines.append(f"enabled = {_toml_bool(c.get('enabled', True))}")
         lines.append(f"timeout_minutes = {float(c.get('timeout_minutes', cfg.get('timeout_minutes', 90)))}")
-        lines.append(f"max_attempts = {int(c.get('max_attempts', cfg.get('max_attempts', 2)))}")
         lines.append(f'create_invoke = "{compiler._escape_toml_value(c.get("create_invoke", ""))}"')
         lines.append(f"create_max_attempts = {int(c.get('create_max_attempts', cfg.get('create_max_attempts', 2)))}")
         break  # single change only
@@ -383,9 +376,9 @@ def _compare_configs(
     diverging: list[str] = []
 
     _SERIALIZED_PLAN_KEYS = [
-        "name", "adapter", "invoke", "state_file",
+        "name", "adapter", "state_file",
         "implement_invoke", "review_invoke", "archive_invoke",
-        "timeout_minutes", "max_attempts", "max_rounds", "no_progress_limit",
+        "timeout_minutes", "max_rounds", "no_progress_limit",
         "escalate_after_review_fails", "finding_recurrence_limit",
         "fast_checks", "check_timeout_minutes", "require_clean_tracked",
         "skip_warning", "skip_suggestion",
@@ -402,7 +395,7 @@ def _compare_configs(
 
     _SERIALIZED_CHANGE_KEYS = [
         "id", "phase", "depends_on", "pause_before", "enabled",
-        "timeout_minutes", "max_attempts", "create_invoke", "create_max_attempts",
+        "timeout_minutes", "create_invoke", "create_max_attempts",
     ]
 
     orig_changes = original.get("changes", {})
@@ -452,8 +445,7 @@ def apply_model_env(cfg: dict) -> None:
 
     Resolution happens once per process (``opsx-plan`` handles exactly one
     plan per invocation), so no save/restore is needed: everything
-    downstream — direct stage dispatch, the legacy nested-controller
-    ``{controller_model}`` substitution, and the telemetry fallback that
+    downstream — direct stage dispatch and the telemetry fallback that
     re-expands the stage invoke string after a stage completes — reads the
     same ``os.environ`` values for the rest of the process.
 
@@ -568,8 +560,6 @@ def save_json(path: Path, payload: dict) -> None:
 
 
 def save_worker_state(repo: Path, cfg: dict, state: dict, cid: str) -> None:
-    if not planref.is_direct_mode(cfg):
-        return
     r = state_mod.rec(state, cid)
     payload = {
         "version": 3,
@@ -602,8 +592,6 @@ def persist_direct_state(repo: Path, cfg: dict, state: dict, cid: str) -> None:
 
 
 def sync_direct_worker_state(repo: Path, cfg: dict, state: dict) -> None:
-    if not planref.is_direct_mode(cfg):
-        return
     for cid in cfg["order"]:
         save_worker_state(repo, cfg, state, cid)
 
@@ -1875,34 +1863,6 @@ def run_preflight_warnings(repo: Path, plan_src: str | None,
 
 
 # ---------------------------------------------------------------------------
-# Retry policy: read the controller's own schema-v3 state to decide whether
-# re-invoking /opsx-drive can plausibly succeed.
-# ---------------------------------------------------------------------------
-
-NO_RETRY_RESULTS = {"max_rounds_reached", "no_progress", "finding_recurrence_exceeded"}
-
-
-def retry_makes_sense(controller_state: dict | None) -> tuple[bool, str]:
-    if controller_state is None:
-        return True, "no controller state written; treating as transient"
-    if controller_state.get("_malformed"):
-        return False, "controller state file is malformed; needs operator"
-    last = controller_state.get("last_result", "")
-    if last in NO_RETRY_RESULTS:
-        return False, f"controller stopped with {last}; needs operator"
-    if last == "archive_failed":
-        outlook = (
-            controller_state.get("archive", {})
-            .get("triage", {})
-            .get("retry_outlook", "unknown")
-        )
-        if outlook == "same_failure":
-            return False, "archive triage says retry would fail the same way"
-        return True, f"archive failed with retry_outlook={outlook}"
-    return True, f"last_result={last or 'unset'}"
-
-
-# ---------------------------------------------------------------------------
 # Drive invocation
 # ---------------------------------------------------------------------------
 
@@ -1910,7 +1870,7 @@ def run_stage(
     repo: Path, cfg: dict, cid: str, stage: str, invoke_tpl: str,
     timeout_minutes: float, attempt: int,
 ) -> tuple[str, Path]:
-    """Run a templated stage command ('create' or 'drive'). Returns
+    """Run a templated stage command ('create'). Returns
     (outcome, log_path) where outcome is 'exited', 'timeout', or
     'spawn_error'. Output goes to a log file so it can be tailed live;
     the exit code is informational only."""
@@ -1926,13 +1886,6 @@ def run_stage(
     base.log(f"  exec[{stage}]: {' '.join(cmd)}  "
         f"(timeout {timeout_s/60:g}m, log {log_path})")
     return run_logged_command(repo, cmd, log_path, timeout_s, stage, attempt)
-
-
-def drive_change(repo: Path, cfg: dict, cid: str, attempt: int) -> tuple[str, Path]:
-    return run_stage(
-        repo, cfg, cid, "drive", cfg["invoke"],
-        cfg["changes"][cid]["timeout_minutes"], attempt,
-    )
 
 
 def terminate_group(proc: subprocess.Popen, grace: float = 15.0) -> None:
@@ -1996,8 +1949,7 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
         archived_on_disk = (
             not groundtruth.change_dir(repo, cid).exists() and groundtruth.find_archive_dir(repo, cid) is not None
         )
-        if planref.is_direct_mode(cfg):
-            r["max_rounds"] = cfg["max_rounds"]
+        r["max_rounds"] = cfg["max_rounds"]
         if r["status"] == base.RUNNING:  # stale from a killed run
             state_mod.set_status(state, cid, base.PENDING, "recovered from interrupted run")
         # A change that failed only because no create_invoke was configured
@@ -2016,59 +1968,52 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
             base.log(f"reconcile: {cid} create config now present; re-queued")
             continue
         if r["status"] != base.DONE:
-            if planref.is_direct_mode(cfg):
-                if archived_on_disk and record_archive_evidence(repo, r, cid):
-                    ok, why = verify_direct_archive_done(repo, cid, r)
-                    if ok:
-                        r["phase"] = "done"
-                        state_mod.set_status(
-                            state,
-                            cid,
-                            base.DONE,
-                            "verified from repository archive evidence",
-                        )
-                        base.log(f"reconcile: {cid} already archived; marked done")
-                        continue
-                    r["archive"]["status"] = "failed"
-                    r["archive"]["reason"] = why
-                if r["archive"].get("status") == "passed":
-                    ok, why = verify_direct_archive_done(repo, cid, r)
-                    if ok:
-                        r["phase"] = "done"
-                        state_mod.set_status(
-                            state,
-                            cid,
-                            base.DONE,
-                            "verified from plan state + repository evidence",
-                        )
-                        base.log(f"reconcile: {cid} already archived; marked done")
-                        continue
-                    if archived_on_disk:
-                        state_mod.set_status(
-                            state,
-                            cid,
-                            base.FAILED,
-                            f"recorded archive success but evidence is inconsistent: {why}",
-                        )
-                        base.log(f"reconcile: {cid} archive evidence inconsistent: {why}")
-                        continue
-                elif archived_on_disk:
+            if archived_on_disk and record_archive_evidence(repo, r, cid):
+                ok, why = verify_direct_archive_done(repo, cid, r)
+                if ok:
+                    r["phase"] = "done"
+                    state_mod.set_status(
+                        state,
+                        cid,
+                        base.DONE,
+                        "verified from repository archive evidence",
+                    )
+                    base.log(f"reconcile: {cid} already archived; marked done")
+                    continue
+                r["archive"]["status"] = "failed"
+                r["archive"]["reason"] = why
+            if r["archive"].get("status") == "passed":
+                ok, why = verify_direct_archive_done(repo, cid, r)
+                if ok:
+                    r["phase"] = "done"
+                    state_mod.set_status(
+                        state,
+                        cid,
+                        base.DONE,
+                        "verified from plan state + repository evidence",
+                    )
+                    base.log(f"reconcile: {cid} already archived; marked done")
+                    continue
+                if archived_on_disk:
                     state_mod.set_status(
                         state,
                         cid,
                         base.FAILED,
-                        "repository archived change but plan state lacks archive worker evidence",
+                        f"recorded archive success but evidence is inconsistent: {why}",
                     )
-                    base.log(
-                        f"reconcile: {cid} archived on disk without plan-owned archive evidence"
-                    )
+                    base.log(f"reconcile: {cid} archive evidence inconsistent: {why}")
                     continue
-            else:
-                ok, _ = groundtruth.verify_change_done(repo, cfg, cid)
-                if ok:
-                    state_mod.set_status(state, cid, base.DONE, "verified from repository evidence")
-                    base.log(f"reconcile: {cid} already archived; marked done")
-                    continue
+            elif archived_on_disk:
+                state_mod.set_status(
+                    state,
+                    cid,
+                    base.FAILED,
+                    "repository archived change but plan state lacks archive worker evidence",
+                )
+                base.log(
+                    f"reconcile: {cid} archived on disk without plan-owned archive evidence"
+                )
+                continue
             if (
                 r["status"] == base.PENDING
                 and r.get("create_attempts", 0) > 0
@@ -2086,10 +2031,7 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
                         f"create verification pending: {created_why}",
                     )
         else:
-            if planref.is_direct_mode(cfg):
-                ok, why = verify_direct_archive_done(repo, cid, r)
-            else:
-                ok, why = groundtruth.verify_change_done(repo, cfg, cid)
+            ok, why = verify_direct_archive_done(repo, cid, r)
             if not ok:
                 state_mod.set_status(
                     state, cid, base.FAILED,
@@ -2334,63 +2276,14 @@ def cmd_run(args: argparse.Namespace) -> int:
             visited.add(cid)  # exists already; nothing to create, don't drive
             continue
 
-        if planref.is_direct_mode(cfg):
-            base.log(f"=== {cid} direct {cfg['adapter']} execution (round {r['round']}) ===")
-            result = run_direct_change(repo, cfg, state, cid, budget_deadline, budget_usd)
-            if result == base.DONE:
-                base.log(f"  done: {cid}")
-                ran += 1
-            elif result == "spawn_error":
-                return 2
-            visited.add(cid)
-            continue
-
-        # ----- drive stage -----
-        attempt = r["attempts"] + 1
-        if attempt > change_cfg["max_attempts"]:
-            state_mod.set_status(state, cid, base.FAILED, "retry budget exhausted")
-            state_mod.save_state(repo, cfg["name"], state)
-            continue
-
-        base.log(f"=== {cid} (attempt {attempt}/{change_cfg['max_attempts']}) ===")
-        r["attempts"] = attempt
-        state_mod.set_status(state, cid, base.RUNNING)
-        state_mod.save_state(repo, cfg["name"], state)
-
-        outcome, log_path = drive_change(repo, cfg, cid, attempt)
-        state_mod.rec(state, cid)["last_log"] = str(log_path)
-
-        if outcome == "spawn_error":
-            state_mod.set_status(state, cid, base.FAILED, f"could not spawn: {cfg['invoke']}")
-            state_mod.save_state(repo, cfg["name"], state)
+        base.log(f"=== {cid} direct {cfg['adapter']} execution (round {r['round']}) ===")
+        result = run_direct_change(repo, cfg, state, cid, budget_deadline, budget_usd)
+        if result == base.DONE:
+            base.log(f"  done: {cid}")
+            ran += 1
+        elif result == "spawn_error":
             return 2
-
-        ok, why = groundtruth.verify_change_done(repo, cfg, cid)
-        if ok:
-            checks_ok, check_why = groundtruth.run_fast_checks(repo, cfg)
-            if checks_ok:
-                state_mod.set_status(state, cid, base.DONE, "verified + checks passed")
-                base.log(f"  done: {cid}")
-                ran += 1
-            else:
-                # The change is archived but the repo fails checks. Re-driving
-                # cannot fix this; an operator must intervene.
-                state_mod.set_status(state, cid, base.FAILED, f"post-archive {check_why}")
-                base.log(f"  FAILED post-archive checks: {check_why}")
-        else:
-            cs = groundtruth.read_controller_state(repo, cfg, cid)
-            can_retry, retry_why = retry_makes_sense(cs)
-            if outcome == "timeout":
-                why = f"drive timed out; {why}"
-            detail = f"{why} :: {retry_why}"
-            if can_retry and attempt < change_cfg["max_attempts"]:
-                state_mod.set_status(state, cid, base.PENDING, f"will retry: {detail}")
-                base.log(f"  not done yet ({detail}); retrying")
-            else:
-                state_mod.set_status(state, cid, base.FAILED, detail)
-                base.log(f"  FAILED: {detail}")
-
-        state_mod.save_state(repo, cfg["name"], state)
+        visited.add(cid)
 
     # --- PR delivery: push branch + create PR after all changes done ---
     if not args.dry_run:
