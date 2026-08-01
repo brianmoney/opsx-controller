@@ -310,16 +310,52 @@ importable `lib/orchestrator/` package alongside the existing `lib/metrics`,
 `lib/pricing`, and `lib/models` runtime packages:
 
 - `lib/orchestrator/base.py` — `log`, `utcnow`, `PlanError`, status constants,
-  adapter defaults. Zero dependency on any other orchestrator module.
+  adapter defaults, header constants (`ARCHIVE_DIR_RE`, `TASK_RE`,
+  `ADAPTER_CLIENTS`, `_RUNTIME_ROOTS`). Zero dependency on any other
+  orchestrator module.
 - `lib/orchestrator/planref.py` — plan location and loading (`load_plan`,
   `resolve_plan`, and the rest of the plan-resolution closure). Depends on
   `base`.
 - `lib/orchestrator/cost.py` — `estimate_stage_cost` and its pricing-catalog
   helpers. Depends on `base`.
+- `lib/orchestrator/groundtruth.py` — `git`, `change_dir`, archive-locating
+  helpers, `verify_change_*`, `run_fast_checks`, and tracked-worktree helpers.
+  Depends on `base`.
+- `lib/orchestrator/state.py` — `.opsx-plan/<name>.state.json` accessors:
+  `load_state`, `save_state`, `rec`, `set_status`, and task-count helpers.
+  Depends on `base` and `groundtruth`.
+- `lib/orchestrator/telemetry.py` — telemetry record construction and writing,
+  plus usage/model extraction helpers. Depends on `base`, `cost`, and `state`.
+- `lib/orchestrator/delivery.py` — branch resolution, PR prerequisites, PR
+  body generation, and `attempt_pr_delivery`. Depends on `base` and
+  `groundtruth`.
+- `lib/orchestrator/doctor.py` — twelve individual `_check_*` preflight probes.
+  Depends on `base`, `groundtruth`, `planref`, and `telemetry`.
+- `lib/orchestrator/compiler.py` — compile source/output resolution, prompt
+  construction, client invocation (`run_compile_client`), and TOML extraction.
+  Depends on `base`.
+- `lib/orchestrator/logs.py` — log discovery, parsing, and selection helpers.
+  Depends on `state`.
 - `lib/orchestrator/report.py` — `opsx-plan report`'s table/JSON rendering
   and `cmd_report`. Depends on `base` and `planref`.
 - `lib/orchestrator/dashboard.py` — `opsx-plan dashboard`'s HTML rendering
   and `cmd_dashboard`. Depends on `base`, `planref`, and `report`.
+
+Dependency direction (acyclic, mechanically verified by
+`tests/orchestrator/test_module_layout.py`):
+
+```
+dashboard → report → planref → base
+cost → base
+groundtruth → base
+state → groundtruth → base
+telemetry → state → groundtruth → base
+  (also telemetry → cost → base)
+delivery → groundtruth → base
+doctor → {groundtruth, telemetry, planref, base}
+compiler → base
+logs → state → groundtruth → base
+```
 
 Modules call across this package through the module object
 (`from lib.orchestrator import base; base.log(...)`), never by importing

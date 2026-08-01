@@ -5,6 +5,7 @@ import this one.
 """
 from __future__ import annotations
 
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,22 @@ PENDING = "pending"
 RUNNING = "running"
 FAILED = "failed"
 SKIPPED = "skipped"
+
+ARCHIVE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-")
+TASK_RE = re.compile(r"^- \[(?P<done>[ xX])\]\s+")
+
+ADAPTER_CLIENTS = {
+    "opencode": "opencode",
+    "claude-code": "claude",
+    "codex-cli": "codex",
+}
+
+# Populated by the entrypoint's `_ensure_runtime_modules()` immediately after
+# `lib.orchestrator` becomes importable. That function runs before the
+# package exists on sys.path, so it cannot set this attribute directly at
+# computation time — it assigns here right after the import succeeds. Empty
+# until then; nothing in this package reads it at import time.
+_RUNTIME_ROOTS: tuple[Path, ...] = ()
 
 # Adapter defaults. Both fields accept a {change} placeholder and may be
 # overridden in the [plan] table. Verify the invoke command for your client

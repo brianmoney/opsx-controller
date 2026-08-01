@@ -1,0 +1,22 @@
+[opsx-plan 13:55:32] warning: plan 'test-fixture' resolves to the deprecated nested-controller '/opsx-drive' path (fewer than all three stage invokes configured); direct dispatch (opsx-run <change-id> or full implement/review/archive stage invokes) is the supported replacement
+==> /home/brian/opsx-controller/scratchpad/fixture/.opsx-plan/logs/define-opencode-plugin-usage-contract.implement.r1.1.log <==
+[0m
+[0m$ [0mopenspec validate define-opencode-plugin-usage-contract --strict
+Change 'define-opencode-plugin-usage-contract' is valid
+[0m
+[0m← [0mEdit openspec/changes/define-opencode-plugin-usage-contract/tasks.md
+Index: /home/brian/opsx-controller/openspec/changes/define-opencode-plugin-usage-contract/tasks.md
+===================================================================
+--- /home/brian/opsx-controller/openspec/changes/define-opencode-plugin-usage-contract/tasks.md
++++ /home/brian/opsx-controller/openspec/changes/define-opencode-plugin-usage-contract/tasks.md
+@@ -8,5 +8,5 @@
+ - [x] 1.6 Define `usage.usage_source = "opencode_plugin"` and source precedence relative to worker JSON and log metadata.
+ 
+ ## 2. Verification
+ 
+-- [ ] 2.1 Run `openspec validate define-opencode-plugin-usage-contract --strict`.
++- [x] 2.1 Run `openspec validate define-opencode-plugin-usage-contract --strict`.
+
+[0m
+[0m→ [0mRead openspec/changes/define-opencode-plugin-usage-contract/tasks.md
+{"status":"implemented","change":"define-opencode-plugin-usage-contract","round":1,"progress_made":true,"completed_tasks":["1.1","1.2","1.3","1.4","1.5","1.6","2.1"],"remaining_tasks":[],"task_counts":{"complete":7,"total":7},"files_touched":["openspec/changes/define-opencode-plugin-usage-contract/tasks.md"],"known_change_files":["openspec/changes/define-opencode-plugin-usage-contract/proposal.md","openspec/changes/define-opencode-plugin-usage-contract/design.md","openspec/changes/define-opencode-plugin-usage-contract/tasks.md","openspec/changes/define-opencode-plugin-usage-contract/specs/plan-run-observability/spec.md","openspec/changes/define-opencode-plugin-usage-contract/.openspec.yaml"],"summary":"All 6 contract requirements were already fully specified in the delta spec; verified each task against spec content, marked tasks complete, and validated with --strict (clean).","cache_update":{"change_summary":"Pure contract change defining OpenCode plugin usage sidecar shape, OPSX_* env vars, normalized fields, final-vs-incremental selection, error handling, and source precedence (usage_source=opencode_plugin). No code implementation — spec delta only.","refresh_reason":"Initial context compilation from all planning artifacts","source_paths":["openspec/changes/define-opencode-plugin-usage-contract/proposal.md","openspec/changes/define-opencode-plugin-usage-contract/design.md","openspec/changes/define-opencode-plugin-usage-contract/specs/plan-run-observability/spec.md","openspec/changes/define-opencode-plugin-usage-contract/tasks.md","openspec/specs/plan-run-observability/spec.md"],"scope_hint":"Spec-only contract: defines sidecar JSONL shape, env vars, event types, final-vs-incremental logic, error handling, and usage_source precedence. Future changes (add-opencode-usage-emitter-plugin, consume-opencode-usage-sidecar) implement against this contract."}}

@@ -69,42 +69,13 @@ except ModuleNotFoundError as exc:  # pragma: no cover
     sys.exit(f"opsx-plan requires the lib.models runtime package: {exc}")
 
 try:
-    from lib.orchestrator import base, dashboard, planref, report
+    from lib.orchestrator import base, compiler, dashboard, delivery, doctor, groundtruth, logs, planref, report, telemetry
     from lib.orchestrator import cost as cost_mod
+    from lib.orchestrator import state as state_mod
 except ModuleNotFoundError as exc:  # pragma: no cover
     sys.exit(f"opsx-plan requires the lib.orchestrator runtime package: {exc}")
+base._RUNTIME_ROOTS = _RUNTIME_ROOTS
 
-ADAPTER_CLIENTS = {
-    "opencode": "opencode",
-    "claude-code": "claude",
-    "codex-cli": "codex",
-}
-
-# Compile-client registry (separate from stage invocation defaults).
-# Maps adapter keys to their compile invocation details.  Entries that lack
-# ``supported`` or set it to ``False`` are recognised by the flag parser but
-# rejected before model resolution or process spawn.
-COMPILE_CLIENTS: dict[str, dict] = {
-    "opencode": {
-        "executable": "opencode",
-        "supported": True,
-        "argv_template": ["{executable}", "run", "--model", "{model}", "{prompt}"],
-    },
-    "claude-code": {
-        "executable": "claude",
-        "supported": True,
-        "argv_template": [
-            "{executable}", "-p", "--model", "{model}", "{prompt}",
-        ],
-    },
-    "codex-cli": {
-        "executable": "codex",
-        "supported": False,
-    },
-}
-
-ARCHIVE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-")
-TASK_RE = re.compile(r"^- \[(?P<done>[ xX])\]\s+")
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 _current_proc: subprocess.Popen | None = None
@@ -208,13 +179,13 @@ def build_single_change_config(repo: Path, change_id: str) -> dict:
     ``--adapter`` flag on ``run-one`` to select ``claude-code`` here. Fails
     early when the change dir is missing or unauthored.
     """
-    cdir = change_dir(repo, change_id)
+    cdir = groundtruth.change_dir(repo, change_id)
     if not cdir.is_dir():
         raise base.PlanError(f"openspec/changes/{change_id} does not exist")
-    if not change_authored(repo, change_id):
+    if not groundtruth.change_authored(repo, change_id):
         raise base.PlanError(
             f"openspec/changes/{change_id} is missing required artifacts "
-            f"({', '.join(AUTHORED_ARTIFACTS)})"
+            f"({', '.join(groundtruth.AUTHORED_ARTIFACTS)})"
         )
 
     defaults = base.ADAPTER_DEFAULTS["opencode"]
@@ -303,7 +274,7 @@ def render_single_change_manifest(cfg: dict) -> str:
         "created_check": cfg.get("created_check", ""),
     }
     for key, val in plan_str_fields.items():
-        lines.append(f'{key} = "{_escape_toml_value(val)}"')
+        lines.append(f'{key} = "{compiler._escape_toml_value(val)}"')
 
     # Numeric plan-level fields — use float/int to match load_plan coercion.
     lines.append(f"timeout_minutes = {float(cfg.get('timeout_minutes', 90))}")
@@ -325,7 +296,7 @@ def render_single_change_manifest(cfg: dict) -> str:
     # fast_checks.
     fast_checks = cfg.get("fast_checks", [])
     if fast_checks:
-        items = ", ".join(f'"{_escape_toml_value(c)}"' for c in fast_checks)
+        items = ", ".join(f'"{compiler._escape_toml_value(c)}"' for c in fast_checks)
         lines.append(f"fast_checks = [{items}]")
     else:
         lines.append("fast_checks = []")
@@ -334,8 +305,8 @@ def render_single_change_manifest(cfg: dict) -> str:
     gd = cfg.get("git_delivery", {})
     lines.append(
         f"git_delivery = {{ enabled = {_toml_bool(gd.get('enabled', False))}, "
-        f'branch = "{_escape_toml_value(gd.get("branch", ""))}", '
-        f'base_ref = "{_escape_toml_value(gd.get("base_ref", ""))}", '
+        f'branch = "{compiler._escape_toml_value(gd.get("branch", ""))}", '
+        f'base_ref = "{compiler._escape_toml_value(gd.get("base_ref", ""))}", '
         f"create_pull_request = {_toml_bool(gd.get('create_pull_request', False))} }}"
     )
 
@@ -344,13 +315,13 @@ def render_single_change_manifest(cfg: dict) -> str:
     changes = cfg.get("changes", {})
     for cid, c in changes.items():
         lines.append("[[changes]]")
-        lines.append(f'id = "{_escape_toml_value(cid)}"')
+        lines.append(f'id = "{compiler._escape_toml_value(cid)}"')
         phase = c.get("phase")
         if phase is not None:
             lines.append(f"phase = {int(phase)}")
         depends_on = c.get("depends_on", [])
         if depends_on:
-            items = ", ".join(f'"{_escape_toml_value(d)}"' for d in depends_on)
+            items = ", ".join(f'"{compiler._escape_toml_value(d)}"' for d in depends_on)
             lines.append(f"depends_on = [{items}]")
         else:
             lines.append("depends_on = []")
@@ -358,7 +329,7 @@ def render_single_change_manifest(cfg: dict) -> str:
         lines.append(f"enabled = {_toml_bool(c.get('enabled', True))}")
         lines.append(f"timeout_minutes = {float(c.get('timeout_minutes', cfg.get('timeout_minutes', 90)))}")
         lines.append(f"max_attempts = {int(c.get('max_attempts', cfg.get('max_attempts', 2)))}")
-        lines.append(f'create_invoke = "{_escape_toml_value(c.get("create_invoke", ""))}"')
+        lines.append(f'create_invoke = "{compiler._escape_toml_value(c.get("create_invoke", ""))}"')
         lines.append(f"create_max_attempts = {int(c.get('create_max_attempts', cfg.get('create_max_attempts', 2)))}")
         break  # single change only
 
@@ -528,202 +499,6 @@ def apply_model_env(cfg: dict) -> None:
     else:
         os.environ.pop(ROLE_ENV[escalation_role], None)
 
-
-# ---------------------------------------------------------------------------
-# Orchestrator state (.opsx-plan/<name>.state.json)
-# ---------------------------------------------------------------------------
-
-def state_path(repo: Path, plan_name: str) -> Path:
-    return repo / ".opsx-plan" / f"{plan_name}.state.json"
-
-
-def default_context_cache() -> dict:
-    return {
-        "valid": False,
-        "status": "missing",
-        "compiled_by": "",
-        "updated_in_round": 0,
-        "source_signature": "",
-        "source_paths": [],
-        "refresh_reason": "",
-        "change_summary": "",
-        "scope_hint": "",
-    }
-
-
-def default_last_review() -> dict:
-    return {
-        "verdict": "pending",
-        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
-        "summary": "",
-        "fix_prompt": "",
-    }
-
-
-def default_archive_state() -> dict:
-    return {
-        "status": "not_started",
-        "path": "",
-        "commit": "",
-        "reason": "",
-        "spec_sync_status": "",
-        "triage": {
-            "scope_basis": "",
-            "in_scope_files": [],
-            "ambiguous_files": [],
-            "retry_guidance": "",
-            "retry_outlook": "unknown",
-        },
-    }
-
-
-def default_last_stage() -> dict:
-    return {
-        "name": "",
-        "round": 0,
-        "outcome": "",
-        "log_path": "",
-        "updated_at": "",
-    }
-
-
-def new_change_record() -> dict:
-    return {
-        "status": base.PENDING,
-        "attempts": 0,
-        "reason": "",
-        "updated_at": "",
-        "create_attempts": 0,
-        "created_by_orchestrator": False,
-        "accepted": False,
-        "phase": "implement",
-        "round": 1,
-        "max_rounds": 5,
-        "no_progress_streak": 0,
-        "latest_fix_prompt": "",
-        "last_result": "",
-        "task_counts": {"complete": 0, "total": 0},
-        "tracked_change_files": [],
-        "context_cache": default_context_cache(),
-        "last_review": default_last_review(),
-        "archive": default_archive_state(),
-        "history": [],
-        "last_stage": default_last_stage(),
-        "last_log": "",
-        "telemetry": {"latest_telemetry": ""},
-        "escalation": {"active": False, "activated_round": 0, "model": ""},
-    }
-
-
-def merge_defaults(target: dict, defaults: dict) -> dict:
-    for key, value in defaults.items():
-        if key not in target:
-            target[key] = copy.deepcopy(value)
-        elif isinstance(target[key], dict) and isinstance(value, dict):
-            merge_defaults(target[key], value)
-    return target
-
-
-def _default_git_delivery_state() -> dict:
-    return {
-        "base_ref": None,
-        "branch_name": None,
-        "delivery_status": "disabled",
-        "pull_request_url": None,
-        "remote_name": None,
-    }
-
-
-def load_state(repo: Path, plan_name: str) -> dict:
-    p = state_path(repo, plan_name)
-    if p.exists():
-        with open(p, encoding="utf-8") as fh:
-            state = json.load(fh)
-    else:
-        state = {"plan": plan_name, "approvals": [], "changes": {}}
-    state.setdefault("plan", plan_name)
-    state.setdefault("approvals", [])
-    state.setdefault("notified_events", {})
-    state.setdefault("changes", {})
-    state.setdefault("git_delivery", _default_git_delivery_state())
-    gd = state["git_delivery"]
-    if not isinstance(gd, dict):
-        state["git_delivery"] = _default_git_delivery_state()
-    else:
-        for key, value in _default_git_delivery_state().items():
-            gd.setdefault(key, value)
-    for cid, record in state["changes"].items():
-        if isinstance(record, dict):
-            merge_defaults(record, new_change_record())
-            record.setdefault("change", cid)
-    return state
-
-
-def save_state(repo: Path, plan_name: str, state: dict) -> None:
-    p = state_path(repo, plan_name)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    gi = p.parent / ".gitignore"
-    if not gi.exists():  # orchestrator state is operational, never committed
-        gi.write_text("*\n", encoding="utf-8")
-    tmp = p.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(state, fh, indent=2)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, p)
-
-
-def rec(state: dict, cid: str) -> dict:
-    record = state["changes"].setdefault(cid, new_change_record())
-    merge_defaults(record, new_change_record())
-    return record
-
-
-def set_status(state: dict, cid: str, status: str, reason: str = "") -> None:
-    r = rec(state, cid)
-    r["status"] = status
-    r["reason"] = reason
-    r["updated_at"] = base.utcnow()
-
-
-def change_task_counts(repo: Path, cid: str) -> dict:
-    counts = {"complete": 0, "total": 0}
-    tasks = change_dir(repo, cid) / "tasks.md"
-    if not tasks.is_file():
-        return counts
-    for line in tasks.read_text(encoding="utf-8").splitlines():
-        match = TASK_RE.match(line)
-        if not match:
-            continue
-        counts["total"] += 1
-        if match.group("done").lower() == "x":
-            counts["complete"] += 1
-    return counts
-
-
-def update_task_counts(repo: Path, state: dict, cid: str) -> None:
-    rec(state, cid)["task_counts"] = change_task_counts(repo, cid)
-
-
-def merge_paths(*groups: list[str]) -> list[str]:
-    merged: list[str] = []
-    seen: set[str] = set()
-    for group in groups:
-        for path in group:
-            if not path or path in seen:
-                continue
-            seen.add(path)
-            merged.append(path)
-    return merged
-
-
-def change_context_paths(repo: Path, cid: str) -> list[str]:
-    cdir = change_dir(repo, cid)
-    if not cdir.is_dir():
-        return []
-    return sorted(str(path.relative_to(repo)) for path in cdir.rglob("*") if path.is_file())
-
-
 # ---------------------------------------------------------------------------
 # Active plan pointer
 # ---------------------------------------------------------------------------
@@ -795,7 +570,7 @@ def save_json(path: Path, payload: dict) -> None:
 def save_worker_state(repo: Path, cfg: dict, state: dict, cid: str) -> None:
     if not planref.is_direct_mode(cfg):
         return
-    r = rec(state, cid)
+    r = state_mod.rec(state, cid)
     payload = {
         "version": 3,
         "change": cid,
@@ -822,7 +597,7 @@ def save_worker_state(repo: Path, cfg: dict, state: dict, cid: str) -> None:
 
 
 def persist_direct_state(repo: Path, cfg: dict, state: dict, cid: str) -> None:
-    save_state(repo, cfg["name"], state)
+    state_mod.save_state(repo, cfg["name"], state)
     save_worker_state(repo, cfg, state, cid)
 
 
@@ -863,8 +638,8 @@ def _prior_finding_loci(r: dict, cfg: dict) -> list[str]:
 
 
 def build_worker_input(repo: Path, cfg: dict, state: dict, cid: str, stage: str = "") -> str:
-    r = rec(state, cid)
-    update_task_counts(repo, state, cid)
+    r = state_mod.rec(state, cid)
+    state_mod.update_task_counts(repo, state, cid)
     cache = r["context_cache"]
     lines = [
         f"CHANGE: {cid}",
@@ -942,7 +717,7 @@ def record_stage_log(
     outcome: str,
     log_path: Path,
 ) -> None:
-    r = rec(state, cid)
+    r = state_mod.rec(state, cid)
     r["last_log"] = str(log_path)
     r["last_stage"] = {
         "name": stage,
@@ -951,947 +726,6 @@ def record_stage_log(
         "log_path": str(log_path),
         "updated_at": base.utcnow(),
     }
-
-
-# ---------------------------------------------------------------------------
-# Telemetry recording (plan-run-observability schema v1)
-# ---------------------------------------------------------------------------
-
-TELEMETRY_SCHEMA_VERSION = 1
-
-
-def compute_duration_ms(started_at: str, ended_at: str) -> int:
-    start = datetime.fromisoformat(started_at)
-    end = datetime.fromisoformat(ended_at)
-    return int((end - start).total_seconds() * 1000)
-
-
-def build_telemetry_record(
-    *,
-    plan_name: str,
-    run_id: str,
-    change_id: str,
-    stage: str,
-    round_num: int,
-    status: str,
-    started_at: str,
-    ended_at: str,
-    duration_ms: int,
-    adapter: str,
-    worker_command: str,
-    timeout_seconds: int,
-    retry_attempt: int = 0,
-    log_path: str = "",
-    stage_status: str | None = None,
-    error_message: str | None = None,
-    verdict: str | None = None,
-    critical_count: int | None = None,
-    warning_count: int | None = None,
-    note_count: int | None = None,
-) -> dict:
-    return {
-        "schema_version": TELEMETRY_SCHEMA_VERSION,
-        "uid": str(uuid.uuid4()),
-        "plan_name": plan_name,
-        "run_id": run_id,
-        "change_id": change_id,
-        "stage": stage,
-        "round": round_num,
-        "status": status,
-        "started_at": started_at,
-        "ended_at": ended_at,
-        "duration_ms": duration_ms,
-        "invocation": {
-            "adapter": adapter,
-            "worker_command": worker_command,
-            "args_sample": None,
-            "timeout_seconds": timeout_seconds,
-            "retry_attempt": retry_attempt,
-        },
-        "model": {
-            "provider": None,
-            "model_id": None,
-            "model_alias": None,
-        },
-        "result": {
-            "log_path": log_path,
-            "stage_status": stage_status,
-            "error_message": error_message,
-            "verdict": verdict,
-            "critical_count": critical_count,
-            "warning_count": warning_count,
-            "note_count": note_count,
-        },
-        "usage": {
-            "usage_available": False,
-            "input_tokens": None,
-            "output_tokens": None,
-            "cached_input_tokens": None,
-            "reasoning_tokens": None,
-            "total_tokens": None,
-            "usage_source": None,
-        },
-        "cost": {
-            "status": "unavailable",
-            "pricing_catalog_version": None,
-            "price_snapshot": None,
-            "unresolved_reason": None,
-            "estimated_cost": None,
-        },
-    }
-
-
-def write_telemetry_record(repo: Path, plan_name: str, record: dict) -> None:
-    telemetry_dir = repo / ".opsx-plan" / "telemetry"
-    telemetry_dir.mkdir(parents=True, exist_ok=True)
-    jsonl_path = telemetry_dir / f"{plan_name}.jsonl"
-    line = json.dumps(record, ensure_ascii=False) + "\n"
-    with open(jsonl_path, "a", encoding="utf-8") as fh:
-        fh.write(line)
-        fh.flush()
-        os.fsync(fh.fileno())
-
-
-# ---------------------------------------------------------------------------
-# Usage / model metadata extraction for direct stage telemetry
-# ---------------------------------------------------------------------------
-
-# Recognized token field names mapped to normalized schema keys.
-_TOKEN_FIELD_MAP = {
-    "input_tokens": "input_tokens",
-    "inputTokens": "input_tokens",
-    "prompt_tokens": "input_tokens",
-    "promptTokens": "input_tokens",
-    "output_tokens": "output_tokens",
-    "outputTokens": "output_tokens",
-    "completion_tokens": "output_tokens",
-    "completionTokens": "output_tokens",
-    "cached_input_tokens": "cached_input_tokens",
-    "cachedInputTokens": "cached_input_tokens",
-    "cache_read_input_tokens": "cached_input_tokens",
-    "cache_creation_input_tokens": "cached_input_tokens",
-    "reasoning_tokens": "reasoning_tokens",
-    "reasoningTokens": "reasoning_tokens",
-    "thinking_tokens": "reasoning_tokens",
-    "thinkingTokens": "reasoning_tokens",
-    "total_tokens": "total_tokens",
-    "totalTokens": "total_tokens",
-}
-
-_MODEL_FIELD_MAP = {
-    "provider": "provider",
-    "model_id": "model_id",
-    "modelId": "model_id",
-    "model": "model_id",
-    "model_alias": "model_alias",
-    "modelAlias": "model_alias",
-}
-
-
-def _valid_token_count(value):
-    """Only non-negative ``int`` values are accepted. Booleans are rejected."""
-    if isinstance(value, bool):
-        return False
-    return isinstance(value, int) and value >= 0
-
-
-def _extract_token_fields(obj):
-    """Return ``(normalized_token_dict, found_any)`` from *obj*.
-
-    Inspects top-level keys and a nested ``usage`` sub-dict when
-    present.  Each recognized field is validated as a non-negative
-    integer; the first valid value for each normalized key wins.
-    """
-    result = {
-        "input_tokens": None,
-        "output_tokens": None,
-        "cached_input_tokens": None,
-        "reasoning_tokens": None,
-        "total_tokens": None,
-    }
-    found_any = False
-
-    candidates = [obj]
-    usage = obj.get("usage")
-    if isinstance(usage, dict):
-        candidates.append(usage)
-
-    for source in candidates:
-        for key, value in source.items():
-            norm = _TOKEN_FIELD_MAP.get(key)
-            if norm is None:
-                continue
-            if result[norm] is not None:
-                continue  # first source wins
-            if _valid_token_count(value):
-                result[norm] = int(value)
-                found_any = True
-
-    return result, found_any
-
-
-def _extract_model_fields(obj):
-    """Return normalized ``{provider, model_id, model_alias}`` dict.
-
-    Inspects top-level keys and a nested ``model`` sub-dict when
-    present.  Only non-empty string values are accepted.
-    """
-    result = {
-        "provider": None,
-        "model_id": None,
-        "model_alias": None,
-    }
-
-    candidates = [obj]
-    model = obj.get("model")
-    if isinstance(model, dict):
-        candidates.append(model)
-
-    for source in candidates:
-        for key, value in source.items():
-            norm = _MODEL_FIELD_MAP.get(key)
-            if norm is None:
-                continue
-            if result[norm] is not None:
-                continue
-            if isinstance(value, str) and value.strip():
-                result[norm] = value.strip()
-
-    return result
-
-
-def _claude_model_usage_tokens(entry) -> int:
-    """Sum recognized token fields on one ``modelUsage`` entry, for ranking."""
-    if not isinstance(entry, dict):
-        return -1
-    total = 0
-    for key in ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"):
-        value = entry.get(key)
-        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-            total += value
-    return total
-
-
-def _extract_claude_envelope_model(envelope: dict) -> dict:
-    """Extract model identity from a Claude Code result envelope.
-
-    Prefers the generic top-level/nested ``model`` fields (matching every
-    other usage source), then falls back to the envelope's own
-    ``modelUsage`` map — a dict keyed by canonical model id, each carrying a
-    ``canonicalModel`` and a hosting ``provider`` (e.g. ``"firstParty"``).
-    When more than one model billed against a stage (sub-agent delegation),
-    the entry with the most combined tokens wins. Provider is normalized to
-    ``"anthropic"`` — the envelope's ``provider`` field describes hosting
-    infrastructure, not the model vendor, and every model Claude Code can
-    dispatch is an Anthropic model regardless of hosting.
-    """
-    result = _extract_model_fields(envelope)
-    if result["provider"] is not None or result["model_id"] is not None:
-        return result
-
-    model_usage = envelope.get("modelUsage")
-    if not isinstance(model_usage, dict) or not model_usage:
-        return result
-
-    best_id, best_entry = max(
-        model_usage.items(), key=lambda kv: _claude_model_usage_tokens(kv[1])
-    )
-    if not isinstance(best_entry, dict):
-        return result
-
-    canonical = best_entry.get("canonicalModel")
-    model_id = canonical if isinstance(canonical, str) and canonical.strip() else best_id
-    if isinstance(model_id, str) and model_id.strip():
-        result["provider"] = "anthropic"
-        result["model_id"] = model_id.strip()
-
-    return result
-
-
-def _try_parse_json_line(line):
-    """Parse *line* as a JSON object dict, or return ``None``."""
-    stripped = line.strip()
-    if not (stripped.startswith("{") and stripped.endswith("}")):
-        return None
-    try:
-        obj = json.loads(stripped)
-    except json.JSONDecodeError:
-        return None
-    return obj if isinstance(obj, dict) else None
-
-
-def _scan_log_for_usage(log_path):
-    """Scan every line of *log_path* for JSON objects that carry token fields.
-
-    Returns ``(normalized_token_dict, found_any)``.
-    """
-    result = {
-        "input_tokens": None,
-        "output_tokens": None,
-        "cached_input_tokens": None,
-        "reasoning_tokens": None,
-        "total_tokens": None,
-    }
-    found_any = False
-
-    try:
-        for line in log_path.read_text(encoding="utf-8").splitlines():
-            obj = _try_parse_json_line(line)
-            if obj is None:
-                continue
-            tokens, any_found = _extract_token_fields(obj)
-            if not any_found:
-                continue
-            for key in result:
-                if result[key] is None and tokens[key] is not None:
-                    result[key] = tokens[key]
-                    found_any = True
-    except OSError:
-        pass
-
-    return result, found_any
-
-
-def _scan_log_for_model(log_path):
-    """Scan every line of *log_path* for JSON objects that carry model fields.
-
-    Returns normalized ``{provider, model_id, model_alias}`` dict.
-    """
-    result = {
-        "provider": None,
-        "model_id": None,
-        "model_alias": None,
-    }
-
-    try:
-        for line in log_path.read_text(encoding="utf-8").splitlines():
-            obj = _try_parse_json_line(line)
-            if obj is None:
-                continue
-            model = _extract_model_fields(obj)
-            for key in result:
-                if result[key] is None and model[key] is not None:
-                    result[key] = model[key]
-    except OSError:
-        pass
-
-    return result
-
-
-def _parse_invocation_model_value(model_value):
-    """Parse an invocation-configured model string into normalized fields.
-
-    Recognizes the common ``provider/model_id`` form used by installed
-    OpenCode agent configs. When no provider prefix is present, preserves the
-    raw value as ``model_id`` and leaves ``provider`` unset.
-    """
-    result = {
-        "provider": None,
-        "model_id": None,
-        "model_alias": None,
-    }
-    if not isinstance(model_value, str):
-        return result
-    value = model_value.strip()
-    if not value:
-        return result
-    if "/" in value:
-        provider, model_id = value.split("/", 1)
-        provider = provider.strip()
-        model_id = model_id.strip()
-        if provider and model_id:
-            result["provider"] = provider
-            result["model_id"] = model_id
-            return result
-    result["model_id"] = value
-    return result
-
-
-_ADAPTER_AGENT_DIR_PARTS = {
-    "opencode": (".config", "opencode", "agents"),
-    "claude-code": (".claude", "agents"),
-}
-
-_ADAPTER_REPO_AGENT_DIR_PARTS = {
-    "opencode": (".opencode", "agents"),
-    "claude-code": (".claude", "agents"),
-}
-
-
-def _adapter_agent_dir(adapter: str, repo: Path | None = None) -> list[Path]:
-    """Return candidate installed agent directories for *adapter*, in lookup
-    order: the repo-local install (when *repo* is given) first, then the
-    home-rooted install location. Empty when *adapter* is unknown."""
-    candidates: list[Path] = []
-    if repo is not None:
-        repo_parts = _ADAPTER_REPO_AGENT_DIR_PARTS.get(adapter)
-        if repo_parts is not None:
-            candidates.append(repo.joinpath(*repo_parts))
-    home_parts = _ADAPTER_AGENT_DIR_PARTS.get(adapter)
-    if home_parts is not None:
-        candidates.append(Path.home().joinpath(*home_parts))
-    return candidates
-
-
-def _best_effort_expand_invoke(invoke: str) -> str:
-    """Expand ``$VAR``/``${VAR}`` references in *invoke* for telemetry fallback.
-
-    Unlike the fail-closed expansion in ``invoke_direct_stage``, this never
-    raises or blocks: it is read-only best-effort parsing of a command that
-    already ran, so an unset variable just leaves that token as-is rather
-    than failing telemetry extraction.
-    """
-    try:
-        tokens = shlex.split(invoke)
-    except ValueError:
-        return invoke
-    return shlex.join(os.path.expandvars(token) for token in tokens)
-
-
-def _extract_invocation_model(worker_command, adapter: str = "opencode", repo: Path | None = None):
-    """Return model identity from the configured worker invocation.
-
-    Supports either an explicit ``--model`` argument or an ``--agent``
-    reference whose installed agent frontmatter (in *adapter*'s own agent
-    directory) declares a ``model:`` value. When *repo* is given, a
-    repo-local agent install is checked before the home-rooted one.
-    """
-    result = {
-        "provider": None,
-        "model_id": None,
-        "model_alias": None,
-    }
-    if not isinstance(worker_command, str) or not worker_command.strip():
-        return result
-
-    try:
-        parts = shlex.split(worker_command)
-    except ValueError:
-        return result
-
-    agent_name = None
-    i = 0
-    while i < len(parts):
-        part = parts[i]
-        if part == "--model" and i + 1 < len(parts):
-            return _parse_invocation_model_value(parts[i + 1])
-        if part.startswith("--model="):
-            return _parse_invocation_model_value(part.split("=", 1)[1])
-        if part == "--agent" and i + 1 < len(parts):
-            agent_name = parts[i + 1].strip() or None
-            i += 2
-            continue
-        if part.startswith("--agent="):
-            agent_name = part.split("=", 1)[1].strip() or None
-        i += 1
-
-    if not agent_name:
-        return result
-
-    for agent_dir in _adapter_agent_dir(adapter, repo):
-        agent_path = agent_dir / f"{agent_name}.md"
-        try:
-            lines = agent_path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            continue
-
-        if not lines or lines[0].strip() != "---":
-            return result
-
-        for line in lines[1:]:
-            stripped = line.strip()
-            if stripped == "---":
-                break
-            if not stripped.startswith("model:"):
-                continue
-            _, _, raw_value = stripped.partition(":")
-            model_value = raw_value.strip()
-            if len(model_value) >= 2 and model_value[0] == model_value[-1] and model_value[0] in {'"', "'"}:
-                model_value = model_value[1:-1].strip()
-            return _parse_invocation_model_value(model_value)
-
-        return result
-
-    return result
-
-
-# Recognized sidecar token field names.  The plugin emits camelCase keys.
-_SIDECAR_TOKEN_FIELD_MAP = {
-    "input_tokens": "input_tokens",
-    "inputTokens": "input_tokens",
-    "output_tokens": "output_tokens",
-    "outputTokens": "output_tokens",
-    "cached_input_tokens": "cached_input_tokens",
-    "cachedInputTokens": "cached_input_tokens",
-    "cache_read_input_tokens": "cached_input_tokens",
-    "reasoning_tokens": "reasoning_tokens",
-    "reasoningTokens": "reasoning_tokens",
-    "thinking_tokens": "reasoning_tokens",
-    "thinkingTokens": "reasoning_tokens",
-    "total_tokens": "total_tokens",
-    "totalTokens": "total_tokens",
-}
-
-_SIDECAR_MODEL_FIELD_MAP = {
-    "provider": "provider",
-    "model_id": "model_id",
-    "modelId": "model_id",
-    "model": "model_id",
-    "model_alias": "model_alias",
-    "modelAlias": "model_alias",
-}
-
-
-def _normalize_sidecar_tokens(obj: dict) -> tuple[dict[str, int | None], bool]:
-    """Extract and validate token counts from a sidecar record.
-
-    Returns ``(normalized, found_any)``.  Only non-negative ``int`` values
-    (not bool) are accepted.  The ``usage`` sub-object is inspected when
-    present.
-    """
-    result: dict[str, int | None] = {
-        "input_tokens": None,
-        "output_tokens": None,
-        "cached_input_tokens": None,
-        "reasoning_tokens": None,
-        "total_tokens": None,
-    }
-    found_any = False
-
-    candidates = [obj]
-    usage = obj.get("usage")
-    if isinstance(usage, dict):
-        candidates.append(usage)
-
-    for source in candidates:
-        for key, value in source.items():
-            norm = _SIDECAR_TOKEN_FIELD_MAP.get(key)
-            if norm is None:
-                continue
-            if result[norm] is not None:
-                continue
-            if isinstance(value, bool):
-                continue
-            if isinstance(value, int) and value >= 0:
-                result[norm] = value
-                found_any = True
-
-    return result, found_any
-
-
-def _normalize_sidecar_model(obj: dict) -> dict[str, str | None]:
-    """Extract model identity from a sidecar record.
-
-    Returns ``{provider, model_id, model_alias}`` with non-empty string
-    values or None.
-    """
-    result: dict[str, str | None] = {
-        "provider": None,
-        "model_id": None,
-        "model_alias": None,
-    }
-    candidates = [obj]
-    model = obj.get("model")
-    if isinstance(model, dict):
-        candidates.append(model)
-    for source in candidates:
-        for key, value in source.items():
-            norm = _SIDECAR_MODEL_FIELD_MAP.get(key)
-            if norm is None:
-                continue
-            if result[norm] is not None:
-                continue
-            if isinstance(value, str) and value.strip():
-                result[norm] = value.strip()
-    return result
-
-
-def _parse_sidecar_timestamp(value):
-    """Try to parse *value* as an ISO-8601 datetime.
-
-    Returns a ``datetime`` or ``None``.
-    """
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        dt = datetime.fromisoformat(value)
-        # Replace naive datetimes with UTC to avoid comparison failures
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except (ValueError, TypeError):
-        return None
-
-
-def _identity_match(record: dict, plan_name: str, run_id: str,
-                    change_id: str, stage: str, round_num: int) -> bool:
-    """Return True when *record* identity fields match the stage invocation."""
-    return (
-        record.get("plan_name") == plan_name
-        and record.get("run_id") == run_id
-        and record.get("change_id") == change_id
-        and record.get("stage") == stage
-        and record.get("round") == round_num
-    )
-
-
-def _read_sidecar_usage(
-    sidecar_path: Path | None,
-    plan_name: str,
-    run_id: str,
-    change_id: str,
-    stage: str,
-    round_num: int,
-    is_normal_completion: bool,
-) -> tuple[dict[str, int | None], dict[str, str | None], bool, str | None]:
-    """Read and select the best valid sidecar usage record.
-
-    Returns ``(token_dict, model_dict, selected, usage_source)``.
-
-    *token_dict* and *model_dict* are caller-owned defaults to fill.
-    *selected* is ``True`` when usable sidecar data was found.
-    *usage_source* is ``"opencode_plugin"`` when sidecar wins.
-    """
-    tokens: dict[str, int | None] = {
-        "input_tokens": None,
-        "output_tokens": None,
-        "cached_input_tokens": None,
-        "reasoning_tokens": None,
-        "total_tokens": None,
-    }
-    model: dict[str, str | None] = {
-        "provider": None,
-        "model_id": None,
-        "model_alias": None,
-    }
-
-    if sidecar_path is None:
-        return tokens, model, False, None
-
-    # 2.1 -- Read file (handle missing, empty, unreadable)
-    try:
-        lines = sidecar_path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return tokens, model, False, None
-
-    # 2.2 -- Validate each record
-    final_records: list[dict] = []
-    incremental_records: list[dict] = []
-
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if not (stripped.startswith("{") and stripped.endswith("}")):
-            continue
-        try:
-            record = json.loads(stripped)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(record, dict):
-            continue
-
-        # -- schema version
-        if record.get("schema_version") != 1:
-            continue
-
-        # -- identity match
-        if not _identity_match(record, plan_name, run_id, change_id, stage, round_num):
-            continue
-
-        # -- event type
-        event_type = record.get("event_type")
-        if event_type not in ("final", "incremental"):
-            continue
-
-        # -- usable timestamp
-        emitted_at = _parse_sidecar_timestamp(record.get("emitted_at"))
-        if emitted_at is None:
-            continue
-
-        # -- conservative numeric fields + model identity
-        norm_tokens, tokens_found = _normalize_sidecar_tokens(record)
-        norm_model = _normalize_sidecar_model(record)
-        model_found = any(v is not None for v in norm_model.values())
-        if not tokens_found and not model_found:
-            continue
-
-        entry = {
-            "record": record,
-            "emitted_at": emitted_at,
-            "tokens": norm_tokens,
-            "model": norm_model,
-        }
-
-        if event_type == "final":
-            final_records.append(entry)
-        else:
-            incremental_records.append(entry)
-
-    # 2.3 -- Select latest valid final record
-    if final_records:
-        best = max(final_records, key=lambda e: e["emitted_at"])
-        tokens = best["tokens"]
-        model = best["model"]
-        return tokens, model, True, "opencode_plugin"
-
-    # 2.4 & 2.5 -- Incremental records
-    if incremental_records and not is_normal_completion:
-        best = max(incremental_records, key=lambda e: e["emitted_at"])
-        tokens = best["tokens"]
-        model = best["model"]
-        return tokens, model, True, "opencode_plugin"
-
-    return tokens, model, False, None
-
-
-def extract_usage_and_model(
-    payload,
-    log_path,
-    sidecar_path=None,
-    plan_name: str = "",
-    run_id: str = "",
-    change_id: str = "",
-    stage: str = "",
-    round_num: int = 0,
-    is_normal_completion: bool = True,
-    envelope=None,
-):
-    """Extract usage and model metadata for a completed stage invocation.
-
-    **Precedence:**
-    1. Usage & model from parsed worker JSON (*payload*) are preferred.
-    2. When *payload* carries no token usage, the selected Claude Code
-       result *envelope* (if any) is consulted.
-    3. When neither worker JSON nor the envelope provides token usage, the
-       stage log is scanned for recognizable token metadata.
-    4. When none of the above provide token usage, the OpenCode plugin
-       sidecar is consulted.
-    5. Model identity follows the same order: worker JSON, then envelope,
-       then log scan, then sidecar. A lower-precedence source never
-       supplements a partial higher-precedence model.
-
-    Returns ``(usage_dict, model_dict)`` where *usage_dict* includes
-    every normalised token field (int or None), ``usage_available``, and
-    ``usage_source``.
-    """
-    usage = {
-        "input_tokens": None,
-        "output_tokens": None,
-        "cached_input_tokens": None,
-        "reasoning_tokens": None,
-        "total_tokens": None,
-        "usage_available": False,
-        "usage_source": None,
-    }
-    model = {
-        "provider": None,
-        "model_id": None,
-        "model_alias": None,
-    }
-
-    worker_usage_found = False
-    worker_model_found = False
-
-    # 1. Worker JSON -------------------------------------------------------
-    if isinstance(payload, dict):
-        tokens, wu_found = _extract_token_fields(payload)
-        if wu_found:
-            worker_usage_found = True
-            for key in ("input_tokens", "output_tokens", "cached_input_tokens",
-                         "reasoning_tokens", "total_tokens"):
-                if tokens[key] is not None:
-                    usage[key] = tokens[key]
-            usage["usage_available"] = True
-            usage["usage_source"] = "worker_json"
-
-        wm = _extract_model_fields(payload)
-        for key in ("provider", "model_id", "model_alias"):
-            if wm[key] is not None:
-                model[key] = wm[key]
-                worker_model_found = True
-
-    # 2. Claude Code result envelope ---------------------------------------
-    envelope_usage_found = False
-    envelope_model_found = False
-    if isinstance(envelope, dict):
-        if not worker_usage_found:
-            env_tokens, eu_found = _extract_token_fields(envelope)
-            if eu_found:
-                envelope_usage_found = True
-                for key in ("input_tokens", "output_tokens", "cached_input_tokens",
-                             "reasoning_tokens", "total_tokens"):
-                    if env_tokens[key] is not None:
-                        usage[key] = env_tokens[key]
-                usage["usage_available"] = True
-                usage["usage_source"] = "claude_result_json"
-
-        if not worker_model_found:
-            env_model = _extract_claude_envelope_model(envelope)
-            for key in ("provider", "model_id", "model_alias"):
-                if env_model[key] is not None:
-                    model[key] = env_model[key]
-                    envelope_model_found = True
-
-    # 3. Log fallback ------------------------------------------------------
-    log_usage_found = False
-    if log_path is not None:
-        if not worker_usage_found and not envelope_usage_found:
-            log_tokens, log_found = _scan_log_for_usage(log_path)
-            if log_found:
-                log_usage_found = True
-                for key in ("input_tokens", "output_tokens", "cached_input_tokens",
-                             "reasoning_tokens", "total_tokens"):
-                    if log_tokens[key] is not None:
-                        usage[key] = log_tokens[key]
-                usage["usage_available"] = True
-                usage["usage_source"] = "log_metadata"
-
-        if not worker_model_found and not envelope_model_found:
-            log_model = _scan_log_for_model(log_path)
-            for key in ("provider", "model_id", "model_alias"):
-                if model[key] is None and log_model[key] is not None:
-                    model[key] = log_model[key]
-
-    # 4. OpenCode plugin sidecar fallback ----------------------------------
-    # Always consult the sidecar for model identity when no higher source
-    # exists, independently of whether usage was provided by a higher source.
-    if sidecar_path is not None:
-        sidecar_tokens, sidecar_model, sidecar_selected, sidecar_source = (
-            _read_sidecar_usage(
-                sidecar_path, plan_name, run_id, change_id, stage, round_num,
-                is_normal_completion,
-            )
-        )
-        # Sidecar token usage only when no higher-precedence source found
-        if not worker_usage_found and not envelope_usage_found and not log_usage_found and sidecar_selected:
-            sidecar_token_found = False
-            for key in ("input_tokens", "output_tokens", "cached_input_tokens",
-                         "reasoning_tokens", "total_tokens"):
-                if sidecar_tokens[key] is not None:
-                    usage[key] = sidecar_tokens[key]
-                    sidecar_token_found = True
-            if sidecar_token_found:
-                usage["usage_available"] = True
-                usage["usage_source"] = "opencode_plugin"
-
-        # Sidecar model identity supplements only when no higher source
-        if not worker_model_found and not envelope_model_found:
-            for key in ("provider", "model_id", "model_alias"):
-                if model[key] is None and sidecar_model[key] is not None:
-                    model[key] = sidecar_model[key]
-
-    return usage, model
-
-
-def get_or_create_run_id(repo: Path, cfg: dict, state: dict) -> str:
-    run_id = state.get("run_id", "")
-    if run_id:
-        return run_id
-    started_at = state.get("started_at", "")
-    if started_at:
-        # Derive stable run_id from plan started_at timestamp
-        run_id = started_at.replace(":", "").replace("-", "").replace("T", "-")
-    else:
-        # First run: generate UUID, persist started_at and run_id
-        now = base.utcnow()
-        state["started_at"] = now
-        run_id = now.replace(":", "").replace("-", "").replace("T", "-")
-    state["run_id"] = run_id
-    save_state(repo, cfg["name"], state)
-    return run_id
-
-
-def _record_stage_telemetry(
-    repo: Path,
-    cfg: dict,
-    state: dict,
-    cid: str,
-    stage: str,
-    round_num: int,
-    started_at: str,
-    ended_at: str,
-    duration_ms: int,
-    telemetry_status: str,
-    error_message: str | None,
-    payload: dict | None,
-    log_path: Path,
-    sidecar_path: Path | None = None,
-    envelope: dict | None = None,
-) -> None:
-    run_id = get_or_create_run_id(repo, cfg, state)
-    plan_name = cfg["name"]
-    is_normal = telemetry_status == "completed"
-    stage_status = payload.get("status") if isinstance(payload, dict) else None
-    verdict = None
-    critical_count = None
-    warning_count = None
-    note_count = None
-    if isinstance(payload, dict) and stage == "review":
-        verdict = payload.get("verdict")
-        counts = payload.get("finding_counts")
-        if isinstance(counts, dict):
-            critical_count = counts.get("critical")
-            warning_count = counts.get("warning")
-            note_count = counts.get("note")
-    rel_log_path = str(log_path.relative_to(repo)) if log_path else ""
-
-    record = build_telemetry_record(
-        plan_name=cfg["name"],
-        run_id=run_id,
-        change_id=cid,
-        stage=stage,
-        round_num=round_num,
-        status=telemetry_status,
-        started_at=started_at,
-        ended_at=ended_at,
-        duration_ms=duration_ms,
-        adapter=cfg["adapter"],
-        worker_command=cfg[f"{stage}_invoke"],
-        timeout_seconds=int(cfg["changes"][cid]["timeout_minutes"] * 60),
-        log_path=rel_log_path,
-        stage_status=stage_status,
-        error_message=error_message,
-        verdict=verdict,
-        critical_count=critical_count,
-        warning_count=warning_count,
-        note_count=note_count,
-    )
-    # Populate usage and model metadata when a payload was parsed
-    # (extraction is best-effort; never fail telemetry write).
-    try:
-        usage, model = extract_usage_and_model(
-            payload, log_path,
-            sidecar_path=sidecar_path,
-            plan_name=plan_name,
-            run_id=run_id,
-            change_id=cid,
-            stage=stage,
-            round_num=round_num,
-            is_normal_completion=is_normal,
-            envelope=envelope,
-        )
-        if model["provider"] is None and model["model_id"] is None:
-            expanded_invoke = _best_effort_expand_invoke(cfg[f"{stage}_invoke"])
-            invocation_model = _extract_invocation_model(expanded_invoke, cfg["adapter"], repo)
-            for key in ("provider", "model_id", "model_alias"):
-                if model[key] is None and invocation_model[key] is not None:
-                    model[key] = invocation_model[key]
-        record["usage"].update(usage)
-        record["model"].update(model)
-    except Exception:
-        pass
-
-    # Attempt cost estimation (best-effort; never fail telemetry write).
-    try:
-        cost = cost_mod.estimate_stage_cost(record["usage"], record["model"], repo=repo)
-        record["cost"].update(cost)
-    except Exception:
-        pass
-
-    write_telemetry_record(repo, cfg["name"], record)
-    rec(state, cid)["telemetry"] = {"latest_telemetry": record["uid"]}
-
 
 # ---------------------------------------------------------------------------
 # Cost estimation for direct stage telemetry
@@ -2074,11 +908,11 @@ def parse_stage_json(log_path: Path) -> tuple[dict | None, str, dict | None]:
 
 
 def record_archive_evidence(repo: Path, record: dict, cid: str) -> bool:
-    archive_dir = find_archive_dir(repo, cid)
+    archive_dir = groundtruth.find_archive_dir(repo, cid)
     if archive_dir is None:
         return False
-    commit = find_archive_commit(repo, cid)
-    if not commit and not archive_dir_ignored(repo):
+    commit = groundtruth.find_archive_commit(repo, cid)
+    if not commit and not groundtruth.archive_dir_ignored(repo):
         return False
     record["archive"].update(
         {
@@ -2092,20 +926,20 @@ def record_archive_evidence(repo: Path, record: dict, cid: str) -> bool:
 
 
 def append_history(state: dict, cid: str, entry: dict) -> None:
-    rec(state, cid)["history"].append(entry)
+    state_mod.rec(state, cid)["history"].append(entry)
 
 
 def reachable_commit(repo: Path, commit: str) -> bool:
     if not commit:
         return False
-    res = git(repo, "merge-base", "--is-ancestor", commit, "HEAD")
+    res = groundtruth.git(repo, "merge-base", "--is-ancestor", commit, "HEAD")
     return res.returncode == 0
 
 
 def resolve_commit(repo: Path, commit: str) -> str:
     if not commit:
         return ""
-    res = git(repo, "rev-parse", "--verify", commit)
+    res = groundtruth.git(repo, "rev-parse", "--verify", commit)
     return res.stdout.strip() if res.returncode == 0 else ""
 
 
@@ -2113,7 +947,7 @@ def verify_direct_archive_done(repo: Path, cid: str, record: dict) -> tuple[bool
     archive = record["archive"]
     if archive.get("status") != "passed":
         return False, "no fresh archive worker result recorded"
-    if change_dir(repo, cid).exists():
+    if groundtruth.change_dir(repo, cid).exists():
         return False, f"openspec/changes/{cid} still exists"
     archive_path = archive.get("path", "")
     if not archive_path:
@@ -2121,7 +955,7 @@ def verify_direct_archive_done(repo: Path, cid: str, record: dict) -> tuple[bool
     archive_dir = repo / archive_path
     if not archive_dir.is_dir():
         return False, f"archive path missing: {archive_path}"
-    actual_archive = find_archive_dir(repo, cid)
+    actual_archive = groundtruth.find_archive_dir(repo, cid)
     if actual_archive is None:
         return False, "no dated archive directory found"
     if actual_archive.resolve() != archive_dir.resolve():
@@ -2134,7 +968,7 @@ def verify_direct_archive_done(repo: Path, cid: str, record: dict) -> tuple[bool
     # nothing to stage and legitimately produces no commit, so it degrades to a
     # corroborating signal. When the directory is tracked it stays load-bearing
     # — a missing commit there means the archive was never durably recorded.
-    commit_optional = archive_dir_ignored(repo)
+    commit_optional = groundtruth.archive_dir_ignored(repo)
     commit = archive.get("commit", "")
     if not commit:
         if not commit_optional:
@@ -2151,7 +985,7 @@ def verify_direct_archive_done(repo: Path, cid: str, record: dict) -> tuple[bool
         resolved_commit = resolve_commit(repo, commit)
         if not resolved_commit and not commit_optional:
             return False, f"archive commit could not be resolved: {commit}"
-        latest_commit = find_archive_commit(repo, cid)
+        latest_commit = groundtruth.find_archive_commit(repo, cid)
         if latest_commit and resolved_commit and latest_commit != resolved_commit:
             base.log(
                 f"  note: {cid} archive state recorded {resolved_commit[:12]} but "
@@ -2196,7 +1030,7 @@ def tracked_files(repo: Path) -> list[str]:
     """
     key = str(repo)
     if key not in _TRACKED_FILES_CACHE:
-        res = git(repo, "ls-files")
+        res = groundtruth.git(repo, "ls-files")
         _TRACKED_FILES_CACHE[key] = (
             [line for line in res.stdout.splitlines() if line]
             if res.returncode == 0
@@ -2375,11 +1209,11 @@ def apply_implement_result(
     cid: str,
     payload: dict,
 ) -> str:
-    r = rec(state, cid)
+    r = state_mod.rec(state, cid)
     status = payload.get("status")
     if status == "blocked":
         r["last_result"] = "implement_blocked"
-        update_task_counts(repo, state, cid)
+        state_mod.update_task_counts(repo, state, cid)
         append_history(
             state,
             cid,
@@ -2391,11 +1225,11 @@ def apply_implement_result(
                 "reason": payload.get("reason", "implement blocked"),
             },
         )
-        set_status(state, cid, base.FAILED, payload.get("reason", "implement blocked"))
+        state_mod.set_status(state, cid, base.FAILED, payload.get("reason", "implement blocked"))
         _try_notify(cfg, "change_failed", payload.get("summary", "change blocked"), change_id=cid)
         return "stop"
     if status != "implemented":
-        set_status(state, cid, base.FAILED, f"implement returned unexpected status={status}")
+        state_mod.set_status(state, cid, base.FAILED, f"implement returned unexpected status={status}")
         r["last_result"] = "implement_invalid"
         _try_notify(cfg, "change_failed", f"implement returned unexpected status={status}", change_id=cid)
         return "stop"
@@ -2404,8 +1238,8 @@ def apply_implement_result(
     r["no_progress_streak"] = 0 if progress else r["no_progress_streak"] + 1
     files_touched = [str(path) for path in payload.get("files_touched", [])]
     known_change_files = [str(path) for path in payload.get("known_change_files", [])]
-    r["tracked_change_files"] = merge_paths(
-        change_context_paths(repo, cid),
+    r["tracked_change_files"] = state_mod.merge_paths(
+        state_mod.change_context_paths(repo, cid),
         r["tracked_change_files"],
         files_touched,
         known_change_files,
@@ -2445,11 +1279,11 @@ def apply_implement_result(
     )
     if r["no_progress_streak"] >= cfg["no_progress_limit"]:
         r["last_result"] = "no_progress"
-        set_status(state, cid, base.FAILED, "no progress ceiling reached")
+        state_mod.set_status(state, cid, base.FAILED, "no progress ceiling reached")
         _try_notify(cfg, "change_failed", "no progress ceiling reached", change_id=cid)
         return "stop"
     r["phase"] = "review"
-    set_status(state, cid, base.PENDING, payload.get("summary", "implementation complete"))
+    state_mod.set_status(state, cid, base.PENDING, payload.get("summary", "implementation complete"))
     return "continue"
 
 
@@ -2525,9 +1359,9 @@ def _locus_recurrence_rounds(history: list[dict], blocking: set[str]) -> dict[st
 
 
 def apply_review_result(repo: Path, cfg: dict, state: dict, cid: str, payload: dict) -> str:
-    r = rec(state, cid)
+    r = state_mod.rec(state, cid)
     if payload.get("status") != "reviewed":
-        set_status(
+        state_mod.set_status(
             state,
             cid,
             base.FAILED,
@@ -2540,7 +1374,7 @@ def apply_review_result(repo: Path, cfg: dict, state: dict, cid: str, payload: d
     verdict = payload.get("verdict")
     summary = payload.get("summary", "review completed")
     fix_prompt = payload.get("fix_prompt", "")
-    update_task_counts(repo, state, cid)
+    state_mod.update_task_counts(repo, state, cid)
     findings = normalize_review_findings(payload, tracked_files(repo))
     r["last_review"] = {
         "verdict": verdict,
@@ -2561,7 +1395,7 @@ def apply_review_result(repo: Path, cfg: dict, state: dict, cid: str, payload: d
         },
     )
     if verdict not in {"pass", "fail"}:
-        set_status(state, cid, base.FAILED, f"review returned unexpected verdict={verdict}")
+        state_mod.set_status(state, cid, base.FAILED, f"review returned unexpected verdict={verdict}")
         r["last_result"] = "review_invalid"
         _try_notify(cfg, "change_failed", f"review returned unexpected verdict={verdict}", change_id=cid)
         return "stop"
@@ -2586,7 +1420,7 @@ def apply_review_result(repo: Path, cfg: dict, state: dict, cid: str, payload: d
         r["latest_fix_prompt"] = ""
         r["last_result"] = "review_passed"
         r["phase"] = "archive"
-        set_status(state, cid, base.PENDING, summary)
+        state_mod.set_status(state, cid, base.PENDING, summary)
         return "continue"
     r["latest_fix_prompt"] = fix_prompt
     recurrence_limit = cfg.get("finding_recurrence_limit", 0)
@@ -2600,23 +1434,23 @@ def apply_review_result(repo: Path, cfg: dict, state: dict, cid: str, payload: d
                     f"blocking finding in rounds {rounds_desc}"
                 )
                 r["last_result"] = "finding_recurrence_exceeded"
-                set_status(state, cid, base.FAILED, reason)
+                state_mod.set_status(state, cid, base.FAILED, reason)
                 _try_notify(cfg, "change_failed", reason, change_id=cid)
                 return "stop"
     if r["round"] >= r["max_rounds"]:
         r["last_result"] = "max_rounds_reached"
-        set_status(state, cid, base.FAILED, "review retry budget exhausted")
+        state_mod.set_status(state, cid, base.FAILED, "review retry budget exhausted")
         _try_notify(cfg, "change_failed", "review retry budget exhausted", change_id=cid)
         return "stop"
     r["last_result"] = "review_failed"
     r["round"] += 1
     r["phase"] = "implement"
-    set_status(state, cid, base.PENDING, summary)
+    state_mod.set_status(state, cid, base.PENDING, summary)
     return "continue"
 
 
 def apply_archive_result(repo: Path, cfg: dict, state: dict, cid: str, payload: dict) -> str:
-    r = rec(state, cid)
+    r = state_mod.rec(state, cid)
     archive = r["archive"]
     if payload.get("status") == "blocked":
         archive.update(
@@ -2626,7 +1460,7 @@ def apply_archive_result(repo: Path, cfg: dict, state: dict, cid: str, payload: 
                 "commit": payload.get("commit", ""),
                 "reason": payload.get("reason", "archive blocked"),
                 "spec_sync_status": payload.get("spec_sync_status", "not_started"),
-                "triage": payload.get("triage", default_archive_state()["triage"]),
+                "triage": payload.get("triage", state_mod.default_archive_state()["triage"]),
             }
         )
         r["last_result"] = "archive_failed"
@@ -2641,11 +1475,11 @@ def apply_archive_result(repo: Path, cfg: dict, state: dict, cid: str, payload: 
                 "reason": payload.get("reason", "archive blocked"),
             },
         )
-        set_status(state, cid, base.FAILED, payload.get("reason", "archive blocked"))
+        state_mod.set_status(state, cid, base.FAILED, payload.get("reason", "archive blocked"))
         _try_notify(cfg, "change_failed", payload.get("summary", "archive blocked"), change_id=cid)
         return "stop"
     if payload.get("status") != "archived":
-        set_status(
+        state_mod.set_status(
             state,
             cid,
             base.FAILED,
@@ -2663,7 +1497,7 @@ def apply_archive_result(repo: Path, cfg: dict, state: dict, cid: str, payload: 
             "commit": payload.get("commit", ""),
             "reason": "",
             "spec_sync_status": payload.get("spec_sync_status", ""),
-            "triage": default_archive_state()["triage"],
+            "triage": state_mod.default_archive_state()["triage"],
         }
     )
     append_history(
@@ -2683,27 +1517,27 @@ def apply_archive_result(repo: Path, cfg: dict, state: dict, cid: str, payload: 
     if not ok:
         archive["status"] = "failed"
         archive["reason"] = why
-        set_status(state, cid, base.FAILED, f"archive unverified: {why}")
+        state_mod.set_status(state, cid, base.FAILED, f"archive unverified: {why}")
         _try_notify(cfg, "change_failed", f"archive unverified: {why}", change_id=cid)
         return "stop"
-    checks_ok, check_why = run_fast_checks(repo, cfg)
+    checks_ok, check_why = groundtruth.run_fast_checks(repo, cfg)
     if not checks_ok:
         archive["status"] = "failed"
         archive["reason"] = f"post-archive {check_why}"
         r["last_result"] = "post_archive_check_failed"
-        set_status(state, cid, base.FAILED, f"post-archive {check_why}")
+        state_mod.set_status(state, cid, base.FAILED, f"post-archive {check_why}")
         _try_notify(cfg, "change_failed", f"post-archive {check_why}", change_id=cid)
         return "stop"
-    clean_ok, clean_why = verify_post_archive_clean(repo, cfg)
+    clean_ok, clean_why = delivery.verify_post_archive_clean(repo, cfg)
     if not clean_ok:
         archive["status"] = "failed"
         archive["reason"] = f"post-archive {clean_why}"
         r["last_result"] = "post_archive_dirty_tracked"
-        set_status(state, cid, base.FAILED, f"post-archive {clean_why}")
+        state_mod.set_status(state, cid, base.FAILED, f"post-archive {clean_why}")
         _try_notify(cfg, "change_failed", f"post-archive {clean_why}", change_id=cid)
         return "stop"
     r["phase"] = "done"
-    set_status(state, cid, base.DONE, "verified + checks passed")
+    state_mod.set_status(state, cid, base.DONE, "verified + checks passed")
     _try_notify(cfg, "change_done", f"change {cid} completed", change_id=cid)
     return "done"
 
@@ -2729,10 +1563,10 @@ def run_direct_change(
     budget_deadline: float | None = None,
     budget_usd: float = 0.0,
 ) -> str:
-    r = rec(state, cid)
+    r = state_mod.rec(state, cid)
     while True:
         if budget_deadline and time.monotonic() > budget_deadline:
-            set_status(state, cid, base.PENDING, f"budget exhausted while waiting to run {r['phase']}")
+            state_mod.set_status(state, cid, base.PENDING, f"budget exhausted while waiting to run {r['phase']}")
             persist_direct_state(repo, cfg, state, cid)
             return "budget"
         stage = r["phase"]
@@ -2740,9 +1574,9 @@ def run_direct_change(
         if stage == "done":
             ok, why = verify_direct_archive_done(repo, cid, r)
             if ok:
-                set_status(state, cid, base.DONE, "verified + checks passed")
+                state_mod.set_status(state, cid, base.DONE, "verified + checks passed")
             else:
-                set_status(state, cid, base.FAILED, f"completed state no longer verifiable: {why}")
+                state_mod.set_status(state, cid, base.FAILED, f"completed state no longer verifiable: {why}")
             persist_direct_state(repo, cfg, state, cid)
             return r["status"]
         # --- spend-budget pre-dispatch check ---
@@ -2758,7 +1592,7 @@ def run_direct_change(
                         f"{spend['unresolved_stages']} unresolved)"
                     )
                     r["last_result"] = "spend_budget_exhausted"
-                    set_status(state, cid, base.PENDING, reason)
+                    state_mod.set_status(state, cid, base.PENDING, reason)
                     base.log(f"  {reason}")
                     persist_direct_state(repo, cfg, state, cid)
                     return "budget"
@@ -2767,13 +1601,13 @@ def run_direct_change(
             stage = "implement"
 
         input_block = build_worker_input(repo, cfg, state, cid, stage=stage)
-        set_status(state, cid, base.RUNNING, f"{stage} round {round_num}")
+        state_mod.set_status(state, cid, base.RUNNING, f"{stage} round {round_num}")
         persist_direct_state(repo, cfg, state, cid)
 
         # 3.1 Capture started_at before invocation
         started_at = base.utcnow()
         plan_name = cfg["name"]
-        run_id = get_or_create_run_id(repo, cfg, state)
+        run_id = telemetry.get_or_create_run_id(repo, cfg, state)
 
         # ---- usage sidecar (OpenCode plugin only; harmless no-op for other adapters) ----
         sidecar_path: Path | None = None
@@ -2790,7 +1624,7 @@ def run_direct_change(
         def _write_telemetry(telemetry_status: str, error_message: str | None) -> None:
             """Write a telemetry record. Logs a warning on failure; never raises."""
             try:
-                _record_stage_telemetry(
+                telemetry._record_stage_telemetry(
                     repo, cfg, state, cid, stage, round_num,
                     started_at, ended_at, duration_ms,
                     telemetry_status, error_message,
@@ -2844,7 +1678,7 @@ def run_direct_change(
 
         # 3.2 Capture ended_at, compute duration, determine telemetry status
         ended_at = base.utcnow()
-        duration_ms = compute_duration_ms(started_at, ended_at)
+        duration_ms = telemetry.compute_duration_ms(started_at, ended_at)
         payload: dict | None = None
         parse_why = ""
         envelope: dict | None = None
@@ -2852,8 +1686,8 @@ def run_direct_change(
         if outcome == "env_error":
             reason = log_path.read_text(encoding="utf-8").splitlines()[0].split(": ", 1)[-1]
             _write_telemetry("spawn_error", reason)
-            rec(state, cid)["last_result"] = f"{stage}_env_error"
-            set_status(state, cid, base.FAILED, reason)
+            state_mod.rec(state, cid)["last_result"] = f"{stage}_env_error"
+            state_mod.set_status(state, cid, base.FAILED, reason)
             _try_notify(cfg, "change_failed", reason, change_id=cid)
             persist_direct_state(repo, cfg, state, cid)
             return "spawn_error"
@@ -2863,16 +1697,16 @@ def run_direct_change(
                 "spawn_error",
                 f"could not spawn {stage}: {cfg[f'{stage}_invoke']}",
             )
-            rec(state, cid)["last_result"] = f"{stage}_spawn_error"
-            set_status(state, cid, base.FAILED, f"could not spawn {stage}: {cfg[f'{stage}_invoke']}")
+            state_mod.rec(state, cid)["last_result"] = f"{stage}_spawn_error"
+            state_mod.set_status(state, cid, base.FAILED, f"could not spawn {stage}: {cfg[f'{stage}_invoke']}")
             _try_notify(cfg, "change_failed", f"could not spawn {stage}", change_id=cid)
             persist_direct_state(repo, cfg, state, cid)
             return "spawn_error"
 
         if outcome == "timeout":
             _write_telemetry("timeout", f"{stage} timed out")
-            rec(state, cid)["last_result"] = f"{stage}_timeout"
-            set_status(state, cid, base.FAILED, f"{stage} timed out")
+            state_mod.rec(state, cid)["last_result"] = f"{stage}_timeout"
+            state_mod.set_status(state, cid, base.FAILED, f"{stage} timed out")
             _try_notify(cfg, "change_failed", f"{stage} timed out", change_id=cid)
             persist_direct_state(repo, cfg, state, cid)
             return "failed"
@@ -2880,11 +1714,11 @@ def run_direct_change(
         payload, parse_why, envelope = parse_stage_json(log_path)
         if payload is None:
             _write_telemetry("invalid_output", parse_why)
-            rec(state, cid)["last_result"] = "subagent_output_invalid"
+            state_mod.rec(state, cid)["last_result"] = "subagent_output_invalid"
             if stage == "archive":
-                rec(state, cid)["archive"]["status"] = "failed"
-                rec(state, cid)["archive"]["reason"] = parse_why
-            set_status(state, cid, base.FAILED, f"{stage} output invalid: {parse_why}")
+                state_mod.rec(state, cid)["archive"]["status"] = "failed"
+                state_mod.rec(state, cid)["archive"]["reason"] = parse_why
+            state_mod.set_status(state, cid, base.FAILED, f"{stage} output invalid: {parse_why}")
             _try_notify(cfg, "change_failed", f"{stage} output invalid", change_id=cid)
             persist_direct_state(repo, cfg, state, cid)
             return "failed"
@@ -2902,8 +1736,8 @@ def run_direct_change(
         # Determine telemetry status from the control-flow decision.
         if action == "stop":
             telemetry_status = "failed"
-            last_result = rec(state, cid).get("last_result", "")
-            reason = rec(state, cid).get("reason", "")
+            last_result = state_mod.rec(state, cid).get("last_result", "")
+            reason = state_mod.rec(state, cid).get("reason", "")
             error_message = f"control flow stopped: {last_result}"
             if reason:
                 error_message += f" - {reason}"
@@ -2919,693 +1753,6 @@ def run_direct_change(
         # for stop/done outcomes (e.g. blocked implement, archived archive).
         persist_direct_state(repo, cfg, state, cid)
         return action
-
-
-# ---------------------------------------------------------------------------
-# Ground-truth verification
-# ---------------------------------------------------------------------------
-
-def git(repo: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args], cwd=repo, capture_output=True, text=True
-    )
-
-
-def read_controller_state(repo: Path, cfg: dict, cid: str) -> dict | None:
-    p = repo / cfg["state_file"].format(change=cid)
-    if not p.exists():
-        return None
-    try:
-        with open(p, encoding="utf-8") as fh:
-            return json.load(fh)
-    except (json.JSONDecodeError, OSError):
-        return {"_malformed": True}
-
-
-def find_archive_dir(repo: Path, cid: str) -> Path | None:
-    root = repo / "openspec" / "changes" / "archive"
-    if not root.is_dir():
-        return None
-    for entry in sorted(root.iterdir(), reverse=True):
-        if entry.is_dir() and entry.name.endswith(f"-{cid}") and ARCHIVE_DIR_RE.match(
-            entry.name
-        ):
-            return entry
-    return None
-
-
-def find_archive_commit(repo: Path, cid: str) -> str:
-    res = git(
-        repo, "log", "--fixed-strings", f"--grep=archive({cid}):",
-        "--format=%H", "-n", "1",
-    )
-    return res.stdout.strip() if res.returncode == 0 else ""
-
-
-def archive_dir_ignored(repo: Path) -> bool:
-    """True when `openspec/changes/archive/` is gitignored in this repo.
-
-    Decides whether an `archive(<id>):` commit is required evidence. When the
-    archive directory is ignored, `openspec archive` moves files git will never
-    track, so the archive worker has nothing to stage and legitimately produces
-    no commit — its absence is expected, not a failure. When the directory is
-    tracked (the default OpenSpec layout), a missing commit means the archive
-    was never durably recorded, which must fail the change.
-    """
-    # --no-index answers purely from the ignore rules. Without it git consults
-    # the index and refuses to call a path ignored once anything under it is
-    # tracked (e.g. a force-added legacy archive), which would flip the gate
-    # even though newly archived files still stage nothing.
-    # The trailing slash matters: a directory-only ignore rule
-    # (`openspec/changes/archive/`) does not match the bare path when the
-    # directory does not exist on disk yet.
-    res = git(repo, "check-ignore", "--no-index", "-q", "openspec/changes/archive/")
-    return res.returncode == 0
-
-
-def verify_change_done(repo: Path, cfg: dict, cid: str) -> tuple[bool, str]:
-    """A change is done when OpenSpec has archived it.
-
-    Authoritative evidence (required): the change has left openspec/changes/
-    and now lives under a dated openspec/changes/archive/ directory. That move
-    is exactly what `openspec archive` produces atomically, and is the ground
-    truth of completion.
-
-    Corroborating signals (warn, never veto): an `archive(<id>):` commit
-    reachable from HEAD, and the controller state file agreeing
-    (completed/done/passed). These go stale when a change was archived by hand,
-    squashed into another commit, or recovered after a drive error, so they are
-    surfaced as notes but no longer fail a change that OpenSpec itself archived.
-    """
-    cdir = change_dir(repo, cid)
-    if cdir.exists():
-        return False, f"{cdir.relative_to(repo)} still exists"
-
-    if find_archive_dir(repo, cid) is None:
-        return False, "no dated archive directory found"
-
-    warnings: list[str] = []
-    if not find_archive_commit(repo, cid):
-        warnings.append("no archive(<id>): commit (archived manually or squashed?)")
-
-    cs = read_controller_state(repo, cfg, cid)
-    if cs is not None:
-        if cs.get("_malformed"):
-            warnings.append("controller state file is malformed JSON")
-        else:
-            if cs.get("status") != "completed" or cs.get("phase") != "done":
-                warnings.append(
-                    f"controller state stale: status={cs.get('status')} "
-                    f"phase={cs.get('phase')}"
-                )
-            arch = cs.get("archive", {})
-            if arch.get("status") != "passed" or not arch.get("commit"):
-                warnings.append("controller archive state not passed")
-
-    if warnings:
-        base.log(f"  note: {cid} archived but {'; '.join(warnings)}")
-
-    return True, ""
-
-
-def run_fast_checks(repo: Path, cfg: dict) -> tuple[bool, str]:
-    timeout = cfg["check_timeout_minutes"] * 60
-    for cmd in cfg["fast_checks"]:
-        base.log(f"  check: {cmd}")
-        try:
-            res = subprocess.run(
-                shlex.split(cmd), cwd=repo, capture_output=True, text=True,
-                timeout=timeout,
-            )
-        except subprocess.TimeoutExpired:
-            return False, f"check timed out: {cmd}"
-        except FileNotFoundError as exc:
-            return False, f"check command not found: {exc}"
-        if res.returncode != 0:
-            tail = (res.stdout + res.stderr).strip().splitlines()[-5:]
-            return False, f"check failed: {cmd} :: " + " | ".join(tail)
-    return True, ""
-
-
-def change_dir(repo: Path, cid: str) -> Path:
-    direct = repo / "openspec" / "changes" / cid
-    if direct.is_dir():
-        return direct
-    changes_dir = repo / "openspec" / "changes"
-    if changes_dir.is_dir():
-        for entry in sorted(changes_dir.iterdir(), reverse=True):
-            if entry.is_dir() and entry.name.endswith(f"-{cid}"):
-                return entry
-    return direct
-
-
-AUTHORED_ARTIFACTS = ("proposal.md", "tasks.md")
-
-
-def change_authored(repo: Path, cid: str) -> bool:
-    """True only when the change dir holds the required artifacts, not just a
-    bare `openspec new change` scaffold (`.openspec.yaml`). The scheduler uses
-    this — instead of mere directory existence — to decide whether a change
-    still needs authoring, so a half-written scaffold no longer silently skips
-    the create stage and gets driven as if complete."""
-    cdir = change_dir(repo, cid)
-    return cdir.is_dir() and all((cdir / a).is_file() for a in AUTHORED_ARTIFACTS)
-
-
-def scaffold_is_clearable(repo: Path, cid: str) -> bool:
-    """True when a change dir is a pure, untracked scaffold the orchestrator may
-    remove before re-creating: it exists, holds no authored markdown, and has no
-    tracked files. Any `.md` content or any tracked file makes it unsafe to
-    delete (it may carry hand-written work), so we refuse and ask the operator."""
-    cdir = change_dir(repo, cid)
-    if not cdir.is_dir():
-        return False
-    if any(p.is_file() for p in cdir.rglob("*.md")):
-        return False
-    tracked = git(repo, "ls-files", "--", str(cdir.relative_to(repo)))
-    return not tracked.stdout.strip()
-
-
-def verify_change_created(
-    repo: Path,
-    cfg: dict,
-    cid: str,
-    before_tracked: tuple[str, str, str] | None = None,
-) -> tuple[bool, str]:
-    """A change counts as created only when independent evidence agrees:
-    1. openspec/changes/<id> exists with proposal.md and tasks.md
-    2. the configured created_check command (default
-       `openspec validate <id> --strict`) exits 0
-    3. when a pre-create snapshot is provided, creation touched no tracked files
-       (change authoring is additive)
-    """
-    reasons: list[str] = []
-    cdir = change_dir(repo, cid)
-    if not cdir.is_dir():
-        return False, f"openspec/changes/{cid} does not exist"
-    for artifact in ("proposal.md", "tasks.md"):
-        if not (cdir / artifact).is_file():
-            reasons.append(f"missing {artifact}")
-
-    check = cfg["created_check"].format(change=cdir.name)
-    if check.strip():
-        try:
-            res = subprocess.run(
-                shlex.split(check), cwd=repo, capture_output=True, text=True,
-                timeout=cfg["check_timeout_minutes"] * 60,
-            )
-            if res.returncode != 0:
-                tail = (res.stdout + res.stderr).strip().splitlines()[-3:]
-                reasons.append(f"created_check failed: " + " | ".join(tail))
-        except subprocess.TimeoutExpired:
-            reasons.append(f"created_check timed out: {check}")
-        except FileNotFoundError as exc:
-            reasons.append(f"created_check command not found: {exc}")
-
-    if before_tracked is not None and tracked_worktree_snapshot(repo) != before_tracked:
-        reasons.append(
-            "creation modified tracked files; change authoring must be "
-            "additive (review with `git status` before continuing)"
-        )
-    return (not reasons, "; ".join(reasons))
-
-
-def tracked_worktree_snapshot(repo: Path) -> tuple[str, str, str]:
-    """Return tracked-file state, excluding untracked files.
-
-    Creation runs are allowed to add untracked OpenSpec files, but must not alter
-    tracked files. Capturing the full tracked diff before and after the create
-    stage avoids falsely failing when unrelated tracked edits already existed.
-    """
-    pieces: list[str] = []
-    for args in (
-        ("status", "--porcelain", "--untracked-files=no"),
-        ("diff", "--no-ext-diff", "--binary"),
-        ("diff", "--cached", "--no-ext-diff", "--binary"),
-    ):
-        res = git(repo, *args)
-        if res.returncode != 0:
-            pieces.append(f"git {' '.join(args)} failed: {res.stderr}")
-        else:
-            pieces.append(res.stdout)
-    return pieces[0], pieces[1], pieces[2]
-
-
-def tracked_tree_clean(repo: Path) -> bool:
-    res = git(repo, "status", "--porcelain", "--untracked-files=no")
-    if res.returncode != 0:
-        return False
-    lines = [
-        ln for ln in res.stdout.splitlines()
-        if ln.strip() and not ln[3:].startswith(".opsx-plan/")
-    ]
-    return not lines
-
-
-# ---------------------------------------------------------------------------
-# Git delivery helpers
-# ---------------------------------------------------------------------------
-
-def _git_current_branch(repo: Path) -> str | None:
-    """Return the current symbolic HEAD branch name, or None when detached."""
-    res = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
-    if res.returncode != 0:
-        return None
-    name = res.stdout.strip()
-    return name if name and name != "HEAD" else None
-
-
-def _git_branch_exists(repo: Path, branch_name: str) -> bool:
-    """Return True when *branch_name* exists in the local repository."""
-    res = git(repo, "rev-parse", "--verify", f"refs/heads/{branch_name}")
-    return res.returncode == 0
-
-
-def _git_create_and_checkout_branch(
-    repo: Path, branch_name: str, base_ref: str
-) -> str | None:
-    """Create and checkout *branch_name* from *base_ref*.  Returns None on
-    success or an error message string on failure."""
-    res = git(repo, "checkout", "-b", branch_name, base_ref)
-    if res.returncode != 0:
-        return f"git checkout -b {branch_name} {base_ref} failed: {res.stderr.strip()}"
-    return None
-
-
-def _git_current_head_on_branch(repo: Path, branch_name: str) -> bool:
-    """Return True when HEAD points to *branch_name*."""
-    current = _git_current_branch(repo)
-    return current == branch_name
-
-
-def resolve_delivery_branch_name(plan_name: str, git_delivery_cfg: dict) -> str:
-    """Resolve the delivery branch name from config or derive from plan name."""
-    configured = (git_delivery_cfg.get("branch") or "").strip()
-    if configured:
-        return configured
-    return f"opsx/{plan_name}"
-
-
-def resolve_delivery_base_ref(
-    repo: Path, git_delivery_cfg: dict
-) -> tuple[str | None, str | None]:
-    """Resolve the delivery base ref from config or current HEAD.
-
-    Returns ``(base_ref, error_message)``.  When *error_message* is None,
-    *base_ref* is the resolved base ref.
-    """
-    configured = (git_delivery_cfg.get("base_ref") or "").strip()
-    if configured:
-        return configured, None
-    current = _git_current_branch(repo)
-    if current is None:
-        return None, "HEAD is detached; cannot resolve base ref for delivery branch"
-    return current, None
-
-
-def ensure_delivery_branch(
-    repo: Path,
-    cfg: dict,
-    state: dict,
-    no_branch: bool = False,
-) -> tuple[bool, str | None]:
-    """Ensure the delivery branch is created/verified before plan dispatch.
-
-    Returns ``(proceed, error)``.  When *proceed* is True, the run may continue.
-    When *error* is not None, the run must stop with that error message.
-    """
-    git_delivery_cfg = cfg.get("git_delivery", {})
-    if not git_delivery_cfg.get("enabled", False):
-        return True, None
-
-    gd_state = state.get("git_delivery", {})
-    recorded_branch = gd_state.get("branch_name")
-
-    # --- Resume guard: branch already recorded ---
-    if recorded_branch:
-        if no_branch:
-            return False, (
-                f"cannot use --no-branch: delivery branch "
-                f"'{recorded_branch}' has already been recorded for this plan state"
-            )
-        if not _git_current_head_on_branch(repo, recorded_branch):
-            actual = _git_current_branch(repo) or "(detached)"
-            return False, (
-                f"expected delivery branch '{recorded_branch}' but HEAD is on "
-                f"'{actual}'; checkout the recorded branch to resume this plan run"
-            )
-        return True, None
-
-    # --- First run: create delivery branch ---
-    if no_branch:
-        base.log("--no-branch: skipping delivery branch creation for this run")
-        return True, None
-
-    if not tracked_tree_clean(repo):
-        return False, (
-            "tracked worktree is dirty; commit or stash changes before "
-            "delivery branch creation"
-        )
-
-    branch_name = resolve_delivery_branch_name(cfg["name"], git_delivery_cfg)
-    base_ref, err = resolve_delivery_base_ref(repo, git_delivery_cfg)
-    if err:
-        return False, err
-
-    base.log(f"git delivery: creating branch '{branch_name}' from '{base_ref}'")
-
-    if _git_branch_exists(repo, branch_name):
-        # Branch exists but state doesn't record it — transition state
-        # (branch may have been created manually or from a previous
-        # interrupted run).  We treat this as the recorded branch.
-        base.log(f"  branch '{branch_name}' already exists; recording in state")
-    else:
-        create_err = _git_create_and_checkout_branch(repo, branch_name, base_ref)
-        if create_err:
-            return False, create_err
-
-    # Checkout again in case branch already existed (ensures it's checked out)
-    if not _git_current_head_on_branch(repo, branch_name):
-        res = git(repo, "checkout", branch_name)
-        if res.returncode != 0:
-            return False, f"failed to checkout existing branch '{branch_name}': {res.stderr.strip()}"
-
-    # Persist delivery branch identity in plan state
-    gd_state["base_ref"] = base_ref
-    gd_state["branch_name"] = branch_name
-    gd_state["delivery_status"] = "branch_ready"
-    base.log(f"git delivery: branch '{branch_name}' ready (base: {base_ref})")
-
-    return True, None
-
-
-def _resolve_pr_remote(repo: Path) -> tuple[str | None, str | None]:
-    """Resolve the git remote name to use for PR delivery.
-
-    Returns ``(remote_name, error_message)``.  Prefers ``origin`` when
-    present; otherwise picks the first remote alphabetically.  Returns
-    ``(None, error)`` when no remote is configured.
-    """
-    res = git(repo, "remote")
-    if res.returncode != 0:
-        return None, "git remote command failed; is this a git repository?"
-    remotes = [r.strip() for r in res.stdout.splitlines() if r.strip()]
-    if not remotes:
-        return None, (
-            "no git remote configured; add a remote for "
-            "configured pull-request delivery"
-        )
-    # Prefer origin when available; otherwise use the first remote.
-    if "origin" in remotes:
-        return "origin", None
-    return remotes[0], None
-
-
-def check_pr_delivery_prerequisites(
-    repo: Path, cfg: dict,
-) -> tuple[bool, str | None, str | None]:
-    """Verify PR delivery prerequisites: gh on PATH and a usable git remote.
-
-    Returns ``(ok, error_message, remote_name)``.  When *ok* is True,
-    *remote_name* is the resolved remote that push should target.  When
-    *ok* is False, *error_message* explains which prerequisite is missing.
-    """
-    git_delivery_cfg = cfg.get("git_delivery", {})
-    if not git_delivery_cfg.get("create_pull_request", False):
-        return True, None, None
-
-    if not shutil.which("gh"):
-        return False, (
-            "gh is not available on PATH; install GitHub CLI for "
-            "configured pull-request delivery"
-        ), None
-
-    remote_name, remote_err = _resolve_pr_remote(repo)
-    if remote_err:
-        return False, remote_err, None
-
-    return True, None, remote_name
-
-
-def push_delivery_branch(repo: Path, cfg: dict, state: dict) -> tuple[bool, str | None]:
-    """Push the recorded delivery branch to the resolved remote.
-
-    Returns ``(ok, error_message)``.
-    """
-    gd_state = state.get("git_delivery", {})
-    branch_name = gd_state.get("branch_name")
-    if not branch_name:
-        return False, "no recorded delivery branch to push"
-
-    remote_name = gd_state.get("remote_name", "origin")
-
-    base.log(f"git delivery: pushing branch '{branch_name}' to remote '{remote_name}'")
-
-    res = git(repo, "push", "--set-upstream", remote_name, branch_name)
-    if res.returncode != 0:
-        return False, (
-            f"git push failed for branch '{branch_name}' to "
-            f"'{remote_name}': "
-            f"{res.stderr.strip() or 'unknown error'}"
-        )
-
-    base.log(f"git delivery: pushed '{branch_name}' successfully")
-    return True, None
-
-
-def generate_pr_body(repo: Path, cfg: dict, state: dict) -> str:
-    """Generate a pull-request body from plan report evidence.
-
-    Includes per-change status, rounds, durations, and estimated cost
-    when telemetry is available.  Omits unavailable cost fields instead
-    of inventing values.
-    """
-    plan_name = cfg["name"]
-    git_delivery_cfg = cfg.get("git_delivery", {})
-
-    lines: list[str] = []
-    lines.append(f"## Plan: {plan_name}")
-    lines.append("")
-
-    # Collect per-change evidence from state + telemetry
-    try:
-        from lib.metrics.aggregator import (
-            AggregationError,
-            _change_aggregation,
-            _read_state,
-            _read_telemetry,
-            _select_run,
-        )
-        records, _ = _read_telemetry(repo, plan_name)
-        selected_records, _, _ = _select_run(records, None)
-        state_for_cm, _ = _read_state(repo, plan_name)
-        cm_list, _ = _change_aggregation(state_for_cm, selected_records, plan_name, [])
-    except (AggregationError, Exception):
-        cm_list = []
-
-    # Filter telemetry-backed change list to enabled changes only
-    if cm_list:
-        cm_list = [
-            c for c in cm_list
-            if cfg.get("changes", {}).get(c.change_id, {}).get("enabled", True)
-        ]
-
-    if cm_list:
-        lines.append("### Change Summary")
-        lines.append("")
-        lines.append("| Change ID | Status | Rounds | Duration | Tokens | Cost |")
-        lines.append("|-----------|--------|--------|----------|--------|------|")
-        for c in cm_list:
-            dur_str = ""
-            if c.duration_ms is not None:
-                total_s = int(c.duration_ms) // 1000
-                dur_str = f"{total_s // 60}m{total_s % 60}s"
-            else:
-                dur_str = "—"
-
-            tokens_str = "—"
-            if c.tokens is not None:
-                n = int(c.tokens)
-                if n >= 1_000_000:
-                    tokens_str = f"{n / 1_000_000:.1f}M"
-                elif n >= 1_000:
-                    tokens_str = f"{n / 1_000:.1f}K"
-                else:
-                    tokens_str = str(n)
-
-            cost_str = "—"
-            if c.cost_status == "estimated" and c.estimated_cost is not None:
-                cost_str = f"${c.estimated_cost:.2f}"
-            elif c.cost_status == "partial":
-                if c.estimated_cost is not None:
-                    cost_str = f"${c.estimated_cost:.2f} (partial)"
-                else:
-                    cost_str = "unresolved"
-            elif c.cost_status == "unresolved":
-                cost_str = "unresolved"
-
-            lines.append(
-                f"| `{c.change_id}` | {c.status} | {c.total_rounds} | "
-                f"{dur_str} | {tokens_str} | {cost_str} |"
-            )
-
-        # Add total cost estimate when available
-        total_cost: float | None = None
-        has_unresolved = False
-        for c in cm_list:
-            if c.estimated_cost is not None and c.cost_status in ("estimated", "partial"):
-                total_cost = (total_cost or 0.0) + c.estimated_cost
-            if c.cost_status in ("unresolved", "partial"):
-                has_unresolved = True
-
-        if total_cost is not None:
-            lines.append("")
-            cost_note = " (partial)" if has_unresolved else ""
-            lines.append(f"**Total estimated cost{cost_note}:** ${total_cost:.2f}")
-
-    else:
-        # Fallback when metrics unavailable: use state evidence
-        lines.append("### Changes")
-        lines.append("")
-        for cid in cfg["order"]:
-            change_cfg = cfg["changes"][cid]
-            if not change_cfg["enabled"]:
-                continue
-            r = state.get("changes", {}).get(cid, {})
-            status = r.get("status", "unknown")
-            lines.append(f"- `{cid}`: {status}")
-
-    lines.append("")
-    lines.append("---")
-    lines.append(
-        f"*This pull request was generated by opsx-plan from the "
-        f"`{plan_name}` plan.*"
-    )
-    return "\n".join(lines)
-
-
-def create_github_pull_request(
-    repo: Path,
-    cfg: dict,
-    state: dict,
-    body: str,
-) -> tuple[bool, str | None, str | None]:
-    """Create a GitHub pull request using ``gh pr create``.
-
-    Returns ``(ok, error_message, pr_url)``.  When *ok* is True, *pr_url*
-    is the URL of the opened pull request.
-    """
-    git_delivery_cfg = cfg.get("git_delivery", {})
-    gd_state = state.get("git_delivery", {})
-    base_ref = gd_state.get("base_ref", git_delivery_cfg.get("base_ref", "main"))
-    branch_name = gd_state.get("branch_name", "")
-
-    if not branch_name:
-        return False, "no recorded delivery branch for PR creation", None
-
-    title = f"opsx-plan: {cfg['name']}"
-
-    base.log(f"git delivery: creating PR '{title}' from '{branch_name}' to '{base_ref}'")
-
-    cmd = [
-        "gh", "pr", "create",
-        "--base", base_ref,
-        "--head", branch_name,
-        "--title", title,
-        "--body", body,
-    ]
-
-    try:
-        res = subprocess.run(
-            cmd,
-            cwd=repo,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-    except subprocess.TimeoutExpired:
-        return False, "gh pr create timed out after 120s", None
-    except FileNotFoundError:
-        return False, "gh CLI not found", None
-
-    if res.returncode != 0:
-        return False, (
-            f"gh pr create failed: {res.stderr.strip() or 'unknown error'}"
-        ), None
-
-    pr_url = res.stdout.strip()
-    base.log(f"git delivery: PR created: {pr_url}")
-    return True, None, pr_url
-
-
-def attempt_pr_delivery(
-    repo: Path,
-    cfg: dict,
-    state: dict,
-    no_pr: bool = False,
-) -> tuple[bool, str | None]:
-    """Attempt pull-request delivery after plan completion.
-
-    Pushes the recorded delivery branch, creates a GitHub PR, and records
-    the result in plan state.  Returns ``(proceed, error_message)``.
-
-    When *no_pr* is True, silently skip PR delivery.
-    When the plan state already records a ``pull_request_url``, treat the
-    recorded PR as authoritative and skip creation (idempotent rerun).
-    """
-    git_delivery_cfg = cfg.get("git_delivery", {})
-    gd_state = state.get("git_delivery", {})
-
-    if no_pr:
-        base.log("git delivery: --no-pr supplied; skipping PR delivery")
-        return True, None
-
-    if not git_delivery_cfg.get("create_pull_request", False):
-        return True, None
-
-    # Idempotency: if PR already recorded, do not create a duplicate
-    existing_url = gd_state.get("pull_request_url")
-    if existing_url:
-        base.log(f"git delivery: PR already recorded ({existing_url}); skipping creation")
-        return True, None
-
-    # Push the delivery branch
-    ok, err = push_delivery_branch(repo, cfg, state)
-    if not ok:
-        # Fail closed: do not claim PR delivery succeeded
-        return False, err
-
-    # Generate PR body from report evidence
-    body = generate_pr_body(repo, cfg, state)
-
-    # Create the pull request
-    ok, err, pr_url = create_github_pull_request(repo, cfg, state, body)
-    if not ok:
-        # Fail closed: push succeeded but PR creation failed;
-        # leave state unambiguous so operator can inspect.
-        return False, err
-
-    # Record delivery outcome in plan state
-    gd_state["pull_request_url"] = pr_url
-    gd_state["delivery_status"] = "pr_opened"
-    base.log(f"git delivery: delivery complete, PR opened at {pr_url}")
-
-    return True, None
-
-
-def verify_post_archive_clean(repo: Path, cfg: dict) -> tuple[bool, str]:
-    """Refuse completion when archive/check steps leave tracked edits behind."""
-    if not cfg.get("require_clean_tracked", True):
-        return True, ""
-    if tracked_tree_clean(repo):
-        return True, ""
-    return (
-        False,
-        "tracked worktree is dirty; archive must commit or restore tracked changes "
-        "before the next change starts",
-    )
-
-
 # ---------------------------------------------------------------------------
 # Doctor / preflight checks
 # ---------------------------------------------------------------------------
@@ -3671,184 +1818,6 @@ def _check_stale_install(repo: Path) -> tuple[bool, str, str]:
     return (True, label, "")
 
 
-def _check_model_resolution(repo: Path, adapter: str) -> tuple[bool, str, str]:
-    """Check that every model role resolves for *adapter*."""
-    label = "Model roles resolve for the target adapter"
-    try:
-        resolved = resolve_models(adapter, repo=repo)
-    except ModelConfigError as exc:
-        return (False, label, str(exc))
-    unresolved = [role for role in ROLES if not resolved[role].model]
-    if unresolved:
-        return (
-            False,
-            label,
-            f"Unresolved role(s) for '{adapter}': {', '.join(unresolved)}; "
-            f"run `opsx-plan models init` to seed a configuration file, or edit "
-            f"models.toml directly",
-        )
-    return (True, label, "")
-
-
-def _check_model_identifier_syntax(repo: Path, adapter: str) -> tuple[bool, str, str]:
-    """Check that resolved model identifiers match *adapter*'s identifier syntax."""
-    label = "Resolved model identifiers match adapter syntax"
-    try:
-        resolved = resolve_models(adapter, repo=repo)
-    except ModelConfigError:
-        # Already reported by _check_model_resolution; nothing new to add here.
-        return (True, label, "")
-    warnings = validate_models(adapter, resolved)
-    if not warnings:
-        return (True, label, "")
-    return (
-        False,
-        label,
-        "; ".join(warnings) + " (edit models.toml or the ambient OPSX_*_MODEL value)",
-    )
-
-
-def _print_model_resolution_detail(repo: Path, adapter: str) -> None:
-    """Print each role's resolved model and source under the model check line."""
-    try:
-        resolved = resolve_models(adapter, repo=repo)
-    except ModelConfigError:
-        return
-    for role in ROLES:
-        entry = resolved[role]
-        value = entry.model if entry.model else "(unresolved)"
-        print(f"      {role:<12} {value}  [{entry.source}]")
-
-
-def _check_openspec_on_path() -> tuple[bool, str, str]:
-    """Check that openspec is on PATH."""
-    label = "openspec on PATH"
-    if shutil.which("openspec"):
-        return (True, label, "")
-    return (False, label, "Install openspec (e.g. npm install -g @openspec/cli)")
-
-
-def _check_adapter_client_on_path(adapter: str) -> tuple[bool, str, str]:
-    """Check that the configured adapter client executable is on PATH."""
-    client = ADAPTER_CLIENTS.get(adapter, adapter)
-    label = f"{client} on PATH"
-    if shutil.which(client):
-        return (True, label, "")
-    return (False, label, f"Install {client} or add it to PATH")
-
-
-def _check_tracked_bytecode(repo: Path) -> tuple[bool, str, str]:
-    """Check that no tracked __pycache__ dirs or .pyc files exist."""
-    label = "No tracked __pycache__ or .pyc files"
-    res = git(repo, "ls-files", "--", ":(glob)**/__pycache__/**", ":(glob)**/*.pyc")
-    if res.returncode != 0:
-        return (True, label, "")
-    lines = [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
-    if not lines:
-        return (True, label, "")
-    sample = ", ".join(lines[:3])
-    if len(lines) > 3:
-        sample += f"... and {len(lines) - 3} more"
-    return (False, label, f"Tracked bytecode found: {sample}. Remove from version control and add to .gitignore")
-
-
-def _check_tracked_tree_clean(repo: Path) -> tuple[bool, str, str]:
-    """Check that the tracked tree has no uncommitted modifications."""
-    label = "Tracked tree is clean"
-    if tracked_tree_clean(repo):
-        return (True, label, "")
-    return (False, label, "Tracked files have uncommitted modifications; commit or stash before running unattended work")
-
-
-def _check_plan_loads(repo: Path, plan_src: str | None) -> tuple[bool, str, str]:
-    """Validate that the resolved plan loads successfully."""
-    label = "Plan loads successfully"
-    if plan_src is None:
-        return (True, label, "")
-    try:
-        planref.load_plan(planref._resolve_plan_path(repo, plan_src), repo=repo)
-        return (True, label, "")
-    except base.PlanError as exc:
-        return (False, label, f"Plan load failed: {exc}")
-    except Exception as exc:
-        return (False, label, f"Plan load error: {exc}")
-
-
-def _check_pr_delivery(repo: Path, plan_src: str | None) -> tuple[bool, str, str]:
-    """When plan enables pull-request delivery, require gh on PATH and a git remote."""
-    label = "PR delivery prerequisites (gh + git remote)"
-    if plan_src is None:
-        return (True, label, "")
-
-    plan_path = planref._resolve_plan_path(repo, plan_src)
-    try:
-        with open(plan_path, "rb") as fh:
-            raw = tomllib.load(fh)
-    except Exception:
-        return (False, label, "Plan failed to load — cannot verify PR delivery prerequisites")
-
-    plan_table = raw.get("plan", {})
-    git_delivery = plan_table.get("git_delivery", {})
-    legacy = (plan_table.get("delivery") or "").strip().lower()
-
-    # Prefer git_delivery.create_pull_request; fall back to legacy delivery key
-    if isinstance(git_delivery, dict) and git_delivery:
-        if not git_delivery.get("create_pull_request", False):
-            return (True, label, "")
-    elif legacy == "pull-request":
-        # Legacy format: delivery = "pull-request"
-        pass
-    else:
-        return (True, label, "")
-
-    if not shutil.which("gh"):
-        return (False, label, "gh not on PATH; install GitHub CLI for PR delivery")
-
-    res = git(repo, "remote")
-    if res.returncode != 0 or not res.stdout.strip():
-        return (False, label, "No git remote configured; add a remote for PR delivery")
-
-    return (True, label, "")
-
-
-_DIRECT_STAGE_AGENT_NAMES = ("opsx-implementer", "opsx-reviewer", "opsx-archiver")
-
-_ADAPTER_INSTALLERS = {
-    "opencode": "adapters/opencode/install.sh",
-    "claude-code": "adapters/claude-code/install.sh",
-}
-
-
-def _check_direct_worker_agents(cfg: dict | None, repo: Path | None = None) -> tuple[bool, str, str]:
-    """When the resolved plan uses direct dispatch, verify the configured
-    adapter's implement/review/archive worker agents are installed, in
-    either a repo-local install (when *repo* is given) or the home-rooted
-    one."""
-    label = "Direct-dispatch worker agents installed"
-    if cfg is None or not planref.is_direct_mode(cfg):
-        return (True, label, "")
-
-    adapter = cfg["adapter"]
-    agent_dirs = _adapter_agent_dir(adapter, repo)
-    if not agent_dirs:
-        return (True, label, "")
-
-    missing = [
-        name for name in _DIRECT_STAGE_AGENT_NAMES
-        if not any((agent_dir / f"{name}.md").is_file() for agent_dir in agent_dirs)
-    ]
-    if not missing:
-        return (True, label, "")
-
-    installer = _ADAPTER_INSTALLERS.get(adapter, f"the {adapter} adapter installer")
-    return (
-        False,
-        label,
-        f"Missing {adapter} worker agent(s): {', '.join(missing)}; "
-        f"run {installer} to install them",
-    )
-
-
 def run_doctor_checks(repo: Path, plan_src: str | None,
                       adapter: str = "opencode", cfg: dict | None = None) -> int:
     """Run all doctor preflight checks. Returns count of failures."""
@@ -3856,17 +1825,17 @@ def run_doctor_checks(repo: Path, plan_src: str | None,
 
     # Plan-independent checks
     checks.append(_check_stale_install(repo))
-    checks.append(_check_model_resolution(repo, adapter))
-    checks.append(_check_model_identifier_syntax(repo, adapter))
-    checks.append(_check_openspec_on_path())
-    checks.append(_check_adapter_client_on_path(adapter))
-    checks.append(_check_tracked_bytecode(repo))
-    checks.append(_check_tracked_tree_clean(repo))
+    checks.append(doctor._check_model_resolution(repo, adapter))
+    checks.append(doctor._check_model_identifier_syntax(repo, adapter))
+    checks.append(doctor._check_openspec_on_path())
+    checks.append(doctor._check_adapter_client_on_path(adapter))
+    checks.append(doctor._check_tracked_bytecode(repo))
+    checks.append(doctor._check_tracked_tree_clean(repo))
 
     # Plan-dependent checks
-    checks.append(_check_plan_loads(repo, plan_src))
-    checks.append(_check_pr_delivery(repo, plan_src))
-    checks.append(_check_direct_worker_agents(cfg, repo))
+    checks.append(doctor._check_plan_loads(repo, plan_src))
+    checks.append(doctor._check_pr_delivery(repo, plan_src))
+    checks.append(doctor._check_direct_worker_agents(cfg, repo))
 
     failures = 0
     for passed, label, remediation in checks:
@@ -3878,7 +1847,7 @@ def run_doctor_checks(repo: Path, plan_src: str | None,
                 print(f"    \u2192 {remediation}")
             failures += 1
         if label == "Model roles resolve for the target adapter":
-            _print_model_resolution_detail(repo, adapter)
+            doctor._print_model_resolution_detail(repo, adapter)
 
     return failures
 
@@ -3889,15 +1858,15 @@ def run_preflight_warnings(repo: Path, plan_src: str | None,
     checks: list[tuple[bool, str, str]] = []
 
     checks.append(_check_stale_install(repo))
-    checks.append(_check_model_resolution(repo, adapter))
-    checks.append(_check_model_identifier_syntax(repo, adapter))
-    checks.append(_check_openspec_on_path())
-    checks.append(_check_adapter_client_on_path(adapter))
-    checks.append(_check_tracked_bytecode(repo))
-    checks.append(_check_tracked_tree_clean(repo))
-    checks.append(_check_plan_loads(repo, plan_src))
-    checks.append(_check_pr_delivery(repo, plan_src))
-    checks.append(_check_direct_worker_agents(cfg, repo))
+    checks.append(doctor._check_model_resolution(repo, adapter))
+    checks.append(doctor._check_model_identifier_syntax(repo, adapter))
+    checks.append(doctor._check_openspec_on_path())
+    checks.append(doctor._check_adapter_client_on_path(adapter))
+    checks.append(doctor._check_tracked_bytecode(repo))
+    checks.append(doctor._check_tracked_tree_clean(repo))
+    checks.append(doctor._check_plan_loads(repo, plan_src))
+    checks.append(doctor._check_pr_delivery(repo, plan_src))
+    checks.append(doctor._check_direct_worker_agents(cfg, repo))
 
     for passed, label, remediation in checks:
         if not passed:
@@ -3998,7 +1967,7 @@ def handle_sigint(signum, frame):  # noqa: ARG001
 def classify(cfg: dict, state: dict, cid: str) -> str:
     """Computed status for reporting: includes blocked/awaiting_approval."""
     c = cfg["changes"][cid]
-    r = rec(state, cid)
+    r = state_mod.rec(state, cid)
     if not c["enabled"]:
         return base.SKIPPED
     if r["status"] in (base.DONE, base.FAILED, base.RUNNING):
@@ -4023,14 +1992,14 @@ def classify(cfg: dict, state: dict, cid: str) -> str:
 def reconcile(repo: Path, cfg: dict, state: dict) -> None:
     """Make recorded state agree with repository reality."""
     for cid in cfg["order"]:
-        r = rec(state, cid)
+        r = state_mod.rec(state, cid)
         archived_on_disk = (
-            not change_dir(repo, cid).exists() and find_archive_dir(repo, cid) is not None
+            not groundtruth.change_dir(repo, cid).exists() and groundtruth.find_archive_dir(repo, cid) is not None
         )
         if planref.is_direct_mode(cfg):
             r["max_rounds"] = cfg["max_rounds"]
         if r["status"] == base.RUNNING:  # stale from a killed run
-            set_status(state, cid, base.PENDING, "recovered from interrupted run")
+            state_mod.set_status(state, cid, base.PENDING, "recovered from interrupted run")
         # A change that failed only because no create_invoke was configured
         # (so create never ran: create_attempts == 0) should re-queue once the
         # operator supplies one — otherwise the stale reason keeps reporting
@@ -4039,11 +2008,11 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
         if (
             r["status"] == base.FAILED
             and r.get("create_attempts", 0) == 0
-            and not change_authored(repo, cid)
+            and not groundtruth.change_authored(repo, cid)
             and not archived_on_disk
             and cfg["changes"][cid]["create_invoke"]
         ):
-            set_status(state, cid, base.PENDING, "create_invoke now configured; will retry")
+            state_mod.set_status(state, cid, base.PENDING, "create_invoke now configured; will retry")
             base.log(f"reconcile: {cid} create config now present; re-queued")
             continue
         if r["status"] != base.DONE:
@@ -4052,7 +2021,7 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
                     ok, why = verify_direct_archive_done(repo, cid, r)
                     if ok:
                         r["phase"] = "done"
-                        set_status(
+                        state_mod.set_status(
                             state,
                             cid,
                             base.DONE,
@@ -4066,7 +2035,7 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
                     ok, why = verify_direct_archive_done(repo, cid, r)
                     if ok:
                         r["phase"] = "done"
-                        set_status(
+                        state_mod.set_status(
                             state,
                             cid,
                             base.DONE,
@@ -4075,7 +2044,7 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
                         base.log(f"reconcile: {cid} already archived; marked done")
                         continue
                     if archived_on_disk:
-                        set_status(
+                        state_mod.set_status(
                             state,
                             cid,
                             base.FAILED,
@@ -4084,7 +2053,7 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
                         base.log(f"reconcile: {cid} archive evidence inconsistent: {why}")
                         continue
                 elif archived_on_disk:
-                    set_status(
+                    state_mod.set_status(
                         state,
                         cid,
                         base.FAILED,
@@ -4095,24 +2064,24 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
                     )
                     continue
             else:
-                ok, _ = verify_change_done(repo, cfg, cid)
+                ok, _ = groundtruth.verify_change_done(repo, cfg, cid)
                 if ok:
-                    set_status(state, cid, base.DONE, "verified from repository evidence")
+                    state_mod.set_status(state, cid, base.DONE, "verified from repository evidence")
                     base.log(f"reconcile: {cid} already archived; marked done")
                     continue
             if (
                 r["status"] == base.PENDING
                 and r.get("create_attempts", 0) > 0
-                and change_authored(repo, cid)
+                and groundtruth.change_authored(repo, cid)
                 and not r.get("created_by_orchestrator")
             ):
-                created_ok, created_why = verify_change_created(repo, cfg, cid)
+                created_ok, created_why = groundtruth.verify_change_created(repo, cfg, cid)
                 if created_ok:
                     r["created_by_orchestrator"] = True
-                    set_status(state, cid, base.PENDING, "created and verified")
+                    state_mod.set_status(state, cid, base.PENDING, "created and verified")
                     base.log(f"reconcile: {cid} already created; marked for acceptance")
                 else:
-                    set_status(
+                    state_mod.set_status(
                         state, cid, base.PENDING,
                         f"create verification pending: {created_why}",
                     )
@@ -4120,9 +2089,9 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
             if planref.is_direct_mode(cfg):
                 ok, why = verify_direct_archive_done(repo, cid, r)
             else:
-                ok, why = verify_change_done(repo, cfg, cid)
+                ok, why = groundtruth.verify_change_done(repo, cfg, cid)
             if not ok:
-                set_status(
+                state_mod.set_status(
                     state, cid, base.FAILED,
                     f"recorded done but evidence missing: {why}",
                 )
@@ -4130,680 +2099,8 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Compile helpers
-# ---------------------------------------------------------------------------
-
-def resolve_compile_source(repo: Path, source: str) -> Path:
-    """Resolve a compile source path relative to *repo*.
-
-    Returns the absolute ``Path`` or raises ``PlanError`` when the source
-    does not exist or is not a ``.md`` file.
-    """
-    p = (repo / source).resolve()
-    if not p.is_file():
-        raise base.PlanError(f"source not found: {p}")
-    if p.suffix.lower() != ".md":
-        raise base.PlanError(f"source must be a markdown file (.md): {p}")
-    return p
-
-
-def resolve_compile_output(repo: Path, output: str, force: bool) -> Path:
-    """Resolve compile output path, refusing overwrite unless *force*.
-
-    Returns the absolute ``Path`` for the output file.  The parent
-    directory is created if it does not already exist.
-    """
-    p = (repo / output).resolve()
-    if p.exists() and not force:
-        raise base.PlanError(
-            f"output exists: {p}  (use --force to overwrite)"
-        )
-    p.parent.mkdir(parents=True, exist_ok=True)
-    return p
-
-
-def check_controller_model(repo: Path | None = None, adapter: str = "opencode") -> str:
-    """Return the controller model resolved for *adapter*.
-
-    Raises ``PlanError`` when the ``controller`` role cannot be resolved
-    for *adapter*, or when the resolved identifier violates the adapter's
-    model syntax rules (e.g. a provider-prefixed identifier for Claude).
-    """
-    try:
-        resolved = resolve_models(adapter, repo=repo)
-    except ModelConfigError as exc:
-        raise base.PlanError(str(exc)) from exc
-    model = resolved["controller"].model
-    if not model:
-        raise base.PlanError(
-            f"controller model is not configured for the {adapter} adapter; "
-            f"compile requires a controller model to invoke the selected client "
-            f"(run `opsx-plan models show --adapter {adapter}` to inspect, "
-            f"or `opsx-plan models init` to seed a configuration file)"
-        )
-
-    # Reject an identifier whose syntax is invalid for the selected adapter
-    # before any process spawn (the opencode adapter expects provider/model,
-    # claude-code rejects provider prefixes, etc.).
-    warnings = validate_models(adapter, resolved)
-    controller_warnings = [w for w in warnings if w.startswith("controller:")]
-    if controller_warnings:
-        raise base.PlanError(
-            f"controller model '{model}' is not valid for the {adapter} adapter: "
-            f"{controller_warnings[0]}\n"
-            f"Run `opsx-plan models show --adapter {adapter}` to inspect "
-            f"resolved models, or `opsx-plan models init` to seed a "
-            f"configuration file."
-        )
-
-    return model
-
-
-def discover_template_pairs(repo: Path) -> list[tuple[Path, Path | None]]:
-    """Find repository template plan pairs (md + matching toml).
-
-    Lists top-level ``openspec/plans/`` pairs first and
-    ``openspec/plans/archived/`` pairs second, without recursing further.
-    Returns a list of ``(md_path, toml_path_or_None)`` tuples.
-    """
-    plans_dir = repo / "openspec" / "plans"
-    pairs: list[tuple[Path, Path | None]] = []
-    if plans_dir.is_dir():
-        for md_path in sorted(plans_dir.glob("*.md")):
-            toml_path = md_path.with_suffix(".toml")
-            pairs.append((md_path, toml_path if toml_path.is_file() else None))
-    archived_dir = repo / "openspec" / "plans" / "archived"
-    if archived_dir.is_dir():
-        for md_path in sorted(archived_dir.glob("*.md")):
-            toml_path = md_path.with_suffix(".toml")
-            pairs.append((md_path, toml_path if toml_path.is_file() else None))
-    return pairs
-
-
-def resolve_sample_plan_pair() -> tuple[Path, Path | None] | None:
-    """Resolve the canonical sample plan pair.
-
-    Probes ``~/.local/lib/opsx-controller/samples`` (installed) first, then
-    falls back to ``<checkout>/orchestrator/samples``.  The installed copy
-    takes precedence because it represents the version that was actually
-    deployed — the checkout copy is only a fallback for development.
-
-    Returns ``(md_path, toml_path)`` or ``None`` when neither location
-    exists.
-    """
-    # 1. Installed samples (authoritative copy).
-    installed = Path.home() / ".local" / "lib" / "opsx-controller" / "samples"
-    md_path = installed / "sample-plan.md"
-    toml_path = installed / "sample-plan.toml"
-    if md_path.is_file() and toml_path.is_file():
-        return md_path, toml_path
-
-    # 2. Checkout fallback (mirrors _SCRIPT_ROOT / _RUNTIME_ROOTS).
-    for root in _RUNTIME_ROOTS:
-        samples_dir = root / "orchestrator" / "samples"
-        md_path = samples_dir / "sample-plan.md"
-        toml_path = samples_dir / "sample-plan.toml"
-        if md_path.is_file() and toml_path.is_file():
-            return md_path, toml_path
-
-    return None
-
-
-def _escape_toml_value(value: str) -> str:
-    """Escape *value* for safe inclusion inside a TOML basic (double-quoted) string.
-
-    Only backslash and double-quote require escaping in the TOML basic-string
-    grammar; other characters (``$``, ``{``, ``}``, etc.) are literal.
-    """
-    return value.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def build_schema_guidance(adapter: str = "opencode") -> str:
-    """Build manifest schema guidance derived from ``load_plan()`` behavior.
-
-    Covers ``[plan]`` fields, ``[[changes]]`` entries, dependency edges,
-    gate defaults, adapter defaults, and fields consumed by the parser.
-
-    *adapter* selects the compile client and determines the ``[plan]``
-    defaults rendered in the prompt — every field shown reflects the
-    selected adapter's own defaults, not a generic template.
-    """
-    default_adapter = adapter
-    defaults = base.ADAPTER_DEFAULTS[default_adapter]
-    invoke = defaults.get("invoke", "")
-    state_file = defaults.get("state_file", "")
-    impl_invoke = defaults.get("implement_invoke", "")
-    review_invoke = defaults.get("review_invoke", "")
-    archive_invoke = defaults.get("archive_invoke", "")
-    return (
-        "## Expected TOML manifest shape\n"
-        "\n"
-        "The manifest is a TOML document with a ``[plan]`` table and\n"
-        "one or more ``[[changes]]`` entries.\n"
-        "\n"
-        f"### ``[plan]`` table fields (all optional; the {adapter} defaults shown)\n"
-        "\n"
-        "| Field | Type | Default | Description |\n"
-        "|-------|------|---------|-------------|\n"
-        "| name | string | stems from filename | plan display name |\n"
-        f"| adapter | string | ``\"{default_adapter}\"`` | adapter key (``ADAPTER_DEFAULTS``) |\n"
-        f"| invoke | string | ``{invoke}`` | legacy drive command |\n"
-        f"| state_file | string | ``{state_file}`` | controller state path |\n"
-        f"| implement_invoke | string | ``{impl_invoke}`` | direct implement command |\n"
-        f"| review_invoke | string | ``{review_invoke}`` | direct review command |\n"
-        f"| archive_invoke | string | ``{archive_invoke}`` | direct archive command |\n"
-        "| timeout_minutes | float | ``90`` | per-change stage timeout |\n"
-        "| max_attempts | int | ``2`` | legacy drive retry ceiling |\n"
-        "| max_rounds | int | ``5`` | implement-review loop ceiling |\n"
-        "| no_progress_limit | int | ``2`` | consecutive no-progress rounds before failing |\n"
-        "| escalate_after_review_fails | int | ``0`` | promote implement to escalation model after N failed reviews; round=(N+1) first escalates; 0 disables |\n"
-        "| finding_recurrence_limit | int | ``0`` | halt a change when one locus is cited by a blocking finding in this many distinct rounds; 0 disables |\n"
-        "| fast_checks | list[str] | ``[]`` | post-archive CLI checks |\n"
-        "| check_timeout_minutes | float | ``15`` | fast-check timeout |\n"
-        "| require_clean_tracked | bool | ``true`` | refuse to run when tracked tree is dirty |\n"
-        "| skip_warning | bool | ``false`` | warning and note findings do not gate the review verdict |\n"
-        "| skip_suggestion | bool | ``false`` | note findings do not gate the review verdict |\n"
-        "| plan_doc | string | ``\"\"`` | path to the source markdown plan for ``create_invoke`` |\n"
-        "| create_invoke | string | ``\"\"`` | authoring command for auto-creating changes |\n"
-        "| create_timeout_minutes | float | ``30`` | create stage timeout |\n"
-        "| create_max_attempts | int | ``2`` | create retry ceiling |\n"
-        "| review_created | bool | ``true`` | require operator ``accept`` before driving created changes |\n"
-        "| created_check | string | ``\"openspec validate {change} --strict\"`` | post-create validation command |\n"
-        "\n"
-        "### ``[[changes]]`` entry fields\n"
-        "\n"
-        "| Field | Type | Default | Description |\n"
-        "|-------|------|---------|-------------|\n"
-        "| id | string | **required** | unique change identifier (slug) |\n"
-        "| phase | int | ``None`` | phase number (e.g. 1, 2, 3) |\n"
-        "| depends_on | list[str] | ``[]`` | ids of changes that must complete first |\n"
-        "| pause_before | bool | ``false`` | wait for ``opsx-plan approve`` before running |\n"
-        "| enabled | bool | ``true`` | set ``false`` to defer a change |\n"
-        "| timeout_minutes | float | plan-level timeout | per-change stage timeout override |\n"
-        "| max_attempts | int | plan-level max_attempts | legacy drive attempt override |\n"
-        "| create_invoke | string | ``\"\"`` | per-change authoring command override |\n"
-        "| create_max_attempts | int | plan-level value | per-change create attempt override |\n"
-        "\n"
-        "### Dependency semantics\n"
-        "\n"
-        "- ``depends_on`` lists only canonical change ids (slugs). Each id must\n"
-        "  appear as another ``[[changes]]`` entry.\n"
-        "- A change cannot depend on itself (no self-loops).\n"
-        "- The orchestrator validates that every dependency id is present and\n"
-        "  that the resulting DAG has no cycles.\n"
-        "- ``depends_on = []`` means no dependencies.\n"
-        "- Backticked known change ids from the source doc become edges.\n"
-        "- ``Phase N`` references expand to that phase's changes.\n"
-        "- Text starting with ``None`` or containing independence wording\n"
-        "  (\"independent\", \"in parallel\", \"may proceed\") produces no\n"
-        "  edges even when other changes are mentioned.\n"
-        "\n"
-        "### Gate manual defaults\n"
-        "\n"
-        "- First change of each capability marked ``(proposed`` in the source\n"
-        "  gets ``pause_before = true``.\n"
-        "- ``deferred`` wording sets ``enabled = false``.\n"
-        "- Manual phase-exit gates (``pause_before = true``) are added by the\n"
-        "  operator; the compiler records but does not invent them.\n"
-        "\n"
-        f"### Adapter defaults ({adapter})\n"
-        "\n"
-        "```toml\n"
-        f"[plan]\n"
-        f"adapter = \"{default_adapter}\"\n"
-        f"invoke = \"{_escape_toml_value(defaults['invoke'])}\"\n"
-        f"state_file = \"{_escape_toml_value(defaults['state_file'])}\"\n"
-        f"implement_invoke = \"{_escape_toml_value(defaults['implement_invoke'])}\"\n"
-        f"review_invoke = \"{_escape_toml_value(defaults['review_invoke'])}\"\n"
-        f"archive_invoke = \"{_escape_toml_value(defaults['archive_invoke'])}\"\n"
-        "```\n"
-    )
-
-
-def build_compile_prompt(source_content: str, source_path: Path,
-                         repo: Path, adapter: str = "opencode") -> str:
-    """Build the complete compile prompt for the selected adapter.
-
-    Includes: source markdown, manifest schema guidance (adapter-aware),
-    template plan pairs from the repository, and model instructions.
-    """
-    try:
-        rel_source = str(source_path.resolve().relative_to(repo.resolve()))
-    except ValueError:
-        rel_source = str(source_path)
-
-    parts: list[str] = []
-
-    parts.append("## Source plan markdown\n")
-    parts.append(source_content)
-
-    parts.append(build_schema_guidance(adapter))
-
-    # Canonical sample plans (installed or from repo checkout) always appear
-    # ahead of repository pairs.
-    sample_pair = resolve_sample_plan_pair()
-    if sample_pair is not None:
-        sample_md, sample_toml = sample_pair
-        parts.append("## Sample plan (canonical)\n")
-        try:
-            parts.append(sample_md.read_text(encoding="utf-8"))
-        except OSError:
-            pass
-        parts.append(f"### Sample manifest (canonical)\n")
-        try:
-            parts.append(sample_toml.read_text(encoding="utf-8"))
-        except OSError:
-            pass
-
-    template_pairs = discover_template_pairs(repo)
-    if template_pairs:
-        parts.append("## Repository template plans\n")
-        for md, toml in template_pairs:
-            rel = md.relative_to(repo)
-            parts.append(f"### Template: `{rel}`\n")
-            try:
-                parts.append(md.read_text(encoding="utf-8"))
-            except OSError:
-                pass
-            if toml is not None:
-                rel_toml = toml.relative_to(repo)
-                parts.append(f"### Template manifest: `{rel_toml}`\n")
-                try:
-                    parts.append(toml.read_text(encoding="utf-8"))
-                except OSError:
-                    pass
-
-    parts.append(
-        "## Compile instructions\n"
-        "\n"
-        "Convert the source plan markdown above into a valid opsx-plan TOML "
-        "manifest that can be loaded by `opsx-plan status` and "
-        "`opsx-plan run`. Follow these rules:\n"
-        "\n"
-        "1. **Output only TOML.** Do not include any prose, explanation, "
-        "markdown headers, or commentary outside the TOML payload. "
-        "Output raw TOML or a single fenced ```toml block.\n"
-        "2. **Emit a `[plan]` table** with at least `name`, `adapter` "
-        f"(\"{adapter}\"), and `plan_doc` set to exactly "
-        f"\"{rel_source}\".\n"
-        "3. **The `adapter` field MUST equal exactly** "
-        f"\"{adapter}\".\n"
-        "4. **Emit one `[[changes]]` entry per change** described in the "
-        "source plan, in phase order.\n"
-        "5. **Preserve dependency semantics:** backticked known change ids "
-        "in the source doc become `depends_on` entries. Independence wording "
-        "(\"independent\", \"in parallel\", \"may proceed\") means no "
-        "dependency edge. Deferred wording means `enabled = false`.\n"
-        "6. **Preserve manual gates:** `pause_before = true` for any change "
-        "that introduces a proposed capability (marked with `(proposed` "
-        "in the source) or has an explicit gate note.\n"
-        "7. **Preserve phase numbers** as `phase` fields on each change.\n"
-        "8. **Every change id must be unique** and every `depends_on` id "
-        "must reference another change in the manifest.\n"
-        "9. **The DAG must have no cycles.**\n"
-    )
-
-    return "\n".join(parts)
-
-
-# ---------------------------------------------------------------------------
-# Compile client invocation
-# ---------------------------------------------------------------------------
-
-def _build_compile_argv(adapter: str, model: str, prompt: str,
-                        prompt_file: Path | None = None) -> list[str]:
-    """Build the compile client argv for *adapter*.
-
-    Raises ``PlanError`` when the adapter is unsupported for compilation.
-    """
-    entry = COMPILE_CLIENTS.get(adapter)
-    if entry is None:
-        raise base.PlanError(f"unknown adapter '{adapter}'; "
-                        f"known adapters: {', '.join(sorted(COMPILE_CLIENTS))}")
-    if not entry.get("supported", False):
-        raise base.PlanError(
-            f"compilation through the {adapter} adapter is not supported "
-            f"in this release; select a supported adapter "
-            f"({'opencode'} or {'claude-code'})"
-        )
-    executable = entry["executable"]
-    if adapter == "opencode" and prompt_file is not None:
-        return [
-            executable, "run", "--model", model,
-            "Follow the complete compile instructions in the attached file. Output only TOML.",
-            "--file", str(prompt_file),
-        ]
-
-    # Use a template-style argv construction so we compose the full command
-    # from the registry without relying on a shared argv template format.
-    tmpl = entry["argv_template"]
-    # Replace {executable} first so later replacements do not interfere.
-    argv: list[str] = []
-    for part in tmpl:
-        argv.append(
-            part.replace("{executable}", executable)
-                .replace("{model}", model)
-                .replace("{prompt}", prompt)
-        )
-    return argv
-
-
-def run_compile_client(repo: Path, adapter: str, model: str,
-                        prompt: str) -> tuple[str, str]:
-    """Invoke the selected compile client non-interactively.
-
-    Returns ``(stdout, stderr)`` as a tuple.  Raises ``PlanError`` on
-    spawn failure, timeout, or unsupported adapter.
-    """
-    executable = COMPILE_CLIENTS[adapter]["executable"]
-    prompt_file: Path | None = None
-    if adapter == "opencode":
-        # OpenCode receives attached files as prompt parts. Keeping the full
-        # prompt out of argv avoids the OS argument-size limit for large plans.
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", prefix="opsx-compile-", suffix=".md",
-            delete=False,
-        ) as handle:
-            handle.write(prompt)
-            prompt_file = Path(handle.name)
-
-    argv = _build_compile_argv(adapter, model, prompt, prompt_file)
-    try:
-        proc = subprocess.run(
-            argv,
-            cwd=repo,
-            capture_output=True,
-            text=True,
-            timeout=600,  # 10 minute timeout for model invocation
-        )
-    except FileNotFoundError:
-        raise base.PlanError(
-            f"could not spawn {executable}; is it installed and on PATH?"
-        )
-    except OSError as exc:
-        raise base.PlanError(f"could not spawn {executable}: {exc}") from exc
-    except subprocess.TimeoutExpired:
-        raise base.PlanError(
-            f"{executable} compile invocation timed out after 600s"
-        )
-    finally:
-        if prompt_file is not None:
-            prompt_file.unlink(missing_ok=True)
-    if proc.returncode != 0:
-        raise base.PlanError(
-            f"{executable} exited with code {proc.returncode}\n"
-            f"stderr: {proc.stderr[:500]}"
-        )
-    return proc.stdout, proc.stderr
-
-
-def _strip_claude_envelope(output: str) -> str:
-    """Strip one known Claude CLI result envelope, if present.
-
-    Claude ``-p`` output may wrap the actual response in one of a small set
-    of stable formats.  This function removes exactly one recognised envelope
-    so the remaining payload can be passed to the standard TOML extractor.
-
-    Returns the input unchanged when no known envelope is detected.
-    """
-    stripped = output.strip()
-
-    # JSON result envelope: {"result": "...", ...}
-    # Claude may return a JSON object with a "result" key containing the
-    # actual model output.  Remove exactly one such outer wrapper.
-    if stripped.startswith("{") and stripped.endswith("}"):
-        try:
-            data = json.loads(stripped)
-        except (json.JSONDecodeError, TypeError):
-            pass
-        else:
-            if isinstance(data, dict) and "result" in data:
-                inner = data["result"]
-                if isinstance(inner, str) and inner.strip():
-                    return inner
-    return output
-
-
-def extract_toml(output: str, adapter: str = "opencode") -> str:
-    """Extract a TOML payload from raw model output.
-
-    Accepts a single clean fenced ``toml` block or a bare TOML
-    payload.  Raises ``PlanError`` for ambiguous output: multiple
-    fenced blocks, extra prose or non-whitespace content surrounding a
-    fenced block, or no TOML content at all.
-
-    *adapter* is used in error messages and may trigger client-specific
-    envelope handling.
-    """
-    if adapter == "claude-code":
-        output = _strip_claude_envelope(output)
-
-    stripped = output.strip()
-    if not stripped:
-        client = COMPILE_CLIENTS.get(adapter, {}).get("executable", adapter)
-        raise base.PlanError(f"{client} returned empty output; no TOML to compile")
-
-    fenced_matches = list(re.finditer(r"```(?:toml)?\s*\n(.*?)```", stripped, re.DOTALL))
-    if len(fenced_matches) > 1:
-        raise base.PlanError(
-            "ambiguous model output: multiple fenced TOML blocks found; "
-            "expected a single clean TOML payload"
-        )
-    if len(fenced_matches) == 1:
-        match = fenced_matches[0]
-        before = stripped[:match.start()].strip()
-        after = stripped[match.end():].strip()
-        if before or after:
-            raise base.PlanError(
-                "ambiguous model output: extra content found around "
-                "the fenced TOML payload; expected only the TOML block"
-            )
-        return match.group(1).strip()
-
-    if "[" in stripped:
-        return stripped
-
-    client = COMPILE_CLIENTS.get(adapter, {}).get("executable", adapter)
-    raise base.PlanError(
-        f"could not extract TOML from {client} output; "
-        "output does not contain a fenced toml block or bare TOML"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Logs command helpers
-# ---------------------------------------------------------------------------
-
-# Recognized log naming patterns in .opsx-plan/logs/.
-_LOG_RE = re.compile(
-    r"^(?P<change>[^.]+)\."
-    r"(?:"
-    r"(?P<stage_direct>[^.]+)\.r(?P<round>\d+)\.(?P<seq>\d+)\.log"
-    r"|"
-    r"(?P<legacy_stage>\D+)(?P<legacy_seq>\d+)\.log"
-    r")$"
-)
-
-
-def _parse_log_name(filename: str) -> dict | None:
-    """Parse a log filename into {change, stage, round, seq, path}.
-
-    Handles two naming patterns:
-    - Direct: ``<cid>.<stage>.r<round>.<seq>.log``
-    - Legacy: ``<cid>.<stage><seq>.log`` (round is unknown, set to 0)
-    """
-    m = _LOG_RE.match(filename)
-    if not m:
-        return None
-    change = m.group("change")
-    if m.group("round") is not None:
-        # Direct pattern
-        stage = m.group("stage_direct")
-        round_num = int(m.group("round"))
-        seq = int(m.group("seq"))
-    else:
-        # Legacy pattern
-        stage = m.group("legacy_stage")
-        round_num = 0
-        seq = int(m.group("legacy_seq"))
-    return {"change": change, "stage": stage, "round": round_num,
-            "seq": seq, "filename": filename}
-
-
-def _collect_logs(repo: Path) -> list[dict]:
-    """Scan ``.opsx-plan/logs/`` and return parsed log entries sorted by
-    modification time descending (newest first)."""
-    log_dir = repo / ".opsx-plan" / "logs"
-    if not log_dir.is_dir():
-        return []
-    entries: list[dict] = []
-    for path in sorted(log_dir.iterdir()):
-        if not path.is_file():
-            continue
-        parsed = _parse_log_name(path.name)
-        if parsed is None:
-            continue
-        parsed["path"] = str(path)
-        parsed["mtime"] = path.stat().st_mtime
-        entries.append(parsed)
-    # Newest first by mtime, then by round desc, then by seq desc
-    entries.sort(key=lambda e: (e["mtime"], e["round"], e["seq"]), reverse=True)
-    return entries
-
-
-def _select_log_from_state(
-    repo: Path,
-    plan_name: str,
-    change_filter: str | None,
-    stage_filter: str | None,
-    plan_change_ids: set[str] | None = None,
-) -> dict | None:
-    """Try to select the default log from recorded plan state metadata.
-
-    When *plan_change_ids* is provided and no explicit *change_filter* is
-    given, only changes belonging to one of those change ids are considered.
-    This scopes state-backed selection to the resolved plan.
-
-    Returns a dict with keys ``path`` (str), ``change``, ``stage``,
-    ``round``, ``seq``, or ``None`` when state does not identify a usable log.
-    """
-    state = load_state(repo, plan_name)
-    candidates: list[dict] = []
-    for cid, record in state.get("changes", {}).items():
-        if not isinstance(record, dict):
-            continue
-        # Scope to plan change ids when no explicit change_filter is given.
-        if change_filter is None and plan_change_ids is not None:
-            if cid not in plan_change_ids:
-                continue
-        ls = record.get("last_stage", {})
-        if not isinstance(ls, dict):
-            continue
-        log_path = ls.get("log_path", "")
-        if not log_path:
-            continue
-        p = Path(log_path)
-        # When the path is relative, resolve against repo.
-        if not p.is_absolute():
-            p = repo / p
-        if not p.is_file():
-            continue
-        parsed = _parse_log_name(p.name)
-        if parsed is None:
-            continue
-        parsed["path"] = str(p)
-        parsed["mtime"] = p.stat().st_mtime
-        if change_filter is not None and parsed["change"] != change_filter:
-            continue
-        if stage_filter is not None and parsed["stage"] != stage_filter:
-            continue
-        candidates.append(parsed)
-    if not candidates:
-        return None
-    # Newest first: prefer highest mtime, then highest round, then highest seq
-    candidates.sort(key=lambda e: (e["mtime"], e["round"], e["seq"]), reverse=True)
-    return candidates[0]
-
-
-def _select_log_from_directory(
-    repo: Path,
-    change_filter: str | None,
-    stage_filter: str | None,
-    plan_change_ids: set[str] | None = None,
-) -> dict | None:
-    """Select the latest matching log from ``.opsx-plan/logs/`` via
-    deterministic ordering.
-
-    When *plan_change_ids* is provided and no explicit *change_filter* is
-    given, only logs belonging to one of those change ids are considered.
-    This scopes the fallback to the resolved plan.
-
-    Returns a parsed log dict or ``None`` when no log matches.
-    """
-    entries = _collect_logs(repo)
-    for entry in entries:
-        if change_filter is not None:
-            if entry["change"] != change_filter:
-                continue
-        elif plan_change_ids is not None and entry["change"] not in plan_change_ids:
-            continue
-        if stage_filter is not None and entry["stage"] != stage_filter:
-            continue
-        return entry
-    return None
-
-
-def _select_log(
-    repo: Path,
-    plan_name: str,
-    change_filter: str | None,
-    stage_filter: str | None,
-    plan_change_ids: set[str] | None = None,
-) -> dict | None:
-    """Select the target log: state metadata first, then directory fallback.
-
-    Returns a parsed log dict with at least ``path``, ``change``, ``stage``,
-    or ``None`` when no matching log is found.
-    """
-    # When no filters are given, prefer recorded state.
-    result = _select_log_from_state(repo, plan_name, change_filter, stage_filter,
-                                    plan_change_ids=plan_change_ids)
-    if result is not None:
-        return result
-    return _select_log_from_directory(repo, change_filter, stage_filter,
-                                      plan_change_ids=plan_change_ids)
-
-
-def _collect_filtered_logs(
-    repo: Path,
-    change_filter: str | None,
-    stage_filter: str | None,
-    plan_change_ids: set[str] | None = None,
-) -> list[dict]:
-    """Return all matching log entries sorted newest-first.
-
-    When *plan_change_ids* is provided and no explicit *change_filter* is
-    given, only logs belonging to one of those change ids are considered.
-    This scopes ``--list`` output to the resolved plan.
-    """
-    entries = _collect_logs(repo)
-    return [
-        e for e in entries
-        if (
-            change_filter is not None
-            and e["change"] == change_filter
-            or (
-                change_filter is None
-                and (plan_change_ids is None or e["change"] in plan_change_ids)
-            )
-        )
-        and (stage_filter is None or e["stage"] == stage_filter)
-    ]
-
-# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
-
 def cmd_use(args: argparse.Namespace) -> int:
     """opsx-plan use <plan.toml> — activate a plan for subsequent commands."""
     repo = Path(args.repo).resolve()
@@ -4857,11 +2154,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             base.log(f"active plan set to: {rel}")
         except ValueError:
             pass  # plan outside repo — skip auto-activation
-    state = load_state(repo, cfg["name"])
+    state = state_mod.load_state(repo, cfg["name"])
     signal.signal(signal.SIGINT, handle_sigint)
 
     reconcile(repo, cfg, state)
-    save_state(repo, cfg["name"], state)
+    state_mod.save_state(repo, cfg["name"], state)
     sync_direct_worker_state(repo, cfg, state)
 
     # --- emit one-time notifications for awaiting states ---
@@ -4877,7 +2174,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         elif status == "awaiting_acceptance" and "awaiting_acceptance" not in change_notified:
             _try_notify(cfg, "awaiting_acceptance", f"change {cid} awaiting acceptance", change_id=cid)
             change_notified.append("awaiting_acceptance")
-    save_state(repo, cfg["name"], state)
+    state_mod.save_state(repo, cfg["name"], state)
 
     # Run preflight checks as warnings only — never change run outcome.
     run_preflight_warnings(repo, plan_src, cfg["adapter"], cfg)
@@ -4885,21 +2182,21 @@ def cmd_run(args: argparse.Namespace) -> int:
     # --- git delivery: ensure delivery branch before any stage dispatch ---
     if not args.dry_run:
         no_branch = getattr(args, "no_branch", False)
-        proceed, delivery_err = ensure_delivery_branch(repo, cfg, state, no_branch=no_branch)
+        proceed, delivery_err = delivery.ensure_delivery_branch(repo, cfg, state, no_branch=no_branch)
         if not proceed:
             print(f"error: {delivery_err}", file=sys.stderr)
             return 2
-        save_state(repo, cfg["name"], state)
+        state_mod.save_state(repo, cfg["name"], state)
 
         # --- PR delivery preflight ---
         no_pr = getattr(args, "no_pr", False)
         if not no_pr:
-            ok, preflight_err, remote_name = check_pr_delivery_prerequisites(repo, cfg)
+            ok, preflight_err, remote_name = delivery.check_pr_delivery_prerequisites(repo, cfg)
             if not ok:
                 print(f"error: {preflight_err}", file=sys.stderr)
                 return 2
             if remote_name:
-                state.setdefault("git_delivery", _default_git_delivery_state())
+                state.setdefault("git_delivery", state_mod._default_git_delivery_state())
                 state["git_delivery"]["remote_name"] = remote_name
 
     if args.dry_run:
@@ -4942,15 +2239,15 @@ def cmd_run(args: argparse.Namespace) -> int:
                 elif status == "awaiting_acceptance" and "awaiting_acceptance" not in change_notified:
                     _try_notify(cfg, "awaiting_acceptance", f"change {cid} awaiting acceptance", change_id=cid)
                     change_notified.append("awaiting_acceptance")
-            save_state(repo, cfg["name"], state)
+            state_mod.save_state(repo, cfg["name"], state)
             break
 
         cid = ready[0]
         change_cfg = cfg["changes"][cid]
-        r = rec(state, cid)
-        needs_create = not change_authored(repo, cid)
+        r = state_mod.rec(state, cid)
+        needs_create = not groundtruth.change_authored(repo, cid)
 
-        if cfg["require_clean_tracked"] and not tracked_tree_clean(repo):
+        if cfg["require_clean_tracked"] and not groundtruth.tracked_tree_clean(repo):
             base.log("tracked worktree is dirty; refusing to start a new stage")
             base.log("commit/stash tracked modifications, then re-run")
             return 2
@@ -4958,43 +2255,43 @@ def cmd_run(args: argparse.Namespace) -> int:
         # ----- create stage: automate the repetitive /opsx-ff invocation -----
         if needs_create:
             if not change_cfg["create_invoke"]:
-                set_status(
+                state_mod.set_status(
                     state, cid, base.FAILED,
                     "change not created and no create_invoke configured",
                 )
-                save_state(repo, cfg["name"], state)
+                state_mod.save_state(repo, cfg["name"], state)
                 continue
             # A previous attempt may have left a bare scaffold (just
             # .openspec.yaml). `openspec new change` refuses a populated dir, so
             # clear a pure untracked scaffold to let the author command start
             # clean; refuse if the dir holds authored or tracked content.
-            if change_dir(repo, cid).is_dir():
+            if groundtruth.change_dir(repo, cid).is_dir():
                 if scaffold_is_clearable(repo, cid):
-                    shutil.rmtree(change_dir(repo, cid))
+                    shutil.rmtree(groundtruth.change_dir(repo, cid))
                     base.log(f"  removed incomplete scaffold openspec/changes/{cid}/ "
                         f"before re-create")
                 else:
-                    set_status(
+                    state_mod.set_status(
                         state, cid, base.FAILED,
                         f"openspec/changes/{cid} exists but is incomplete "
-                        f"(missing {', '.join(AUTHORED_ARTIFACTS)}) and holds "
+                        f"(missing {', '.join(groundtruth.AUTHORED_ARTIFACTS)}) and holds "
                         f"authored or tracked content; finish or remove it, "
                         f"then reset",
                     )
-                    save_state(repo, cfg["name"], state)
+                    state_mod.save_state(repo, cfg["name"], state)
                     continue
             c_attempt = r["create_attempts"] + 1
             if c_attempt > change_cfg["create_max_attempts"]:
-                set_status(state, cid, base.FAILED, "create retry budget exhausted")
-                save_state(repo, cfg["name"], state)
+                state_mod.set_status(state, cid, base.FAILED, "create retry budget exhausted")
+                state_mod.save_state(repo, cfg["name"], state)
                 continue
 
             base.log(f"=== {cid} create "
                 f"(attempt {c_attempt}/{change_cfg['create_max_attempts']}) ===")
             r["create_attempts"] = c_attempt
-            set_status(state, cid, base.RUNNING, "creating change")
-            save_state(repo, cfg["name"], state)
-            before_tracked = tracked_worktree_snapshot(repo)
+            state_mod.set_status(state, cid, base.RUNNING, "creating change")
+            state_mod.save_state(repo, cfg["name"], state)
+            before_tracked = groundtruth.tracked_worktree_snapshot(repo)
 
             outcome, log_path = run_stage(
                 repo, cfg, cid, "create", change_cfg["create_invoke"],
@@ -5003,15 +2300,15 @@ def cmd_run(args: argparse.Namespace) -> int:
             r["last_log"] = str(log_path)
 
             if outcome == "spawn_error":
-                set_status(state, cid, base.FAILED,
+                state_mod.set_status(state, cid, base.FAILED,
                            f"could not spawn create: {change_cfg['create_invoke']}")
-                save_state(repo, cfg["name"], state)
+                state_mod.save_state(repo, cfg["name"], state)
                 return 2
 
-            ok, why = verify_change_created(repo, cfg, cid, before_tracked)
+            ok, why = groundtruth.verify_change_created(repo, cfg, cid, before_tracked)
             if ok:
                 r["created_by_orchestrator"] = True
-                set_status(state, cid, base.PENDING, "created and verified")
+                state_mod.set_status(state, cid, base.PENDING, "created and verified")
                 base.log(f"  created: {cid}")
                 if cfg["review_created"]:
                     base.log(f"  awaiting acceptance — review openspec/changes/{cid}/ "
@@ -5024,12 +2321,12 @@ def cmd_run(args: argparse.Namespace) -> int:
                 if outcome == "timeout":
                     why = f"create timed out; {why}"
                 if c_attempt < change_cfg["create_max_attempts"]:
-                    set_status(state, cid, base.PENDING, f"create will retry: {why}")
+                    state_mod.set_status(state, cid, base.PENDING, f"create will retry: {why}")
                     base.log(f"  create not verified ({why}); retrying")
                 else:
-                    set_status(state, cid, base.FAILED, f"create failed: {why}")
+                    state_mod.set_status(state, cid, base.FAILED, f"create failed: {why}")
                     base.log(f"  CREATE FAILED: {why}")
-            save_state(repo, cfg["name"], state)
+            state_mod.save_state(repo, cfg["name"], state)
             # re-classify: acceptance gate may now hold this change
             continue
 
@@ -5051,49 +2348,49 @@ def cmd_run(args: argparse.Namespace) -> int:
         # ----- drive stage -----
         attempt = r["attempts"] + 1
         if attempt > change_cfg["max_attempts"]:
-            set_status(state, cid, base.FAILED, "retry budget exhausted")
-            save_state(repo, cfg["name"], state)
+            state_mod.set_status(state, cid, base.FAILED, "retry budget exhausted")
+            state_mod.save_state(repo, cfg["name"], state)
             continue
 
         base.log(f"=== {cid} (attempt {attempt}/{change_cfg['max_attempts']}) ===")
         r["attempts"] = attempt
-        set_status(state, cid, base.RUNNING)
-        save_state(repo, cfg["name"], state)
+        state_mod.set_status(state, cid, base.RUNNING)
+        state_mod.save_state(repo, cfg["name"], state)
 
         outcome, log_path = drive_change(repo, cfg, cid, attempt)
-        rec(state, cid)["last_log"] = str(log_path)
+        state_mod.rec(state, cid)["last_log"] = str(log_path)
 
         if outcome == "spawn_error":
-            set_status(state, cid, base.FAILED, f"could not spawn: {cfg['invoke']}")
-            save_state(repo, cfg["name"], state)
+            state_mod.set_status(state, cid, base.FAILED, f"could not spawn: {cfg['invoke']}")
+            state_mod.save_state(repo, cfg["name"], state)
             return 2
 
-        ok, why = verify_change_done(repo, cfg, cid)
+        ok, why = groundtruth.verify_change_done(repo, cfg, cid)
         if ok:
-            checks_ok, check_why = run_fast_checks(repo, cfg)
+            checks_ok, check_why = groundtruth.run_fast_checks(repo, cfg)
             if checks_ok:
-                set_status(state, cid, base.DONE, "verified + checks passed")
+                state_mod.set_status(state, cid, base.DONE, "verified + checks passed")
                 base.log(f"  done: {cid}")
                 ran += 1
             else:
                 # The change is archived but the repo fails checks. Re-driving
                 # cannot fix this; an operator must intervene.
-                set_status(state, cid, base.FAILED, f"post-archive {check_why}")
+                state_mod.set_status(state, cid, base.FAILED, f"post-archive {check_why}")
                 base.log(f"  FAILED post-archive checks: {check_why}")
         else:
-            cs = read_controller_state(repo, cfg, cid)
+            cs = groundtruth.read_controller_state(repo, cfg, cid)
             can_retry, retry_why = retry_makes_sense(cs)
             if outcome == "timeout":
                 why = f"drive timed out; {why}"
             detail = f"{why} :: {retry_why}"
             if can_retry and attempt < change_cfg["max_attempts"]:
-                set_status(state, cid, base.PENDING, f"will retry: {detail}")
+                state_mod.set_status(state, cid, base.PENDING, f"will retry: {detail}")
                 base.log(f"  not done yet ({detail}); retrying")
             else:
-                set_status(state, cid, base.FAILED, detail)
+                state_mod.set_status(state, cid, base.FAILED, detail)
                 base.log(f"  FAILED: {detail}")
 
-        save_state(repo, cfg["name"], state)
+        state_mod.save_state(repo, cfg["name"], state)
 
     # --- PR delivery: push branch + create PR after all changes done ---
     if not args.dry_run:
@@ -5108,12 +2405,12 @@ def cmd_run(args: argparse.Namespace) -> int:
             if "plan_complete" not in plan_notified:
                 _try_notify(cfg, "plan_complete", f"plan {cfg['name']} complete")
                 plan_notified.append("plan_complete")
-            ok, delivery_err = attempt_pr_delivery(repo, cfg, state, no_pr=no_pr)
+            ok, delivery_err = delivery.attempt_pr_delivery(repo, cfg, state, no_pr=no_pr)
             if not ok:
                 print(f"error: {delivery_err}", file=sys.stderr)
                 # Save state (which may include partial delivery outcome)
                 # before returning an error status.
-                save_state(repo, cfg["name"], state)
+                state_mod.save_state(repo, cfg["name"], state)
                 print()
                 return cmd_status_inner(cfg, state, header="run finished (PR delivery failed)")
             gd_state = state.get("git_delivery", {})
@@ -5125,7 +2422,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                         f"pull request opened for plan {cfg['name']}: {gd_state.get('pull_request_url', '')}",
                     )
                     plan_notified.append("pull_request_opened")
-            save_state(repo, cfg["name"], state)
+            state_mod.save_state(repo, cfg["name"], state)
 
     print()
     return cmd_status_inner(cfg, state, header="run finished")
@@ -5135,9 +2432,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
     plan_src = planref.resolve_plan(repo, args.plan)
     cfg = planref.load_plan(planref._resolve_plan_path(repo, plan_src), repo=repo)
-    state = load_state(repo, cfg["name"])
+    state = state_mod.load_state(repo, cfg["name"])
     reconcile(repo, cfg, state)
-    save_state(repo, cfg["name"], state)
+    state_mod.save_state(repo, cfg["name"], state)
     sync_direct_worker_state(repo, cfg, state)
     header = f"plan: {cfg['name']}"
     active = planref.read_active_plan(repo)
@@ -5183,7 +2480,7 @@ def cmd_status_inner(cfg: dict, state: dict, header: str,
     failed = 0
     for cid in display_order(cfg):
         status = classify(cfg, state, cid)
-        r = rec(state, cid)
+        r = state_mod.rec(state, cid)
         extra = f"  ({r['reason']})" if r.get("reason") and status != base.DONE else ""
         phase = cfg["changes"][cid].get("phase")
         phase_s = f"P{phase} " if phase is not None else ""
@@ -5241,7 +2538,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
 
     plan_path = planref.resolve_plan(repo, args.plan)
     cfg = planref.load_plan(planref._resolve_plan_path(repo, plan_path), repo=repo)
-    state = load_state(repo, cfg["name"])
+    state = state_mod.load_state(repo, cfg["name"])
 
     if args.approve_all:
         affected = [
@@ -5256,7 +2553,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
                 state["approvals"].append(cid)
                 base.log(f"approved: {cid}")
         print(f"Approved: {', '.join(affected)}")
-        save_state(repo, cfg["name"], state)
+        state_mod.save_state(repo, cfg["name"], state)
         return 0
 
     if not args.change:
@@ -5269,7 +2566,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
         if cid not in state["approvals"]:
             state["approvals"].append(cid)
             base.log(f"approved: {cid}")
-    save_state(repo, cfg["name"], state)
+    state_mod.save_state(repo, cfg["name"], state)
     return 0
 
 
@@ -5286,7 +2583,7 @@ def cmd_accept(args: argparse.Namespace) -> int:
 
     plan_path = planref.resolve_plan(repo, args.plan)
     cfg = planref.load_plan(planref._resolve_plan_path(repo, plan_path), repo=repo)
-    state = load_state(repo, cfg["name"])
+    state = state_mod.load_state(repo, cfg["name"])
 
     if args.accept_all:
         affected = [
@@ -5299,17 +2596,17 @@ def cmd_accept(args: argparse.Namespace) -> int:
         had_failure = False
         accepted: list[str] = []
         for cid in affected:
-            ok, why = verify_change_created(repo, cfg, cid)
+            ok, why = groundtruth.verify_change_created(repo, cfg, cid)
             if not ok:
                 print(f"refusing to accept {cid}: {why}", file=sys.stderr)
                 had_failure = True
                 continue
-            rec(state, cid)["accepted"] = True
+            state_mod.rec(state, cid)["accepted"] = True
             base.log(f"accepted: {cid}")
             accepted.append(cid)
         if accepted:
             print(f"Accepted: {', '.join(accepted)}")
-            save_state(repo, cfg["name"], state)
+            state_mod.save_state(repo, cfg["name"], state)
         return 2 if had_failure else 0
 
     if not args.change:
@@ -5321,16 +2618,16 @@ def cmd_accept(args: argparse.Namespace) -> int:
     had_failure = False
     changed = False
     for cid in changes:
-        ok, why = verify_change_created(repo, cfg, cid)
+        ok, why = groundtruth.verify_change_created(repo, cfg, cid)
         if not ok:
             print(f"refusing to accept {cid}: {why}", file=sys.stderr)
             had_failure = True
             continue
-        rec(state, cid)["accepted"] = True
+        state_mod.rec(state, cid)["accepted"] = True
         base.log(f"accepted: {cid}")
         changed = True
     if changed:
-        save_state(repo, cfg["name"], state)
+        state_mod.save_state(repo, cfg["name"], state)
     return 2 if had_failure else 0
 
 
@@ -5346,7 +2643,7 @@ def cmd_reset(args: argparse.Namespace) -> int:
 
     plan_path = planref.resolve_plan(repo, args.plan)
     cfg = planref.load_plan(planref._resolve_plan_path(repo, plan_path), repo=repo)
-    state = load_state(repo, cfg["name"])
+    state = state_mod.load_state(repo, cfg["name"])
 
     if args.failed:
         affected = [
@@ -5357,13 +2654,13 @@ def cmd_reset(args: argparse.Namespace) -> int:
             print("No failed changes to reset.")
             return 0
         for cid in affected:
-            state["changes"][cid] = new_change_record()
+            state["changes"][cid] = state_mod.new_change_record()
             state["changes"][cid]["max_rounds"] = cfg["max_rounds"]
             state["changes"][cid]["reason"] = "reset by operator"
             state["changes"][cid]["updated_at"] = base.utcnow()
             base.log(f"reset: {cid}")
         print(f"Reset: {', '.join(affected)}")
-        save_state(repo, cfg["name"], state)
+        state_mod.save_state(repo, cfg["name"], state)
         return 0
 
     if not args.change:
@@ -5373,12 +2670,12 @@ def cmd_reset(args: argparse.Namespace) -> int:
     if changes is None:
         return 2
     for cid in changes:
-        state["changes"][cid] = new_change_record()
+        state["changes"][cid] = state_mod.new_change_record()
         state["changes"][cid]["max_rounds"] = cfg["max_rounds"]
         state["changes"][cid]["reason"] = "reset by operator"
         state["changes"][cid]["updated_at"] = base.utcnow()
         base.log(f"reset: {cid}")
-    save_state(repo, cfg["name"], state)
+    state_mod.save_state(repo, cfg["name"], state)
     return 0
 
 
@@ -5391,23 +2688,23 @@ def cmd_run_one(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
     change_id = args.change
 
-    cdir = change_dir(repo, change_id)
+    cdir = groundtruth.change_dir(repo, change_id)
     if not cdir.is_dir():
         print(f"error: openspec/changes/{change_id} does not exist", file=sys.stderr)
         return 2
-    if not change_authored(repo, change_id):
+    if not groundtruth.change_authored(repo, change_id):
         print(
             f"error: openspec/changes/{change_id} is missing required artifacts "
-            f"({', '.join(AUTHORED_ARTIFACTS)})",
+            f"({', '.join(groundtruth.AUTHORED_ARTIFACTS)})",
             file=sys.stderr,
         )
         return 2
 
     cfg = build_single_change_config(repo, change_id)
-    state = load_state(repo, cfg["name"])
+    state = state_mod.load_state(repo, cfg["name"])
     signal.signal(signal.SIGINT, handle_sigint)
 
-    if cfg["require_clean_tracked"] and not tracked_tree_clean(repo):
+    if cfg["require_clean_tracked"] and not groundtruth.tracked_tree_clean(repo):
         print(
             "error: tracked worktree is dirty; commit/stash then re-run",
             file=sys.stderr,
@@ -5425,10 +2722,10 @@ def cmd_run_one(args: argparse.Namespace) -> int:
     write_single_change_manifest(repo, change_id, cfg)
 
     reconcile(repo, cfg, state)
-    save_state(repo, cfg["name"], state)
+    state_mod.save_state(repo, cfg["name"], state)
     sync_direct_worker_state(repo, cfg, state)
 
-    r = rec(state, change_id)
+    r = state_mod.rec(state, change_id)
     if r["status"] == base.DONE:
         base.log(f"{change_id} is already done")
         return 0
@@ -5474,10 +2771,10 @@ def cmd_compile(args: argparse.Namespace) -> int:
     adapter = getattr(args, "adapter", "opencode") or "opencode"
 
     # Reject unsupported adapters before model resolution.
-    entry = COMPILE_CLIENTS.get(adapter)
+    entry = compiler.COMPILE_CLIENTS.get(adapter)
     if entry is None:
         print(f"error: unknown adapter '{adapter}'; "
-              f"known adapters: {', '.join(sorted(COMPILE_CLIENTS))}",
+              f"known adapters: {', '.join(sorted(compiler.COMPILE_CLIENTS))}",
               file=sys.stderr)
         return 2
     if not entry.get("supported", False):
@@ -5487,7 +2784,7 @@ def cmd_compile(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
 
-    source_path = resolve_compile_source(repo, args.source)
+    source_path = compiler.resolve_compile_source(repo, args.source)
 
     # Default output: openspec/plans/<source-stem>.toml
     if args.output is None:
@@ -5499,23 +2796,23 @@ def cmd_compile(args: argparse.Namespace) -> int:
             )
         output_path.parent.mkdir(parents=True, exist_ok=True)
     else:
-        output_path = resolve_compile_output(repo, args.output, args.force)
-    model = check_controller_model(repo, adapter=adapter)
+        output_path = compiler.resolve_compile_output(repo, args.output, args.force)
+    model = compiler.check_controller_model(repo, adapter=adapter)
 
     client_name = entry["executable"]
     base.log(f"compile: {source_path} -> {output_path}  "
         f"(adapter: {adapter}, client: {client_name}, model: {model})")
 
     source_content = source_path.read_text(encoding="utf-8")
-    prompt = build_compile_prompt(source_content, source_path, repo, adapter=adapter)
+    prompt = compiler.build_compile_prompt(source_content, source_path, repo, adapter=adapter)
     base.log(f"  prompt size: {len(prompt)} chars")
 
     base.log(f"  invoking {client_name} ...")
-    stdout, stderr = run_compile_client(repo, adapter, model, prompt)
+    stdout, stderr = compiler.run_compile_client(repo, adapter, model, prompt)
     if stderr.strip():
         base.log(f"  {client_name} stderr: {stderr.strip()[:500]}")
 
-    toml_text = extract_toml(stdout, adapter=adapter)
+    toml_text = compiler.extract_toml(stdout, adapter=adapter)
     if not toml_text:
         raise base.PlanError("extracted TOML payload is empty")
 
@@ -5883,7 +3180,7 @@ def cmd_logs(args: argparse.Namespace) -> int:
     plan_change_ids: set[str] = set(cfg["changes"].keys())
 
     if args.list:
-        entries = _collect_filtered_logs(repo, change_filter, stage_filter,
+        entries = logs._collect_filtered_logs(repo, change_filter, stage_filter,
                                          plan_change_ids=plan_change_ids)
         if not entries:
             filters_desc = _describe_filters(change_filter, stage_filter, plan_name)
@@ -5896,7 +3193,7 @@ def cmd_logs(args: argparse.Namespace) -> int:
             print(f"  {entry['path']}")
         return 0
 
-    selected = _select_log(repo, plan_name, change_filter, stage_filter,
+    selected = logs._select_log(repo, plan_name, change_filter, stage_filter,
                            plan_change_ids=plan_change_ids)
     if selected is None:
         filters_desc = _describe_filters(change_filter, stage_filter, plan_name)
@@ -6095,7 +3392,7 @@ def main() -> int:
     )
     p_compile.add_argument(
         "--adapter", default="opencode",
-        choices=list(COMPILE_CLIENTS),
+        choices=list(compiler.COMPILE_CLIENTS),
         help="adapter to compile against (default: opencode)",
     )
     p_compile.set_defaults(fn=cmd_compile)
@@ -6191,7 +3488,7 @@ def main() -> int:
     p_doctor.add_argument("plan", nargs="?", default=None, help="path to plan TOML")
     p_doctor.add_argument(
         "--adapter", default=None,
-        choices=list(COMPILE_CLIENTS) if COMPILE_CLIENTS else None,
+        choices=list(compiler.COMPILE_CLIENTS) if compiler.COMPILE_CLIENTS else None,
         help="adapter to preflight (default: plan's adapter, or opencode when no plan)",
     )
     p_doctor.set_defaults(fn=cmd_doctor)

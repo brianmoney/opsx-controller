@@ -53,6 +53,53 @@ defaults, exit codes, or output.
 - **THEN** the listed subcommands and their flags are the same as before the
   extraction
 
+### Requirement: Cross-module references resolve through the module object
+
+An orchestrator module SHALL reach a definition owned by another orchestrator
+module through the owning module object — importing the module and calling the
+definition as an attribute of it (`base.log(...)`, `state.load_state(...)`) —
+and SHALL NOT import that definition by name into its own namespace (`from
+lib.orchestrator.base import log`). The same rule SHALL apply to the
+`orchestrator/opsx-plan.py` entrypoint when it references a definition that has
+moved into a module.
+
+This makes the module object the single canonical location for every
+definition, so rebinding the attribute is observed by every caller. Name
+imports would give each importing module a private binding, and patching any
+one of them would leave the others resolving the original function — a failure
+that produces a passing test rather than an error.
+
+Module-level constants that are read but never rebound MAY be referenced
+through the module object under the same spelling; they SHALL NOT be copied
+into the importing module.
+
+#### Scenario: A patched definition is observed across module boundaries
+
+- **WHEN** a test rebinds a definition on the module that owns it, and code in
+  a different orchestrator module calls that definition
+- **THEN** the call reaches the replacement, not the original
+
+#### Scenario: A module does not shadow another module's definitions
+
+- **WHEN** the orchestrator package is inspected for imports of the form
+  `from lib.orchestrator.<module> import <name>`
+- **THEN** none are present between orchestrator modules, and each cross-module
+  call site is qualified by the owning module's name
+
+### Requirement: Extracted modules are named for the concern they own
+
+Each module in `lib/orchestrator/` SHALL be named for the single concern it
+owns, and its name SHALL NOT shadow a Python builtin or standard-library
+module name, so that a reader of an importing module can tell what the
+qualified call site refers to without opening the target.
+
+#### Scenario: A concern-named module is added
+
+- **WHEN** a section covering the compile pipeline is extracted from the
+  entrypoint
+- **THEN** it is placed in a module whose name identifies that concern and does
+  not collide with a builtin or standard-library name
+
 ### Requirement: Extraction preserves observable behavior
 
 Moving code into a module SHALL be behavior-preserving. The extracted
@@ -60,7 +107,9 @@ definitions SHALL keep their names and signatures, and no requirement in
 `plan-run-observability` SHALL change as a result of the move.
 
 A module extraction SHALL NOT introduce an import cycle: modules SHALL depend
-only on modules extracted before them or on shared runtime packages.
+only on modules extracted before them or on shared runtime packages. The absence
+of cycles SHALL be verified mechanically against the package rather than
+asserted from the intended design.
 
 #### Scenario: The existing suite passes unchanged in count
 
@@ -68,17 +117,25 @@ only on modules extracted before them or on shared runtime packages.
 - **THEN** it passes with no fewer tests than before the extraction, and no
   test is skipped or deleted to accommodate the new layout
 
-#### Scenario: Report and dashboard output is identical
+#### Scenario: Command output is identical after its implementation moves
 
-- **WHEN** `opsx-plan report --json` and `opsx-plan dashboard` run against a
-  fixed telemetry directory and plan state before and after the extraction
-- **THEN** the JSON payload and the generated HTML are identical
+- **WHEN** a command whose implementation has been extracted into a module runs
+  against a fixed repository, plan state, and telemetry directory, before and
+  after the extraction
+- **THEN** its standard output, its standard error, and its exit code are
+  identical
 
 #### Scenario: A cyclic import is rejected
 
 - **WHEN** an extracted module imports a module that transitively imports it
 - **THEN** the layout is invalid and the extraction is reworked so the
   dependency runs in one direction only
+
+#### Scenario: The dependency direction is checked mechanically
+
+- **WHEN** the orchestrator package is analyzed for inter-module imports
+- **THEN** the resulting graph is acyclic, and the check is repeatable without
+  reading the design document
 
 ### Requirement: Test modules mirror the source modules they cover
 

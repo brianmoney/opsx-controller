@@ -1,0 +1,15 @@
+usage: opsx-plan compile [-h] [-o OUTPUT] [--force]
+                         [--adapter {opencode,claude-code,codex-cli}]
+                         source
+
+positional arguments:
+  source                path to source markdown plan (.md)
+
+options:
+  -h, --help            show this help message and exit
+  -o OUTPUT, --output OUTPUT
+                        output TOML path (default: openspec/plans/<source-
+                        stem>.toml)
+  --force               overwrite existing output
+  --adapter {opencode,claude-code,codex-cli}
+                        adapter to compile against (default: opencode)
