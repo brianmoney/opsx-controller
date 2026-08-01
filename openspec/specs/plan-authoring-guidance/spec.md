@@ -26,17 +26,27 @@ four supported dependency forms.
 
 ### Requirement: The reference distinguishes command namespaces and current OpenSpec facts
 
-The reference SHALL distinguish upstream OpenSpec per-change commands from
-opsx-controller plan-level commands, state that authoring command spellings
-must match the client registration in the repository, and document current
-OpenSpec facts including `skip_specs: true` for docs-only or refactor changes
-and nested capability folders under `openspec/specs/`.
+The reference and every adapter-facing plan-authoring surface SHALL distinguish
+upstream OpenSpec per-change commands from opsx-controller plan-level commands.
+The surfaces SHALL direct authors to the installed `plan-authoring.md`
+reference, state that authoring command spellings must match the client
+registration in the repository, and document current OpenSpec facts including
+`skip_specs: true` for docs-only or refactor changes and nested capability
+folders under `openspec/specs/`.
 
-#### Scenario: A model selects a command
+#### Scenario: A model selects a command from project guidance
 
-- **WHEN** a model needs to propose, apply, archive, compile, or run work
-- **THEN** the reference directs it to the correct upstream or
-  opsx-controller namespace and to verify the actual client registration
+- **WHEN** a model reads an installed project's guidance before proposing,
+  applying, archiving, compiling, or running work
+- **THEN** it is pointed to the shared plan-authoring reference and can
+  distinguish upstream per-change commands from opsx-controller plan-level
+  commands
+
+#### Scenario: Adapter guidance uses registered command spelling
+
+- **WHEN** a model follows an adapter's plan-authoring surface
+- **THEN** the surface tells it to verify the actual client registration rather
+  than assuming one client's slash-command namespace
 
 #### Scenario: A docs-only change has no behavior delta
 
@@ -69,8 +79,10 @@ the TOML half.
 
 The OpenCode, Claude Code, and Codex CLI adapters SHALL deploy the same
 reference into their global and project-level controller support directories.
-The installer output and verification mode SHALL identify the deployed
-reference path and its installation status.
+Their project guidance snippets and plan-authoring surfaces SHALL point to the
+project-level reference first and the global reference second. The installer
+output and verification mode SHALL identify the deployed reference path and its
+installation status.
 
 #### Scenario: Global adapter installation deploys the reference
 
@@ -84,3 +96,9 @@ reference path and its installation status.
 - **THEN** the reference is present in that project's adapter support
   directory and the installer verifies it
 
+#### Scenario: A missing reference is reported honestly
+
+- **WHEN** neither the project-level nor global reference exists
+- **THEN** the plan-authoring surface reports that the shared guidance is
+  unavailable instead of reproducing a second convention or claiming it was
+  read

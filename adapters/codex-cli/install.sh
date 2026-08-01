@@ -34,12 +34,18 @@ for arg in "$@"; do
   esac
 done
 
-install_skill() {
-  local src_dir="$1"
-  local dest_base="$2"
-  # The opsx-drive skill has been removed; this function is retained as a
-  # no-op so global/project install paths do not fail. Supported skills are
-  # installed by install_plugin when --plugin is used.
+install_skills() {
+  local dest_root="$1"
+  mkdir -p "$dest_root"
+  # Remove stale opsx-drive skill directory from previous installations
+  rm -rf "$dest_root/opsx-drive"
+  local skill_dir skill_name
+  for skill_dir in "$SCRIPT_DIR/skills"/*; do
+    [[ -d "$skill_dir" ]] || continue
+    skill_name="$(basename "$skill_dir")"
+    mkdir -p "$dest_root/$skill_name"
+    cp -R "$skill_dir"/. "$dest_root/$skill_name/"
+  done
 }
 
 install_agents() {
@@ -117,15 +123,14 @@ install_global() {
 
   local skills_root="$HOME/.agents"
   local agents_root="$HOME/.codex"
-  # Remove stale opsx-drive skill directory before installing
-  rm -rf "$skills_root/skills/opsx-drive"
-  install_skill "$SCRIPT_DIR" "$skills_root"
+  install_skills "$skills_root/skills"
   install_agents "$SCRIPT_DIR" "$agents_root/agents"
   install_support_readme "$SCRIPT_DIR" "$agents_root/opsx-controller"
   install_plan_authoring_reference "$agents_root/opsx-controller"
   bash "$ROOT_DIR/scripts/install-orchestrator.sh" "$ROOT_DIR"
 
   printf '%s\n' \
+    "Installed skills to $skills_root/skills" \
     "Installed agents to $agents_root/agents/" \
     "Installed support files to $agents_root/opsx-controller/" \
     "Installed plan-authoring reference to $agents_root/opsx-controller/plan-authoring.md"
@@ -144,15 +149,14 @@ install_project() {
 
   local skills_root="$project_dir/.agents"
   local agents_root="$project_dir/.codex"
-  # Remove stale opsx-drive skill directory before installing
-  rm -rf "$skills_root/skills/opsx-drive"
-  install_skill "$SCRIPT_DIR" "$skills_root"
+  install_skills "$skills_root/skills"
   install_agents "$SCRIPT_DIR" "$agents_root/agents"
   install_support_readme "$SCRIPT_DIR" "$agents_root/opsx-controller"
   install_plan_authoring_reference "$agents_root/opsx-controller"
   ensure_project_gitignore "$project_dir"
 
   printf '%s\n' \
+    "Installed skills to $skills_root/skills" \
     "Installed agents to $agents_root/agents/" \
     "Installed support files to $agents_root/opsx-controller/" \
     "Installed plan-authoring reference to $agents_root/opsx-controller/plan-authoring.md" \
@@ -166,12 +170,23 @@ install_plugin() {
   # Remove stale opsx-drive before regenerating the bundle
   rm -rf "$plugin_dir/skills/opsx-drive"
   mkdir -p "$plugin_dir/agents"
+  mkdir -p "$plugin_dir/skills"
   mkdir -p "$plugin_dir/.codex-plugin"
 
   local file
   for file in "$SCRIPT_DIR/agents/"*.toml; do
     [[ -e "$file" ]] || continue
     install -m 0644 "$file" "$plugin_dir/agents/$(basename "$file")"
+  done
+
+  # Install skills from the adapter
+  local skill_dir skill_name
+  rm -rf "$plugin_dir/skills"/*
+  for skill_dir in "$SCRIPT_DIR/skills"/*; do
+    [[ -d "$skill_dir" ]] || continue
+    skill_name="$(basename "$skill_dir")"
+    mkdir -p "$plugin_dir/skills/$skill_name"
+    cp -R "$skill_dir"/. "$plugin_dir/skills/$skill_name/"
   done
 
   mkdir -p "$plugin_dir/opsx-controller"
@@ -183,6 +198,7 @@ install_plugin() {
     "Plugin bundle created at $plugin_dir" \
     "  $plugin_dir/.codex-plugin/plugin.json" \
     "  $plugin_dir/agents/" \
+    "  $plugin_dir/skills/" \
     "  $plugin_dir/opsx-controller/plan-authoring.md"
 }
 

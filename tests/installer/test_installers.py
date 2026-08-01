@@ -552,6 +552,42 @@ class AdapterInstallerTests(unittest.TestCase):
             "plugin bundle must contain agent directory",
         )
 
+    def test_codex_global_install_deploys_opsx_plan_skill(self) -> None:
+        """Codex --global must deploy the opsx-plan skill."""
+        _run_installer(_CODEX_INSTALLER, Path(self.home.name), self.env)
+        skill_path = (
+            Path(self.home.name) / ".agents" / "skills" / "opsx-plan" / "SKILL.md"
+        )
+        self.assertTrue(
+            skill_path.is_file(),
+            f"opsx-plan skill must exist at {skill_path}",
+        )
+        content = skill_path.read_text(encoding="utf-8")
+        self.assertIn("plan-authoring.md", content,
+                       "opsx-plan skill must reference plan-authoring reference")
+
+    def test_codex_plugin_includes_opsx_plan_skill(self) -> None:
+        """Codex --plugin must include the opsx-plan skill."""
+        subprocess.run(
+            ["bash", str(_CODEX_INSTALLER), "--plugin"],
+            cwd=_REPO,
+            env={**os.environ, **self.env},
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        plugin_dir = _CODEX_INSTALLER.parent / "plugin"
+        skill_path = plugin_dir / "skills" / "opsx-plan" / "SKILL.md"
+        self.assertTrue(
+            skill_path.is_file(),
+            "plugin bundle must contain opsx-plan skill",
+        )
+        content = skill_path.read_text(encoding="utf-8")
+        self.assertIn("plan-authoring.md", content,
+                       "plugin opsx-plan skill must reference plan-authoring reference")
+        self.assertIn("unsupported", content,
+                       "Codex opsx-plan skill must state plan-run is unsupported")
+
 
 class ProjectInstallerTests(unittest.TestCase):
     """Verify that project-level installs deploy the plan-authoring reference."""
@@ -659,6 +695,26 @@ class ProjectInstallerTests(unittest.TestCase):
             hashlib.sha256(installed.read_bytes()).digest(),
             "repeat project install must replace stale plan-authoring reference",
         )
+
+    def test_codex_project_deploys_opsx_plan_skill(self) -> None:
+        """Codex --project must deploy the opsx-plan skill."""
+        proc = _run_installer_project(
+            _CODEX_INSTALLER, Path(self.project.name), Path(self.home.name),
+            self.env,
+        )
+        skill_path = (
+            Path(self.project.name) / ".agents" / "skills"
+            / "opsx-plan" / "SKILL.md"
+        )
+        self.assertTrue(
+            skill_path.is_file(),
+            f"project opsx-plan skill must exist at {skill_path}",
+        )
+        content = skill_path.read_text(encoding="utf-8")
+        self.assertIn("plan-authoring.md", content,
+                       "project opsx-plan skill must reference plan-authoring reference")
+        self.assertIn("skills", proc.stdout,
+                       "Codex project install output must mention skills")
 
 
 class StaleInstallDetectionTests(unittest.TestCase):

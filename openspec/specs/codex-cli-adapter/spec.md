@@ -150,42 +150,55 @@ The archiver agent SHALL:
 
 ### Requirement: Install script
 
-The adapter SHALL provide an install script at `install.sh` supporting three modes:
-- `--global`: Removes any previously deployed `opsx-drive` skill directory, then copies supported skills, agents, and support files to the global Codex locations.
-- `--project <path>`: Removes any previously deployed `opsx-drive` skill directory, then copies supported skills, agents, and support files to the project Codex locations and creates/updates `.codex/.gitignore` to ignore `opsx-controller/*.json`.
-- `--plugin`: Creates a plugin bundle directory structure with `.codex-plugin/plugin.json` and copies supported agents and skills without an `opsx-drive` path.
+The adapter SHALL provide an install script at `install.sh` supporting three
+modes:
+- `--global`: copies the `opsx-plan` skill, supported skills, agents, and
+  support files to the global Codex locations.
+- `--project <path>`: copies the `opsx-plan` skill, supported skills, agents,
+  and support files to the project Codex locations and creates or updates
+  `.codex/.gitignore` to ignore `opsx-controller/*.json`.
+- `--plugin`: creates a plugin bundle directory structure with
+  `.codex-plugin/plugin.json` and copies the `opsx-plan` skill, supported
+  agents, and skills.
 
-The install script SHALL fail with a usage message when no valid mode is provided.
+The installed Codex plan-authoring skill SHALL read
+`plan-authoring.md` from the project controller support directory first and
+the global controller support directory second. It SHALL state that Codex
+plan-run is unsupported, direct per-change propose, apply, archive, and verify
+work to upstream OpenSpec, and report honestly when no compile adapter is
+configured.
 
-The Codex adapter SHALL NOT define or install a legacy `invoke` or
-`max_attempts` plan default. Codex plans that do not provide the complete direct
-stage invoke configuration SHALL fail closed with guidance naming
-`implement_invoke`, `review_invoke`, and `archive_invoke`.
+The install script SHALL fail with a usage message when no valid mode is
+provided.
 
-#### Scenario: Global install succeeds
+#### Scenario: Global install includes plan authoring
 
-- **WHEN** user runs `bash install.sh --global` from the adapter directory
-- **THEN** any previous `$HOME/.agents/skills/opsx-drive/` directory is removed, supported agent files appear in `$HOME/.codex/agents/`, and support README appears in `$HOME/.codex/opsx-controller/`
+- **WHEN** a user runs `bash install.sh --global` from the adapter directory
+- **THEN** the installed Codex support files include the `opsx-plan` skill and
+  the shared plan-authoring reference path is discoverable
 
-#### Scenario: Project install succeeds
+#### Scenario: Project install includes plan authoring
 
-- **WHEN** user runs `bash install.sh --project /path/to/project`
-- **THEN** any previous `/path/to/project/.agents/skills/opsx-drive/` directory is removed and supported files appear in the project's `.agents/skills/`, `.codex/agents/`, and `.codex/opsx-controller/` directories
+- **WHEN** a user runs `bash install.sh --project /path/to/project`
+- **THEN** the project receives the `opsx-plan` skill and support files that
+  make the project-level reference the first lookup location
 
-#### Scenario: Plugin install creates bundle
+#### Scenario: Plugin install packages plan authoring
 
-- **WHEN** user runs `bash install.sh --plugin`
-- **THEN** a self-contained plugin directory is created with `.codex-plugin/plugin.json`, supported `skills/`, and `agents/`, with no `opsx-drive` path
+- **WHEN** a user runs `bash install.sh --plugin`
+- **THEN** the self-contained plugin includes the `opsx-plan` skill and no
+  plan-run entrypoint is advertised for Codex
+
+#### Scenario: No compile adapter is configured
+
+- **WHEN** the Codex plan-authoring skill cannot resolve a compile adapter
+- **THEN** it reports that the Markdown plan may be authored but compilation
+  was not performed and names the missing configuration
 
 #### Scenario: No mode specified
 
-- **WHEN** user runs `bash install.sh` with no arguments
-- **THEN** script prints usage message and exits with non-zero code
-
-#### Scenario: Codex plan does not fall back to legacy drive mode
-
-- **WHEN** a Codex plan omits any of the three direct stage invoke keys
-- **THEN** the orchestrator refuses the plan and names all three required keys without dispatching a legacy command
+- **WHEN** a user runs `bash install.sh` with no arguments
+- **THEN** the script prints a usage message and exits with non-zero code
 
 ### Requirement: Plugin manifest for marketplace distribution
 
