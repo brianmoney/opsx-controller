@@ -397,6 +397,8 @@ def build_single_change_config(repo: Path, change_id: str) -> dict:
         "check_timeout_minutes": 15,
         "require_clean_tracked": True,
         "escalate_after_review_fails": 0,
+        "skip_warning": False,
+        "skip_suggestion": False,
         "notify_cmd": "",
         "plan_doc": "",
         "create_invoke": "",
@@ -574,6 +576,7 @@ def _compare_configs(
         "timeout_minutes", "max_attempts", "max_rounds", "no_progress_limit",
         "escalate_after_review_fails",
         "fast_checks", "check_timeout_minutes", "require_clean_tracked",
+        "skip_warning", "skip_suggestion",
         "notify_cmd", "plan_doc", "create_invoke",
         "create_timeout_minutes", "create_max_attempts",
         "review_created", "created_check", "git_delivery",
@@ -2907,25 +2910,34 @@ def apply_review_result(repo: Path, cfg: dict, state: dict, cid: str, payload: d
             "finding_counts": counts,
         },
     )
+    if verdict not in {"pass", "fail"}:
+        set_status(state, cid, FAILED, f"review returned unexpected verdict={verdict}")
+        r["last_result"] = "review_invalid"
+        _try_notify(cfg, "change_failed", f"review returned unexpected verdict={verdict}", change_id=cid)
+        return "stop"
+    # Review workers apply a strict rule and recommend `fail` for any non-zero
+    # count, so the skip keys cannot work by deferring to the verdict. They are
+    # operator policy the controller applies on top of that recommendation:
+    # count only the severities that still gate, and accept a recommended
+    # failure whose remaining findings are all skipped. With no skip configured
+    # the verdict still has to agree, preserving the strict default gate.
     skip_warning = cfg.get("skip_warning", False)
     skip_suggestion = cfg.get("skip_suggestion", False) or skip_warning
-    if skip_warning:
-        passed = verdict == "pass" and counts.get("critical", 0) == 0
-    elif skip_suggestion:
-        passed = verdict == "pass" and counts.get("critical", 0) == 0 and counts.get("warning", 0) == 0
+    blocking = counts["critical"]
+    if not skip_warning:
+        blocking += counts["warning"]
+    if not skip_suggestion:
+        blocking += counts["note"]
+    if skip_warning or skip_suggestion:
+        passed = blocking == 0
     else:
-        passed = verdict == "pass" and counts == {"critical": 0, "warning": 0, "note": 0}
+        passed = verdict == "pass" and blocking == 0
     if passed:
         r["latest_fix_prompt"] = ""
         r["last_result"] = "review_passed"
         r["phase"] = "archive"
         set_status(state, cid, PENDING, summary)
         return "continue"
-    if verdict not in {"pass", "fail"}:
-        set_status(state, cid, FAILED, f"review returned unexpected verdict={verdict}")
-        r["last_result"] = "review_invalid"
-        _try_notify(cfg, "change_failed", f"review returned unexpected verdict={verdict}", change_id=cid)
-        return "stop"
     r["latest_fix_prompt"] = fix_prompt
     if r["round"] >= r["max_rounds"]:
         r["last_result"] = "max_rounds_reached"
@@ -4586,6 +4598,8 @@ def build_schema_guidance(adapter: str = "opencode") -> str:
         "| fast_checks | list[str] | ``[]`` | post-archive CLI checks |\n"
         "| check_timeout_minutes | float | ``15`` | fast-check timeout |\n"
         "| require_clean_tracked | bool | ``true`` | refuse to run when tracked tree is dirty |\n"
+        "| skip_warning | bool | ``false`` | warning and note findings do not gate the review verdict |\n"
+        "| skip_suggestion | bool | ``false`` | note findings do not gate the review verdict |\n"
         "| plan_doc | string | ``\"\"`` | path to the source markdown plan for ``create_invoke`` |\n"
         "| create_invoke | string | ``\"\"`` | authoring command for auto-creating changes |\n"
         "| create_timeout_minutes | float | ``30`` | create stage timeout |\n"
@@ -5118,8 +5132,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     plan_src = resolve_plan(repo, args.plan)
     plan_abs = _resolve_plan_path(repo, plan_src)
     cfg = load_plan(plan_abs, repo=repo)
-    cfg["skip_warning"] = getattr(args, "skip_warning", False)
-    cfg["skip_suggestion"] = getattr(args, "skip_suggestion", False)
+    # The flags are additive overrides: passing one turns the skip on for this
+    # run, but omitting one must not clobber a manifest that already set it.
+    cfg["skip_warning"] = bool(cfg.get("skip_warning", False)) or getattr(
+        args, "skip_warning", False
+    )
+    cfg["skip_suggestion"] = bool(cfg.get("skip_suggestion", False)) or getattr(
+        args, "skip_suggestion", False
+    )
     try:
         apply_model_env(cfg)
     except PlanError as exc:
@@ -5691,9 +5711,15 @@ def cmd_run_one(args: argparse.Namespace) -> int:
         )
         return 2
 
+    # Set before serialization so the derived manifest records the skips this
+    # run actually applies, and so round-trip verification compares them.
+    cfg["skip_warning"] = bool(cfg.get("skip_warning", False)) or getattr(
+        args, "skip_warning", False
+    )
+    cfg["skip_suggestion"] = bool(cfg.get("skip_suggestion", False)) or getattr(
+        args, "skip_suggestion", False
+    )
     write_single_change_manifest(repo, change_id, cfg)
-    cfg["skip_warning"] = getattr(args, "skip_warning", False)
-    cfg["skip_suggestion"] = getattr(args, "skip_suggestion", False)
 
     reconcile(repo, cfg, state)
     save_state(repo, cfg["name"], state)
