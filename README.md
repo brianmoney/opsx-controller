@@ -126,8 +126,9 @@ Workflow](core/model-efficiency-workflow.md) for that benchmarking loop.
 ## Quick start
 
 Requires Python 3.11+ (the orchestrator uses `tomllib`), git, the
-[OpenSpec](https://github.com/Fission-AI/OpenSpec) CLI, and a supported coding
-client. There is nothing to pip install — the orchestrator is stdlib-only.
+[OpenSpec](https://github.com/Fission-AI/OpenSpec) CLI >= 1.7, and a supported
+coding client. There is nothing to pip install — the orchestrator is
+stdlib-only.
 
 > **OpenCode and Claude Code can compile plans; all three adapters install the
 > orchestrator to `~/.local/bin/`.**  `opsx-plan compile` supports `--adapter
