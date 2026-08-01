@@ -41,6 +41,11 @@ set -- "${args[@]}"
 install_commands() {
   local dest_dir="$1"
   mkdir -p "$dest_dir"
+  # Remove stale legacy command files from previous installations
+  local legacy cmd
+  for legacy in opsx-author.md opsx-archive-no-prompt.md opsx-verify-auto.md opsx-review.md opsx-drive.md; do
+    rm -f "$dest_dir/$legacy"
+  done
   local file
   for file in "$ROOT_DIR"/adapters/opencode/commands/*.md; do
     install -m 0644 "$file" "$dest_dir/$(basename "$file")"
@@ -50,6 +55,8 @@ install_commands() {
 install_agents() {
   local dest_dir="$1"
   mkdir -p "$dest_dir"
+  # Remove stale nested controller agent from previous installations
+  rm -f "$dest_dir/opsx-controller.md"
 
   local file
   for file in "$ROOT_DIR"/adapters/opencode/agents/*.md; do

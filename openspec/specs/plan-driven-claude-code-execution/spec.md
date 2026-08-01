@@ -20,6 +20,27 @@ The orchestrator SHALL apply the same plan-owned round control, retry budgets, n
 - **WHEN** the Claude Code review worker returns a non-zero finding count and the change is below the round ceiling
 - **THEN** `opsx-plan` persists the fix prompt, increments the round, and dispatches another implement worker itself
 
+### Requirement: Claude Code installation excludes the legacy drive skill
+
+The Claude Code adapter SHALL NOT ship or install the superseded `opsx-drive`
+skill. Reinstalling globally or into a project SHALL remove a previously
+deployed `opsx-drive` skill directory while preserving supported skills,
+agents, and plan-level support files.
+
+#### Scenario: Global reinstall removes the legacy skill
+
+- **WHEN** the Claude Code installer runs in global mode against a home
+  directory containing a previously deployed `opsx-drive` skill
+- **THEN** that skill directory is removed and supported Claude Code surfaces
+  are installed
+
+#### Scenario: Project reinstall removes the legacy skill
+
+- **WHEN** the Claude Code installer runs in project mode against a project
+  containing a previously deployed `opsx-drive` skill
+- **THEN** that skill directory is removed and supported project surfaces are
+  installed
+
 ### Requirement: The `claude-code` adapter supplies direct stage invoke defaults
 
 `ADAPTER_DEFAULTS` for `claude-code` SHALL provide `implement_invoke`, `review_invoke`, and `archive_invoke` in addition to `invoke` and `state_file`.

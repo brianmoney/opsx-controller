@@ -6,55 +6,6 @@ single change through the implement, review, and archive loop.
 
 ## Requirements
 
-### Requirement: Skill entrypoint for controller orchestration
-
-The adapter SHALL provide a Codex skill at `skills/opsx-drive/SKILL.md` that serves as the user-facing entrypoint for starting or resuming the OpenSpec controller workflow for exactly one change.
-
-The skill SHALL instruct the hosting Codex agent to:
-- Parse exactly one change-id argument from user input
-- Initialize or resume durable state at `.opsx-controller/<change-id>.json`
-- Read repository guidance from `AGENTS.md` if it exists
-- Run `openspec status --change "<change>" --json` and `openspec instructions apply --change "<change>" --json`
-- Manage a `context_cache` with source signatures derived from repository guidance and OpenSpec context files
-- Manage a deduplicated `tracked_change_files` list seeded from accepted change artifacts and current dirty worktree
-- Dispatch phase agents (`opsx-implementer`, `opsx-reviewer`, `opsx-archiver`) in strict order using `spawn_agent` and `wait_agent`
-- Provide each phase agent a compact plaintext input block with fields: CHANGE, ROUND, STATE_FILE, LATEST_FIX_PROMPT, TASK_COUNTS, CONTEXT_CACHE_STATUS, CONTEXT_CACHE_VALID, CONTEXT_CACHE_SUMMARY
-- Parse single-line JSON output from each phase agent
-- Loop from review back to implement when review returns any non-zero finding count
-- Archive only after a fresh clean review (all finding counts zero, verdict=pass)
-- Stop after `max_rounds` (5) failed review rounds or `no_progress_streak` (2) consecutive no-progress rounds
-- Persist state after initialization, after every phase result, and before any blocked or completed exit
-
-#### Scenario: Fresh controller run with valid change
-
-- **WHEN** user invokes the skill with a valid change-id and the change exists in `openspec/changes/<id>/` with pending tasks
-- **THEN** the controller initializes a fresh state file, seeds context cache, seeds tracked files, dispatches implementer, review succeeds, and archiver completes — resulting in `status=completed` and `phase=done`
-
-#### Scenario: Resume after interrupted run
-
-- **WHEN** user invokes the skill for a change with an existing state file at `phase=implement` and `round=2`
-- **THEN** the controller loads existing state, validates context cache signature, and resumes from the current phase with the persisted `latest_fix_prompt`
-
-#### Scenario: Missing change-id argument
-
-- **WHEN** user invokes the skill without providing a change-id
-- **THEN** the controller stops and reports that a change-id is required
-
-#### Scenario: Review failure triggers re-implementation
-
-- **WHEN** reviewer returns `verdict=fail` with non-zero `finding_counts` and `round < max_rounds`
-- **THEN** the controller persists `latest_fix_prompt`, increments round, sets `phase=implement`, and dispatches implementer again
-
-#### Scenario: Max rounds reached
-
-- **WHEN** reviewer returns `verdict=fail` and `round` equals `max_rounds`
-- **THEN** the controller persists `status=blocked` and `last_result=max_rounds_reached` and stops
-
-#### Scenario: Consecutive no-progress stops
-
-- **WHEN** implementer returns `progress_made=false` for 2 consecutive rounds
-- **THEN** the controller persists `status=blocked` and stops
-
 ### Requirement: Implementer phase agent
 
 The adapter SHALL provide a Codex custom agent at `agents/opsx-implementer.toml` with:
@@ -200,26 +151,26 @@ The archiver agent SHALL:
 ### Requirement: Install script
 
 The adapter SHALL provide an install script at `install.sh` supporting three modes:
-- `--global`: Copies skill to `$HOME/.agents/skills/opsx-drive/`, agents to `$HOME/.codex/agents/`, and support files to `$HOME/.codex/opsx-controller/`
-- `--project <path>`: Copies skill to `<path>/.agents/skills/opsx-drive/`, agents to `<path>/.codex/agents/`, support files to `<path>/.codex/opsx-controller/`, and creates/updates `.codex/.gitignore` to ignore `opsx-controller/*.json`
-- `--plugin`: Creates plugin bundle directory structure with `.codex-plugin/plugin.json` and copies skill and agent files
+- `--global`: Removes any previously deployed `opsx-drive` skill directory, then copies supported skills, agents, and support files to the global Codex locations.
+- `--project <path>`: Removes any previously deployed `opsx-drive` skill directory, then copies supported skills, agents, and support files to the project Codex locations and creates/updates `.codex/.gitignore` to ignore `opsx-controller/*.json`.
+- `--plugin`: Creates a plugin bundle directory structure with `.codex-plugin/plugin.json` and copies supported agents and skills without an `opsx-drive` path.
 
 The install script SHALL fail with a usage message when no valid mode is provided.
 
 #### Scenario: Global install succeeds
 
 - **WHEN** user runs `bash install.sh --global` from the adapter directory
-- **THEN** skill files appear in `$HOME/.agents/skills/opsx-drive/`, agent TOML files in `$HOME/.codex/agents/`, and support README in `$HOME/.codex/opsx-controller/`
+- **THEN** any previous `$HOME/.agents/skills/opsx-drive/` directory is removed, supported agent files appear in `$HOME/.codex/agents/`, and support README appears in `$HOME/.codex/opsx-controller/`
 
 #### Scenario: Project install succeeds
 
 - **WHEN** user runs `bash install.sh --project /path/to/project`
-- **THEN** files appear in the project's `.agents/skills/`, `.codex/agents/`, and `.codex/opsx-controller/` directories
+- **THEN** any previous `/path/to/project/.agents/skills/opsx-drive/` directory is removed and supported files appear in the project's `.agents/skills/`, `.codex/agents/`, and `.codex/opsx-controller/` directories
 
 #### Scenario: Plugin install creates bundle
 
 - **WHEN** user runs `bash install.sh --plugin`
-- **THEN** a self-contained plugin directory is created with `.codex-plugin/plugin.json`, `skills/`, and `agents/`
+- **THEN** a self-contained plugin directory is created with `.codex-plugin/plugin.json`, supported `skills/`, and `agents/`, with no `opsx-drive` path
 
 #### Scenario: No mode specified
 
@@ -233,10 +184,12 @@ The adapter SHALL provide a plugin manifest at `plugin/.codex-plugin/plugin.json
 - `skills` pointing to `./skills/`
 - `interface` with `displayName`, `shortDescription`, `category`, and `capabilities`
 
+The manifest SHALL NOT register or describe `opsx-drive`.
+
 #### Scenario: Plugin manifest is valid
 
 - **WHEN** Codex loads the plugin manifest
-- **THEN** the `opsx-drive` skill is registered and discoverable in the Codex plugin/skill browser
+- **THEN** no `opsx-drive` skill is registered or discoverable in the Codex plugin/skill browser
 
 ### Requirement: Durable state file
 

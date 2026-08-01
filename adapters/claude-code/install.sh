@@ -41,6 +41,8 @@ set -- "${_verify_filtered[@]}"
 install_skills() {
   local dest_root="$1"
   mkdir -p "$dest_root"
+  # Remove stale opsx-drive skill directory from previous installations
+  rm -rf "$dest_root/opsx-drive"
   local skill_dir skill_name
   for skill_dir in "$ROOT_DIR"/adapters/claude-code/skills/*; do
     [[ -d "$skill_dir" ]] || continue

@@ -205,6 +205,104 @@ class AdapterInstallerTests(unittest.TestCase):
         self._assert_executables_installed()
         self._assert_runtime_libraries_installed()
 
+    # -- stale-file cleanup assertions ------------------------------------
+
+    def test_opencode_install_removes_stale_legacy_commands(self) -> None:
+        """Global reinstall must remove previously-deployed legacy command
+        files that are no longer shipped."""
+        home = Path(self.home.name)
+        cmds = home / ".config" / "opencode" / "commands"
+        cmds.mkdir(parents=True)
+        for legacy in ("opsx-author.md", "opsx-archive-no-prompt.md",
+                       "opsx-verify-auto.md", "opsx-review.md",
+                       "opsx-drive.md"):
+            (cmds / legacy).write_text("stale legacy command\n", encoding="utf-8")
+
+        _run_installer(_OPENCODE_INSTALLER, home, self.env)
+
+        for legacy in ("opsx-author.md", "opsx-archive-no-prompt.md",
+                       "opsx-verify-auto.md", "opsx-review.md",
+                       "opsx-drive.md"):
+            self.assertFalse(
+                (cmds / legacy).exists(),
+                f"stale legacy command {legacy} must be removed by installer",
+            )
+        self.assertTrue(
+            (cmds / "opsx-plan.md").is_file(),
+            "supported command opsx-plan must survive",
+        )
+
+    def test_opencode_install_removes_stale_nested_agent(self) -> None:
+        """Global reinstall must remove the previously-deployed nested
+        opsx-controller agent."""
+        home = Path(self.home.name)
+        agents = home / ".config" / "opencode" / "agents"
+        agents.mkdir(parents=True)
+        (agents / "opsx-controller.md").write_text("stale\n", encoding="utf-8")
+
+        _run_installer(_OPENCODE_INSTALLER, home, self.env)
+
+        self.assertFalse(
+            (agents / "opsx-controller.md").exists(),
+            "stale nested controller agent must be removed",
+        )
+        self.assertTrue(
+            (agents / "opsx-implementer.md").is_file(),
+            "supported worker agent must survive",
+        )
+
+    def test_claude_install_removes_stale_opsx_drive_skill(self) -> None:
+        """Global reinstall must remove previously-deployed opsx-drive skill."""
+        home = Path(self.home.name)
+        drive_dir = home / ".claude" / "skills" / "opsx-drive"
+        drive_dir.mkdir(parents=True)
+        (drive_dir / "SKILL.md").write_text("stale skill\n", encoding="utf-8")
+
+        _run_installer(_CLAUDE_INSTALLER, home, self.env)
+
+        self.assertFalse(
+            drive_dir.exists(),
+            "stale opsx-drive skill must be removed by installer",
+        )
+        self.assertTrue(
+            (home / ".claude" / "skills" / "opsx-plan" / "SKILL.md").is_file(),
+            "supported opsx-plan skill must survive",
+        )
+
+    def test_codex_install_removes_stale_opsx_drive_skill(self) -> None:
+        """Global reinstall must remove previously-deployed opsx-drive skill."""
+        home = Path(self.home.name)
+        drive_dir = home / ".agents" / "skills" / "opsx-drive"
+        drive_dir.mkdir(parents=True)
+        (drive_dir / "SKILL.md").write_text("stale\n", encoding="utf-8")
+
+        _run_installer(_CODEX_INSTALLER, home, self.env)
+
+        self.assertFalse(
+            drive_dir.exists(),
+            "stale opsx-drive skill must be removed by Codex installer",
+        )
+
+    def test_codex_plugin_excludes_stale_opsx_drive(self) -> None:
+        """Codex --plugin output must not contain opsx-drive."""
+        subprocess.run(
+            ["bash", str(_CODEX_INSTALLER), "--plugin"],
+            cwd=_REPO,
+            env={**os.environ, **self.env},
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        plugin_dir = _CODEX_INSTALLER.parent / "plugin"
+        self.assertFalse(
+            (plugin_dir / "skills" / "opsx-drive").exists(),
+            "plugin bundle must not contain opsx-drive",
+        )
+        self.assertTrue(
+            (plugin_dir / "agents").is_dir(),
+            "plugin bundle must contain agent directory",
+        )
+
 
 class StaleInstallDetectionTests(unittest.TestCase):
     """_check_stale_install must work regardless of which installer deployed."""

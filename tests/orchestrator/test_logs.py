@@ -94,7 +94,7 @@ class LogsCommandTests(unittest.TestCase):
             "implement_invoke": "opencode run --agent opsx-implementer",
             "review_invoke": "opencode run --agent opsx-reviewer",
             "archive_invoke": "opencode run --agent opsx-archiver",
-            "invoke": 'opencode run "/opsx-drive {change}"',
+            "invoke": 'opencode run "/opsx-plan {change}"',
             "state_file": ".opencode/opsx-controller/{change}.json",
             "timeout_minutes": 1,
             "max_attempts": 2,

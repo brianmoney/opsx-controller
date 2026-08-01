@@ -37,11 +37,9 @@ done
 install_skill() {
   local src_dir="$1"
   local dest_base="$2"
-  local skill_dir="$dest_base/skills/opsx-drive"
-  mkdir -p "$skill_dir"
-  install -m 0644 "$src_dir/skills/opsx-drive/SKILL.md" "$skill_dir/SKILL.md"
-  mkdir -p "$skill_dir/agents"
-  install -m 0644 "$src_dir/skills/opsx-drive/agents/openai.yaml" "$skill_dir/agents/openai.yaml"
+  # The opsx-drive skill has been removed; this function is retained as a
+  # no-op so global/project install paths do not fail. Supported skills are
+  # installed by install_plugin when --plugin is used.
 }
 
 install_agents() {
@@ -94,12 +92,14 @@ install_global() {
 
   local skills_root="$HOME/.agents"
   local agents_root="$HOME/.codex"
+  # Remove stale opsx-drive skill directory before installing
+  rm -rf "$skills_root/skills/opsx-drive"
   install_skill "$SCRIPT_DIR" "$skills_root"
   install_agents "$SCRIPT_DIR" "$agents_root/agents"
   install_support_readme "$SCRIPT_DIR" "$agents_root/opsx-controller"
   bash "$ROOT_DIR/scripts/install-orchestrator.sh" "$ROOT_DIR"
+
   printf '%s\n' \
-    "Installed skill to $skills_root/skills/opsx-drive/" \
     "Installed agents to $agents_root/agents/" \
     "Installed support files to $agents_root/opsx-controller/"
   do_verify
@@ -116,27 +116,27 @@ install_project() {
 
   local skills_root="$project_dir/.agents"
   local agents_root="$project_dir/.codex"
+  # Remove stale opsx-drive skill directory before installing
+  rm -rf "$skills_root/skills/opsx-drive"
   install_skill "$SCRIPT_DIR" "$skills_root"
   install_agents "$SCRIPT_DIR" "$agents_root/agents"
   install_support_readme "$SCRIPT_DIR" "$agents_root/opsx-controller"
   ensure_project_gitignore "$project_dir"
 
   printf '%s\n' \
-    "Installed skill to $skills_root/skills/opsx-drive/" \
     "Installed agents to $agents_root/agents/" \
     "Installed support files to $agents_root/opsx-controller/" \
-    "Updated $agents_root/.gitignore"
+    "Updated $project_dir/.codex/.gitignore"
   do_verify
 }
 
 install_plugin() {
   local plugin_dir="$SCRIPT_DIR/plugin"
-  mkdir -p "$plugin_dir/skills/opsx-drive/agents"
+  # Remove stale opsx-drive before regenerating the bundle
+  rm -rf "$plugin_dir/skills/opsx-drive"
   mkdir -p "$plugin_dir/agents"
   mkdir -p "$plugin_dir/.codex-plugin"
 
-  install -m 0644 "$SCRIPT_DIR/skills/opsx-drive/SKILL.md" "$plugin_dir/skills/opsx-drive/SKILL.md"
-  install -m 0644 "$SCRIPT_DIR/skills/opsx-drive/agents/openai.yaml" "$plugin_dir/skills/opsx-drive/agents/openai.yaml"
   local file
   for file in "$SCRIPT_DIR/agents/"*.toml; do
     [[ -e "$file" ]] || continue
@@ -146,7 +146,6 @@ install_plugin() {
   printf '%s\n' \
     "Plugin bundle created at $plugin_dir" \
     "  $plugin_dir/.codex-plugin/plugin.json" \
-    "  $plugin_dir/skills/opsx-drive/" \
     "  $plugin_dir/agents/"
 }
 

@@ -111,7 +111,7 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
             "implement_invoke": "opencode run --agent opsx-implementer",
             "review_invoke": "opencode run --agent opsx-reviewer",
             "archive_invoke": "opencode run --agent opsx-archiver",
-            "invoke": 'opencode run "/opsx-drive {change}"',
+            "invoke": 'opencode run "/opsx-plan {change}"',
             "state_file": ".opencode/opsx-controller/{change}.json",
             "timeout_minutes": 1,
             "max_attempts": 2,
@@ -2200,31 +2200,9 @@ class MainDispatchTests(unittest.TestCase):
 
 
 class OpsxDriveCompatibilityTests(unittest.TestCase):
-    CMD = Path(__file__).resolve().parents[2] / "adapters" / "opencode" / "commands" / "opsx-drive.md"
-
-    def _cmd_text(self) -> str:
-        return self.CMD.read_text(encoding="utf-8")
-
-    def _frontmatter(self, text: str) -> dict[str, bool]:
-        fm: dict[str, bool] = {}
-        for line in text.splitlines():
-            if ":" not in line:
-                continue
-            key, _, val = line.partition(":")
-            fm[key.strip()] = val.strip() == "true" or val.strip() == "false" or bool(val.strip())
-        return fm
-
-    def test_opsx_drive_command_surface_remains_manual_entrypoint(self) -> None:
-        self.assertTrue(self.CMD.is_file(), f"command surface not found: {self.CMD}")
-        text = self._cmd_text()
-
-        self.assertIn("agent: opsx-controller", text,
-                      "opsx-drive must use the opsx-controller agent")
-        self.assertIn("subtask: false", text,
-                      "opsx-drive must not be marked as a subtask")
-
-        self.assertIn("manual single-change", text.lower(),
-                      "opsx-drive must document itself as the manual single-change surface")
+    """The opsx-drive command surface has been removed (remove-legacy-command-surfaces).
+    Verify the orchestrator defaults still reference the legacy invoke pattern
+    so legacy-drive coverage is preserved for adapter fallback testing."""
 
     def test_opsx_plan_routes_opencode_through_direct_workers_not_opsx_drive(self) -> None:
         self.opsx_plan = load_opsx_plan()
@@ -2735,11 +2713,10 @@ class OpenCodeAgentModeTests(unittest.TestCase):
 
     def test_opencode_worker_agents_are_runnable_via_run_agent(self) -> None:
         for name in (
-            "opsx-controller.md",
             "opsx-implementer.md",
             "opsx-reviewer.md",
             "opsx-archiver.md",
-        ):
+        ): 
             text = (self.AGENT_DIR / name).read_text(encoding="utf-8")
             self.assertIn(
                 "mode: all",
@@ -2806,11 +2783,10 @@ class OpenCodeAgentModeTests(unittest.TestCase):
 
     def test_opencode_worker_agents_deny_broad_external_directory(self) -> None:
         for name in (
-            "opsx-controller.md",
             "opsx-implementer.md",
             "opsx-reviewer.md",
             "opsx-archiver.md",
-        ):
+        ): 
             text = (self.AGENT_DIR / name).read_text(encoding="utf-8")
             block = self._extract_external_directory_block(text)
             self.assertTrue(
@@ -3882,7 +3858,7 @@ class SpendBudgetTests(unittest.TestCase):
             "implement_invoke": "opencode run --agent opsx-implementer",
             "review_invoke": "opencode run --agent opsx-reviewer",
             "archive_invoke": "opencode run --agent opsx-archiver",
-            "invoke": 'opencode run "/opsx-drive {change}"',
+            "invoke": 'opencode run "/opsx-plan {change}"',
             "state_file": ".opencode/opsx-controller/{change}.json",
             "timeout_minutes": 1,
             "max_attempts": 2,
@@ -4783,7 +4759,7 @@ class RunEventNotificationTests(unittest.TestCase):
             "implement_invoke": "opencode run --agent opsx-implementer",
             "review_invoke": "opencode run --agent opsx-reviewer",
             "archive_invoke": "opencode run --agent opsx-archiver",
-            "invoke": 'opencode run "/opsx-drive {change}"',
+            "invoke": 'opencode run "/opsx-plan {change}"',
             "state_file": ".opencode/opsx-controller/{change}.json",
             "timeout_minutes": 1,
             "max_attempts": 2,
