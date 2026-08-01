@@ -16344,6 +16344,7 @@ class SamplePlanTests(unittest.TestCase):
             "timeout_minutes", "max_attempts", "max_rounds", "no_progress_limit",
             "escalate_after_review_fails",
             "fast_checks", "check_timeout_minutes", "require_clean_tracked",
+            "skip_warning", "skip_suggestion",
             "notify_cmd", "plan_doc", "create_invoke",
             "create_timeout_minutes", "create_max_attempts",
             "review_created", "created_check", "git_delivery",
@@ -16515,7 +16516,8 @@ class SamplePlanTests(unittest.TestCase):
             "timeout_minutes", "max_attempts", "max_rounds",
             "no_progress_limit", "escalate_after_review_fails",
             "fast_checks", "check_timeout_minutes",
-            "require_clean_tracked", "notify_cmd", "plan_doc",
+            "require_clean_tracked", "skip_warning", "skip_suggestion",
+            "notify_cmd", "plan_doc",
             "create_invoke", "create_timeout_minutes", "create_max_attempts",
             "review_created", "created_check", "git_delivery",
         }

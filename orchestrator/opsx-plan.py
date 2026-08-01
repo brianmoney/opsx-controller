@@ -296,6 +296,8 @@ def load_plan(path: Path, repo: Path | None = None) -> dict:
         "escalate_after_review_fails": _parse_escalation_threshold(
             plan.get("escalate_after_review_fails", 0)
         ),
+        "skip_warning": bool(plan.get("skip_warning", False)),
+        "skip_suggestion": bool(plan.get("skip_suggestion", False)),
         # --- run-event notifications ---
         "notify_cmd": plan.get("notify_cmd", "").strip() if plan.get("notify_cmd") else "",
         # --- create stage (the /opsx-ff automation) ---
@@ -474,6 +476,8 @@ def render_single_change_manifest(cfg: dict) -> str:
     # Boolean plan-level fields.
     lines.append(f"require_clean_tracked = {_toml_bool(cfg.get('require_clean_tracked', True))}")
     lines.append(f"review_created = {_toml_bool(cfg.get('review_created', False))}")
+    lines.append(f"skip_warning = {_toml_bool(cfg.get('skip_warning', False))}")
+    lines.append(f"skip_suggestion = {_toml_bool(cfg.get('skip_suggestion', False))}")
 
     # fast_checks.
     fast_checks = cfg.get("fast_checks", [])
