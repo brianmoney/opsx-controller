@@ -1,0 +1,52 @@
+[plan]
+name = "plan-authoring-and-surface-trim"
+adapter = "opencode"
+timeout_minutes = 90
+max_attempts = 2
+max_rounds = 5
+no_progress_limit = 2
+require_clean_tracked = true
+plan_doc = "openspec/plans/plan-authoring-and-surface-trim-plan.md"
+create_invoke = "opencode run --model {controller_model} \"/opsx-propose Please review @{plan_doc} and create a change for {change}\""
+create_timeout_minutes = 30
+create_max_attempts = 2
+created_check = "openspec validate {change} --strict"
+review_created = true
+fast_checks = [
+  "openspec validate --all",
+]
+
+# Phase 1: Retire Legacy Surfaces
+
+[[changes]]
+id = "remove-legacy-command-surfaces"
+phase = 1
+pause_before = true # suggested manual gate — first user-facing deletion (git-recoverable, pre-approved during planning)
+
+[[changes]]
+id = "remove-legacy-drive-mode"
+phase = 1
+depends_on = ["remove-legacy-command-surfaces"]
+
+# Phase 2: Plan-Authoring Guidance
+
+[[changes]]
+id = "add-plan-authoring-reference"
+phase = 2
+depends_on = ["remove-legacy-command-surfaces"]
+pause_before = true # first change in proposed `plan-authoring-guidance` capability
+
+[[changes]]
+id = "rewrite-plan-guidance-surfaces"
+phase = 2
+depends_on = ["add-plan-authoring-reference"]
+
+# Phase 3: Documentation
+
+[[changes]]
+id = "update-docs-for-trimmed-controller"
+phase = 3
+depends_on = [
+  "remove-legacy-drive-mode",
+  "rewrite-plan-guidance-surfaces",
+]
