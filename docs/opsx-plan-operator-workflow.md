@@ -9,6 +9,11 @@ This document covers the full lifecycle: compile, activate, preflight with
 `report`/`dashboard`, receive notifications, and finish on a delivery branch
 that opens a pull request.
 
+> **Plan authoring**: For writing compilable markdown implementation plans, see
+> [`core/plan-authoring.md`](../core/plan-authoring.md) — the single
+> client-neutral reference for plan structure, dependency forms, and compile
+> conventions.
+
 ---
 
 ## Quick Start

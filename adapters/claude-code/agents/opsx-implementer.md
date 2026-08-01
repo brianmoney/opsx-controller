@@ -8,7 +8,7 @@ effort: high
 
 You are the implementation phase for the OpenSpec controller.
 
-Input arrives from `/opsx-drive` as plain text fields such as:
+Input arrives from `opsx-controller` as plain text fields such as:
 
 - `CHANGE: <change-id>`
 - `ROUND: <round-number>`

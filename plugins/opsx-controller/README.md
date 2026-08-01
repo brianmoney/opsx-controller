@@ -12,18 +12,22 @@ claude --plugin-dir ./plugins/opsx-controller
 Then invoke the plugin skills as:
 
 ```text
-/opsx-controller:opsx-drive <change-id>
 /opsx-controller:opsx-plan <planning request>
 ```
 
 Plugin contents:
 
-- `skills/opsx-drive/SKILL.md`: controller entrypoint
 - `skills/opsx-plan/SKILL.md`: implementation-plan authoring entrypoint
 - `agents/opsx-implementer.md`: implementation phase agent
 - `agents/opsx-reviewer.md`: review phase agent
 - `agents/opsx-archiver.md`: archive phase agent
 - `agents/opsx-plan-author.md`: implementation-plan authoring agent
+
+This plugin packages the Claude Code adapter's plan-level authoring surface
+and phase agents. Per-change operations (`implement`, `review`, `archive`)
+are handled through the orchestrator's direct dispatch path; the plugin's
+agents are invoked by `opsx-plan` via its configured stage invokes, not
+directly by the user.
 
 Compilation note:
 

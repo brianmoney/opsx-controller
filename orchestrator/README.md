@@ -258,13 +258,11 @@ state file.
   `implementer_escalation` role and exported as
   `OPSX_IMPLEMENTER_ESCALATION_MODEL`. Runs fail closed at plan load when
   `escalate_after_review_fails > 0` and the escalation role is unresolved.
-- Manual `/opsx-drive <change-id>` remains available for single-change control,
-  but `opsx-plan` no longer nests `/opsx-drive` for OpenCode execution.
-  `/opsx-drive` is **deprecated**: `opsx-run <change-id>` (equivalently
-  `opsx-plan run-one <change-id>`) is the supported replacement, driving the
-  same loop with no manifest required. A plan missing one or more of the
-  three stage invokes fails at load time with a `PlanError` naming all three
-  required keys — there is no fallback execution path.
+- A plan missing one or more of the three stage invokes
+  (`implement_invoke`, `review_invoke`, `archive_invoke`) fails at load time
+  with a `PlanError` naming all three required keys — there is no fallback
+  execution path. Direct dispatch is the only execution model; the legacy
+  nested-controller path is removed.
 - A change that archives successfully but then fails `fast_checks` is marked
   failed without retry (re-archiving an already archived change cannot fix the
   repo).
@@ -280,9 +278,9 @@ Defaults (override with `implement_invoke` / `review_invoke` /
 
 | adapter | invocation | state file |
 |---|---|---|
-| `opencode` | `opencode run --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL"`, and similarly for reviewer/archiver, for plan runs; `opencode run "/opsx-drive {change}"` remains the manual single-change controller entrypoint (**deprecated** — use `opsx-run <change-id>`) | `.opencode/opsx-controller/{change}.json` for manual `/opsx-drive`; `.opsx-plan/<plan>.state.json` is authoritative for direct plan execution |
-| `claude-code` | `claude -p --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL" ...` for plan runs; `claude -p "/opsx-drive {change}"` remains the manual single-change controller entrypoint (**deprecated** — use `opsx-run <change-id>`) | `.claude/opsx-controller/{change}.json` |
-| `codex-cli` | Direct dispatch not available by default — `codex-cli` has no default stage invokes and a codex-cli plan missing explicit `implement_invoke` / `review_invoke` / `archive_invoke` keys fails at load time with a `PlanError` naming all three required keys. An operator can opt into direct dispatch by hand-writing all three invokes in `[plan]`. | `.opsx-controller/{change}.json` |
+| `opencode` | `opencode run --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL"`, and similarly for reviewer/archiver | `.opsx-plan/<plan>.state.json` |
+| `claude-code` | `claude -p --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL" --permission-mode bypassPermissions --output-format json`, and similarly for reviewer/archiver | `.opsx-plan/<plan>.state.json` |
+| `codex-cli` | Direct dispatch not available by default — `codex-cli` has no default stage invokes and a codex-cli plan missing explicit `implement_invoke` / `review_invoke` / `archive_invoke` keys fails at load time with a `PlanError` naming all three required keys. An operator can opt into direct dispatch by hand-writing all three invokes in `[plan]`. | `.opsx-plan/<plan>.state.json` |
 
 Verify your client's headless syntax and permission configuration before an
 unattended run — for example, Claude Code's `-p` mode needs tool permissions

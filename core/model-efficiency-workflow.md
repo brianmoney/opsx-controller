@@ -18,9 +18,8 @@ optional machine-local `<repo>/.opsx-plan/models.toml` override), by
 `opsx-plan`'s built-in resolver. Resolution happens once when a plan loads
 and stays active for the whole run — changing `models.toml` takes effect on
 the next `opsx-plan run`, with **no installer re-run required** for direct
-dispatch (the default execution path for every adapter). See
-[Configuring Model Sets](#configuring-model-sets) below for the full
-precedence rules and the one remaining case that still needs a reinstall.
+dispatch. See [Configuring Model Sets](#configuring-model-sets) below for the
+full precedence rules.
 
 ```bash
 # 0. Record the baseline commit (required for clean re-runs)
@@ -109,7 +108,7 @@ for the full file shape.
 
 | Role | Env var exported at plan load | Agent role |
 |---|---|---|
-| `controller` | `OPSX_CONTROLLER_MODEL` | plan‑drive orchestrator (nested-controller path only) |
+| `controller` | `OPSX_CONTROLLER_MODEL` | plan‑drive orchestrator (`opsx-plan compile`) |
 | `implementer` | `OPSX_IMPLEMENTER_MODEL` | implement phase |
 | `reviewer` | `OPSX_REVIEWER_MODEL` | review phase |
 | `archiver` | `OPSX_ARCHIVER_MODEL` | archive phase |
@@ -119,7 +118,7 @@ The resolved model value is captured in telemetry as `model.model_id` (and
 It flows into aggregation, leaderboard grouping, and cost‑estimation lookups.
 
 **To change models**, edit `models.toml` — no reinstall needed for direct
-dispatch, the default execution path for every adapter:
+dispatch, the only execution path:
 
 ```bash
 opsx-plan models init                     # first time only
@@ -127,11 +126,8 @@ $EDITOR ~/.config/opsx-controller/models.toml
 opsx-plan models show --adapter opencode  # confirm resolution and source
 ```
 
-The one remaining case that *does* need a reinstall is OpenCode's deprecated
-nested-controller `/opsx-drive` path: its subagents are spawned by OpenCode
-itself, so they can only get a model from installed agent frontmatter.
-`bash adapters/opencode/install.sh --global --verify` re-bakes that
-frontmatter from the resolver. Direct dispatch (the default) is unaffected.
+A model change in `models.toml` takes effect on the next `opsx-plan run` —
+no installer re-run required for direct dispatch.
 
 ### Comparing two model sets
 

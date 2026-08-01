@@ -24,6 +24,17 @@ it can be installed with Vercel's `npx skill` flow.
 
 ## Core Workflow
 
+`opsx-controller` operates at two levels:
+
+**Plan-level orchestration** (`opsx-plan` / `opsx-run`):
+1. Write a compilable markdown implementation plan following
+   `core/plan-authoring.md`.
+2. `opsx-plan compile` converts it into a runnable TOML dependency DAG.
+3. `opsx-plan run` sequences changes through implement → review → archive
+   via the controller's per-change loop.
+
+**Per-change controller** (driven by the orchestrator, or standalone via
+`opsx-run`):
 1. Pick exactly one accepted OpenSpec change.
 2. Read repository guidance and the relevant OpenSpec artifacts.
 3. Implement the next required work.
