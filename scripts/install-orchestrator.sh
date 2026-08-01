@@ -27,6 +27,10 @@ install_orchestrator() {
     "$repo_root/orchestrator/samples/sample-plan.toml" \
     "$runtime_dir/samples/"
 
+  install -m 0644 \
+    "$repo_root/core/plan-authoring.md" \
+    "$runtime_dir/plan-authoring.md"
+
   install -m 0755 \
     "$repo_root/orchestrator/opsx-plan.py" \
     "$dest_dir/opsx-plan"
@@ -40,6 +44,7 @@ install_orchestrator() {
   printf '%s\n' \
     "Installed opsx-plan runtime libraries to $runtime_dir" \
     "Installed opsx-plan samples to $runtime_dir/samples" \
+    "Installed plan-authoring reference to $runtime_dir/plan-authoring.md" \
     "Installed opsx-plan to $dest_dir/opsx-plan" \
     "Installed opsx-run to $dest_dir/opsx-run" \
     "Installed opsx-watch-plan to $dest_dir/opsx-watch-plan"

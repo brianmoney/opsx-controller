@@ -62,6 +62,31 @@ install_support_readme() {
     "$dest_dir/README.md"
 }
 
+install_plan_authoring_reference() {
+  local dest_dir="$1"
+  mkdir -p "$dest_dir"
+  install -m 0644 \
+    "$ROOT_DIR/core/plan-authoring.md" \
+    "$dest_dir/plan-authoring.md"
+}
+
+verify_plan_authoring_reference() {
+  local support_dir="$1"
+  local ref="$support_dir/plan-authoring.md"
+  if [[ -f "$ref" ]]; then
+    if cmp -s "$ROOT_DIR/core/plan-authoring.md" "$ref"; then
+      printf '%s\n' "Verify: plan-authoring reference deployed and matches source at $ref"
+      return 0
+    else
+      printf '%s\n' "Verify: plan-authoring reference at $ref differs from $ROOT_DIR/core/plan-authoring.md" >&2
+      return 1
+    fi
+  else
+    printf '%s\n' "Verify: plan-authoring reference MISSING from $ref" >&2
+    return 1
+  fi
+}
+
 ensure_project_gitignore() {
   local gitignore_path="$1/.codex/.gitignore"
   local ignore_line='opsx-controller/*.json'
@@ -97,12 +122,15 @@ install_global() {
   install_skill "$SCRIPT_DIR" "$skills_root"
   install_agents "$SCRIPT_DIR" "$agents_root/agents"
   install_support_readme "$SCRIPT_DIR" "$agents_root/opsx-controller"
+  install_plan_authoring_reference "$agents_root/opsx-controller"
   bash "$ROOT_DIR/scripts/install-orchestrator.sh" "$ROOT_DIR"
 
   printf '%s\n' \
     "Installed agents to $agents_root/agents/" \
-    "Installed support files to $agents_root/opsx-controller/"
+    "Installed support files to $agents_root/opsx-controller/" \
+    "Installed plan-authoring reference to $agents_root/opsx-controller/plan-authoring.md"
   do_verify
+  verify_plan_authoring_reference "$agents_root/opsx-controller"
 }
 
 install_project() {
@@ -121,13 +149,16 @@ install_project() {
   install_skill "$SCRIPT_DIR" "$skills_root"
   install_agents "$SCRIPT_DIR" "$agents_root/agents"
   install_support_readme "$SCRIPT_DIR" "$agents_root/opsx-controller"
+  install_plan_authoring_reference "$agents_root/opsx-controller"
   ensure_project_gitignore "$project_dir"
 
   printf '%s\n' \
     "Installed agents to $agents_root/agents/" \
     "Installed support files to $agents_root/opsx-controller/" \
+    "Installed plan-authoring reference to $agents_root/opsx-controller/plan-authoring.md" \
     "Updated $project_dir/.codex/.gitignore"
   do_verify
+  verify_plan_authoring_reference "$agents_root/opsx-controller"
 }
 
 install_plugin() {
@@ -143,10 +174,16 @@ install_plugin() {
     install -m 0644 "$file" "$plugin_dir/agents/$(basename "$file")"
   done
 
+  mkdir -p "$plugin_dir/opsx-controller"
+  install -m 0644 \
+    "$ROOT_DIR/core/plan-authoring.md" \
+    "$plugin_dir/opsx-controller/plan-authoring.md"
+
   printf '%s\n' \
     "Plugin bundle created at $plugin_dir" \
     "  $plugin_dir/.codex-plugin/plugin.json" \
-    "  $plugin_dir/agents/"
+    "  $plugin_dir/agents/" \
+    "  $plugin_dir/opsx-controller/plan-authoring.md"
 }
 
 if [[ $# -eq 0 ]]; then

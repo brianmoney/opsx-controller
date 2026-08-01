@@ -4,9 +4,7 @@
 
 Define the common orchestrator deployment performed by every global adapter
 installer.
-
 ## Requirements
-
 ### Requirement: Every global adapter install deploys the shared orchestrator
 
 Each global adapter installer SHALL deploy the client-neutral `opsx-plan`,
@@ -24,8 +22,12 @@ plan pair to `~/.local/lib/opsx-controller/samples`, so that compile prompts
 carry a worked example regardless of which repository the orchestrator is
 invoked against.
 
-The installed executable paths and runtime layout SHALL be identical regardless
-of whether OpenCode, Claude Code, or Codex CLI performed the installation.
+Each global adapter installer SHALL additionally deploy the client-neutral
+plan-authoring reference to `~/.local/lib/opsx-controller/plan-authoring.md`.
+
+The installed executable paths, runtime layout, sample paths, and reference
+path SHALL be identical regardless of whether OpenCode, Claude Code, or Codex
+CLI performed the installation.
 
 #### Scenario: Claude global install provides the executables
 
@@ -52,6 +54,12 @@ of whether OpenCode, Claude Code, or Codex CLI performed the installation.
 - **WHEN** an operator runs any adapter's global installer
 - **THEN** the canonical sample plan markdown and its compiled TOML are
   installed under `~/.local/lib/opsx-controller/samples`
+
+#### Scenario: Global install provides the plan-authoring reference
+
+- **WHEN** an operator runs any adapter's global installer
+- **THEN** `~/.local/lib/opsx-controller/plan-authoring.md` contains the
+  current repository reference document
 
 #### Scenario: Installed watcher follows stage logs
 
@@ -103,3 +111,4 @@ alone SHALL NOT be sufficient to report the installation as current.
 - **THEN** the installed `orchestrator` package is replaced with the current
   repository version, and modules deleted from the repository do not persist
   in the installed copy
+

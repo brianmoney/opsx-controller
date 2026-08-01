@@ -72,6 +72,14 @@ install_support_readme() {
     "$dest_dir/README.md"
 }
 
+install_plan_authoring_reference() {
+  local dest_dir="$1"
+  mkdir -p "$dest_dir"
+  install -m 0644 \
+    "$ROOT_DIR/core/plan-authoring.md" \
+    "$dest_dir/plan-authoring.md"
+}
+
 install_plugins() {
   local dest_dir="$1"
   mkdir -p "$dest_dir"
@@ -142,6 +150,23 @@ verify_plugin_deployed() {
   fi
 }
 
+verify_plan_authoring_reference() {
+  local support_dir="$1"
+  local ref="$support_dir/plan-authoring.md"
+  if [[ -f "$ref" ]]; then
+    if cmp -s "$ROOT_DIR/core/plan-authoring.md" "$ref"; then
+      printf '%s\n' "Verify: plan-authoring reference deployed and matches source at $ref"
+      return 0
+    else
+      printf '%s\n' "Verify: plan-authoring reference at $ref differs from $ROOT_DIR/core/plan-authoring.md" >&2
+      return 1
+    fi
+  else
+    printf '%s\n' "Verify: plan-authoring reference MISSING from $ref" >&2
+    return 1
+  fi
+}
+
 install_global() {
   load_model_env opencode
 
@@ -150,18 +175,21 @@ install_global() {
   install_agents "$config_root/agents"
   install_plugins "$config_root/plugins"
   install_support_readme "$config_root/opsx-controller"
+  install_plan_authoring_reference "$config_root/opsx-controller"
   install_orchestrator
   printf '%s\n' \
     "Installed commands to $config_root/commands" \
     "Installed agents to $config_root/agents" \
     "Installed plugins to $config_root/plugins" \
     "Installed support files to $config_root/opsx-controller" \
+    "Installed plan-authoring reference to $config_root/opsx-controller/plan-authoring.md" \
     "Installed opsx-plan runtime libraries to $HOME/.local/lib/opsx-controller" \
     "Installed opsx-plan to $HOME/.local/bin/opsx-plan" \
     "Installed opsx-run to $HOME/.local/bin/opsx-run" \
     "Installed opsx-watch-plan to $HOME/.local/bin/opsx-watch-plan"
   do_verify
   verify_plugin_deployed "$config_root/plugins"
+  verify_plan_authoring_reference "$config_root/opsx-controller"
 }
 
 install_project() {
@@ -177,6 +205,7 @@ install_project() {
   install_agents "$project_dir/.opencode/agents"
   install_plugins "$project_dir/.opencode/plugins"
   install_support_readme "$project_dir/.opencode/opsx-controller"
+  install_plan_authoring_reference "$project_dir/.opencode/opsx-controller"
   ensure_project_gitignore "$project_dir"
   ensure_project_config "$project_dir"
 
@@ -185,9 +214,11 @@ install_project() {
     "Installed agents to $project_dir/.opencode/agents" \
     "Installed plugins to $project_dir/.opencode/plugins" \
     "Installed support files to $project_dir/.opencode/opsx-controller" \
+    "Installed plan-authoring reference to $project_dir/.opencode/opsx-controller/plan-authoring.md" \
     "Updated $project_dir/.opencode/.gitignore"
   do_verify
   verify_plugin_deployed "$project_dir/.opencode/plugins"
+  verify_plan_authoring_reference "$project_dir/.opencode/opsx-controller"
 }
 
 if [[ $# -eq 0 ]]; then

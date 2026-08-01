@@ -69,6 +69,31 @@ install_support_readme() {
     "$dest_dir/README.md"
 }
 
+install_plan_authoring_reference() {
+  local dest_dir="$1"
+  mkdir -p "$dest_dir"
+  install -m 0644 \
+    "$ROOT_DIR/core/plan-authoring.md" \
+    "$dest_dir/plan-authoring.md"
+}
+
+verify_plan_authoring_reference() {
+  local support_dir="$1"
+  local ref="$support_dir/plan-authoring.md"
+  if [[ -f "$ref" ]]; then
+    if cmp -s "$ROOT_DIR/core/plan-authoring.md" "$ref"; then
+      printf '%s\n' "Verify: plan-authoring reference deployed and matches source at $ref"
+      return 0
+    else
+      printf '%s\n' "Verify: plan-authoring reference at $ref differs from $ROOT_DIR/core/plan-authoring.md" >&2
+      return 1
+    fi
+  else
+    printf '%s\n' "Verify: plan-authoring reference MISSING from $ref" >&2
+    return 1
+  fi
+}
+
 ensure_project_gitignore() {
   local gitignore_path="$1/.claude/.gitignore"
   local ignore_line='opsx-controller/*.json'
@@ -99,12 +124,15 @@ install_global() {
   install_skills "$config_root/skills"
   install_agents "$config_root/agents"
   install_support_readme "$config_root/opsx-controller"
+  install_plan_authoring_reference "$config_root/opsx-controller"
   bash "$ROOT_DIR/scripts/install-orchestrator.sh" "$ROOT_DIR"
   printf '%s\n' \
     "Installed skills to $config_root/skills" \
     "Installed agents to $config_root/agents" \
-    "Installed support files to $config_root/opsx-controller"
+    "Installed support files to $config_root/opsx-controller" \
+    "Installed plan-authoring reference to $config_root/opsx-controller/plan-authoring.md"
   do_verify
+  verify_plan_authoring_reference "$config_root/opsx-controller"
 }
 
 install_project() {
@@ -117,14 +145,17 @@ install_project() {
   install_skills "$project_dir/.claude/skills"
   install_agents "$project_dir/.claude/agents"
   install_support_readme "$project_dir/.claude/opsx-controller"
+  install_plan_authoring_reference "$project_dir/.claude/opsx-controller"
   ensure_project_gitignore "$project_dir"
 
   printf '%s\n' \
     "Installed skills to $project_dir/.claude/skills" \
     "Installed agents to $project_dir/.claude/agents" \
     "Installed support files to $project_dir/.claude/opsx-controller" \
+    "Installed plan-authoring reference to $project_dir/.claude/opsx-controller/plan-authoring.md" \
     "Updated $project_dir/.claude/.gitignore"
   do_verify
+  verify_plan_authoring_reference "$project_dir/.claude/opsx-controller"
 }
 
 if [[ $# -eq 0 ]]; then
