@@ -1,0 +1,731 @@
+from __future__ import annotations
+
+import argparse
+import ast
+import importlib.util
+import inspect
+import io
+import os
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from lib.models import resolver
+from lib.orchestrator import doctor as doctor_mod
+from lib.orchestrator import state as state_mod
+from lib.orchestrator import base as base_mod
+from lib.orchestrator import groundtruth as groundtruth_mod
+from lib.orchestrator import telemetry as telemetry_mod
+
+_SCRIPT = Path(__file__).resolve().parents[2] / "orchestrator" / "opsx-plan.py"
+
+_MODEL_HOME: tempfile.TemporaryDirectory | None = None
+_MODEL_CONFIG_PATCH = None
+_MODEL_ENV_PATCH = None
+
+
+def setUpModule() -> None:
+    global _MODEL_HOME, _MODEL_CONFIG_PATCH, _MODEL_ENV_PATCH
+    _MODEL_HOME = tempfile.TemporaryDirectory()
+    _MODEL_CONFIG_PATCH = mock.patch.object(
+        resolver, "USER_CONFIG_PATH", Path(_MODEL_HOME.name) / "models.toml"
+    )
+    _MODEL_CONFIG_PATCH.start()
+    _MODEL_ENV_PATCH = mock.patch.dict(
+        os.environ,
+        {
+            "OPSX_CONTROLLER_MODEL": "test-provider/test-controller",
+            "OPSX_IMPLEMENTER_MODEL": "test-provider/test-implementer",
+            "OPSX_REVIEWER_MODEL": "test-provider/test-reviewer",
+            "OPSX_ARCHIVER_MODEL": "test-provider/test-archiver",
+        },
+    )
+    _MODEL_ENV_PATCH.start()
+
+
+def tearDownModule() -> None:
+    assert _MODEL_ENV_PATCH is not None
+    assert _MODEL_CONFIG_PATCH is not None
+    assert _MODEL_HOME is not None
+    _MODEL_ENV_PATCH.stop()
+    _MODEL_CONFIG_PATCH.stop()
+    _MODEL_HOME.cleanup()
+
+
+def git(repo: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True)
+
+
+def load_opsx_plan():
+    spec = importlib.util.spec_from_file_location("opsx_plan", _SCRIPT)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class DoctorPreflightTests(unittest.TestCase):
+    """Tests for ``opsx-plan doctor`` preflight checks and run-start warnings
+    (tasks 4.1, 4.2, 4.3)."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        git(self.repo, "init")
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        git(self.repo, "add", "tracked.txt")
+        git(
+            self.repo,
+            "-c", "user.email=test@example.invalid",
+            "-c", "user.name=Test User",
+            "commit", "-m", "init",
+        )
+        # Isolate model resolution from whatever the real machine's home
+        # directory happens to contain, so these tests are hermetic.
+        from lib.models import resolver as _resolver
+        self._models_patch = mock.patch.object(
+            _resolver, "USER_CONFIG_PATH", Path(self.tmp.name) / "unused-home" / "models.toml"
+        )
+        self._models_patch.start()
+        self.addCleanup(self._models_patch.stop)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _write_plan_toml(self, name: str = "doctor-test-plan",
+                         delivery: str = "") -> Path:
+        """Write a minimal plan TOML and return its absolute path."""
+        plan_content = (
+            f'[plan]\nname = "{name}"\nadapter = "opencode"\n'
+            f'timeout_minutes = 1\nmax_rounds = 5\n'
+            f'require_clean_tracked = false\n'
+        )
+        if delivery:
+            plan_content += f'delivery = "{delivery}"\n'
+        plan_content += (
+            '[[changes]]\nid = "ch-doctor"\n'
+        )
+        p = self.repo / f"{name}.toml"
+        p.write_text(plan_content, encoding="utf-8")
+        return p
+
+    # -- 4.1: failing check classes ---------------------------------------
+
+    def test_check_model_resolution_missing_reports_failures(self) -> None:
+        """Unresolved OPSX_*_MODEL roles should produce a failing check."""
+        saved_env = {}
+        for v in self.opsx_plan.ROLE_ENV.values():
+            saved_env[v] = os.environ.pop(v, None)
+        try:
+            passed, label, remediation = doctor_mod._check_model_resolution(
+                self.repo, "opencode"
+            )
+            self.assertFalse(passed)
+            self.assertIn("Unresolved role", remediation)
+        finally:
+            for v, val in saved_env.items():
+                if val is not None:
+                    os.environ[v] = val
+                elif v in os.environ:
+                    del os.environ[v]
+
+    def test_check_model_resolution_passes_when_all_set(self) -> None:
+        """When all OPSX_*_MODEL vars resolve, the check passes."""
+        saved_env = {}
+        for v in self.opsx_plan.ROLE_ENV.values():
+            saved_env[v] = os.environ.get(v)
+            os.environ[v] = "provider/test-model-value"
+        try:
+            passed, label, remediation = doctor_mod._check_model_resolution(
+                self.repo, "opencode"
+            )
+            self.assertTrue(passed, f"check failed: {remediation}")
+        finally:
+            for v, val in saved_env.items():
+                if val is not None:
+                    os.environ[v] = val
+                elif v in os.environ:
+                    del os.environ[v]
+
+    def test_check_model_identifier_syntax_fails_on_provider_prefix_for_claude_code(self) -> None:
+        """A provider-prefixed identifier under claude-code fails the syntax check."""
+        saved_env = {}
+        for v in self.opsx_plan.ROLE_ENV.values():
+            saved_env[v] = os.environ.get(v)
+            os.environ[v] = "deepseek/deepseek-v4-pro"
+        try:
+            passed, label, remediation = doctor_mod._check_model_identifier_syntax(
+                self.repo, "claude-code"
+            )
+            self.assertFalse(passed)
+            self.assertIn("provider-prefixed", remediation)
+        finally:
+            for v, val in saved_env.items():
+                if val is not None:
+                    os.environ[v] = val
+                elif v in os.environ:
+                    del os.environ[v]
+
+    def test_check_model_identifier_syntax_fails_on_bare_identifier_for_opencode(self) -> None:
+        """A bare identifier under opencode fails the syntax check."""
+        saved_env = {}
+        for v in self.opsx_plan.ROLE_ENV.values():
+            saved_env[v] = os.environ.get(v)
+            os.environ[v] = "gpt-5.4"
+        try:
+            passed, label, remediation = doctor_mod._check_model_identifier_syntax(
+                self.repo, "opencode"
+            )
+            self.assertFalse(passed)
+            self.assertIn("provider/", remediation)
+        finally:
+            for v, val in saved_env.items():
+                if val is not None:
+                    os.environ[v] = val
+                elif v in os.environ:
+                    del os.environ[v]
+
+    def test_check_model_identifier_syntax_passes_for_matching_syntax(self) -> None:
+        """A correctly-shaped identifier passes the syntax check."""
+        saved_env = {}
+        for v in self.opsx_plan.ROLE_ENV.values():
+            saved_env[v] = os.environ.get(v)
+            os.environ[v] = "provider/test-model-value"
+        try:
+            passed, label, remediation = doctor_mod._check_model_identifier_syntax(
+                self.repo, "opencode"
+            )
+            self.assertTrue(passed, f"check failed: {remediation}")
+        finally:
+            for v, val in saved_env.items():
+                if val is not None:
+                    os.environ[v] = val
+                elif v in os.environ:
+                    del os.environ[v]
+
+    def test_check_tracked_bytecode_no_false_positives_on_clean_tree(self) -> None:
+        """A clean tree without bytecode should pass."""
+        passed, label, remediation = doctor_mod._check_tracked_bytecode(self.repo)
+        self.assertTrue(passed, f"unexpected failure: {remediation}")
+
+    def test_check_tracked_bytecode_detects_tracked_pyc(self) -> None:
+        """Tracked .pyc files should be detected."""
+        pyc = self.repo / "cached.pyc"
+        pyc.write_text("fake", encoding="utf-8")
+        git(self.repo, "add", "cached.pyc")
+        git(
+            self.repo,
+            "-c", "user.email=test@example.invalid",
+            "-c", "user.name=Test User",
+            "commit", "-m", "add pyc",
+        )
+        passed, label, remediation = doctor_mod._check_tracked_bytecode(self.repo)
+        self.assertFalse(passed)
+        self.assertIn("cached.pyc", remediation)
+
+    def test_check_tracked_tree_clean_passes_on_clean_tree(self) -> None:
+        """A clean tree should pass the check."""
+        passed, label, remediation = doctor_mod._check_tracked_tree_clean(self.repo)
+        self.assertTrue(passed, f"unexpected failure: {remediation}")
+
+    def test_check_tracked_tree_clean_detects_dirty_tree(self) -> None:
+        """A dirty tracked tree should fail the check."""
+        (self.repo / "tracked.txt").write_text("modified\n", encoding="utf-8")
+        passed, label, remediation = doctor_mod._check_tracked_tree_clean(self.repo)
+        self.assertFalse(passed)
+        self.assertIn("uncommitted", remediation)
+
+    def test_check_plan_loads_passes_when_plan_is_valid(self) -> None:
+        """A valid plan should load successfully."""
+        plan_path = self._write_plan_toml()
+        plan_src = str(plan_path.relative_to(self.repo))
+        passed, label, remediation = doctor_mod._check_plan_loads(self.repo, plan_src)
+        self.assertTrue(passed, f"unexpected failure: {remediation}")
+
+    def test_check_plan_loads_fails_when_plan_is_invalid(self) -> None:
+        """An invalid plan should fail to load with a clear message."""
+        path = self.repo / "bad.toml"
+        path.write_text("not valid toml [[[", encoding="utf-8")
+        plan_src = str(path.relative_to(self.repo))
+        passed, label, remediation = doctor_mod._check_plan_loads(self.repo, plan_src)
+        self.assertFalse(passed)
+        self.assertIn("Plan load failed", remediation)
+
+    def test_check_plan_loads_skips_when_plan_src_is_none(self) -> None:
+        """No plan should be treated as a pass (skip)."""
+        passed, label, remediation = doctor_mod._check_plan_loads(self.repo, None)
+        self.assertTrue(passed)
+
+    def test_check_pr_delivery_skips_when_no_plan(self) -> None:
+        """When plan_src is None, PR check should skip (pass)."""
+        passed, label, remediation = doctor_mod._check_pr_delivery(self.repo, None)
+        self.assertTrue(passed)
+
+    def test_check_pr_delivery_fails_when_plan_load_fails(self) -> None:
+        """When the plan TOML cannot be loaded, PR check must FAIL, not pass."""
+        path = self.repo / "bad-pr.toml"
+        path.write_text("broken toml [[{", encoding="utf-8")
+        plan_src = str(path.relative_to(self.repo))
+        passed, label, remediation = doctor_mod._check_pr_delivery(self.repo, plan_src)
+        self.assertFalse(passed)
+        self.assertIn("Plan failed to load", remediation)
+
+    def test_check_pr_delivery_passes_when_delivery_is_not_pr(self) -> None:
+        """When delivery is not pull-request, the check passes."""
+        plan_path = self._write_plan_toml(delivery="none")
+        plan_src = str(plan_path.relative_to(self.repo))
+        passed, label, remediation = doctor_mod._check_pr_delivery(self.repo, plan_src)
+        self.assertTrue(passed)
+
+    def test_check_pr_delivery_fails_when_gh_missing(self) -> None:
+        """When delivery is pull-request but gh is missing, check fails."""
+        plan_path = self._write_plan_toml(delivery="pull-request")
+        plan_src = str(plan_path.relative_to(self.repo))
+        with mock.patch("shutil.which", return_value=None):
+            passed, label, remediation = doctor_mod._check_pr_delivery(self.repo, plan_src)
+        self.assertFalse(passed)
+        self.assertIn("gh", remediation.lower())
+
+    def test_check_pr_delivery_fails_when_no_git_remote(self) -> None:
+        """When delivery is pull-request, gh is present but no remote, check fails."""
+        plan_path = self._write_plan_toml(delivery="pull-request")
+        plan_src = str(plan_path.relative_to(self.repo))
+        # gh on PATH, but we have no remote (bare init)
+        with mock.patch("shutil.which", return_value="/usr/bin/gh"):
+            passed, label, remediation = doctor_mod._check_pr_delivery(self.repo, plan_src)
+        self.assertFalse(passed)
+        self.assertIn("No git remote", remediation)
+
+    # -- 4.1 (continued): missing failure-path tests for stale install,
+    #    missing openspec, and missing adapter client -----------------------
+
+    def test_check_stale_install_fails_when_hashes_differ(self) -> None:
+        """When the installed copy content differs from the repo copy, the
+        check must fail with a stale-install message."""
+        import hashlib
+
+        repo_copy = self.repo / "orchestrator" / "opsx-plan.py"
+        repo_copy.parent.mkdir(parents=True)
+        repo_copy.write_text("repo content", encoding="utf-8")
+
+        fake_home = Path(self.tmp.name) / "fake-home"
+        fake_home.mkdir(parents=True, exist_ok=True)
+        installed = fake_home / ".local" / "bin" / "opsx-plan"
+        installed.parent.mkdir(parents=True, exist_ok=True)
+        installed.write_text("different installed content", encoding="utf-8")
+
+        with mock.patch.object(Path, "home", return_value=fake_home):
+            passed, label, remediation = self.opsx_plan._check_stale_install(self.repo)
+
+        self.assertFalse(passed)
+        self.assertIn("stale", remediation.lower())
+
+    def test_check_stale_install_fails_when_installed_missing(self) -> None:
+        """When the installed copy does not exist at all, the check must fail."""
+        repo_copy = self.repo / "orchestrator" / "opsx-plan.py"
+        repo_copy.parent.mkdir(parents=True)
+        repo_copy.write_text("repo content", encoding="utf-8")
+
+        fake_home = Path(self.tmp.name) / "fake-home-missing"
+        fake_home.mkdir(parents=True, exist_ok=True)
+
+        with mock.patch.object(Path, "home", return_value=fake_home):
+            passed, label, remediation = self.opsx_plan._check_stale_install(self.repo)
+
+        self.assertFalse(passed)
+        self.assertIn("not found", remediation.lower())
+
+    def test_check_openspec_on_path_fails_when_openspec_missing(self) -> None:
+        """When openspec is not on PATH, the check must fail with an install hint."""
+        with mock.patch("shutil.which", return_value=None):
+            passed, label, remediation = doctor_mod._check_openspec_on_path()
+
+        self.assertFalse(passed)
+        self.assertIn("Install openspec", remediation)
+
+    def test_check_openspec_on_path_passes_when_found(self) -> None:
+        """When openspec is on PATH, the check must pass."""
+        with mock.patch("shutil.which", return_value="/usr/bin/openspec"):
+            passed, label, remediation = doctor_mod._check_openspec_on_path()
+
+        self.assertTrue(passed, f"unexpected failure: {remediation}")
+
+    def test_check_adapter_client_on_path_fails_when_client_missing(self) -> None:
+        """When the adapter client executable is not on PATH, the check must
+        fail with an install hint."""
+        with mock.patch("shutil.which", return_value=None):
+            passed, label, remediation = doctor_mod._check_adapter_client_on_path("opencode")
+
+        self.assertFalse(passed)
+        self.assertIn("opencode", label.lower())
+        self.assertIn("Install", remediation)
+
+    def test_check_adapter_client_on_path_passes_when_client_found(self) -> None:
+        """When the adapter client is on PATH, the check must pass."""
+        with mock.patch("shutil.which", return_value="/usr/bin/opencode"):
+            passed, label, remediation = doctor_mod._check_adapter_client_on_path("opencode")
+
+        self.assertTrue(passed, f"unexpected failure: {remediation}")
+
+    # -- 4.2: doctor with different plan states ----------------------------
+
+    def test_cmd_doctor_with_no_plan_runs_plan_independent_checks(self) -> None:
+        """Doctor without any plan should still run plan-independent checks and
+        surface failures."""
+        args = argparse.Namespace(repo=str(self.repo), plan=None)
+        stdout = io.StringIO()
+        # Simulate missing required env vars to force a failure
+        saved_env = {}
+        for v in self.opsx_plan.ROLE_ENV.values():
+            saved_env[v] = os.environ.pop(v, None)
+        try:
+            with mock.patch("sys.stdout", stdout):
+                rc = self.opsx_plan.cmd_doctor(args)
+        finally:
+            for v, val in saved_env.items():
+                if val is not None:
+                    os.environ[v] = val
+                elif v in os.environ:
+                    del os.environ[v]
+        # Should report plan as none
+        self.assertIn("(none", stdout.getvalue())
+        # Should exit non-zero due to missing env vars
+        self.assertEqual(rc, 1)
+
+    def test_cmd_doctor_with_explicit_plan_loads_plan_checks(self) -> None:
+        """Doctor with an explicit valid plan should run plan-dependent checks."""
+        plan_path = self._write_plan_toml()
+        plan_src = str(plan_path.relative_to(self.repo))
+        args = argparse.Namespace(repo=str(self.repo), plan=plan_src)
+        stdout = io.StringIO()
+        with mock.patch("sys.stdout", stdout):
+            rc = self.opsx_plan.cmd_doctor(args)
+        output = stdout.getvalue()
+        self.assertIn("opsx-plan doctor", output)
+        self.assertIn(plan_src, output)
+        # The plan-dependent checks are what this test is about. The overall
+        # exit code is not asserted: doctor also checks host installation state
+        # (~/.local/bin/opsx-plan, installed worker agents), which is absent on
+        # a clean checkout and on CI, so requiring rc == 0 would only pass on a
+        # machine where the installer had already been run.
+        self.assertIn("✓ Plan loads successfully", output)
+        self.assertIn("✓ Model roles resolve for the target adapter", output)
+        self.assertIsNotNone(rc)
+        # 4.2: each resolved role's source is reported alongside the model
+        self.assertIn("controller", output)
+        self.assertIn("ambient environment", output)
+
+    def test_cmd_doctor_with_missing_explicit_plan_exits_nonzero(self) -> None:
+        """Doctor with a non-existent explicit plan should fail hard."""
+        args = argparse.Namespace(repo=str(self.repo), plan="nonexistent.toml")
+        rc = self.opsx_plan.cmd_doctor(args)
+        self.assertEqual(rc, 2)
+
+    def test_cmd_doctor_with_stale_active_plan_warns_and_continues(self) -> None:
+        """When the active plan pointer references a missing file, doctor must
+        warn rather than silently swallow the error."""
+        # Write a stale active plan pointer
+        self.opsx_plan.write_active_plan(self.repo, "gone-plan.toml")
+        args = argparse.Namespace(repo=str(self.repo), plan=None)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+            rc = self.opsx_plan.cmd_doctor(args)
+        stderr_val = stderr.getvalue()
+        self.assertIn("active plan pointer references missing file", stderr_val)
+        self.assertIn("gone-plan.toml", stderr_val)
+        # Should still run plan-independent checks
+        self.assertIn("(none", stdout.getvalue())
+
+    def test_cmd_doctor_with_unloadable_active_plan_exits_nonzero(self) -> None:
+        """When the active plan file exists but cannot be loaded, doctor must
+        fail with a non-zero exit."""
+        # Write an active plan pointer to a file that exists but is invalid
+        bad_plan = self.repo / "bad-active.toml"
+        bad_plan.write_text("not valid toml {{{", encoding="utf-8")
+        self.opsx_plan.write_active_plan(self.repo, "bad-active.toml")
+        args = argparse.Namespace(repo=str(self.repo), plan=None)
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr):
+            rc = self.opsx_plan.cmd_doctor(args)
+        self.assertEqual(rc, 2)
+        self.assertIn("cannot load plan", stderr.getvalue())
+        self.assertIn("bad-active.toml", stderr.getvalue())
+
+    # -- 4.3: run-start preflight is warning-only -----------------------
+
+    def test_run_preflight_warnings_never_blocks_dispatch(self) -> None:
+        """Run-start preflight warnings must not raise, exit, or block."""
+        try:
+            self.opsx_plan.run_preflight_warnings(self.repo, None)
+        except Exception as exc:
+            self.fail(f"run_preflight_warnings raised unexpectedly: {exc}")
+
+    def test_run_preflight_warnings_logs_stale_install_and_dirty_tree(self) -> None:
+        """Warnings should be logged for stale install and dirty tree, but
+        the function must always return None."""
+        (self.repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+        logs: list[str] = []
+
+        def capture_log(msg: str) -> None:
+            logs.append(msg)
+
+        with mock.patch.object(self.opsx_plan.base, "log", side_effect=capture_log):
+            result = self.opsx_plan.run_preflight_warnings(self.repo, None)
+        self.assertIsNone(result)
+        # At least one warning about dirty tree should appear
+        warning_msgs = [m for m in logs if "Tracked tree is clean" in m or "uncommitted" in m.lower()]
+        self.assertTrue(warning_msgs, f"No dirty-tree warning in logs: {logs}")
+
+    def test_cmd_run_runs_preflight_warnings_without_changing_outcome(self) -> None:
+        """When cmd_run executes, preflight warnings fire but the run continues
+        normally."""
+        plan_path = self._write_plan_toml(name="preflight-run-plan")
+        plan_src = str(plan_path.relative_to(self.repo))
+
+        # Verify plan loads and run_preflight_warnings is called
+        preflight_called: list[bool] = []
+
+        def fake_preflight(repo, plan_src_, adapter, cfg=None):
+            preflight_called.append(True)
+
+        with mock.patch.object(
+            self.opsx_plan, "run_preflight_warnings",
+            side_effect=fake_preflight,
+        ):
+            args = argparse.Namespace(
+                repo=str(self.repo),
+                plan=plan_src,
+                dry_run=True,
+                only=None,
+                max_changes=0,
+                budget_minutes=0,
+                budget_usd=0,
+                create_only=False,
+            )
+            rc = self.opsx_plan.cmd_run(args)
+        self.assertTrue(preflight_called, "run_preflight_warnings was not called")
+
+    # -- doctor --adapter tests --
+
+    def test_doctor_planless_claude_selection(self) -> None:
+        """Doctor without a plan uses explicit --adapter."""
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            plan=None,
+            adapter="claude-code",
+        )
+        with mock.patch.object(self.opsx_plan, "run_doctor_checks") as m_run:
+            m_run.return_value = 0
+            rc = self.opsx_plan.cmd_doctor(args)
+        self.assertEqual(rc, 0)
+        m_run.assert_called_once()
+        _, _, passed_adapter, _ = m_run.call_args[0]
+        self.assertEqual(passed_adapter, "claude-code",
+                         "plan-less doctor should propagate --adapter")
+
+    def test_doctor_plan_adapter_overrides_flag(self) -> None:
+        """A resolved plan's adapter is authoritative even when --adapter is given."""
+        plan_path = self._write_plan_toml(name="override-test")
+        plan_src = str(plan_path.relative_to(self.repo))
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            plan=plan_src,
+            adapter="claude-code",
+        )
+        with mock.patch.object(self.opsx_plan, "run_doctor_checks") as m_run:
+            m_run.return_value = 0
+            rc = self.opsx_plan.cmd_doctor(args)
+        self.assertEqual(rc, 0)
+        _, _, passed_adapter, _ = m_run.call_args[0]
+        self.assertEqual(passed_adapter, "opencode",
+                         "plan's adapter must override --adapter flag")
+
+    def test_doctor_defaults_to_opencode_without_flag_or_plan(self) -> None:
+        """Doctor without --adapter and without plan defaults to opencode."""
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            plan=None,
+        )
+        with mock.patch.object(self.opsx_plan, "run_doctor_checks") as m_run:
+            m_run.return_value = 0
+            rc = self.opsx_plan.cmd_doctor(args)
+        self.assertEqual(rc, 0)
+        _, _, passed_adapter, _ = m_run.call_args[0]
+        self.assertEqual(passed_adapter, "opencode")
+
+
+class DirectWorkerAgentDoctorCheckTests(unittest.TestCase):
+    """Tests for the doctor check that verifies worker agents are installed
+    for a direct-dispatch plan (task 7)."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.fake_home = Path(self.tmp.name) / "home"
+        self.fake_home.mkdir()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _direct_cfg(self, adapter: str = "claude-code") -> dict:
+        return {
+            "adapter": adapter,
+            "implement_invoke": "claude -p --agent opsx-implementer",
+            "review_invoke": "claude -p --agent opsx-reviewer",
+            "archive_invoke": "claude -p --agent opsx-archiver",
+        }
+
+    def _write_agents(self, agent_dir: Path, names: tuple[str, ...]) -> None:
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            (agent_dir / f"{name}.md").write_text(
+                f"---\nname: {name}\n---\n", encoding="utf-8"
+            )
+
+    def test_reports_missing_agents_by_name_with_installer(self) -> None:
+        agent_dir = self.fake_home / ".claude" / "agents"
+        self._write_agents(agent_dir, ("opsx-implementer",))  # reviewer + archiver missing
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.fake_home)}, clear=False):
+            passed, label, remediation = doctor_mod._check_direct_worker_agents(
+                self._direct_cfg()
+            )
+
+        self.assertFalse(passed)
+        self.assertIn("opsx-reviewer", remediation)
+        self.assertIn("opsx-archiver", remediation)
+        self.assertNotIn("opsx-implementer", remediation)
+        self.assertIn("adapters/claude-code/install.sh", remediation)
+
+    def test_passes_when_all_worker_agents_present(self) -> None:
+        agent_dir = self.fake_home / ".claude" / "agents"
+        self._write_agents(
+            agent_dir, ("opsx-implementer", "opsx-reviewer", "opsx-archiver")
+        )
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.fake_home)}, clear=False):
+            passed, label, remediation = doctor_mod._check_direct_worker_agents(
+                self._direct_cfg()
+            )
+
+        self.assertTrue(passed, remediation)
+
+    def test_skipped_when_no_plan_resolved(self) -> None:
+        passed, label, remediation = doctor_mod._check_direct_worker_agents(None)
+        self.assertTrue(passed)
+        self.assertEqual(remediation, "")
+
+    def test_skipped_when_plan_does_not_use_direct_dispatch(self) -> None:
+        cfg = self._direct_cfg()
+        cfg["archive_invoke"] = ""  # fewer than three invokes -> nested-controller path
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.fake_home)}, clear=False):
+            passed, label, remediation = doctor_mod._check_direct_worker_agents(cfg)
+
+        self.assertTrue(passed)
+
+    def test_opencode_direct_plan_checks_opencode_agent_directory(self) -> None:
+        agent_dir = self.fake_home / ".config" / "opencode" / "agents"
+        self._write_agents(
+            agent_dir, ("opsx-implementer", "opsx-reviewer", "opsx-archiver")
+        )
+        cfg = self._direct_cfg(adapter="opencode")
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.fake_home)}, clear=False):
+            passed, label, remediation = doctor_mod._check_direct_worker_agents(cfg)
+
+        self.assertTrue(passed, remediation)
+
+    def test_passes_when_agents_only_in_repo_local_install(self) -> None:
+        repo = Path(self.tmp.name) / "repo"
+        agent_dir = repo / ".claude" / "agents"
+        self._write_agents(
+            agent_dir, ("opsx-implementer", "opsx-reviewer", "opsx-archiver")
+        )
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.fake_home)}, clear=False):
+            passed, label, remediation = doctor_mod._check_direct_worker_agents(
+                self._direct_cfg(), repo
+            )
+
+        self.assertTrue(passed, remediation)
+
+    def test_passes_when_agents_only_in_home_install_with_repo_given(self) -> None:
+        repo = Path(self.tmp.name) / "repo"
+        repo.mkdir()
+        agent_dir = self.fake_home / ".claude" / "agents"
+        self._write_agents(
+            agent_dir, ("opsx-implementer", "opsx-reviewer", "opsx-archiver")
+        )
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.fake_home)}, clear=False):
+            passed, label, remediation = doctor_mod._check_direct_worker_agents(
+                self._direct_cfg(), repo
+            )
+
+        self.assertTrue(passed, remediation)
+
+    def test_fails_naming_missing_agents_when_in_neither_location(self) -> None:
+        repo = Path(self.tmp.name) / "repo"
+        repo.mkdir()
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.fake_home)}, clear=False):
+            passed, label, remediation = doctor_mod._check_direct_worker_agents(
+                self._direct_cfg(), repo
+            )
+
+        self.assertFalse(passed)
+        self.assertIn("opsx-implementer", remediation)
+        self.assertIn("opsx-reviewer", remediation)
+        self.assertIn("opsx-archiver", remediation)
+        self.assertIn("adapters/claude-code/install.sh", remediation)
+
+
+class DoctorProbeCoverageTests(unittest.TestCase):
+    """Assert that every _check_* probe defined in doctor.py is invoked by
+    both ``run_doctor_checks`` and ``run_preflight_warnings`` in the
+    entrypoint (tasks.md 7.6 / design.md D6)."""
+
+    def test_every_doctor_probe_is_called_by_both_aggregators(self) -> None:
+        opsx_plan = load_opsx_plan()
+
+        probes = {
+            name for name in dir(doctor_mod)
+            if name.startswith("_check_")
+            and callable(getattr(doctor_mod, name))
+            and name != "_check_stale_install"  # lives in the entrypoint
+        }
+
+        def _called_doctor_checks(func):
+            called = set()
+            tree = ast.parse(inspect.getsource(func))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                if not isinstance(node.func, ast.Attribute):
+                    continue
+                attr = node.func
+                if (
+                    isinstance(attr.value, ast.Name)
+                    and attr.value.id == "doctor"
+                    and attr.attr.startswith("_check_")
+                ):
+                    called.add(attr.attr)
+            return called
+
+        doctor_called = _called_doctor_checks(opsx_plan.run_doctor_checks)
+        preflight_called = _called_doctor_checks(opsx_plan.run_preflight_warnings)
+
+        missing_doctor = probes - doctor_called
+        missing_preflight = probes - preflight_called
+        if missing_doctor or missing_preflight:
+            self.fail(
+                f"doctor.py probes missing from aggregators:\n"
+                f"  run_doctor_checks: {sorted(missing_doctor)}\n"
+                f"  run_preflight_warnings: {sorted(missing_preflight)}"
+            )

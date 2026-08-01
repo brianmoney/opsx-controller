@@ -1,0 +1,19 @@
+opsx-plan doctor (repo: /home/brian/opsx-controller/scratchpad/fixture)
+  plan: (none; running plan-independent checks only)
+
+  ✓ Installed orchestrator matches repo copy
+  ✓ Model roles resolve for the target adapter
+      controller   openai/gpt-5.6-terra  [user-global config (/home/brian/.config/opsx-controller/models.toml)]
+      implementer  deepseek/deepseek-v4-pro  [user-global config (/home/brian/.config/opsx-controller/models.toml)]
+      reviewer     openai/gpt-5.6-terra  [user-global config (/home/brian/.config/opsx-controller/models.toml)]
+      archiver     deepseek/deepseek-v4-pro  [user-global config (/home/brian/.config/opsx-controller/models.toml)]
+  ✓ Resolved model identifiers match adapter syntax
+  ✓ openspec on PATH
+  ✓ opencode on PATH
+  ✓ No tracked __pycache__ or .pyc files
+  ✓ Tracked tree is clean
+  ✓ Plan loads successfully
+  ✓ PR delivery prerequisites (gh + git remote)
+  ✓ Direct-dispatch worker agents installed
+
+All checks passed

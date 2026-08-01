@@ -78,66 +78,6 @@ def git(repo: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True)
 
 
-class VerifyChangeCreatedTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.opsx_plan = load_opsx_plan()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.repo = Path(self.tmp.name)
-        git(self.repo, "init")
-        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
-        git(self.repo, "add", "tracked.txt")
-        git(
-            self.repo,
-            "-c",
-            "user.email=test@example.invalid",
-            "-c",
-            "user.name=Test User",
-            "commit",
-            "-m",
-            "init",
-        )
-        self.cfg = {"created_check": "", "check_timeout_minutes": 1}
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-
-    def write_authored_change(self, cid: str) -> None:
-        cdir = self.repo / "openspec" / "changes" / cid
-        cdir.mkdir(parents=True)
-        (cdir / "proposal.md").write_text("## Why\n", encoding="utf-8")
-        (cdir / "tasks.md").write_text("## 1. Tasks\n", encoding="utf-8")
-
-    def test_create_allows_preexisting_tracked_changes(self) -> None:
-        (self.repo / "tracked.txt").write_text("dirty before create\n", encoding="utf-8")
-        before = self.opsx_plan.tracked_worktree_snapshot(self.repo)
-
-        self.write_authored_change("add-example")
-
-        ok, why = self.opsx_plan.verify_change_created(
-            self.repo, self.cfg, "add-example", before
-        )
-        self.assertTrue(ok, why)
-
-    def test_create_rejects_new_tracked_changes(self) -> None:
-        before = self.opsx_plan.tracked_worktree_snapshot(self.repo)
-
-        self.write_authored_change("add-example")
-        (self.repo / "tracked.txt").write_text("dirty during create\n", encoding="utf-8")
-
-        ok, why = self.opsx_plan.verify_change_created(
-            self.repo, self.cfg, "add-example", before
-        )
-        self.assertFalse(ok)
-        self.assertIn("creation modified tracked files", why)
-
-    def test_accept_verification_ignores_unrelated_dirty_tree(self) -> None:
-        (self.repo / "tracked.txt").write_text("dirty before accept\n", encoding="utf-8")
-        self.write_authored_change("add-example")
-
-        ok, why = self.opsx_plan.verify_change_created(self.repo, self.cfg, "add-example")
-        self.assertTrue(ok, why)
-
-
 class DirectOpenCodeExecutionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.opsx_plan = load_opsx_plan()
@@ -200,17 +140,17 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
         }
         self.state = {"plan": self.plan_name, "approvals": [], "changes": {}}
         self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+        record["tracked_change_files"] = self.opsx_plan.state_mod.change_context_paths(
             self.repo, self.cid
         )
         self._saved_invoke = self.opsx_plan.invoke_direct_stage
-        self._saved_checks = self.opsx_plan.run_fast_checks
+        self._saved_checks = self.opsx_plan.groundtruth.run_fast_checks
 
     def tearDown(self) -> None:
         self.opsx_plan.invoke_direct_stage = self._saved_invoke
-        self.opsx_plan.run_fast_checks = self._saved_checks
+        self.opsx_plan.groundtruth.run_fast_checks = self._saved_checks
         self.tmp.cleanup()
 
     def write_authored_change(self, cid: str) -> None:
@@ -363,7 +303,7 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
         self.assertIn(f"CHANGE: {self.cid}", inputs[0])
         self.assertIn("ROUND: 1", inputs[0])
 
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         self.assertEqual(record["phase"], "done")
         self.assertEqual(record["status"], self.opsx_plan.base.DONE)
         self.assertEqual(record["archive"]["status"], "passed")
@@ -390,7 +330,7 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
         result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
 
         self.assertEqual(result, "failed")
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         self.assertEqual(record["last_result"], "subagent_output_invalid")
         self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
         self.assertIn("output invalid", record["reason"])
@@ -484,7 +424,7 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
         result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
 
         self.assertEqual(result, "stop")
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
         self.assertEqual(record["archive"]["status"], "failed")
         self.assertEqual(record["last_result"], "post_archive_dirty_tracked")
@@ -549,7 +489,7 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
         result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
 
         self.assertEqual(result, self.opsx_plan.base.DONE)
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         self.assertEqual(record["status"], self.opsx_plan.base.DONE)
         self.assertEqual(record["archive"]["status"], "passed")
         self.assertEqual(record["archive"]["commit"], "")
@@ -561,7 +501,7 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
         # in-memory state, without relying on the archive commit.
         fresh_state = {"plan": self.plan_name, "approvals": [], "changes": {}}
         self.opsx_plan.reconcile(self.repo, self.cfg, fresh_state)
-        fresh_record = self.opsx_plan.rec(fresh_state, self.cid)
+        fresh_record = self.opsx_plan.state_mod.rec(fresh_state, self.cid)
         self.assertEqual(fresh_record["status"], self.opsx_plan.base.DONE)
 
     def test_reconcile_keeps_done_change_when_newer_archive_prefix_commit_exists(self) -> None:
@@ -639,21 +579,21 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
 
         self.opsx_plan.reconcile(self.repo, self.cfg, self.state)
 
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         self.assertEqual(record["status"], self.opsx_plan.base.DONE)
         self.assertEqual(record["phase"], "done")
         ok, why = self.opsx_plan.verify_direct_archive_done(self.repo, self.cid, record)
         self.assertTrue(ok, why)
 
     def test_reconcile_recovers_interrupted_review_from_plan_state(self) -> None:
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         record["status"] = self.opsx_plan.base.RUNNING
         record["phase"] = "review"
         record["round"] = 2
 
         self.opsx_plan.reconcile(self.repo, self.cfg, self.state)
 
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         self.assertEqual(record["status"], self.opsx_plan.base.PENDING)
         self.assertEqual(record["phase"], "review")
         self.assertEqual(record["round"], 2)
@@ -739,12 +679,12 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
             [stage for stage, _, _ in calls],
             ["implement", "review", "implement", "review", "archive"],
         )
-        self.assertEqual(self.opsx_plan.rec(self.state, self.cid)["round"], 2)
-        self.assertEqual(self.opsx_plan.rec(self.state, self.cid)["latest_fix_prompt"], "")
+        self.assertEqual(self.opsx_plan.state_mod.rec(self.state, self.cid)["round"], 2)
+        self.assertEqual(self.opsx_plan.state_mod.rec(self.state, self.cid)["latest_fix_prompt"], "")
 
     def test_review_retry_budget_exhaustion_stops_change(self) -> None:
         self.cfg["max_rounds"] = 1
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         record["max_rounds"] = 1
         self.stage_runner(
             [
@@ -782,7 +722,7 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
         result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
 
         self.assertEqual(result, "stop")
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
         self.assertEqual(record["last_result"], "max_rounds_reached")
         self.assertIn("retry budget exhausted", record["reason"])
@@ -839,7 +779,7 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
         result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
 
         self.assertEqual(result, "stop")
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
         self.assertEqual(record["last_result"], "no_progress")
         self.assertEqual(record["no_progress_streak"], 2)
@@ -892,13 +832,13 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
         result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
 
         self.assertEqual(result, "stop")
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
         self.assertEqual(record["archive"]["status"], "failed")
         self.assertIn("still exists", record["reason"])
 
     def test_archive_success_still_requires_fast_checks(self) -> None:
-        self.opsx_plan.run_fast_checks = lambda repo, cfg: (False, "check failed: smoke")
+        self.opsx_plan.groundtruth.run_fast_checks = lambda repo, cfg: (False, "check failed: smoke")
         self.stage_runner(
             [
                 {
@@ -947,7 +887,7 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
         result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
 
         self.assertEqual(result, "stop")
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
         self.assertEqual(record["last_result"], "post_archive_check_failed")
         self.assertIn("post-archive", record["reason"])
@@ -1049,15 +989,15 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
         self.assertIn(multi_finding_handoff.splitlines()[0], retry_input)
         # After the clean review, latest_fix_prompt must be cleared.
         self.assertEqual(
-            self.opsx_plan.rec(self.state, self.cid)["latest_fix_prompt"], ""
+            self.opsx_plan.state_mod.rec(self.state, self.cid)["latest_fix_prompt"], ""
         )
         # The passing review's last_review carries an empty fix_prompt,
         # confirming the handoff was cleared (not carried forward).
         self.assertEqual(
-            self.opsx_plan.rec(self.state, self.cid)["last_review"]["verdict"], "pass"
+            self.opsx_plan.state_mod.rec(self.state, self.cid)["last_review"]["verdict"], "pass"
         )
         self.assertEqual(
-            self.opsx_plan.rec(self.state, self.cid)["last_review"]["fix_prompt"], ""
+            self.opsx_plan.state_mod.rec(self.state, self.cid)["last_review"]["fix_prompt"], ""
         )
 
     def test_log_metadata_exposes_handoff_without_breaking_parsing(self) -> None:
@@ -1188,136 +1128,6 @@ class SingleChangeConfigTests(unittest.TestCase):
         self.assertIn("tracked worktree is dirty", stderr.getvalue())
 
 
-class ArchiveCommitEvidenceGateTests(unittest.TestCase):
-    """Whether an `archive(<id>):` commit is required evidence depends on
-    whether openspec/changes/archive/ is gitignored.
-
-    When the directory is tracked (the default OpenSpec layout) a missing
-    commit means the archive was never durably recorded and must fail the
-    change. When it is gitignored the archiver has nothing to stage, so the
-    commit legitimately does not exist and must not veto completion.
-    """
-
-    def setUp(self) -> None:
-        self.opsx_plan = load_opsx_plan()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.repo = Path(self.tmp.name)
-        git(self.repo, "init")
-        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
-        git(self.repo, "add", "tracked.txt")
-        git(
-            self.repo,
-            "-c",
-            "user.email=test@example.invalid",
-            "-c",
-            "user.name=Test User",
-            "commit",
-            "-m",
-            "init",
-        )
-        self.cid = "add-gate-example"
-        self.archive_rel = f"openspec/changes/archive/2026-07-26-{self.cid}"
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-
-    def ignore_archive_dir(self) -> None:
-        (self.repo / ".gitignore").write_text(
-            "openspec/changes/archive/\n", encoding="utf-8"
-        )
-
-    def archive_on_disk(self) -> None:
-        dst = self.repo / self.archive_rel
-        dst.mkdir(parents=True, exist_ok=True)
-        (dst / "proposal.md").write_text("# archived\n", encoding="utf-8")
-
-    def record_without_commit(self) -> dict:
-        return {
-            "archive": {
-                "status": "passed",
-                "path": self.archive_rel,
-                "commit": "",
-                "reason": "",
-            }
-        }
-
-    def test_archive_dir_ignored_reports_ignore_rules(self) -> None:
-        self.assertFalse(self.opsx_plan.archive_dir_ignored(self.repo))
-        self.ignore_archive_dir()
-        self.assertTrue(self.opsx_plan.archive_dir_ignored(self.repo))
-
-    def test_archive_dir_ignored_ignores_index_state(self) -> None:
-        """A force-added legacy archive must not flip the gate: newly
-        archived files still stage nothing under the same ignore rule."""
-        self.ignore_archive_dir()
-        self.archive_on_disk()
-        git(self.repo, "add", "-f", f"{self.archive_rel}/proposal.md")
-        git(
-            self.repo,
-            "-c",
-            "user.email=test@example.invalid",
-            "-c",
-            "user.name=Test User",
-            "commit",
-            "-m",
-            f"archive({self.cid}): force-added legacy archive",
-        )
-        self.assertTrue(self.opsx_plan.archive_dir_ignored(self.repo))
-
-    def test_tracked_archive_dir_requires_archive_commit(self) -> None:
-        self.archive_on_disk()
-        ok, why = self.opsx_plan.verify_direct_archive_done(
-            self.repo, self.cid, self.record_without_commit()
-        )
-        self.assertFalse(ok)
-        self.assertIn("did not record archive commit", why)
-
-    def test_ignored_archive_dir_allows_missing_archive_commit(self) -> None:
-        self.ignore_archive_dir()
-        self.archive_on_disk()
-        ok, why = self.opsx_plan.verify_direct_archive_done(
-            self.repo, self.cid, self.record_without_commit()
-        )
-        self.assertTrue(ok, why)
-
-    def test_tracked_archive_dir_requires_reachable_commit(self) -> None:
-        self.archive_on_disk()
-        record = self.record_without_commit()
-        record["archive"]["commit"] = "0" * 40
-        ok, why = self.opsx_plan.verify_direct_archive_done(
-            self.repo, self.cid, record
-        )
-        self.assertFalse(ok)
-        self.assertIn("not reachable from HEAD", why)
-
-    def test_ignored_archive_dir_tolerates_unreachable_commit(self) -> None:
-        self.ignore_archive_dir()
-        self.archive_on_disk()
-        record = self.record_without_commit()
-        record["archive"]["commit"] = "0" * 40
-        ok, why = self.opsx_plan.verify_direct_archive_done(
-            self.repo, self.cid, record
-        )
-        self.assertTrue(ok, why)
-
-    def test_record_archive_evidence_requires_commit_when_tracked(self) -> None:
-        self.archive_on_disk()
-        record = {"archive": {}}
-        self.assertFalse(
-            self.opsx_plan.record_archive_evidence(self.repo, record, self.cid)
-        )
-
-    def test_record_archive_evidence_accepts_no_commit_when_ignored(self) -> None:
-        self.ignore_archive_dir()
-        self.archive_on_disk()
-        record = {"archive": {}}
-        self.assertTrue(
-            self.opsx_plan.record_archive_evidence(self.repo, record, self.cid)
-        )
-        self.assertEqual(record["archive"]["status"], "passed")
-        self.assertEqual(record["archive"]["commit"], "")
-
-
 class SingleChangeRunnerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.opsx_plan = load_opsx_plan()
@@ -1354,11 +1164,11 @@ class SingleChangeRunnerTests(unittest.TestCase):
         self.cid = "add-single-runner"
         self.plan_name = f"run-{self.cid}"
         self._saved_invoke = self.opsx_plan.invoke_direct_stage
-        self._saved_checks = self.opsx_plan.run_fast_checks
+        self._saved_checks = self.opsx_plan.groundtruth.run_fast_checks
 
     def tearDown(self) -> None:
         self.opsx_plan.invoke_direct_stage = self._saved_invoke
-        self.opsx_plan.run_fast_checks = self._saved_checks
+        self.opsx_plan.groundtruth.run_fast_checks = self._saved_checks
         self.tmp.cleanup()
 
     def write_authored_change(self, cid: str) -> None:
@@ -1450,7 +1260,7 @@ class SingleChangeRunnerTests(unittest.TestCase):
 
     def test_single_change_runs_implement_review_archive(self) -> None:
         self.write_authored_change(self.cid)
-        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        state = self.opsx_plan.state_mod.load_state(self.repo, self.plan_name)
         cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
 
         calls, _ = self.stage_runner(
@@ -1505,14 +1315,14 @@ class SingleChangeRunnerTests(unittest.TestCase):
             [stage for stage, _, _ in calls],
             ["implement", "review", "archive"],
         )
-        record = self.opsx_plan.rec(state, self.cid)
+        record = self.opsx_plan.state_mod.rec(state, self.cid)
         self.assertEqual(record["phase"], "done")
         self.assertEqual(record["status"], self.opsx_plan.base.DONE)
         self.assertEqual(record["archive"]["status"], "passed")
 
     def test_single_change_review_failure_retries_implement(self) -> None:
         self.write_authored_change(self.cid)
-        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        state = self.opsx_plan.state_mod.load_state(self.repo, self.plan_name)
         cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
 
         calls, _ = self.stage_runner(
@@ -1595,14 +1405,14 @@ class SingleChangeRunnerTests(unittest.TestCase):
             [stage for stage, _, _ in calls],
             ["implement", "review", "implement", "review", "archive"],
         )
-        self.assertEqual(self.opsx_plan.rec(state, self.cid)["round"], 2)
+        self.assertEqual(self.opsx_plan.state_mod.rec(state, self.cid)["round"], 2)
         self.assertEqual(
-            self.opsx_plan.rec(state, self.cid)["latest_fix_prompt"], ""
+            self.opsx_plan.state_mod.rec(state, self.cid)["latest_fix_prompt"], ""
         )
 
     def test_single_change_state_persists_under_run_prefix(self) -> None:
         self.write_authored_change(self.cid)
-        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        state = self.opsx_plan.state_mod.load_state(self.repo, self.plan_name)
         cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
 
         self.stage_runner(
@@ -1652,7 +1462,7 @@ class SingleChangeRunnerTests(unittest.TestCase):
 
         self.opsx_plan.run_direct_change(self.repo, cfg, state, self.cid)
 
-        state_path = self.opsx_plan.state_path(self.repo, self.plan_name)
+        state_path = self.opsx_plan.state_mod.state_path(self.repo, self.plan_name)
         self.assertTrue(state_path.is_file(), f"expected state at {state_path}")
 
         worker_state = self.opsx_plan.worker_state_path(self.repo, self.plan_name, self.cid)
@@ -1713,7 +1523,7 @@ class SingleChangeRunnerTests(unittest.TestCase):
         os.environ["OPSX_CONTROLLER_MODEL"] = "github-copilot/gpt-5.4"
         os.environ["OPSX_IMPLEMENTER_ESCALATION_MODEL"] = esc_model
 
-        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        state = self.opsx_plan.state_mod.load_state(self.repo, self.plan_name)
         cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
         cfg["escalate_after_review_fails"] = 2
 
@@ -1817,7 +1627,7 @@ class SingleChangeRunnerTests(unittest.TestCase):
         os.environ["OPSX_CONTROLLER_MODEL"] = "github-copilot/gpt-5.4"
         os.environ["OPSX_IMPLEMENTER_ESCALATION_MODEL"] = esc_model
 
-        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        state = self.opsx_plan.state_mod.load_state(self.repo, self.plan_name)
         cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
         cfg["escalate_after_review_fails"] = 0
 
@@ -1897,7 +1707,7 @@ class SingleChangeRunnerTests(unittest.TestCase):
         os.environ["OPSX_CONTROLLER_MODEL"] = "github-copilot/gpt-5.4"
         os.environ["OPSX_IMPLEMENTER_ESCALATION_MODEL"] = esc_model
 
-        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        state = self.opsx_plan.state_mod.load_state(self.repo, self.plan_name)
         cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
         cfg["escalate_after_review_fails"] = 1
         cfg["max_rounds"] = 4
@@ -1998,7 +1808,7 @@ class SingleChangeRunnerTests(unittest.TestCase):
         os.environ["OPSX_CONTROLLER_MODEL"] = "github-copilot/gpt-5.4"
         os.environ["OPSX_IMPLEMENTER_ESCALATION_MODEL"] = esc_model
 
-        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        state = self.opsx_plan.state_mod.load_state(self.repo, self.plan_name)
         cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
         cfg["escalate_after_review_fails"] = 1
 
@@ -2063,7 +1873,7 @@ class SingleChangeRunnerTests(unittest.TestCase):
         os.environ["OPSX_CONTROLLER_MODEL"] = "github-copilot/gpt-5.4"
         os.environ["OPSX_IMPLEMENTER_ESCALATION_MODEL"] = esc_model
 
-        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        state = self.opsx_plan.state_mod.load_state(self.repo, self.plan_name)
         cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
         cfg["escalate_after_review_fails"] = 1
         cfg["implement_invoke"] = "my-tool $OPSX_IMPLEMENTER_MODEL {change}"
@@ -2150,7 +1960,7 @@ class SingleChangeRunnerTests(unittest.TestCase):
 
         # ── Run change A that escalates ──
         plan_name_a = f"run-{cid_a}"
-        state_a = self.opsx_plan.load_state(self.repo, plan_name_a)
+        state_a = self.opsx_plan.state_mod.load_state(self.repo, plan_name_a)
         cfg_a = self.opsx_plan.build_single_change_config(self.repo, cid_a)
         cfg_a["name"] = plan_name_a
         cfg_a["escalate_after_review_fails"] = 1
@@ -2204,7 +2014,7 @@ class SingleChangeRunnerTests(unittest.TestCase):
             return "exited", log_path
 
         self.opsx_plan.invoke_direct_stage = fake_invoke
-        self.opsx_plan.run_fast_checks = lambda _repo, _cfg: (True, "")
+        self.opsx_plan.groundtruth.run_fast_checks = lambda _repo, _cfg: (True, "")
         self.opsx_plan.run_direct_change(self.repo, cfg_a, state_a, cid_a)
 
         # Verify change A escalated on its second implement dispatch.
@@ -2222,7 +2032,7 @@ class SingleChangeRunnerTests(unittest.TestCase):
         #    overwrote the env.  Build cfg_b independently with the base model
         #    so its resolved models entry is the non-escalated value. ──
         plan_name_b = f"run-{cid_b}"
-        state_b = self.opsx_plan.load_state(self.repo, plan_name_b)
+        state_b = self.opsx_plan.state_mod.load_state(self.repo, plan_name_b)
         # Reset env to base so resolve_models picks up the correct base model,
         # then apply_model_env encodes it in cfg_b.
         os.environ["OPSX_IMPLEMENTER_MODEL"] = impl_model
@@ -2318,9 +2128,9 @@ class MainDispatchTests(unittest.TestCase):
             self.assertEqual(repo, self.repo.resolve())
             self.assertIsNone(budget_deadline)
             self.assertEqual(budget_usd, 0.0)
-            record = self.opsx_plan.rec(state, cid)
+            record = self.opsx_plan.state_mod.rec(state, cid)
             record["phase"] = "implement"
-            self.opsx_plan.set_status(
+            self.opsx_plan.state_mod.set_status(
                 state,
                 cid,
                 self.opsx_plan.base.FAILED,
@@ -3375,4534 +3185,6 @@ class ClaudeCodeResultEnvelopeParsingTests(unittest.TestCase):
         self.assertIsNone(payload)
         self.assertIn("permission denied before JSON output", reason)
         self.assertIsNotNone(envelope)
-
-
-class DirectStageTelemetryTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.opsx_plan = load_opsx_plan()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.repo = Path(self.tmp.name)
-        # Save and clear env vars so tests start from a known state.
-        self._saved_env = {}
-        for key in ("OPSX_IMPLEMENTER_MODEL", "OPSX_IMPLEMENTER_ESCALATION_MODEL",
-                     "OPSX_REVIEWER_MODEL", "OPSX_ARCHIVER_MODEL",
-                     "OPSX_CONTROLLER_MODEL"):
-            self._saved_env[key] = os.environ.get(key)
-            os.environ.pop(key, None)
-        git(self.repo, "init")
-        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
-        # openspec/changes/archive/ is gitignored here, mirroring this
-        # repo: archiving stages nothing, so no archive(<id>): commit is
-        # produced and none is required.
-        (self.repo / ".gitignore").write_text(
-            "openspec/changes/archive/\n", encoding="utf-8"
-        )
-        git(self.repo, "add", "tracked.txt", ".gitignore")
-        git(
-            self.repo,
-            "-c",
-            "user.email=test@example.invalid",
-            "-c",
-            "user.name=Test User",
-            "commit",
-            "-m",
-            "init",
-        )
-        self.cid = "add-telemetry-test"
-        self.plan_name = f"run-{self.cid}"
-        self.cfg = {
-            "name": self.plan_name,
-            "adapter": "opencode",
-            "implement_invoke": "opencode run --agent opsx-implementer",
-            "review_invoke": "opencode run --agent opsx-reviewer",
-            "archive_invoke": "opencode run --agent opsx-archiver",
-            "invoke": 'opencode run "/opsx-drive {change}"',
-            "state_file": ".opencode/opsx-controller/{change}.json",
-            "timeout_minutes": 1,
-            "max_attempts": 2,
-            "max_rounds": 2,
-            "no_progress_limit": 2,
-            "fast_checks": [],
-            "check_timeout_minutes": 1,
-            "require_clean_tracked": False,
-            "review_created": False,
-            "changes": {
-                self.cid: {
-                    "id": self.cid,
-                    "depends_on": [],
-                    "enabled": True,
-                    "pause_before": False,
-                    "timeout_minutes": 1,
-                    "max_attempts": 2,
-                    "create_invoke": "",
-                    "create_max_attempts": 1,
-                }
-            },
-            "order": [self.cid],
-            "created_check": "",
-            "plan_doc": "",
-            "create_timeout_minutes": 1,
-        }
-        self.state = {"plan": self.plan_name, "approvals": [], "changes": {}}
-        self._saved_invoke = self.opsx_plan.invoke_direct_stage
-        self._saved_checks = self.opsx_plan.run_fast_checks
-
-    def tearDown(self) -> None:
-        self.opsx_plan.invoke_direct_stage = self._saved_invoke
-        self.opsx_plan.run_fast_checks = self._saved_checks
-        # Restore env vars that tests may have modified.
-        for key, val in self._saved_env.items():
-            if val is not None:
-                os.environ[key] = val
-            else:
-                os.environ.pop(key, None)
-        self.tmp.cleanup()
-
-    def write_authored_change(self, cid: str) -> None:
-        cdir = self.repo / "openspec" / "changes" / cid
-        cdir.mkdir(parents=True)
-        (cdir / "proposal.md").write_text("## Why\n", encoding="utf-8")
-        (cdir / "tasks.md").write_text(
-            "## 1. Tasks\n\n- [ ] 1.1 Example task\n- [ ] 1.2 Example task\n",
-            encoding="utf-8",
-        )
-
-    def archive_change_in_repo(self, cid: str) -> tuple[str, str]:
-        src = self.repo / "openspec" / "changes" / cid
-        archive_rel = f"openspec/changes/archive/2026-07-05-{cid}"
-        dst = self.repo / archive_rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        src.rename(dst)
-        # openspec/changes/archive/ is gitignored: only the change-directory
-        # deletion (when tracked) is ever staged, mirroring the real
-        # opsx-archiver's git-ls-files guard.
-        tracked = subprocess.run(
-            ["git", "ls-files", "--", f"openspec/changes/{cid}"],
-            cwd=self.repo, check=True, capture_output=True, text=True,
-        ).stdout.strip()
-        if tracked:
-            git(self.repo, "add", "-A", "--", f"openspec/changes/{cid}")
-        staged = subprocess.run(
-            ["git", "diff", "--cached", "--name-only"],
-            cwd=self.repo, check=True, capture_output=True, text=True,
-        ).stdout.strip()
-        if not staged:
-            return archive_rel, ""
-        git(
-            self.repo,
-            "-c",
-            "user.email=test@example.invalid",
-            "-c",
-            "user.name=Test User",
-            "commit",
-            "-m",
-            f"archive({cid}): archive completed OpenSpec change",
-        )
-        commit = (
-            subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=self.repo,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            .stdout.strip()
-        )
-        return archive_rel, commit
-
-    def stage_runner(self, payloads: list[dict]) -> list[str]:
-        input_blocks: list[str] = []
-
-        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
-            self.assertTrue(payloads, f"unexpected stage call: {stage}")
-            payload = payloads.pop(0)
-            self.assertEqual(stage, payload["stage"])
-            input_blocks.append(input_block)
-            if stage == "archive" and payload.get("archive_repo"):
-                archive_path, commit = self.archive_change_in_repo(cid)
-                payload = {
-                    **payload,
-                    "result": {
-                        **payload["result"],
-                        "archive_path": archive_path,
-                        "commit": commit,
-                    },
-                    "archive_path": archive_path,
-                    "commit": commit,
-                }
-            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            lines = payload.get("lines")
-            if lines is None:
-                if "result" in payload:
-                    body = json.dumps(payload["result"]) + "\n"
-                else:
-                    body = "\n"
-            else:
-                body = lines
-            log_path.write_text(body, encoding="utf-8")
-            return payload.get("outcome", "exited"), log_path
-
-        self.opsx_plan.invoke_direct_stage = fake_invoke
-        return input_blocks
-
-    def _read_telemetry(self) -> list[dict]:
-        jsonl = self.repo / ".opsx-plan" / "telemetry" / f"{self.plan_name}.jsonl"
-        if not jsonl.is_file():
-            return []
-        records: list[dict] = []
-        for line in jsonl.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                records.append(json.loads(line))
-        return records
-
-    # 6.1
-    def test_successful_implement_stage_produces_completed_record(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
-                        "files_touched": ["orchestrator/opsx-plan.py"],
-                        "known_change_files": [],
-                        "summary": "implemented first round",
-                    },
-                },
-                {"stage": "review", "outcome": "timeout"},
-            ]
-        )
-
-        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        records = self._read_telemetry()
-        self.assertGreaterEqual(len(records), 1)
-        r = records[0]
-        self.assertEqual(r["status"], "completed")
-        self.assertEqual(r["stage"], "implement")
-        self.assertIsNotNone(r["ended_at"])
-        self.assertIsNotNone(r["duration_ms"])
-        self.assertGreaterEqual(r["duration_ms"], 0)
-        self.assertEqual(r["change_id"], self.cid)
-        self.assertEqual(r["plan_name"], self.plan_name)
-        self.assertEqual(r["schema_version"], self.opsx_plan.TELEMETRY_SCHEMA_VERSION)
-        self.assertTrue(r["uid"])
-        self.assertIsNotNone(r["started_at"])
-        self.assertIn("log_path", r["result"])
-        self.assertIsNotNone(r["result"]["log_path"])
-
-    # 7.6: model environment set once (as apply_model_env would) survives the
-    # usage-sidecar env restore and is still readable when telemetry
-    # attribution re-expands the stage invoke string.
-    def test_model_env_still_populated_after_sidecar_restore_for_telemetry(self) -> None:
-        saved = os.environ.get("OPSX_IMPLEMENTER_MODEL")
-        os.environ["OPSX_IMPLEMENTER_MODEL"] = "deepseek/deepseek-v4-pro"
-        try:
-            self.cfg["implement_invoke"] = (
-                'opencode run --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL"'
-            )
-            self.write_authored_change(self.cid)
-            record = self.opsx_plan.rec(self.state, self.cid)
-            record["max_rounds"] = self.cfg["max_rounds"]
-            record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-                self.repo, self.cid
-            )
-            self.stage_runner(
-                [
-                    {
-                        "stage": "implement",
-                        "result": {
-                            "status": "implemented",
-                            "change": self.cid,
-                            "round": 1,
-                            "progress_made": True,
-                            "completed_tasks": ["1.1"],
-                            "remaining_tasks": ["1.2"],
-                            "task_counts": {"complete": 1, "total": 2},
-                            "files_touched": ["orchestrator/opsx-plan.py"],
-                            "known_change_files": [],
-                            "summary": "implemented first round",
-                        },
-                    },
-                    {"stage": "review", "outcome": "timeout"},
-                ]
-            )
-
-            self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-            # The env var must still be set post-run: run_direct_change's
-            # usage-sidecar restore only ever touches OPSX_USAGE_PATH and
-            # friends, never OPSX_*_MODEL.
-            self.assertEqual(os.environ.get("OPSX_IMPLEMENTER_MODEL"), "deepseek/deepseek-v4-pro")
-
-            records = self._read_telemetry()
-            self.assertGreaterEqual(len(records), 1)
-            r = records[0]
-            self.assertEqual(r["stage"], "implement")
-            self.assertEqual(r["model"]["provider"], "deepseek")
-            self.assertEqual(r["model"]["model_id"], "deepseek-v4-pro")
-        finally:
-            if saved is not None:
-                os.environ["OPSX_IMPLEMENTER_MODEL"] = saved
-            else:
-                os.environ.pop("OPSX_IMPLEMENTER_MODEL", None)
-
-    # 6.2
-    def test_successful_review_stage_populates_verdict_and_findings(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "implemented",
-                    },
-                },
-                {
-                    "stage": "review",
-                    "result": {
-                        "status": "reviewed",
-                        "change": self.cid,
-                        "round": 1,
-                        "verdict": "fail",
-                        "finding_counts": {"critical": 2, "warning": 3, "note": 1},
-                        "summary": "review failed with findings",
-                        "fix_prompt": "fix stuff",
-                        "next_phase": "implement",
-                    },
-                },
-                {"stage": "implement", "outcome": "timeout"},
-            ]
-        )
-
-        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        records = self._read_telemetry()
-        review_records = [r for r in records if r["stage"] == "review"]
-        self.assertGreaterEqual(len(review_records), 1)
-        rev = review_records[0]
-        self.assertEqual(rev["status"], "completed")
-        self.assertEqual(rev["result"]["verdict"], "fail")
-        self.assertEqual(rev["result"]["critical_count"], 2)
-        self.assertEqual(rev["result"]["warning_count"], 3)
-        self.assertEqual(rev["result"]["note_count"], 1)
-        self.assertEqual(rev["result"]["stage_status"], "reviewed")
-
-    # 6.3
-    def test_successful_archive_stage_produces_completed_record(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "implemented",
-                    },
-                },
-                {
-                    "stage": "review",
-                    "result": {
-                        "status": "reviewed",
-                        "change": self.cid,
-                        "round": 1,
-                        "verdict": "pass",
-                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
-                        "summary": "review passed",
-                        "fix_prompt": "",
-                        "next_phase": "archive",
-                    },
-                },
-                {
-                    "stage": "archive",
-                    "archive_repo": True,
-                    "result": {
-                        "status": "archived",
-                        "change": self.cid,
-                        "archive_path": "",
-                        "spec_sync_status": "no-delta",
-                        "commit": "",
-                        "summary": "archive succeeded",
-                    },
-                },
-            ]
-        )
-
-        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        records = self._read_telemetry()
-        archive_records = [r for r in records if r["stage"] == "archive"]
-        self.assertGreaterEqual(len(archive_records), 1)
-        arch = archive_records[0]
-        self.assertEqual(arch["status"], "completed")
-        self.assertEqual(arch["result"]["stage_status"], "archived")
-
-    # 6.4
-    def test_timeout_produces_timeout_record(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "outcome": "timeout",
-                },
-            ]
-        )
-
-        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        records = self._read_telemetry()
-        self.assertGreaterEqual(len(records), 1)
-        r = records[0]
-        self.assertEqual(r["status"], "timeout")
-        self.assertIsNotNone(r["result"]["error_message"])
-        self.assertIn("timed out", r["result"]["error_message"])
-        self.assertIsNotNone(r["duration_ms"])
-
-    # 6.5
-    def test_spawn_error_produces_spawn_error_record(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "outcome": "spawn_error",
-                },
-            ]
-        )
-
-        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        records = self._read_telemetry()
-        self.assertGreaterEqual(len(records), 1)
-        r = records[0]
-        self.assertEqual(r["status"], "spawn_error")
-        self.assertIsNotNone(r["result"]["error_message"])
-        self.assertIn("could not spawn", r["result"]["error_message"])
-        self.assertIsNone(r["result"]["stage_status"])
-
-    # 6.6
-    def test_invalid_worker_json_produces_invalid_output_record(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "lines": "not json\nsecond line\n",
-                },
-            ]
-        )
-
-        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        records = self._read_telemetry()
-        self.assertGreaterEqual(len(records), 1)
-        r = records[0]
-        self.assertEqual(r["status"], "invalid_output")
-        self.assertIsNotNone(r["result"]["error_message"])
-        self.assertIsNone(r["result"]["stage_status"])
-
-    # 6.7
-    def test_telemetry_record_appended_to_correct_plan_jsonl(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "implemented",
-                    },
-                },
-                {"stage": "review", "outcome": "timeout"},
-            ]
-        )
-
-        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        jsonl = self.repo / ".opsx-plan" / "telemetry" / f"{self.plan_name}.jsonl"
-        self.assertTrue(jsonl.is_file(), f"expected {jsonl}")
-        content = jsonl.read_text(encoding="utf-8")
-        self.assertTrue(content.endswith("\n"))
-
-    # 6.8
-    def test_worker_state_includes_telemetry_latest_uid(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "implemented",
-                    },
-                },
-                {"stage": "review", "outcome": "timeout"},
-            ]
-        )
-
-        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        worker_state = self.opsx_plan.worker_state_path(self.repo, self.plan_name, self.cid)
-        self.assertTrue(worker_state.is_file())
-        payload = json.loads(worker_state.read_text(encoding="utf-8"))
-        self.assertIn("telemetry", payload)
-        self.assertIn("latest_telemetry", payload["telemetry"])
-        self.assertTrue(payload["telemetry"]["latest_telemetry"])
-
-        # Verify the UID matches what's in the JSONL (latest record)
-        records = self._read_telemetry()
-        self.assertGreaterEqual(len(records), 1)
-        self.assertEqual(
-            payload["telemetry"]["latest_telemetry"],
-            records[-1]["uid"],
-        )
-
-    # 6.9
-    def test_usage_and_cost_are_default_unavailable(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "implemented",
-                    },
-                },
-                {"stage": "review", "outcome": "timeout"},
-            ]
-        )
-
-        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        records = self._read_telemetry()
-        r = records[0]
-        usage = r["usage"]
-        self.assertFalse(usage["usage_available"])
-        self.assertIsNone(usage["input_tokens"])
-        self.assertIsNone(usage["output_tokens"])
-        self.assertIsNone(usage["cached_input_tokens"])
-        self.assertIsNone(usage["reasoning_tokens"])
-        self.assertIsNone(usage["total_tokens"])
-        self.assertIsNone(usage["usage_source"])
-        cost = r["cost"]
-        self.assertEqual(cost["status"], "unresolved")
-        self.assertIsNone(cost["pricing_catalog_version"])
-        self.assertIsNone(cost["price_snapshot"])
-        self.assertEqual(cost["unresolved_reason"], "usage unavailable")
-        self.assertIsNone(cost["estimated_cost"])
-
-    # 6.10
-    def test_telemetry_directory_created_on_first_write(self) -> None:
-        telemetry_dir = self.repo / ".opsx-plan" / "telemetry"
-        self.assertFalse(telemetry_dir.is_dir())
-
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "implemented",
-                    },
-                },
-                {"stage": "review", "outcome": "timeout"},
-            ]
-        )
-
-        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        self.assertTrue(telemetry_dir.is_dir())
-
-    # 6.11
-    def test_run_id_stable_across_pause_and_resume(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-
-        # First run: implement succeeds, review fails
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "implemented",
-                    },
-                },
-                {
-                    "stage": "review",
-                    "result": {
-                        "status": "reviewed",
-                        "change": self.cid,
-                        "round": 1,
-                        "verdict": "fail",
-                        "finding_counts": {"critical": 1, "warning": 0, "note": 0},
-                        "summary": "review failed",
-                        "fix_prompt": "fix it",
-                        "next_phase": "implement",
-                    },
-                },
-                {
-                    "stage": "implement",
-                    "outcome": "timeout",
-                },
-            ]
-        )
-
-        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        records = self._read_telemetry()
-        self.assertGreaterEqual(len(records), 2)
-        run_ids = {r["run_id"] for r in records}
-        self.assertEqual(len(run_ids), 1, f"all records should share the same run_id, got: {run_ids}")
-
-        first_run_id = records[0]["run_id"]
-        self.assertTrue(first_run_id)
-
-    # 6.12
-    def test_existing_resume_behavior_preserved(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-
-        # First run: implement succeeds, review fails
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "implemented",
-                    },
-                },
-                {
-                    "stage": "review",
-                    "result": {
-                        "status": "reviewed",
-                        "change": self.cid,
-                        "round": 1,
-                        "verdict": "fail",
-                        "finding_counts": {"critical": 1, "warning": 0, "note": 0},
-                        "summary": "review failed",
-                        "fix_prompt": "Add tests",
-                        "next_phase": "implement",
-                    },
-                },
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 2,
-                        "progress_made": True,
-                        "completed_tasks": ["1.2"],
-                        "remaining_tasks": [],
-                        "task_counts": {"complete": 2, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "implemented round 2",
-                    },
-                },
-                {
-                    "stage": "review",
-                    "result": {
-                        "status": "reviewed",
-                        "change": self.cid,
-                        "round": 2,
-                        "verdict": "pass",
-                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
-                        "summary": "review passed",
-                        "fix_prompt": "",
-                        "next_phase": "archive",
-                    },
-                },
-                {
-                    "stage": "archive",
-                    "archive_repo": True,
-                    "result": {
-                        "status": "archived",
-                        "change": self.cid,
-                        "archive_path": "",
-                        "spec_sync_status": "no-delta",
-                        "commit": "",
-                        "summary": "archive succeeded",
-                    },
-                },
-            ]
-        )
-
-        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        self.assertEqual(result, self.opsx_plan.base.DONE)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        self.assertEqual(record["phase"], "done")
-        self.assertEqual(record["round"], 2)
-        self.assertEqual(record["status"], self.opsx_plan.base.DONE)
-        self.assertEqual(record["archive"]["status"], "passed")
-
-        # Verify telemetry was written for all stages
-        records = self._read_telemetry()
-        stages = [r["stage"] for r in records]
-        self.assertEqual(stages, ["implement", "review", "implement", "review", "archive"])
-
-    def test_blocked_implement_produces_failed_telemetry(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "blocked",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": False,
-                        "completed_tasks": [],
-                        "remaining_tasks": ["1.1"],
-                        "task_counts": {"complete": 0, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "implement blocked",
-                        "reason": "missing design artifact",
-                    },
-                },
-            ]
-        )
-
-        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        self.assertEqual(result, "stop")
-        records = self._read_telemetry()
-        self.assertGreaterEqual(len(records), 1)
-        r = records[0]
-        self.assertEqual(r["status"], "failed")
-        self.assertEqual(r["stage"], "implement")
-        self.assertIsNotNone(r["result"]["error_message"])
-        self.assertIn("implement_blocked", r["result"]["error_message"])
-
-    def test_unexpected_implement_status_produces_failed_telemetry(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "unknown-weird-status",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": False,
-                        "completed_tasks": [],
-                        "remaining_tasks": [],
-                        "task_counts": {"complete": 0, "total": 0},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "weird",
-                    },
-                },
-            ]
-        )
-
-        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        records = self._read_telemetry()
-        self.assertGreaterEqual(len(records), 1)
-        r = records[0]
-        self.assertEqual(r["status"], "failed")
-        self.assertIsNotNone(r["result"]["error_message"])
-        self.assertIn("implement_invalid", r["result"]["error_message"])
-
-    def test_unexpected_review_status_produces_failed_telemetry(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "implemented",
-                    },
-                },
-                {
-                    "stage": "review",
-                    "result": {
-                        "status": "not-reviewed",
-                        "change": self.cid,
-                        "round": 1,
-                        "verdict": "unknown",
-                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
-                        "summary": "bad review",
-                        "fix_prompt": "",
-                    },
-                },
-            ]
-        )
-
-        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        records = self._read_telemetry()
-        review_records = [r for r in records if r["stage"] == "review"]
-        self.assertGreaterEqual(len(review_records), 1)
-        rev = review_records[0]
-        self.assertEqual(rev["status"], "failed")
-        self.assertIsNotNone(rev["result"]["error_message"])
-        self.assertIn("review_invalid", rev["result"]["error_message"])
-
-    def test_unexpected_review_verdict_produces_failed_telemetry(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "implemented",
-                    },
-                },
-                {
-                    "stage": "review",
-                    "result": {
-                        "status": "reviewed",
-                        "change": self.cid,
-                        "round": 1,
-                        "verdict": "undecided",
-                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
-                        "summary": "unexpected verdict",
-                        "fix_prompt": "",
-                    },
-                },
-            ]
-        )
-
-        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        records = self._read_telemetry()
-        review_records = [r for r in records if r["stage"] == "review"]
-        self.assertGreaterEqual(len(review_records), 1)
-        rev = review_records[0]
-        self.assertEqual(rev["status"], "failed")
-        self.assertIsNotNone(rev["result"]["error_message"])
-        self.assertIn("review_invalid", rev["result"]["error_message"])
-
-    def test_blocked_archive_produces_failed_telemetry(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "implemented",
-                    },
-                },
-                {
-                    "stage": "review",
-                    "result": {
-                        "status": "reviewed",
-                        "change": self.cid,
-                        "round": 1,
-                        "verdict": "pass",
-                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
-                        "summary": "review passed",
-                        "fix_prompt": "",
-                        "next_phase": "archive",
-                    },
-                },
-                {
-                    "stage": "archive",
-                    "result": {
-                        "status": "blocked",
-                        "change": self.cid,
-                        "archive_path": "",
-                        "commit": "",
-                        "reason": "cannot archive: dirty tree",
-                        "spec_sync_status": "not_started",
-                        "summary": "archive blocked",
-                    },
-                },
-            ]
-        )
-
-        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        records = self._read_telemetry()
-        archive_records = [r for r in records if r["stage"] == "archive"]
-        self.assertGreaterEqual(len(archive_records), 1)
-        arch = archive_records[0]
-        self.assertEqual(arch["status"], "failed")
-        self.assertIsNotNone(arch["result"]["error_message"])
-        self.assertIn("archive_failed", arch["result"]["error_message"])
-
-    def test_unexpected_archive_status_produces_failed_telemetry(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "implemented",
-                    },
-                },
-                {
-                    "stage": "review",
-                    "result": {
-                        "status": "reviewed",
-                        "change": self.cid,
-                        "round": 1,
-                        "verdict": "pass",
-                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
-                        "summary": "review passed",
-                        "fix_prompt": "",
-                        "next_phase": "archive",
-                    },
-                },
-                {
-                    "stage": "archive",
-                    "result": {
-                        "status": "weird-archive-status",
-                        "change": self.cid,
-                        "archive_path": "",
-                        "commit": "",
-                        "reason": "",
-                        "spec_sync_status": "not_started",
-                        "summary": "unexpected",
-                    },
-                },
-            ]
-        )
-
-        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        records = self._read_telemetry()
-        archive_records = [r for r in records if r["stage"] == "archive"]
-        self.assertGreaterEqual(len(archive_records), 1)
-        arch = archive_records[0]
-        self.assertEqual(arch["status"], "failed")
-        self.assertIsNotNone(arch["result"]["error_message"])
-        self.assertIn("archive_invalid", arch["result"]["error_message"])
-
-    def test_telemetry_write_failure_logs_warning_but_does_not_block(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "implemented",
-                    },
-                },
-                {"stage": "review", "outcome": "timeout"},
-            ]
-        )
-
-        log_calls: list[str] = []
-
-        def capture_log(msg: str) -> None:
-            log_calls.append(msg)
-
-        with mock.patch.object(
-            self.opsx_plan, "write_telemetry_record", side_effect=OSError("disk full")
-        ), mock.patch.object(self.opsx_plan.base, "log", side_effect=capture_log):
-            self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        # Stage must still advance despite telemetry write failure
-        record = self.opsx_plan.rec(self.state, self.cid)
-        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
-
-        # A warning must have been logged
-        warning_msgs = [msg for msg in log_calls if "warning" in msg.lower()]
-        self.assertTrue(warning_msgs, f"expected warning log, got: {log_calls}")
-
-    def test_no_progress_produces_failed_telemetry(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": False,
-                        "completed_tasks": [],
-                        "remaining_tasks": ["1.1", "1.2"],
-                        "task_counts": {"complete": 0, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "no progress round 1",
-                    },
-                },
-                {
-                    "stage": "review",
-                    "result": {
-                        "status": "reviewed",
-                        "change": self.cid,
-                        "round": 1,
-                        "verdict": "fail",
-                        "finding_counts": {"critical": 1, "warning": 0, "note": 0},
-                        "summary": "still missing",
-                        "fix_prompt": "do it",
-                        "next_phase": "implement",
-                    },
-                },
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 2,
-                        "progress_made": False,
-                        "completed_tasks": [],
-                        "remaining_tasks": ["1.1", "1.2"],
-                        "task_counts": {"complete": 0, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "no progress round 2",
-                    },
-                },
-            ]
-        )
-
-        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        self.assertEqual(result, "stop")
-        records = self._read_telemetry()
-        implement_records = [r for r in records if r["stage"] == "implement"]
-        # The last implement should have status=failed due to no_progress
-        last_impl = implement_records[-1]
-        self.assertEqual(last_impl["status"], "failed")
-        self.assertIsNotNone(last_impl["result"]["error_message"])
-        self.assertIn("no_progress", last_impl["result"]["error_message"])
-
-    def test_max_rounds_produces_failed_telemetry(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        self.cfg["max_rounds"] = 1
-        record["max_rounds"] = 1
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": True,
-                        "completed_tasks": [],
-                        "remaining_tasks": ["1.1"],
-                        "task_counts": {"complete": 0, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "implemented round 1",
-                    },
-                },
-                {
-                    "stage": "review",
-                    "result": {
-                        "status": "reviewed",
-                        "change": self.cid,
-                        "round": 1,
-                        "verdict": "fail",
-                        "finding_counts": {"critical": 1, "warning": 0, "note": 0},
-                        "summary": "review failed",
-                        "fix_prompt": "fix",
-                        "next_phase": "implement",
-                    },
-                },
-            ]
-        )
-
-        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        self.assertEqual(result, "stop")
-        records = self._read_telemetry()
-        review_records = [r for r in records if r["stage"] == "review"]
-        self.assertGreaterEqual(len(review_records), 1)
-        rev = review_records[0]
-        self.assertEqual(rev["status"], "failed")
-        self.assertIsNotNone(rev["result"]["error_message"])
-        self.assertIn("max_rounds_reached", rev["result"]["error_message"])
-
-    def test_review_fail_verdict_continues_and_produces_completed_telemetry(self) -> None:
-        """Review with verdict=fail loops back to implement (action=continue),
-        so its telemetry must stay 'completed', not 'failed'."""
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "implemented",
-                    },
-                },
-                {
-                    "stage": "review",
-                    "result": {
-                        "status": "reviewed",
-                        "change": self.cid,
-                        "round": 1,
-                        "verdict": "fail",
-                        "finding_counts": {"critical": 1, "warning": 0, "note": 0},
-                        "summary": "review failed",
-                        "fix_prompt": "fix it",
-                        "next_phase": "implement",
-                    },
-                },
-                {"stage": "implement", "outcome": "timeout"},
-            ]
-        )
-
-        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        records = self._read_telemetry()
-        review_records = [r for r in records if r["stage"] == "review"]
-        self.assertGreaterEqual(len(review_records), 1)
-        rev = review_records[0]
-        self.assertEqual(rev["status"], "completed")
-        self.assertEqual(rev["result"]["verdict"], "fail")
-
-    def _assert_worker_state_has_latest_telemetry_uid(self) -> None:
-        """Helper: verify worker state JSON has the telemetry UID matching the
-        last record in the JSONL file."""
-        worker_state = self.opsx_plan.worker_state_path(self.repo, self.plan_name, self.cid)
-        self.assertTrue(worker_state.is_file(), f"worker state missing: {worker_state}")
-        payload = json.loads(worker_state.read_text(encoding="utf-8"))
-        self.assertIn("telemetry", payload)
-        self.assertIn("latest_telemetry", payload["telemetry"])
-        uid = payload["telemetry"]["latest_telemetry"]
-        self.assertTrue(uid, "latest_telemetry must be a non-empty UID string")
-
-        records = self._read_telemetry()
-        self.assertGreaterEqual(len(records), 1, "at least one telemetry record expected")
-        self.assertEqual(
-            uid,
-            records[-1]["uid"],
-            "worker state telemetry.latest_telemetry must match last JSONL record UID",
-        )
-
-    def test_terminal_blocked_implement_persists_telemetry_uid_to_worker_state(self) -> None:
-        """Blocked implement (action=stop) must persist its telemetry UID to
-        worker state so the link is available for later analysis."""
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "blocked",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": False,
-                        "completed_tasks": [],
-                        "remaining_tasks": ["1.1"],
-                        "task_counts": {"complete": 0, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "implement blocked",
-                        "reason": "missing design artifact",
-                    },
-                },
-            ]
-        )
-
-        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-        self.assertEqual(result, "stop")
-        self._assert_worker_state_has_latest_telemetry_uid()
-
-    def test_terminal_blocked_archive_persists_telemetry_uid_to_worker_state(self) -> None:
-        """Blocked archive (action=stop) must persist its telemetry UID to
-        worker state."""
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "implemented",
-                    },
-                },
-                {
-                    "stage": "review",
-                    "result": {
-                        "status": "reviewed",
-                        "change": self.cid,
-                        "round": 1,
-                        "verdict": "pass",
-                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
-                        "summary": "review passed",
-                        "fix_prompt": "",
-                        "next_phase": "archive",
-                    },
-                },
-                {
-                    "stage": "archive",
-                    "result": {
-                        "status": "blocked",
-                        "change": self.cid,
-                        "archive_path": "",
-                        "commit": "",
-                        "reason": "cannot archive: dirty tree",
-                        "spec_sync_status": "not_started",
-                        "summary": "archive blocked",
-                    },
-                },
-            ]
-        )
-
-        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-        self.assertEqual(result, "stop")
-        self._assert_worker_state_has_latest_telemetry_uid()
-
-    def test_terminal_successful_archive_persists_telemetry_uid_to_worker_state(self) -> None:
-        """Successful archive (action=done) must persist its telemetry UID to
-        worker state even though the change is complete."""
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "implemented",
-                    },
-                },
-                {
-                    "stage": "review",
-                    "result": {
-                        "status": "reviewed",
-                        "change": self.cid,
-                        "round": 1,
-                        "verdict": "pass",
-                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
-                        "summary": "review passed",
-                        "fix_prompt": "",
-                        "next_phase": "archive",
-                    },
-                },
-                {
-                    "stage": "archive",
-                    "archive_repo": True,
-                    "result": {
-                        "status": "archived",
-                        "change": self.cid,
-                        "archive_path": "",
-                        "spec_sync_status": "no-delta",
-                        "commit": "",
-                        "summary": "archive succeeded",
-                    },
-                },
-            ]
-        )
-
-        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-        self.assertEqual(result, self.opsx_plan.base.DONE)
-        self._assert_worker_state_has_latest_telemetry_uid()
-
-    def test_terminal_no_progress_persists_telemetry_uid_to_worker_state(self) -> None:
-        """No-progress stop must also persist its telemetry UID."""
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": False,
-                        "completed_tasks": [],
-                        "remaining_tasks": ["1.1", "1.2"],
-                        "task_counts": {"complete": 0, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "no progress round 1",
-                    },
-                },
-                {
-                    "stage": "review",
-                    "result": {
-                        "status": "reviewed",
-                        "change": self.cid,
-                        "round": 1,
-                        "verdict": "fail",
-                        "finding_counts": {"critical": 1, "warning": 0, "note": 0},
-                        "summary": "still missing",
-                        "fix_prompt": "do it",
-                        "next_phase": "implement",
-                    },
-                },
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 2,
-                        "progress_made": False,
-                        "completed_tasks": [],
-                        "remaining_tasks": ["1.1", "1.2"],
-                        "task_counts": {"complete": 0, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "no progress round 2",
-                    },
-                },
-            ]
-        )
-
-        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-        self.assertEqual(result, "stop")
-        self._assert_worker_state_has_latest_telemetry_uid()
-
-    def test_terminal_max_rounds_persists_telemetry_uid_to_worker_state(self) -> None:
-        """Max-rounds stop must persist its telemetry UID."""
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        self.cfg["max_rounds"] = 1
-        record["max_rounds"] = 1
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": True,
-                        "completed_tasks": [],
-                        "remaining_tasks": ["1.1"],
-                        "task_counts": {"complete": 0, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "implemented round 1",
-                    },
-                },
-                {
-                    "stage": "review",
-                    "result": {
-                        "status": "reviewed",
-                        "change": self.cid,
-                        "round": 1,
-                        "verdict": "fail",
-                        "finding_counts": {"critical": 1, "warning": 0, "note": 0},
-                        "summary": "review failed",
-                        "fix_prompt": "fix",
-                        "next_phase": "implement",
-                    },
-                },
-            ]
-        )
-
-        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-        self.assertEqual(result, "stop")
-        self._assert_worker_state_has_latest_telemetry_uid()
-
-    def test_terminal_unexpected_archive_verdict_persists_telemetry_uid_to_worker_state(self) -> None:
-        """Unexpected archive verdict (action=stop) must also persist its
-        telemetry UID."""
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "implemented",
-                    },
-                },
-                {
-                    "stage": "review",
-                    "result": {
-                        "status": "reviewed",
-                        "change": self.cid,
-                        "round": 1,
-                        "verdict": "pass",
-                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
-                        "summary": "review passed",
-                        "fix_prompt": "",
-                        "next_phase": "archive",
-                    },
-                },
-                {
-                    "stage": "archive",
-                    "result": {
-                        "status": "weird-archive-status",
-                        "change": self.cid,
-                        "archive_path": "",
-                        "commit": "",
-                        "reason": "",
-                        "spec_sync_status": "not_started",
-                        "summary": "unexpected",
-                    },
-                },
-            ]
-        )
-
-        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-        self.assertEqual(result, "stop")
-        self._assert_worker_state_has_latest_telemetry_uid()
-
-    def test_escalated_implement_writes_escalation_model_in_telemetry(self) -> None:
-        """4.6: escalated implement round writes escalation model in telemetry"""
-        self.write_authored_change(self.cid)
-        impl_model = "deepseek/deepseek-v4-basic"
-        esc_model = "deepseek/deepseek-v4-ultra"
-        os.environ["OPSX_IMPLEMENTER_MODEL"] = impl_model
-        os.environ["OPSX_IMPLEMENTER_ESCALATION_MODEL"] = esc_model
-        os.environ["OPSX_REVIEWER_MODEL"] = "github-copilot/gpt-5.4"
-        os.environ["OPSX_ARCHIVER_MODEL"] = "github-copilot/gpt-5.4"
-
-        self.cfg["escalate_after_review_fails"] = 1
-        self.cfg["implement_invoke"] = (
-            'opencode run --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL"'
-        )
-        self.cfg["max_rounds"] = 2
-
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-        self.stage_runner(
-            [
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 1,
-                        "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
-                        "files_touched": ["orchestrator/opsx-plan.py"],
-                        "known_change_files": [],
-                        "summary": "r1",
-                    },
-                },
-                {
-                    "stage": "review",
-                    "result": {
-                        "status": "reviewed",
-                        "change": self.cid,
-                        "round": 1,
-                        "verdict": "fail",
-                        "finding_counts": {"critical": 1, "warning": 0, "note": 0},
-                        "summary": "review failed",
-                        "fix_prompt": "fix",
-                    },
-                },
-                {
-                    "stage": "implement",
-                    "result": {
-                        "status": "implemented",
-                        "change": self.cid,
-                        "round": 2,
-                        "progress_made": True,
-                        "completed_tasks": ["1.2"],
-                        "remaining_tasks": [],
-                        "task_counts": {"complete": 2, "total": 2},
-                        "files_touched": ["orchestrator/opsx-plan.py"],
-                        "known_change_files": [],
-                        "summary": "r2 escalated",
-                    },
-                },
-                {
-                    "stage": "review",
-                    "result": {
-                        "status": "reviewed",
-                        "change": self.cid,
-                        "round": 2,
-                        "verdict": "pass",
-                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
-                        "summary": "pass",
-                        "fix_prompt": "",
-                    },
-                },
-                {
-                    "stage": "archive",
-                    "archive_repo": True,
-                    "result": {
-                        "status": "archived",
-                        "change": self.cid,
-                        "round": 2,
-                        "verdict": "pass",
-                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
-                        "summary": "archived",
-                        "fix_prompt": "",
-                    },
-                },
-            ]
-        )
-
-        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-        self.assertEqual(result, "done")
-
-        records = self._read_telemetry()
-        implement_records = [r for r in records if r["stage"] == "implement"]
-        self.assertEqual(len(implement_records), 2)
-
-        # Round 1: base model (provider prefix stripped by extraction)
-        r1_model = implement_records[0].get("model", {})
-        self.assertEqual(r1_model.get("model_id"), "deepseek-v4-basic",
-                         "round 1 telemetry must show base model")
-
-        # Round 2: escalated model (provider prefix stripped by extraction)
-        r2_model = implement_records[1].get("model", {})
-        self.assertEqual(r2_model.get("model_id"), "deepseek-v4-ultra",
-                         "round 2 telemetry must show escalation model")
-
-
-class CompileTests(unittest.TestCase):
-    """Tests for ``opsx-plan compile``: prompt construction, template
-    injection, validation, error handling, and CLI routing."""
-
-    def setUp(self) -> None:
-        self.opsx_plan = load_opsx_plan()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.repo = Path(self.tmp.name)
-        git(self.repo, "init")
-        git(
-            self.repo,
-            "-c",
-            "user.email=test@example.invalid",
-            "-c",
-            "user.name=Test User",
-            "commit",
-            "-m",
-            "init",
-            "--allow-empty",
-        )
-        # Isolate model resolution from whatever the real machine's home
-        # directory happens to contain, so these tests are hermetic.
-        from lib.models import resolver as _resolver
-        self._models_patch = mock.patch.object(
-            _resolver, "USER_CONFIG_PATH", Path(self.tmp.name) / "unused-home" / "models.toml"
-        )
-        self._models_patch.start()
-        self.addCleanup(self._models_patch.stop)
-        # _set_model/_clear_model mutate OPSX_CONTROLLER_MODEL directly;
-        # restore it so later test classes don't observe leftover state.
-        self._original_controller_model = os.environ.get("OPSX_CONTROLLER_MODEL")
-        self.addCleanup(self._restore_controller_model)
-
-    def _restore_controller_model(self) -> None:
-        if self._original_controller_model is not None:
-            os.environ["OPSX_CONTROLLER_MODEL"] = self._original_controller_model
-        else:
-            os.environ.pop("OPSX_CONTROLLER_MODEL", None)
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-
-    def _write_plan_md(self, rel_path: str, content: str) -> Path:
-        p = self.repo / rel_path
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
-        return p
-
-    def _set_model(self) -> None:
-        import os as _os
-        _os.environ["OPSX_CONTROLLER_MODEL"] = "test-provider/test-model"
-
-    def _clear_model(self) -> None:
-        import os as _os
-        _os.environ.pop("OPSX_CONTROLLER_MODEL", None)
-
-    # -- resolve / validation helpers (already covered by earlier tasks) --
-
-    def test_resolve_compile_source_rejects_missing_file(self) -> None:
-        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-            self.opsx_plan.resolve_compile_source(self.repo, "nonexistent.md")
-        self.assertIn("not found", str(ctx.exception))
-
-    def test_resolve_compile_source_rejects_non_md_extension(self) -> None:
-        p = self.repo / "plan.txt"
-        p.write_text("text", encoding="utf-8")
-        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-            self.opsx_plan.resolve_compile_source(self.repo, "plan.txt")
-        self.assertIn("must be a markdown file", str(ctx.exception))
-
-    def test_resolve_compile_output_refuses_existing_without_force(self) -> None:
-        p = self.repo / "out.toml"
-        p.write_text("existing", encoding="utf-8")
-        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-            self.opsx_plan.resolve_compile_output(self.repo, "out.toml", force=False)
-        self.assertIn("exists", str(ctx.exception))
-        self.assertIn("--force", str(ctx.exception))
-
-    def test_resolve_compile_output_allows_overwrite_with_force(self) -> None:
-        p = self.repo / "out.toml"
-        p.write_text("existing", encoding="utf-8")
-        result = self.opsx_plan.resolve_compile_output(self.repo, "out.toml", force=True)
-        self.assertEqual(result, p.resolve())
-
-    def test_check_controller_model_fails_when_unset(self) -> None:
-        self._clear_model()
-        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-            self.opsx_plan.check_controller_model()
-        self.assertIn("controller model", str(ctx.exception))
-
-    def test_check_controller_model_succeeds_when_set(self) -> None:
-        self._set_model()
-        model = self.opsx_plan.check_controller_model()
-        self.assertEqual(model, "test-provider/test-model")
-
-    # -- prompt construction --
-
-    def test_build_compile_prompt_includes_source_content(self) -> None:
-        content = "# My Plan\n\n## Phase 1\n\n### Change: `my-change`\n\n**Depends on:** None.\n"
-        prompt = self.opsx_plan.build_compile_prompt(content, Path("/tmp/fake.md"), self.repo)
-        self.assertIn("My Plan", prompt)
-        self.assertIn("my-change", prompt)
-        self.assertIn("Source plan markdown", prompt)
-
-    def test_build_compile_prompt_includes_schema_guidance(self) -> None:
-        prompt = self.opsx_plan.build_compile_prompt("content", Path("/tmp/fake.md"), self.repo)
-        self.assertIn("[plan]", prompt)
-        self.assertIn("[[changes]]", prompt)
-        self.assertIn("depends_on", prompt)
-        self.assertIn("pause_before", prompt)
-
-    def test_build_compile_prompt_instructs_toml_only_output(self) -> None:
-        prompt = self.opsx_plan.build_compile_prompt("content", Path("/tmp/fake.md"), self.repo)
-        self.assertIn("Output only TOML", prompt)
-        self.assertIn("fenced ```toml block", prompt)
-
-    def test_build_compile_prompt_includes_dependency_semantics(self) -> None:
-        prompt = self.opsx_plan.build_compile_prompt("content", Path("/tmp/fake.md"), self.repo)
-        self.assertIn("become `depends_on`", prompt)
-        self.assertIn("independence wording", prompt)
-        self.assertIn("deferred", prompt.lower())
-
-    def test_build_compile_prompt_instructs_plan_doc_reference(self) -> None:
-        prompt = self.opsx_plan.build_compile_prompt("content", Path("/tmp/fake.md"), self.repo)
-        self.assertIn("plan_doc", prompt)
-        self.assertIn("/tmp/fake.md", prompt)
-
-    def test_build_compile_prompt_includes_repo_relative_source_path(self) -> None:
-        source = self._write_plan_md("openspec/plans/my-plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
-        prompt = self.opsx_plan.build_compile_prompt("# Plan\n", source, self.repo)
-        self.assertIn('"openspec/plans/my-plan.md"', prompt)
-        self.assertIn("plan_doc", prompt)
-
-    def test_build_compile_prompt_includes_canonical_sample_when_no_repo_pairs(self) -> None:
-        prompt = self.opsx_plan.build_compile_prompt("content", Path("/tmp/fake.md"), self.repo)
-        self.assertIn("Sample plan (canonical)", prompt)
-        self.assertIn("Sample manifest (canonical)", prompt)
-
-    def test_build_compile_prompt_injects_template_pairs(self) -> None:
-        plans_dir = self.repo / "openspec" / "plans"
-        plans_dir.mkdir(parents=True)
-        (plans_dir / "example-plan.md").write_text("# Example plan\n", encoding="utf-8")
-        (plans_dir / "example-plan.toml").write_text('[plan]\nname = "example"\n', encoding="utf-8")
-
-        prompt = self.opsx_plan.build_compile_prompt("content", Path("/tmp/fake.md"), self.repo)
-        self.assertIn("Example plan", prompt)
-        self.assertIn("example-plan.toml", prompt)
-        self.assertIn('name = "example"', prompt)
-
-    def test_discover_template_pairs_returns_empty_when_no_plans_dir(self) -> None:
-        pairs = self.opsx_plan.discover_template_pairs(self.repo)
-        self.assertEqual(pairs, [])
-
-    def test_discover_template_pairs_finds_md_and_toml(self) -> None:
-        plans_dir = self.repo / "openspec" / "plans"
-        plans_dir.mkdir(parents=True)
-        (plans_dir / "a.md").write_text("md", encoding="utf-8")
-        (plans_dir / "a.toml").write_text("toml", encoding="utf-8")
-        (plans_dir / "b.md").write_text("md2", encoding="utf-8")
-
-        pairs = self.opsx_plan.discover_template_pairs(self.repo)
-        self.assertEqual(len(pairs), 2)
-        self.assertEqual(pairs[0][0].name, "a.md")
-        self.assertIsNotNone(pairs[0][1])
-        self.assertEqual(pairs[1][0].name, "b.md")
-        self.assertIsNone(pairs[1][1])
-
-    # -- cmd_compile error handling --
-
-    def test_cmd_compile_fails_without_model(self) -> None:
-        self._clear_model()
-        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
-        out = self.repo / "out.toml"
-        args = argparse.Namespace(repo=str(self.repo), source="plan.md",
-                                  output=str(out), force=False)
-        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-            self.opsx_plan.cmd_compile(args)
-        self.assertIn("controller model", str(ctx.exception))
-
-    def test_cmd_compile_fails_when_output_exists_without_force(self) -> None:
-        self._set_model()
-        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
-        out = self.repo / "out.toml"
-        out.write_text("existing", encoding="utf-8")
-        args = argparse.Namespace(repo=str(self.repo), source="plan.md",
-                                  output=str(out), force=False)
-        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-            self.opsx_plan.cmd_compile(args)
-        self.assertIn("exists", str(ctx.exception))
-
-    def test_cmd_compile_fails_when_source_not_found(self) -> None:
-        self._set_model()
-        out = self.repo / "out.toml"
-        args = argparse.Namespace(repo=str(self.repo), source="missing.md",
-                                  output=str(out), force=False)
-        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-            self.opsx_plan.cmd_compile(args)
-        self.assertIn("not found", str(ctx.exception))
-
-    # -- successful compile (mocked opencode) --
-
-    def test_cmd_compile_success_with_valid_toml(self) -> None:
-        self._set_model()
-        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
-
-        valid_toml = (
-            '[plan]\nname = "test"\nadapter = "opencode"\n\n'
-            "[[changes]]\nid = \"c1\"\nphase = 1\n"
-        )
-
-        def fake_run(repo, adapter, model, prompt):
-            return valid_toml, ""
-
-        original = self.opsx_plan.run_compile_client
-        try:
-            self.opsx_plan.run_compile_client = fake_run
-            out = self.repo / "out.toml"
-            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
-                                      output=str(out), force=False, adapter="opencode")
-            rc = self.opsx_plan.cmd_compile(args)
-            self.assertEqual(rc, 0)
-            self.assertTrue(out.is_file())
-            content = out.read_text(encoding="utf-8")
-            self.assertIn("c1", content)
-        finally:
-            self.opsx_plan.run_compile_client = original
-
-    def test_cmd_compile_success_with_fenced_toml(self) -> None:
-        self._set_model()
-        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
-
-        fenced_toml = (
-            '```toml\n'
-            '[plan]\nname = "test"\nadapter = "opencode"\n\n'
-            "[[changes]]\nid = \"c1\"\nphase = 1\n"
-            '```\n'
-        )
-
-        def fake_run(repo, adapter, model, prompt):
-            return fenced_toml, ""
-
-        original = self.opsx_plan.run_compile_client
-        try:
-            self.opsx_plan.run_compile_client = fake_run
-            out = self.repo / "out.toml"
-            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
-                                      output=str(out), force=False)
-            rc = self.opsx_plan.cmd_compile(args)
-            self.assertEqual(rc, 0)
-            self.assertTrue(out.is_file())
-            content = out.read_text(encoding="utf-8")
-            self.assertIn("c1", content)
-        finally:
-            self.opsx_plan.run_compile_client = original
-
-    # -- invalid TOML rejection --
-
-    def test_cmd_compile_rejects_invalid_toml(self) -> None:
-        self._set_model()
-        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
-
-        def fake_run(repo, adapter, model, prompt):
-            return "not valid toml {{{", ""
-
-        original = self.opsx_plan.run_compile_client
-        try:
-            self.opsx_plan.run_compile_client = fake_run
-            out = self.repo / "out.toml"
-            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
-                                      output=str(out), force=False)
-            with self.assertRaises(self.opsx_plan.base.PlanError):
-                self.opsx_plan.cmd_compile(args)
-            self.assertFalse(out.is_file())
-        finally:
-            self.opsx_plan.run_compile_client = original
-
-    def test_cmd_compile_rejects_empty_output(self) -> None:
-        self._set_model()
-        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
-
-        def fake_run(repo, adapter, model, prompt):
-            return "   ", ""
-
-        original = self.opsx_plan.run_compile_client
-        try:
-            self.opsx_plan.run_compile_client = fake_run
-            out = self.repo / "out.toml"
-            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
-                                      output=str(out), force=False)
-            with self.assertRaises(self.opsx_plan.base.PlanError):
-                self.opsx_plan.cmd_compile(args)
-            self.assertFalse(out.is_file())
-        finally:
-            self.opsx_plan.run_compile_client = original
-
-    def test_cmd_compile_rejects_toml_with_no_changes(self) -> None:
-        self._set_model()
-        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
-
-        no_changes_toml = '[plan]\nname = "test"\n'
-
-        def fake_run(repo, adapter, model, prompt):
-            return no_changes_toml, ""
-
-        original = self.opsx_plan.run_compile_client
-        try:
-            self.opsx_plan.run_compile_client = fake_run
-            out = self.repo / "out.toml"
-            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
-                                      output=str(out), force=False)
-            with self.assertRaises(self.opsx_plan.base.PlanError):
-                self.opsx_plan.cmd_compile(args)
-            self.assertFalse(out.is_file())
-        finally:
-            self.opsx_plan.run_compile_client = original
-
-    def test_cmd_compile_rejects_unknown_dependency(self) -> None:
-        self._set_model()
-        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
-
-        unknown_dep_toml = (
-            '[plan]\nname = "test"\nadapter = "opencode"\n\n'
-            "[[changes]]\nid = \"c1\"\nphase = 1\n"
-            "depends_on = [\"nonexistent\"]\n"
-        )
-
-        def fake_run(repo, adapter, model, prompt):
-            return unknown_dep_toml, ""
-
-        original = self.opsx_plan.run_compile_client
-        try:
-            self.opsx_plan.run_compile_client = fake_run
-            out = self.repo / "out.toml"
-            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
-                                      output=str(out), force=False)
-            with self.assertRaises(self.opsx_plan.base.PlanError):
-                self.opsx_plan.cmd_compile(args)
-            self.assertFalse(out.is_file())
-        finally:
-            self.opsx_plan.run_compile_client = original
-
-    def test_cmd_compile_rejects_duplicate_change_id(self) -> None:
-        self._set_model()
-        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
-
-        dup_id_toml = (
-            '[plan]\nname = "test"\nadapter = "opencode"\n\n'
-            "[[changes]]\nid = \"c1\"\nphase = 1\n"
-            "[[changes]]\nid = \"c1\"\nphase = 2\n"
-        )
-
-        def fake_run(repo, adapter, model, prompt):
-            return dup_id_toml, ""
-
-        original = self.opsx_plan.run_compile_client
-        try:
-            self.opsx_plan.run_compile_client = fake_run
-            out = self.repo / "out.toml"
-            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
-                                      output=str(out), force=False)
-            with self.assertRaises(self.opsx_plan.base.PlanError):
-                self.opsx_plan.cmd_compile(args)
-            self.assertFalse(out.is_file())
-        finally:
-            self.opsx_plan.run_compile_client = original
-
-    def test_cmd_compile_does_not_overwrite_on_failure(self) -> None:
-        """Even when --force is passed, an invalid model output must not
-        overwrite an existing file."""
-        self._set_model()
-        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
-        out = self.repo / "out.toml"
-        out.write_text("original content", encoding="utf-8")
-
-        def fake_run(repo, adapter, model, prompt):
-            return "bad toml {{{", ""
-
-        original = self.opsx_plan.run_compile_client
-        try:
-            self.opsx_plan.run_compile_client = fake_run
-            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
-                                      output=str(out), force=True)
-            with self.assertRaises(self.opsx_plan.base.PlanError):
-                self.opsx_plan.cmd_compile(args)
-            self.assertEqual(out.read_text(encoding="utf-8"), "original content")
-        finally:
-            self.opsx_plan.run_compile_client = original
-
-    def test_cmd_compile_rejects_scalar_plan_without_overwriting(self) -> None:
-        """A scalar replacement for [plan] must be a validation error."""
-        self._set_model()
-        self._write_plan_md("plan.md", "# Plan\n")
-        out = self.repo / "out.toml"
-        out.write_text("original content", encoding="utf-8")
-
-        malformed_toml = (
-            'plan = "invalid"\n\n'
-            '[[changes]]\nid = "c1"\n'
-        )
-
-        original = self.opsx_plan.run_compile_client
-        try:
-            self.opsx_plan.run_compile_client = lambda repo, adapter, model, prompt: (
-                malformed_toml, ""
-            )
-            args = argparse.Namespace(
-                repo=str(self.repo), source="plan.md",
-                output=str(out), force=True, adapter="opencode",
-            )
-            with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-                self.opsx_plan.cmd_compile(args)
-            self.assertIn("[plan]", str(ctx.exception))
-            self.assertIn("table", str(ctx.exception))
-            self.assertEqual(out.read_text(encoding="utf-8"), "original content")
-        finally:
-            self.opsx_plan.run_compile_client = original
-
-    def test_cmd_compile_rejects_malformed_changes_without_overwriting(self) -> None:
-        """Every [[changes]] entry must be a TOML table."""
-        self._set_model()
-        self._write_plan_md("plan.md", "# Plan\n")
-        out = self.repo / "out.toml"
-        out.write_text("original content", encoding="utf-8")
-
-        malformed_toml = (
-            'changes = ["invalid"]\n\n'
-            '[plan]\nadapter = "opencode"\n'
-        )
-
-        original = self.opsx_plan.run_compile_client
-        try:
-            self.opsx_plan.run_compile_client = lambda repo, adapter, model, prompt: (
-                malformed_toml, ""
-            )
-            args = argparse.Namespace(
-                repo=str(self.repo), source="plan.md",
-                output=str(out), force=True, adapter="opencode",
-            )
-            with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-                self.opsx_plan.cmd_compile(args)
-            self.assertIn("[[changes]]", str(ctx.exception))
-            self.assertIn("table", str(ctx.exception))
-            self.assertEqual(out.read_text(encoding="utf-8"), "original content")
-        finally:
-            self.opsx_plan.run_compile_client = original
-
-    # -- extract_toml --
-
-    def test_extract_toml_from_fenced_block(self) -> None:
-        output = '```toml\n[plan]\nname = "x"\n```\n'
-        result = self.opsx_plan.extract_toml(output)
-        self.assertIn('[plan]', result)
-        self.assertNotIn('```', result)
-
-    def test_extract_toml_from_bare_output(self) -> None:
-        output = '[plan]\nname = "x"\n'
-        result = self.opsx_plan.extract_toml(output)
-        self.assertEqual(result, output.strip())
-
-    def test_extract_toml_rejects_empty(self) -> None:
-        with self.assertRaises(self.opsx_plan.base.PlanError):
-            self.opsx_plan.extract_toml("   ")
-
-    def test_extract_toml_rejects_no_toml(self) -> None:
-        with self.assertRaises(self.opsx_plan.base.PlanError):
-            self.opsx_plan.extract_toml("just some prose, no brackets")
-
-    def test_extract_toml_rejects_multiple_fenced_blocks(self) -> None:
-        output = (
-            '```toml\n[plan]\nname = "x"\n```\n'
-            '```toml\n[plan]\nname = "y"\n```\n'
-        )
-        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-            self.opsx_plan.extract_toml(output)
-        self.assertIn("multiple fenced", str(ctx.exception))
-
-    def test_extract_toml_rejects_prose_before_fenced_block(self) -> None:
-        output = "Here is the compiled plan:\n\n```toml\n[plan]\nname = \"x\"\n```\n"
-        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-            self.opsx_plan.extract_toml(output)
-        self.assertIn("extra content found around", str(ctx.exception))
-
-    def test_extract_toml_rejects_prose_after_fenced_block(self) -> None:
-        output = "```toml\n[plan]\nname = \"x\"\n```\n\nLet me know if you need changes."
-        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-            self.opsx_plan.extract_toml(output)
-        self.assertIn("extra content found around", str(ctx.exception))
-
-    def test_extract_toml_accepts_clean_fenced_block_with_surrounding_whitespace(self) -> None:
-        output = "\n\n```toml\n[plan]\nname = \"x\"\n```\n\n"
-        result = self.opsx_plan.extract_toml(output)
-        self.assertIn('[plan]', result)
-        self.assertNotIn('```', result)
-
-    # -- CLI parser coverage --
-
-    def test_compile_subcommand_appears_in_help(self) -> None:
-        """Prove ``compile`` appears in the subcommand list."""
-        self.opsx_plan.sys = mock.Mock()
-        stderr = io.StringIO()
-
-        with mock.patch.object(self.opsx_plan.sys, "argv", ["opsx-plan", "--help"]), \
-             mock.patch("sys.stdout", io.StringIO()) as stdout, \
-             mock.patch("sys.stderr", stderr):
-            # argparse calls sys.exit on --help; suppress it
-            try:
-                self.opsx_plan.main()
-            except SystemExit:
-                pass
-
-        combined = stdout.getvalue() + stderr.getvalue()
-        self.assertIn("compile", combined)
-
-    def test_compile_subcommand_routes_to_cmd_compile(self) -> None:
-        """Prove ``opsx-plan compile`` routes to ``cmd_compile``."""
-        self._set_model()
-        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
-        out = self.repo / "out.toml"
-
-        valid_toml = (
-            '[plan]\nname = "test"\nadapter = "opencode"\n\n'
-            "[[changes]]\nid = \"c1\"\nphase = 1\n"
-        )
-
-        def fake_run(repo, adapter, model, prompt):
-            return valid_toml, ""
-
-        original = self.opsx_plan.run_compile_client
-        try:
-            self.opsx_plan.run_compile_client = fake_run
-            with mock.patch.object(
-                self.opsx_plan.sys,
-                "argv",
-                ["opsx-plan", "--repo", str(self.repo),
-                 "compile", "plan.md", "-o", str(out)],
-            ):
-                rc = self.opsx_plan.main()
-            self.assertEqual(rc, 0)
-            self.assertTrue(out.is_file())
-        finally:
-            self.opsx_plan.run_compile_client = original
-
-    def test_run_compile_client_raises_on_spawn_failure(self) -> None:
-        def fake_run(*args, **kwargs):
-            raise FileNotFoundError("no opencode")
-
-        with mock.patch("subprocess.run", side_effect=fake_run):
-            with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-                self.opsx_plan.run_compile_client(self.repo, "opencode", "m", "prompt")
-            self.assertIn("could not spawn", str(ctx.exception))
-
-    def test_run_compile_client_passes_model_in_argv(self) -> None:
-        """Verify ``run_compile_client`` spawns opencode with the
-        configured model."""
-        model = "configured-model-v1"
-        prompt = "compile this plan"
-
-        real_run = subprocess.run
-
-        def fake_run(args, **kwargs):
-            self.assertEqual(args[0], "opencode")
-            self.assertEqual(args[1], "run")
-            self.assertEqual(args[2], "--model")
-            self.assertEqual(args[3], model)
-            self.assertEqual(
-                args[4],
-                "Follow the complete compile instructions in the attached file. Output only TOML.",
-            )
-            self.assertEqual(args[5], "--file")
-            self.assertEqual(Path(args[6]).read_text(encoding="utf-8"), prompt)
-            result = mock.Mock()
-            result.returncode = 0
-            result.stdout = '[plan]\nname = "x"\n\n[[changes]]\nid = "c1"\n'
-            result.stderr = ""
-            return result
-
-        with mock.patch("subprocess.run", side_effect=fake_run):
-            stdout, stderr = self.opsx_plan.run_compile_client(
-                self.repo, "opencode", model, prompt
-            )
-
-    def test_run_compile_client_raises_on_nonzero_exit(self) -> None:
-        fake_result = mock.Mock()
-        fake_result.returncode = 1
-        fake_result.stdout = ""
-        fake_result.stderr = "some error"
-
-        with mock.patch("subprocess.run", return_value=fake_result):
-            with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-                self.opsx_plan.run_compile_client(self.repo, "opencode", "m", "prompt")
-            self.assertIn("exited with code 1", str(ctx.exception))
-
-    def test_build_schema_guidance_includes_load_plan_fields(self) -> None:
-        guidance = self.opsx_plan.build_schema_guidance()
-        for field in ("name", "adapter", "invoke", "implement_invoke",
-                       "review_invoke", "archive_invoke", "timeout_minutes",
-                       "max_rounds", "no_progress_limit", "fast_checks",
-                       "plan_doc", "create_invoke", "pause_before", "depends_on",
-                       "enabled", "phase", "id", "max_attempts", "review_created"):
-            self.assertIn(field, guidance,
-                          f"schema guidance must mention field '{field}' consumed by load_plan()")
-
-    def test_build_schema_guidance_toml_block_parses_for_each_adapter(self) -> None:
-        """The TOML fenced block rendered by schema guidance must be valid TOML."""
-        import tomllib
-
-        for adapter in ("opencode", "claude-code"):
-            guidance = self.opsx_plan.build_schema_guidance(adapter)
-            m = _TOM_BLOCK.search(guidance)
-            self.assertIsNotNone(m, f"{adapter}: no fenced toml block found")
-            try:
-                parsed = tomllib.loads(m.group(1))
-            except Exception as exc:
-                self.fail(f"{adapter}: generated TOML block must parse: {exc}")
-            plan = parsed.get("plan", {})
-            self.assertEqual(plan.get("adapter"), adapter,
-                             f"{adapter}: adapter field must match")
-            for key in ("invoke", "state_file", "implement_invoke",
-                         "review_invoke", "archive_invoke"):
-                self.assertIn(key, plan,
-                              f"{adapter}: [plan] must include '{key}'")
-
-    # -- adapter-aware compile tests --
-
-    def test_cmd_compile_codex_rejected_before_spawn(self) -> None:
-        """Codex CLI compile exits non-zero before model resolution."""
-        self._set_model()
-        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
-        out = self.repo / "out.toml"
-        args = argparse.Namespace(repo=str(self.repo), source="plan.md",
-                                  output=str(out), force=False, adapter="codex-cli")
-        # Must not call subprocess.run at all — reject in cmd_compile itself.
-        with mock.patch("subprocess.run") as m_run:
-            rc = self.opsx_plan.cmd_compile(args)
-        m_run.assert_not_called()
-        self.assertNotEqual(rc, 0)
-
-    def test_cmd_compile_claude_adapter_propagates_to_prompt(self) -> None:
-        """Claude adapter appears in the compile prompt."""
-        # _set_model() provides a provider-prefixed model valid for opencode
-        # but rejected by claude-code. Override with a claude-valid model.
-        os.environ["OPSX_CONTROLLER_MODEL"] = "claude-sonnet-5"
-        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
-
-        def fake_run(repo, adapter, model, prompt):
-            self.assertEqual(adapter, "claude-code")
-            self.assertIn("adapter defaults (claude-code)", prompt.lower())
-            return (
-                '[plan]\nname = "test"\nadapter = "claude-code"\n\n'
-                "[[changes]]\nid = \"c1\"\nphase = 1\n",
-                "",
-            )
-
-        original = self.opsx_plan.run_compile_client
-        try:
-            self.opsx_plan.run_compile_client = fake_run
-            out = self.repo / "out.toml"
-            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
-                                      output=str(out), force=False,
-                                      adapter="claude-code")
-            rc = self.opsx_plan.cmd_compile(args)
-            self.assertEqual(rc, 0)
-        finally:
-            self.opsx_plan.run_compile_client = original
-
-    def test_cmd_compile_rejects_mismatched_adapter_in_manifest(self) -> None:
-        """Generated manifest must have adapter matching the selected one."""
-        os.environ["OPSX_CONTROLLER_MODEL"] = "claude-sonnet-5"
-        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
-
-        # Model returns opencode adapter despite claude-code selection.
-        wrong_toml = (
-            '[plan]\nname = "test"\nadapter = "opencode"\n\n'
-            "[[changes]]\nid = \"c1\"\nphase = 1\n"
-        )
-
-        invoked = False
-
-        def fake_run(repo, adapter, model, prompt):
-            nonlocal invoked
-            invoked = True
-            return wrong_toml, ""
-
-        original = self.opsx_plan.run_compile_client
-        try:
-            self.opsx_plan.run_compile_client = fake_run
-            out = self.repo / "out.toml"
-            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
-                                      output=str(out), force=False,
-                                      adapter="claude-code")
-            with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-                self.opsx_plan.cmd_compile(args)
-            self.assertIn("adapter", str(ctx.exception).lower())
-            self.assertTrue(invoked)
-            self.assertFalse(out.exists())
-        finally:
-            self.opsx_plan.run_compile_client = original
-
-    def test_cmd_compile_unknown_adapter_exits_nonzero(self) -> None:
-        """Unknown adapter name exits 2 before model resolution."""
-        self._set_model()
-        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
-        out = self.repo / "out.toml"
-        args = argparse.Namespace(repo=str(self.repo), source="plan.md",
-                                  output=str(out), force=False,
-                                  adapter="nonexistent")
-        rc = self.opsx_plan.cmd_compile(args)
-        self.assertEqual(rc, 2)
-
-    # -- _build_compile_argv tests --
-
-    def test_build_argv_for_opencode(self) -> None:
-        prompt_file = self.repo / "compile-prompt.md"
-        argv = self.opsx_plan._build_compile_argv(
-            "opencode", "m1", "prompt text", prompt_file
-        )
-        self.assertIn("opencode", argv[0])
-        self.assertIn("run", argv)
-        self.assertIn("m1", argv)
-        self.assertIn("--file", argv)
-        self.assertIn(str(prompt_file), argv)
-        self.assertLess(argv.index(
-            "Follow the complete compile instructions in the attached file. Output only TOML."
-        ), argv.index("--file"))
-        self.assertNotIn("prompt text", argv)
-
-    def test_build_argv_for_claude_code(self) -> None:
-        argv = self.opsx_plan._build_compile_argv(
-            "claude-code", "m2", "compile this"
-        )
-        self.assertIn("claude", argv[0])
-        self.assertIn("-p", argv)
-        self.assertIn("m2", argv)
-        self.assertIn("compile this", argv)
-
-    def test_build_argv_rejects_unsupported_codex(self) -> None:
-        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-            self.opsx_plan._build_compile_argv("codex-cli", "m", "prompt")
-        self.assertIn("not supported", str(ctx.exception))
-
-    # -- controller model syntax validation (reject before spawn) -----------
-
-    def test_check_controller_model_rejects_provider_prefix_for_claude(self) -> None:
-        """A provider-prefixed model (e.g. 'anthropic/claude-sonnet-5') is
-        rejected for the claude-code adapter before any process spawn."""
-        os.environ["OPSX_CONTROLLER_MODEL"] = "anthropic/claude-sonnet-5"
-        try:
-            with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-                self.opsx_plan.check_controller_model(adapter="claude-code")
-            self.assertIn("not valid", str(ctx.exception))
-            self.assertIn("claude-code", str(ctx.exception))
-            self.assertIn("controller", str(ctx.exception))
-        finally:
-            os.environ.pop("OPSX_CONTROLLER_MODEL", None)
-
-    def test_check_controller_model_rejects_missing_provider_prefix_for_opencode(self) -> None:
-        """A model identifier without a 'provider/' prefix is rejected for
-        the opencode adapter."""
-        os.environ["OPSX_CONTROLLER_MODEL"] = "sonnet-direct"
-        try:
-            with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-                self.opsx_plan.check_controller_model(adapter="opencode")
-            self.assertIn("not valid", str(ctx.exception))
-            self.assertIn("opencode", str(ctx.exception))
-            self.assertIn("controller", str(ctx.exception))
-        finally:
-            os.environ.pop("OPSX_CONTROLLER_MODEL", None)
-
-    def test_check_controller_model_accepts_valid_opencode_model(self) -> None:
-        """A valid provider/model identifier is accepted for opencode."""
-        self._set_model()  # sets OPSX_CONTROLLER_MODEL = "test-provider/test-model"
-        model = self.opsx_plan.check_controller_model(adapter="opencode")
-        self.assertEqual(model, "test-provider/test-model")
-
-    def test_check_controller_model_accepts_valid_claude_model(self) -> None:
-        """A non-prefixed model identifier is accepted for claude-code."""
-        os.environ["OPSX_CONTROLLER_MODEL"] = "claude-sonnet-5"
-        try:
-            model = self.opsx_plan.check_controller_model(adapter="claude-code")
-            self.assertEqual(model, "claude-sonnet-5")
-        finally:
-            os.environ.pop("OPSX_CONTROLLER_MODEL", None)
-
-    # -- compile client timeout ----------------------------------------------
-
-    def test_run_compile_client_raises_on_timeout(self) -> None:
-        """A compile client invocation that exceeds the timeout is reported
-        as a PlanError."""
-        def fake_run(args, **kwargs):
-            raise subprocess.TimeoutExpired(args, kwargs.get("timeout", 60))
-
-        with mock.patch("subprocess.run", side_effect=fake_run):
-            with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-                self.opsx_plan.run_compile_client(self.repo, "claude-code",
-                                                   "m", "prompt")
-            self.assertIn("timed out", str(ctx.exception).lower())
-
-    def test_run_compile_client_opencode_attaches_and_removes_prompt_file(self) -> None:
-        prompt = "large compile prompt"
-        observed: dict[str, object] = {}
-        result = mock.Mock(returncode=0, stdout="[plan]\n", stderr="")
-
-        def fake_run(argv, **kwargs):
-            prompt_file = Path(argv[argv.index("--file") + 1])
-            observed["argv"] = argv
-            observed["content"] = prompt_file.read_text(encoding="utf-8")
-            observed["path"] = prompt_file
-            return result
-
-        with mock.patch("subprocess.run", side_effect=fake_run):
-            stdout, stderr = self.opsx_plan.run_compile_client(
-                self.repo, "opencode", "test-provider/test-model", prompt
-            )
-
-        self.assertEqual((stdout, stderr), ("[plan]\n", ""))
-        self.assertEqual(observed["content"], prompt)
-        self.assertLess(observed["argv"].index(
-            "Follow the complete compile instructions in the attached file. Output only TOML."
-        ), observed["argv"].index("--file"))
-        self.assertNotIn(prompt, observed["argv"])
-        self.assertFalse(observed["path"].exists())
-
-    # -- _strip_claude_envelope / extract_toml tests --
-
-    def test_strip_claude_json_result_envelope(self) -> None:
-        output = '{"result": "[plan]\\nname = \\\"p\\\"\\nadapter = \\\"claude-code\\\"\\n\\n"}'
-        stripped = self.opsx_plan._strip_claude_envelope(output)
-        self.assertIn("[plan]", stripped)
-        self.assertNotIn('{"result"', stripped)
-
-    def test_strip_claude_envelope_preserves_non_json(self) -> None:
-        output = '[plan]\nname = "p"\n'
-        result = self.opsx_plan._strip_claude_envelope(output)
-        self.assertEqual(result, output)
-
-    def test_extract_toml_claude_jason_envelope(self) -> None:
-        inner = '[plan]\nname = "p"\nadapter = "claude-code"\n\n[[changes]]\nid = "c1"\n'
-        output = '{"result": "' + inner.replace('\n', '\\n').replace('"', '\\"') + '"}'
-        result = self.opsx_plan.extract_toml(output, adapter="claude-code")
-        self.assertIn("[plan]", result)
-
-    def test_extract_toml_claude_plain_rejected_without_envelope(self) -> None:
-        """Claude plain text without TOML content is rejected with named client."""
-        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-            self.opsx_plan.extract_toml("here is some prose", adapter="claude-code")
-        self.assertIn("claude", str(ctx.exception).lower())
-
-    def test_extract_toml_empty_opencode_mentions_opencode(self) -> None:
-        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-            self.opsx_plan.extract_toml("", adapter="opencode")
-        self.assertIn("opencode", str(ctx.exception).lower())
-
-    # -- Claude extraction edge cases ----------------------------------------
-
-    def test_extract_toml_claude_strips_envelope_with_leading_whitespace(self) -> None:
-        """Claude JSON envelope with leading/trailing whitespace is stripped."""
-        inner = '[plan]\nname = "p"\nadapter = "claude-code"\n\n[[changes]]\nid = "c1"\n'
-        escaped = inner.replace('\n', '\\n').replace('"', '\\"')
-        output = ' \n {"result": "' + escaped + '"} \n'
-        result = self.opsx_plan.extract_toml(output, adapter="claude-code")
-        self.assertIn("[plan]", result)
-
-    def test_extract_toml_claude_envelope_with_fenced_toml_inside_result(self) -> None:
-        """When the envelope result string contains a fenced TOML block,
-        the envelope is stripped before the fenced-block extraction."""
-        inner = '```toml\n[plan]\nname = "p"\nadapter = "claude-code"\n\n[[changes]]\nid = "c1"\n```\n'
-        escaped = json.dumps(inner)
-        output = '{"result": ' + escaped + '}'
-        result = self.opsx_plan.extract_toml(output, adapter="claude-code")
-        self.assertIn("[plan]", result)
-        self.assertNotIn("```", result)
-
-    def test_extract_toml_claude_handles_result_not_a_string(self) -> None:
-        """Claude envelope whose result is not a string falls through to
-        standard extraction (e.g. result is a dict)."""
-        output = '{"result": {"status": "ok"}}'
-        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-            self.opsx_plan.extract_toml(output, adapter="claude-code")
-        self.assertIn("claude", str(ctx.exception).lower())
-
-    def test_extract_toml_claude_handles_broken_json_gracefully(self) -> None:
-        """Claude output that looks like JSON but is broken falls through
-        without crashing the extractor."""
-        # Malformed JSON that starts with `{` but is not parseable.
-        output = '{"result": unfinished'
-        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-            self.opsx_plan.extract_toml(output, adapter="claude-code")
-        self.assertIn("claude", str(ctx.exception).lower())
-
-    def test_extract_toml_claude_envelope_result_empty_string(self) -> None:
-        """Claude envelope with empty result string is treated as no TOML."""
-        output = '{"result": ""}'
-        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-            self.opsx_plan.extract_toml(output, adapter="claude-code")
-        self.assertIn("claude", str(ctx.exception).lower())
-
-    # -- Claude compile client-level error and rejection tests ---------------
-
-    def test_run_compile_client_claude_spawn_failure(self) -> None:
-        """Claude compile client raises PlanError when the 'claude' binary
-        is not on PATH (FileNotFoundError), reporting the missing executable
-        by name."""
-        def fake_run(*args, **kwargs):
-            raise FileNotFoundError("no claude")
-
-        with mock.patch("subprocess.run", side_effect=fake_run):
-            with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-                self.opsx_plan.run_compile_client(
-                    self.repo, "claude-code", "m", "prompt"
-                )
-            self.assertIn("could not spawn", str(ctx.exception))
-            self.assertIn("claude", str(ctx.exception))
-
-    def test_run_compile_client_claude_nonzero_exit(self) -> None:
-        """Claude compile client raises PlanError with exit code and stderr
-        when the Claude process exits non-zero."""
-        fake_result = mock.Mock()
-        fake_result.returncode = 1
-        fake_result.stdout = ""
-        fake_result.stderr = "Claude error: model not configured"
-
-        with mock.patch("subprocess.run", return_value=fake_result):
-            with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-                self.opsx_plan.run_compile_client(
-                    self.repo, "claude-code", "m", "prompt"
-                )
-            self.assertIn("exited with code 1", str(ctx.exception))
-            self.assertIn("Claude error", str(ctx.exception))
-
-    def test_cmd_compile_claude_raw_toml_no_envelope(self) -> None:
-        """Claude compile succeeds when output is plain TOML (no JSON
-        envelope, no fenced block)."""
-        self._set_model()
-        os.environ["OPSX_CONTROLLER_MODEL"] = "claude-sonnet-5"
-        source = self._write_plan_md(
-            "plan.md",
-            "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n",
-        )
-
-        raw_toml = (
-            '[plan]\nname = "test"\nadapter = "claude-code"\n\n'
-            "[[changes]]\nid = \"c1\"\nphase = 1\n"
-        )
-
-        def fake_run(repo, adapter, model, prompt):
-            return raw_toml, ""
-
-        original = self.opsx_plan.run_compile_client
-        try:
-            self.opsx_plan.run_compile_client = fake_run
-            out = self.repo / "out.toml"
-            args = argparse.Namespace(
-                repo=str(self.repo), source="plan.md",
-                output=str(out), force=False, adapter="claude-code",
-            )
-            rc = self.opsx_plan.cmd_compile(args)
-            self.assertEqual(rc, 0)
-            self.assertTrue(out.is_file())
-            content = out.read_text(encoding="utf-8")
-            self.assertIn("c1", content)
-            self.assertIn("claude-code", content)
-        finally:
-            self.opsx_plan.run_compile_client = original
-            os.environ.pop("OPSX_CONTROLLER_MODEL", None)
-
-    def test_cmd_compile_claude_fenced_toml_no_envelope(self) -> None:
-        """Claude compile succeeds when output is a fenced TOML block with
-        no JSON envelope — the generic fenced-block extraction applies."""
-        self._set_model()
-        os.environ["OPSX_CONTROLLER_MODEL"] = "claude-sonnet-5"
-        source = self._write_plan_md(
-            "plan.md",
-            "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n",
-        )
-
-        fenced_toml = (
-            '```toml\n'
-            '[plan]\nname = "test"\nadapter = "claude-code"\n\n'
-            "[[changes]]\nid = \"c1\"\nphase = 1\n"
-            '```\n'
-        )
-
-        def fake_run(repo, adapter, model, prompt):
-            return fenced_toml, ""
-
-        original = self.opsx_plan.run_compile_client
-        try:
-            self.opsx_plan.run_compile_client = fake_run
-            out = self.repo / "out.toml"
-            args = argparse.Namespace(
-                repo=str(self.repo), source="plan.md",
-                output=str(out), force=False, adapter="claude-code",
-            )
-            rc = self.opsx_plan.cmd_compile(args)
-            self.assertEqual(rc, 0)
-            self.assertTrue(out.is_file())
-            content = out.read_text(encoding="utf-8")
-            self.assertIn("c1", content)
-            self.assertIn("claude-code", content)
-        finally:
-            self.opsx_plan.run_compile_client = original
-            os.environ.pop("OPSX_CONTROLLER_MODEL", None)
-
-    def test_cmd_compile_claude_rejects_prose_output(self) -> None:
-        """Claude compile raises PlanError when output is plain prose with
-        no TOML content — the extraction fails with a client-named message."""
-        self._set_model()
-        os.environ["OPSX_CONTROLLER_MODEL"] = "claude-sonnet-5"
-        source = self._write_plan_md(
-            "plan.md",
-            "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n",
-        )
-
-        def fake_run(repo, adapter, model, prompt):
-            return "I cannot compile this plan because it lacks change entries.", ""
-
-        original = self.opsx_plan.run_compile_client
-        try:
-            self.opsx_plan.run_compile_client = fake_run
-            out = self.repo / "out.toml"
-            args = argparse.Namespace(
-                repo=str(self.repo), source="plan.md",
-                output=str(out), force=False, adapter="claude-code",
-            )
-            with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
-                self.opsx_plan.cmd_compile(args)
-            self.assertIn("claude", str(ctx.exception).lower())
-            self.assertIn("TOML", str(ctx.exception))
-            self.assertFalse(out.is_file())
-        finally:
-            self.opsx_plan.run_compile_client = original
-            os.environ.pop("OPSX_CONTROLLER_MODEL", None)
-
-    # -- default compile output and auto-activation (7.8) -------------------
-
-    def test_compile_no_output_flag_defaults_and_activates(self) -> None:
-        """7.8 — compile with no -o writes to openspec/plans/<stem>.toml
-        and auto-activates the active-plan pointer."""
-        self._set_model()
-        source = self._write_plan_md(
-            "openspec/plans/my-plan.md",
-            "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n",
-        )
-
-        valid_toml = (
-            '[plan]\nname = "test"\nadapter = "opencode"\n\n'
-            "[[changes]]\nid = \"c1\"\nphase = 1\n"
-        )
-
-        def fake_run(repo, adapter, model, prompt):
-            return valid_toml, ""
-
-        original = self.opsx_plan.run_compile_client
-        try:
-            self.opsx_plan.run_compile_client = fake_run
-            args = argparse.Namespace(
-                repo=str(self.repo), source="openspec/plans/my-plan.md",
-                output=None, force=False, adapter="opencode",
-            )
-            rc = self.opsx_plan.cmd_compile(args)
-            self.assertEqual(rc, 0)
-            default_out = self.repo / "openspec" / "plans" / "my-plan.toml"
-            self.assertTrue(default_out.is_file(),
-                            f"expected default output at {default_out}")
-            content = default_out.read_text(encoding="utf-8")
-            self.assertIn("c1", content)
-            # Auto-activation: active-plan pointer must reference the compiled plan
-            active = self.opsx_plan.planref.read_active_plan(self.repo)
-            self.assertEqual(
-                active, "openspec/plans/my-plan.toml",
-                "compile without -o must auto-activate the output plan",
-            )
-        finally:
-            self.opsx_plan.run_compile_client = original
-
-
-class DirectStageUsageExtractionTests(unittest.TestCase):
-    """Unit tests for usage / model metadata extraction functions."""
-
-    def setUp(self) -> None:
-        self.opsx_plan = load_opsx_plan()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.log_dir = Path(self.tmp.name)
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-
-    def _write_log(self, *lines: str) -> Path:
-        p = self.log_dir / f"test-{hash(lines)}.log"
-        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return p
-
-    # -- Extraction helpers -------------------------------------------------
-
-    def _assert_usage_unavailable(self, usage: dict) -> None:
-        self.assertFalse(usage["usage_available"])
-        self.assertIsNone(usage["usage_source"])
-        self.assertIsNone(usage["input_tokens"])
-        self.assertIsNone(usage["output_tokens"])
-        self.assertIsNone(usage["cached_input_tokens"])
-        self.assertIsNone(usage["reasoning_tokens"])
-        self.assertIsNone(usage["total_tokens"])
-
-    def _assert_model_null(self, model: dict) -> None:
-        self.assertIsNone(model["provider"])
-        self.assertIsNone(model["model_id"])
-        self.assertIsNone(model["model_alias"])
-
-    # -- 4.1 Full token usage from worker JSON ------------------------------
-
-    def test_worker_json_full_usage_populates_all_fields(self) -> None:
-        payload = {
-            "status": "implemented",
-            "change": "ex",
-            "round": 1,
-            "usage": {
-                "input_tokens": 100,
-                "output_tokens": 20,
-                "cached_input_tokens": 10,
-                "reasoning_tokens": 5,
-                "total_tokens": 135,
-            },
-        }
-        usage, model = self.opsx_plan.extract_usage_and_model(payload, None)
-        self.assertTrue(usage["usage_available"])
-        self.assertEqual(usage["usage_source"], "worker_json")
-        self.assertEqual(usage["input_tokens"], 100)
-        self.assertEqual(usage["output_tokens"], 20)
-        self.assertEqual(usage["cached_input_tokens"], 10)
-        self.assertEqual(usage["reasoning_tokens"], 5)
-        self.assertEqual(usage["total_tokens"], 135)
-
-    def test_worker_json_full_usage_top_level_alternate_keys(self) -> None:
-        payload = {
-            "status": "implemented",
-            "change": "ex",
-            "prompt_tokens": 100,
-            "completion_tokens": 20,
-            "cachedInputTokens": 10,
-            "reasoningTokens": 5,
-            "totalTokens": 135,
-        }
-        usage, _ = self.opsx_plan.extract_usage_and_model(payload, None)
-        self.assertTrue(usage["usage_available"])
-        self.assertEqual(usage["usage_source"], "worker_json")
-        self.assertEqual(usage["input_tokens"], 100)
-        self.assertEqual(usage["output_tokens"], 20)
-        self.assertEqual(usage["cached_input_tokens"], 10)
-        self.assertEqual(usage["reasoning_tokens"], 5)
-        self.assertEqual(usage["total_tokens"], 135)
-
-    # -- 4.2 Partial token usage --------------------------------------------
-
-    def test_worker_json_partial_usage_preserves_null(self) -> None:
-        payload = {
-            "status": "implemented",
-            "change": "ex",
-            "usage": {
-                "input_tokens": 100,
-                "output_tokens": 20,
-            },
-        }
-        usage, _ = self.opsx_plan.extract_usage_and_model(payload, None)
-        self.assertTrue(usage["usage_available"])
-        self.assertEqual(usage["usage_source"], "worker_json")
-        self.assertEqual(usage["input_tokens"], 100)
-        self.assertEqual(usage["output_tokens"], 20)
-        self.assertIsNone(usage["cached_input_tokens"])
-        self.assertIsNone(usage["reasoning_tokens"])
-        self.assertIsNone(usage["total_tokens"])
-
-    # -- 4.3 Zero token values ---------------------------------------------
-
-    def test_reported_zero_token_values_remain_zero(self) -> None:
-        payload = {
-            "status": "implemented",
-            "change": "ex",
-            "usage": {
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "total_tokens": 0,
-            },
-        }
-        usage, _ = self.opsx_plan.extract_usage_and_model(payload, None)
-        self.assertTrue(usage["usage_available"])
-        self.assertEqual(usage["input_tokens"], 0)
-        self.assertEqual(usage["output_tokens"], 0)
-        self.assertEqual(usage["total_tokens"], 0)
-        self.assertIsNone(usage["cached_input_tokens"])
-        self.assertIsNone(usage["reasoning_tokens"])
-
-    # -- 4.4 Model metadata from worker JSON -------------------------------
-
-    def test_worker_json_model_identity_populates_fields(self) -> None:
-        payload = {
-            "status": "implemented",
-            "change": "ex",
-            "model": {
-                "provider": "openai",
-                "model_id": "gpt-5.5",
-                "model_alias": "primary",
-            },
-        }
-        _, model = self.opsx_plan.extract_usage_and_model(payload, None)
-        self.assertEqual(model["provider"], "openai")
-        self.assertEqual(model["model_id"], "gpt-5.5")
-        self.assertEqual(model["model_alias"], "primary")
-
-    def test_worker_json_model_top_level_alternate_keys(self) -> None:
-        payload = {
-            "status": "implemented",
-            "change": "ex",
-            "provider": "anthropic",
-            "modelId": "claude-4",
-        }
-        _, model = self.opsx_plan.extract_usage_and_model(payload, None)
-        self.assertEqual(model["provider"], "anthropic")
-        self.assertEqual(model["model_id"], "claude-4")
-        self.assertIsNone(model["model_alias"])
-
-    # -- 4.5 Log metadata fallback -----------------------------------------
-
-    def test_log_metadata_fallback_usage_when_worker_json_has_none(self) -> None:
-        log_path = self._write_log(
-            "# header",
-            '{"input_tokens": 200, "output_tokens": 50}',
-        )
-        # Worker JSON has no usage fields
-        payload = {"status": "implemented", "change": "ex"}
-        usage, _ = self.opsx_plan.extract_usage_and_model(payload, log_path)
-        self.assertTrue(usage["usage_available"])
-        self.assertEqual(usage["usage_source"], "log_metadata")
-        self.assertEqual(usage["input_tokens"], 200)
-        self.assertEqual(usage["output_tokens"], 50)
-
-    def test_log_metadata_fallback_model_when_worker_json_has_none(self) -> None:
-        log_path = self._write_log(
-            "# header",
-            '{"provider": "openai", "model_id": "gpt-5.5"}',
-        )
-        payload = {"status": "implemented", "change": "ex"}
-        _, model = self.opsx_plan.extract_usage_and_model(payload, log_path)
-        self.assertEqual(model["provider"], "openai")
-        self.assertEqual(model["model_id"], "gpt-5.5")
-
-    # -- 4.6 Worker JSON takes precedence over log -------------------------
-
-    def test_worker_json_usage_wins_over_log_metadata(self) -> None:
-        log_path = self._write_log(
-            '{"input_tokens": 999, "output_tokens": 888}',
-        )
-        payload = {
-            "status": "implemented",
-            "change": "ex",
-            "usage": {"input_tokens": 100, "output_tokens": 20},
-        }
-        usage, _ = self.opsx_plan.extract_usage_and_model(payload, log_path)
-        self.assertTrue(usage["usage_available"])
-        self.assertEqual(usage["usage_source"], "worker_json")
-        self.assertEqual(usage["input_tokens"], 100)
-        self.assertEqual(usage["output_tokens"], 20)
-
-    def test_worker_json_model_wins_over_log_metadata(self) -> None:
-        log_path = self._write_log(
-            '{"provider": "log-provider", "model_id": "log-model"}',
-        )
-        payload = {
-            "status": "implemented",
-            "change": "ex",
-            "model": {"provider": "worker-provider", "model_id": "worker-model"},
-        }
-        _, model = self.opsx_plan.extract_usage_and_model(payload, log_path)
-        self.assertEqual(model["provider"], "worker-provider")
-        self.assertEqual(model["model_id"], "worker-model")
-
-    def test_log_model_fallback_blocked_when_worker_has_any_model_field(self) -> None:
-        """Worker provides provider only; log model fallback is blocked because worker already carries a model field."""
-        log_path = self._write_log(
-            '{"model_id": "log-model-id"}',
-        )
-        payload = {"status": "implemented", "change": "ex", "provider": "openai"}
-        _, model = self.opsx_plan.extract_usage_and_model(payload, log_path)
-        self.assertEqual(model["provider"], "openai")
-        self.assertIsNone(model["model_id"])
-
-    def test_log_model_fallback_when_worker_has_no_model(self) -> None:
-        """Log provides model identity when worker JSON has none."""
-        log_path = self._write_log(
-            '{"model_id": "log-model-id", "provider": "log-provider"}',
-        )
-        payload = {"status": "implemented", "change": "ex"}
-        _, model = self.opsx_plan.extract_usage_and_model(payload, log_path)
-        self.assertEqual(model["provider"], "log-provider")
-        self.assertEqual(model["model_id"], "log-model-id")
-
-    def test_invocation_model_fallback_reads_installed_agent_model(self) -> None:
-        home_dir = self.log_dir / "home"
-        agent_dir = home_dir / ".config" / "opencode" / "agents"
-        agent_dir.mkdir(parents=True)
-        (agent_dir / "opsx-reviewer.md").write_text(
-            "---\nmodel: \"openai/gpt-5.4\"\n---\n",
-            encoding="utf-8",
-        )
-
-        with mock.patch.dict(os.environ, {"HOME": str(home_dir)}, clear=False):
-            model = self.opsx_plan._extract_invocation_model(
-                "opencode run --agent opsx-reviewer"
-            )
-
-        self.assertEqual(model["provider"], "openai")
-        self.assertEqual(model["model_id"], "gpt-5.4")
-        self.assertIsNone(model["model_alias"])
-
-    def test_invocation_model_resolution_unchanged_for_opencode_with_explicit_adapter(self) -> None:
-        home_dir = self.log_dir / "home-opencode"
-        agent_dir = home_dir / ".config" / "opencode" / "agents"
-        agent_dir.mkdir(parents=True)
-        (agent_dir / "opsx-reviewer.md").write_text(
-            "---\nmodel: \"openai/gpt-5.4\"\n---\n",
-            encoding="utf-8",
-        )
-
-        with mock.patch.dict(os.environ, {"HOME": str(home_dir)}, clear=False):
-            model = self.opsx_plan._extract_invocation_model(
-                "opencode run --agent opsx-reviewer", "opencode"
-            )
-
-        self.assertEqual(model["provider"], "openai")
-        self.assertEqual(model["model_id"], "gpt-5.4")
-
-    def test_invocation_model_resolved_from_claude_code_agent_directory(self) -> None:
-        home_dir = self.log_dir / "home-claude"
-        agent_dir = home_dir / ".claude" / "agents"
-        agent_dir.mkdir(parents=True)
-        (agent_dir / "opsx-implementer.md").write_text(
-            "---\nmodel: \"anthropic/claude-opus-5\"\n---\n",
-            encoding="utf-8",
-        )
-
-        with mock.patch.dict(os.environ, {"HOME": str(home_dir)}, clear=False):
-            model = self.opsx_plan._extract_invocation_model(
-                "claude -p --agent opsx-implementer", "claude-code"
-            )
-
-        self.assertEqual(model["provider"], "anthropic")
-        self.assertEqual(model["model_id"], "claude-opus-5")
-        self.assertIsNone(model["model_alias"])
-
-    def test_invocation_model_claude_code_does_not_read_opencode_agent_dir(self) -> None:
-        """A claude-code invocation must not resolve against the opencode
-        agent directory even if a same-named agent file exists there."""
-        home_dir = self.log_dir / "home-mixed"
-        opencode_agent_dir = home_dir / ".config" / "opencode" / "agents"
-        opencode_agent_dir.mkdir(parents=True)
-        (opencode_agent_dir / "opsx-implementer.md").write_text(
-            "---\nmodel: \"openai/gpt-5.4\"\n---\n",
-            encoding="utf-8",
-        )
-        # No .claude/agents directory exists under this fake home.
-
-        with mock.patch.dict(os.environ, {"HOME": str(home_dir)}, clear=False):
-            model = self.opsx_plan._extract_invocation_model(
-                "claude -p --agent opsx-implementer", "claude-code"
-            )
-
-        self.assertIsNone(model["provider"])
-        self.assertIsNone(model["model_id"])
-
-    def test_invocation_model_resolved_from_repo_local_claude_code_agent_directory(self) -> None:
-        home_dir = self.log_dir / "home-claude-repo-fallback"
-        home_dir.mkdir(parents=True, exist_ok=True)
-        repo_dir = self.log_dir / "repo-claude"
-        agent_dir = repo_dir / ".claude" / "agents"
-        agent_dir.mkdir(parents=True)
-        (agent_dir / "opsx-implementer.md").write_text(
-            "---\nmodel: \"anthropic/claude-opus-5\"\n---\n",
-            encoding="utf-8",
-        )
-        # No agent file at all under the fake home; only the repo-local install has it.
-
-        with mock.patch.dict(os.environ, {"HOME": str(home_dir)}, clear=False):
-            model = self.opsx_plan._extract_invocation_model(
-                "claude -p --agent opsx-implementer", "claude-code", repo_dir
-            )
-
-        self.assertEqual(model["provider"], "anthropic")
-        self.assertEqual(model["model_id"], "claude-opus-5")
-        self.assertIsNone(model["model_alias"])
-
-    def test_invocation_model_fallback_expands_env_var_model_flag(self) -> None:
-        """Regression test: the invocation-model fallback must resolve the
-        model that was actually dispatched, not the unexpanded $VAR
-        placeholder still stored in the plan config's invoke string."""
-        var = "OPSX_TEST_TELEMETRY_MODEL"
-        os.environ[var] = "sonnet"
-        try:
-            expanded = self.opsx_plan._best_effort_expand_invoke(
-                f'claude -p --agent opsx-implementer --model "${var}"'
-            )
-            model = self.opsx_plan._extract_invocation_model(expanded, "claude-code")
-        finally:
-            del os.environ[var]
-
-        self.assertEqual(model["model_id"], "sonnet")
-        self.assertIsNone(model["provider"])
-
-    def test_best_effort_expand_invoke_leaves_unset_var_unexpanded(self) -> None:
-        """Best-effort expansion must not raise or fail-closed like the
-        dispatch-time expansion — it just leaves an unset reference as-is."""
-        var = "OPSX_TEST_TELEMETRY_MODEL_UNSET"
-        os.environ.pop(var, None)
-        expanded = self.opsx_plan._best_effort_expand_invoke(
-            f'claude -p --model "${var}"'
-        )
-        self.assertIn(f"${var}", expanded)
-
-    # -- 4.7 Unknown formats -----------------------------------------------
-
-    def test_unknown_format_produces_unavailable_usage(self) -> None:
-        payload = {"status": "implemented", "change": "ex"}
-        usage, model = self.opsx_plan.extract_usage_and_model(payload, None)
-        self._assert_usage_unavailable(usage)
-        self._assert_model_null(model)
-
-    def test_log_without_usage_produces_unavailable(self) -> None:
-        log_path = self._write_log(
-            "# just some text",
-            "no json here",
-            '{"some_other_field": 42}',
-        )
-        payload = {"status": "implemented", "change": "ex"}
-        usage, _ = self.opsx_plan.extract_usage_and_model(payload, log_path)
-        self._assert_usage_unavailable(usage)
-
-    def test_none_payload_produces_unavailable(self) -> None:
-        usage, model = self.opsx_plan.extract_usage_and_model(None, None)
-        self._assert_usage_unavailable(usage)
-        self._assert_model_null(model)
-
-    # -- 4.8 Malformed usage values ----------------------------------------
-
-    def test_negative_token_value_ignored(self) -> None:
-        payload = {
-            "status": "implemented",
-            "change": "ex",
-            "usage": {"input_tokens": -1, "output_tokens": 20},
-        }
-        usage, _ = self.opsx_plan.extract_usage_and_model(payload, None)
-        self.assertTrue(usage["usage_available"])
-        self.assertIsNone(usage["input_tokens"])
-        self.assertEqual(usage["output_tokens"], 20)
-
-    def test_floating_point_token_value_ignored(self) -> None:
-        payload = {
-            "status": "implemented",
-            "change": "ex",
-            "usage": {"input_tokens": 100.5},
-        }
-        usage, _ = self.opsx_plan.extract_usage_and_model(payload, None)
-        self._assert_usage_unavailable(usage)
-
-    def test_non_numeric_token_value_ignored(self) -> None:
-        payload = {
-            "status": "implemented",
-            "change": "ex",
-            "usage": {"input_tokens": "100", "total_tokens": None},
-        }
-        usage, _ = self.opsx_plan.extract_usage_and_model(payload, None)
-        self._assert_usage_unavailable(usage)
-
-    def test_boolean_token_value_ignored(self) -> None:
-        payload = {
-            "status": "implemented",
-            "change": "ex",
-            "usage": {"input_tokens": True, "output_tokens": False},
-        }
-        usage, _ = self.opsx_plan.extract_usage_and_model(payload, None)
-        self._assert_usage_unavailable(usage)
-
-    # -- 4.9 Default-unavailable for failure outcomes -----------------------
-
-    def test_timeout_record_usage_default_unavailable(self) -> None:
-        """Simulate payload=None (timeout path) keeps usage unavailable."""
-        usage, model = self.opsx_plan.extract_usage_and_model(None, None)
-        self._assert_usage_unavailable(usage)
-        self._assert_model_null(model)
-
-    def test_spawn_error_record_usage_default_unavailable(self) -> None:
-        usage, model = self.opsx_plan.extract_usage_and_model(None, None)
-        self._assert_usage_unavailable(usage)
-        self._assert_model_null(model)
-
-    def test_invalid_output_record_usage_default_unavailable(self) -> None:
-        usage, model = self.opsx_plan.extract_usage_and_model(None, None)
-        self._assert_usage_unavailable(usage)
-        self._assert_model_null(model)
-
-    # -- Edge cases ---------------------------------------------------------
-
-    def test_extraction_never_raises_on_broken_payload(self) -> None:
-        """Extraction must be best-effort and never raise."""
-        # A payload that is a dict but has weird internal types should not
-        # crash the extractor.
-        payload = {"usage": "not_a_dict"}
-        usage, model = self.opsx_plan.extract_usage_and_model(payload, None)
-        self._assert_usage_unavailable(usage)
-        self._assert_model_null(model)
-
-    def test_log_with_malformed_json_lines_is_ignored(self) -> None:
-        log_path = self._write_log(
-            "{not valid json",
-            '{"input_tokens": 50}',
-            "{still not valid",
-        )
-        payload = {"status": "implemented", "change": "ex"}
-        usage, _ = self.opsx_plan.extract_usage_and_model(payload, log_path)
-        self.assertTrue(usage["usage_available"])
-        self.assertEqual(usage["usage_source"], "log_metadata")
-        self.assertEqual(usage["input_tokens"], 50)
-
-    def test_nested_usage_object_recognized(self) -> None:
-        payload = {
-            "status": "implemented",
-            "change": "ex",
-            "usage": {
-                "input_tokens": 500,
-                "output_tokens": 200,
-            },
-        }
-        usage, _ = self.opsx_plan.extract_usage_and_model(payload, None)
-        self.assertTrue(usage["usage_available"])
-        self.assertEqual(usage["usage_source"], "worker_json")
-        self.assertEqual(usage["input_tokens"], 500)
-        self.assertEqual(usage["output_tokens"], 200)
-
-    def test_nested_model_object_recognized(self) -> None:
-        payload = {
-            "status": "implemented",
-            "change": "ex",
-            "model": {
-                "provider": "openai",
-                "model_id": "gpt-4",
-            },
-        }
-        _, model = self.opsx_plan.extract_usage_and_model(payload, None)
-        self.assertEqual(model["provider"], "openai")
-        self.assertEqual(model["model_id"], "gpt-4")
-
-    # -- Sidecar tests (tasks 4.1-4.6) ---------------------------------------
-
-    def _write_sidecar(self, *records: dict) -> Path:
-        """Write a sidecar JSONL file and return its path."""
-        p = self.log_dir / f"sidecar-{id(records)}.jsonl"
-        lines = "\n".join(json.dumps(r) for r in records) + "\n"
-        p.write_text(lines, encoding="utf-8")
-        return p
-
-    def _sidecar_identity(self, plan_name="test-plan", run_id="run-001",
-                          change_id="ex", stage="implement", round_num=1):
-        return {
-            "plan_name": plan_name,
-            "run_id": run_id,
-            "change_id": change_id,
-            "stage": stage,
-            "round": round_num,
-        }
-
-    # 4.1 -- Valid final sidecar populates usage, model, usage_source
-    def test_valid_final_sidecar_populates_usage_and_model(self) -> None:
-        sidecar_path = self._write_sidecar(
-            {
-                "schema_version": 1,
-                "event_type": "final",
-                "emitted_at": "2026-07-01T10:00:05Z",
-                "usage": {
-                    "input_tokens": 500,
-                    "output_tokens": 200,
-                    "total_tokens": 700,
-                },
-                "model": {
-                    "provider": "openai",
-                    "model_id": "gpt-4o",
-                },
-                **self._sidecar_identity(),
-            },
-        )
-        # Worker JSON has no usage or model
-        payload = {"status": "implemented", "change": "ex"}
-        usage, model = self.opsx_plan.extract_usage_and_model(
-            payload, None,
-            sidecar_path=sidecar_path,
-            plan_name="test-plan", run_id="run-001", change_id="ex",
-            stage="implement", round_num=1,
-            is_normal_completion=True,
-        )
-        self.assertTrue(usage["usage_available"])
-        self.assertEqual(usage["usage_source"], "opencode_plugin")
-        self.assertEqual(usage["input_tokens"], 500)
-        self.assertEqual(usage["output_tokens"], 200)
-        self.assertEqual(usage["total_tokens"], 700)
-        self.assertEqual(model["provider"], "openai")
-        self.assertEqual(model["model_id"], "gpt-4o")
-
-    # 4.2 -- Missing sidecar preserves unavailable usage
-    def test_missing_sidecar_preserves_unavailable_usage(self) -> None:
-        missing_path = self.log_dir / "nonexistent.jsonl"
-        payload = {"status": "implemented", "change": "ex"}
-        usage, model = self.opsx_plan.extract_usage_and_model(
-            payload, None,
-            sidecar_path=missing_path,
-            plan_name="test-plan", run_id="run-001", change_id="ex",
-            stage="implement", round_num=1,
-            is_normal_completion=True,
-        )
-        self._assert_usage_unavailable(usage)
-        self._assert_model_null(model)
-
-    # 4.3 -- Malformed JSONL, invalid values, unsupported schemas,
-    #        unknown event types, identity mismatches ignored
-    def test_sidecar_invalid_records_ignored_independently(self) -> None:
-        # Write sidecar manually so we can include a genuinely malformed
-        # JSONL line (not just valid-JSON records with bad content).
-        sidecar_path = self.log_dir / "malformed-sidecar.jsonl"
-        identity = self._sidecar_identity()
-        records: list[str] = [
-            # Truly malformed JSON — not a parseable JSON value at all
-            "{broken json that cannot be parsed",
-            # Garbage text that does not even look like JSON
-            "just some garbage text without braces",
-            # Valid JSON but an array (not a dict) — a subclass of malformed record
-            '[1, 2, 3]',
-            # Unsupported schema
-            json.dumps({
-                "schema_version": 99,
-                "event_type": "final",
-                "emitted_at": "2026-07-01T10:00:00Z",
-                "usage": {"input_tokens": 999},
-                **identity,
-            }),
-            # Unknown event type
-            json.dumps({
-                "schema_version": 1,
-                "event_type": "unknown-type",
-                "emitted_at": "2026-07-01T10:00:01Z",
-                "usage": {"input_tokens": 888},
-                **identity,
-            }),
-            # Identity mismatch
-            json.dumps({
-                "schema_version": 1,
-                "event_type": "final",
-                "emitted_at": "2026-07-01T10:00:02Z",
-                "usage": {"input_tokens": 777},
-                **self._sidecar_identity(change_id="wrong-change"),
-            }),
-            # Negative token value — ignored
-            json.dumps({
-                "schema_version": 1,
-                "event_type": "final",
-                "emitted_at": "2026-07-01T10:00:03Z",
-                "usage": {"input_tokens": -5, "output_tokens": 20},
-                **identity,
-            }),
-            # Valid record — should be selected
-            json.dumps({
-                "schema_version": 1,
-                "event_type": "final",
-                "emitted_at": "2026-07-01T10:00:04Z",
-                "usage": {"input_tokens": 300, "output_tokens": 100},
-                "model": {"provider": "anthropic", "model_id": "claude-4"},
-                **identity,
-            }),
-        ]
-        sidecar_path.write_text("\n".join(records) + "\n", encoding="utf-8")
-
-        payload = {"status": "implemented", "change": "ex"}
-        usage, model = self.opsx_plan.extract_usage_and_model(
-            payload, None,
-            sidecar_path=sidecar_path,
-            plan_name="test-plan", run_id="run-001", change_id="ex",
-            stage="implement", round_num=1,
-            is_normal_completion=True,
-        )
-        # The valid record at the end should have been selected
-        self.assertTrue(usage["usage_available"])
-        self.assertEqual(usage["usage_source"], "opencode_plugin")
-        self.assertEqual(usage["input_tokens"], 300)
-        self.assertEqual(usage["output_tokens"], 100)
-        self.assertEqual(model["provider"], "anthropic")
-        self.assertEqual(model["model_id"], "claude-4")
-
-    # 4.4 -- Timeout uses latest valid incremental record when no final
-    def test_timeout_uses_incremental_when_no_final(self) -> None:
-        sidecar_path = self._write_sidecar(
-            {
-                "schema_version": 1,
-                "event_type": "incremental",
-                "emitted_at": "2026-07-01T10:00:01Z",
-                "usage": {"input_tokens": 100, "output_tokens": 50},
-                **self._sidecar_identity(),
-            },
-            {
-                "schema_version": 1,
-                "event_type": "incremental",
-                "emitted_at": "2026-07-01T10:00:03Z",  # later
-                "usage": {"input_tokens": 400, "output_tokens": 150},
-                **self._sidecar_identity(),
-            },
-        )
-        payload = {"status": "implemented", "change": "ex"}
-        usage, model = self.opsx_plan.extract_usage_and_model(
-            payload, None,
-            sidecar_path=sidecar_path,
-            plan_name="test-plan", run_id="run-001", change_id="ex",
-            stage="implement", round_num=1,
-            is_normal_completion=False,  # timeout = non-normal
-        )
-        self.assertTrue(usage["usage_available"])
-        self.assertEqual(usage["usage_source"], "opencode_plugin")
-        # Latest incremental record wins
-        self.assertEqual(usage["input_tokens"], 400)
-        self.assertEqual(usage["output_tokens"], 150)
-
-    # 4.5 -- Completed stage with only incremental records ignores them
-    def test_completed_stage_ignores_incremental_only_sidecar(self) -> None:
-        sidecar_path = self._write_sidecar(
-            {
-                "schema_version": 1,
-                "event_type": "incremental",
-                "emitted_at": "2026-07-01T10:00:01Z",
-                "usage": {"input_tokens": 200, "output_tokens": 80},
-                **self._sidecar_identity(),
-            },
-        )
-        payload = {"status": "implemented", "change": "ex"}
-        usage, model = self.opsx_plan.extract_usage_and_model(
-            payload, None,
-            sidecar_path=sidecar_path,
-            plan_name="test-plan", run_id="run-001", change_id="ex",
-            stage="implement", round_num=1,
-            is_normal_completion=True,  # normal completion
-        )
-        # Normal completion with only incremental => sidecar ignored
-        self._assert_usage_unavailable(usage)
-        self._assert_model_null(model)
-
-    # 4.6 -- Worker JSON and log metadata keep precedence over sidecar
-    def test_worker_json_precedence_over_sidecar(self) -> None:
-        sidecar_path = self._write_sidecar(
-            {
-                "schema_version": 1,
-                "event_type": "final",
-                "emitted_at": "2026-07-01T10:00:05Z",
-                "usage": {"input_tokens": 999, "output_tokens": 888},
-                "model": {"provider": "sidecar-provider", "model_id": "sidecar-model"},
-                **self._sidecar_identity(),
-            },
-        )
-        # Worker JSON has usage and model — both take precedence
-        payload = {
-            "status": "implemented",
-            "change": "ex",
-            "usage": {"input_tokens": 100, "output_tokens": 50},
-            "model": {"provider": "worker-provider", "model_id": "worker-model"},
-        }
-        usage, model = self.opsx_plan.extract_usage_and_model(
-            payload, None,
-            sidecar_path=sidecar_path,
-            plan_name="test-plan", run_id="run-001", change_id="ex",
-            stage="implement", round_num=1,
-            is_normal_completion=True,
-        )
-        self.assertTrue(usage["usage_available"])
-        self.assertEqual(usage["usage_source"], "worker_json")
-        self.assertEqual(usage["input_tokens"], 100)
-        self.assertEqual(usage["output_tokens"], 50)
-        self.assertEqual(model["provider"], "worker-provider")
-        self.assertEqual(model["model_id"], "worker-model")
-
-    def test_log_metadata_precedence_over_sidecar(self) -> None:
-        sidecar_path = self._write_sidecar(
-            {
-                "schema_version": 1,
-                "event_type": "final",
-                "emitted_at": "2026-07-01T10:00:05Z",
-                "usage": {"input_tokens": 999, "output_tokens": 888},
-                "model": {"provider": "sidecar-provider", "model_id": "sidecar-model"},
-                **self._sidecar_identity(),
-            },
-        )
-        log_path = self._write_log(
-            '{"input_tokens": 500, "output_tokens": 250}',
-            '{"provider": "log-provider", "model_id": "log-model"}',
-        )
-        # Worker JSON has no usage or model — log should win over sidecar
-        payload = {"status": "implemented", "change": "ex"}
-        usage, model = self.opsx_plan.extract_usage_and_model(
-            payload, log_path,
-            sidecar_path=sidecar_path,
-            plan_name="test-plan", run_id="run-001", change_id="ex",
-            stage="implement", round_num=1,
-            is_normal_completion=True,
-        )
-        self.assertTrue(usage["usage_available"])
-        self.assertEqual(usage["usage_source"], "log_metadata")
-        self.assertEqual(usage["input_tokens"], 500)
-        self.assertEqual(usage["output_tokens"], 250)
-        self.assertEqual(model["provider"], "log-provider")
-        self.assertEqual(model["model_id"], "log-model")
-
-    def test_sidecar_model_fallback_when_worker_has_usage_but_no_model(self) -> None:
-        """Sidecar model metadata fills telemetry even when worker/log usage
-        exists but model metadata does not (the key fix for this round)."""
-        sidecar_path = self._write_sidecar(
-            {
-                "schema_version": 1,
-                "event_type": "final",
-                "emitted_at": "2026-07-01T10:00:05Z",
-                # No token usage in sidecar — model-only record
-                "model": {"provider": "openai", "model_id": "gpt-4o"},
-                **self._sidecar_identity(),
-            },
-        )
-        # Worker JSON has usage but no model
-        payload = {
-            "status": "implemented",
-            "change": "ex",
-            "usage": {"input_tokens": 500, "output_tokens": 200},
-        }
-        usage, model = self.opsx_plan.extract_usage_and_model(
-            payload, None,
-            sidecar_path=sidecar_path,
-            plan_name="test-plan", run_id="run-001", change_id="ex",
-            stage="implement", round_num=1,
-            is_normal_completion=True,
-        )
-        # Usage comes from worker
-        self.assertTrue(usage["usage_available"])
-        self.assertEqual(usage["usage_source"], "worker_json")
-        self.assertEqual(usage["input_tokens"], 500)
-        self.assertEqual(usage["output_tokens"], 200)
-        # Model comes from sidecar because worker had none
-        self.assertEqual(model["provider"], "openai")
-        self.assertEqual(model["model_id"], "gpt-4o")
-
-    def test_sidecar_model_fallback_when_log_has_usage_but_no_model(self) -> None:
-        """Sidecar model metadata fills when log provides usage but not model."""
-        sidecar_path = self._write_sidecar(
-            {
-                "schema_version": 1,
-                "event_type": "final",
-                "emitted_at": "2026-07-01T10:00:05Z",
-                "model": {"provider": "anthropic", "model_id": "claude-4"},
-                **self._sidecar_identity(),
-            },
-        )
-        # Log has usage tokens but no model fields
-        log_path = self._write_log(
-            '{"input_tokens": 300, "output_tokens": 100}',
-        )
-        payload = {"status": "implemented", "change": "ex"}
-        usage, model = self.opsx_plan.extract_usage_and_model(
-            payload, log_path,
-            sidecar_path=sidecar_path,
-            plan_name="test-plan", run_id="run-001", change_id="ex",
-            stage="implement", round_num=1,
-            is_normal_completion=True,
-        )
-        # Usage comes from log
-        self.assertTrue(usage["usage_available"])
-        self.assertEqual(usage["usage_source"], "log_metadata")
-        self.assertEqual(usage["input_tokens"], 300)
-        self.assertEqual(usage["output_tokens"], 100)
-        # Model comes from sidecar because log had none
-        self.assertEqual(model["provider"], "anthropic")
-        self.assertEqual(model["model_id"], "claude-4")
-
-    # -- Regression: model-only sidecar with no higher-precedence usage ----
-
-    def test_model_only_sidecar_no_higher_precedence_does_not_mark_usage_available(self) -> None:
-        """Model-only sidecar records only backfill model identity and
-        must never set usage_available, usage_source, or estimated cost
-        when no token counts are present and no higher-precedence source
-        provides usage."""
-        sidecar_path = self._write_sidecar(
-            {
-                "schema_version": 1,
-                "event_type": "final",
-                "emitted_at": "2026-07-01T10:00:05Z",
-                # No usage / token fields at all — model-only record
-                "model": {"provider": "openai", "model_id": "gpt-4o"},
-                **self._sidecar_identity(),
-            },
-        )
-        # Worker JSON has no usage and no model — sidecar is the only source
-        payload = {"status": "implemented", "change": "ex"}
-        usage, model = self.opsx_plan.extract_usage_and_model(
-            payload, None,
-            sidecar_path=sidecar_path,
-            plan_name="test-plan", run_id="run-001", change_id="ex",
-            stage="implement", round_num=1,
-            is_normal_completion=True,
-        )
-        # Model identity comes from sidecar — it was missing from worker
-        self.assertEqual(model["provider"], "openai")
-        self.assertEqual(model["model_id"], "gpt-4o")
-        # Usage must NOT be marked available — no token counts exist
-        self._assert_usage_unavailable(usage)
-
-
-class ClaudeResultEnvelopeUsagePrecedenceTests(unittest.TestCase):
-    """Tests for the claude_result_json usage/model source and its precedence."""
-
-    def setUp(self) -> None:
-        self.opsx_plan = load_opsx_plan()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.log_dir = Path(self.tmp.name)
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-
-    def _write_log(self, *lines: str) -> Path:
-        p = self.log_dir / f"test-{hash(lines)}.log"
-        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return p
-
-    def test_envelope_is_only_usage_source(self) -> None:
-        payload = {"status": "implemented", "change": "ex"}
-        envelope = {
-            "type": "result",
-            "result": "...",
-            "usage": {"input_tokens": 30, "output_tokens": 12},
-        }
-        usage, model = self.opsx_plan.extract_usage_and_model(
-            payload, None, envelope=envelope,
-        )
-        self.assertTrue(usage["usage_available"])
-        self.assertEqual(usage["usage_source"], "claude_result_json")
-        self.assertEqual(usage["input_tokens"], 30)
-        self.assertEqual(usage["output_tokens"], 12)
-
-    def test_worker_json_wins_over_envelope(self) -> None:
-        payload = {
-            "status": "implemented",
-            "change": "ex",
-            "usage": {"input_tokens": 100, "output_tokens": 50},
-        }
-        envelope = {
-            "type": "result",
-            "result": "...",
-            "usage": {"input_tokens": 999, "output_tokens": 888},
-        }
-        usage, _ = self.opsx_plan.extract_usage_and_model(
-            payload, None, envelope=envelope,
-        )
-        self.assertEqual(usage["usage_source"], "worker_json")
-        self.assertEqual(usage["input_tokens"], 100)
-        self.assertEqual(usage["output_tokens"], 50)
-
-    def test_envelope_outranks_log_metadata(self) -> None:
-        log_path = self._write_log(
-            '{"input_tokens": 777, "output_tokens": 666}',
-        )
-        payload = {"status": "implemented", "change": "ex"}
-        envelope = {
-            "type": "result",
-            "result": "...",
-            "usage": {"input_tokens": 40, "output_tokens": 15},
-        }
-        usage, _ = self.opsx_plan.extract_usage_and_model(
-            payload, log_path, envelope=envelope,
-        )
-        self.assertEqual(usage["usage_source"], "claude_result_json")
-        self.assertEqual(usage["input_tokens"], 40)
-        self.assertEqual(usage["output_tokens"], 15)
-
-    def test_log_metadata_wins_when_no_envelope(self) -> None:
-        log_path = self._write_log(
-            '{"input_tokens": 777, "output_tokens": 666}',
-        )
-        payload = {"status": "implemented", "change": "ex"}
-        usage, _ = self.opsx_plan.extract_usage_and_model(
-            payload, log_path, envelope=None,
-        )
-        self.assertEqual(usage["usage_source"], "log_metadata")
-        self.assertEqual(usage["input_tokens"], 777)
-
-    def test_envelope_model_identity_recorded_when_worker_json_has_none(self) -> None:
-        payload = {"status": "implemented", "change": "ex"}
-        envelope = {
-            "type": "result",
-            "result": "...",
-            "model": {"provider": "anthropic", "model_id": "claude-opus-5"},
-        }
-        _, model = self.opsx_plan.extract_usage_and_model(
-            payload, None, envelope=envelope,
-        )
-        self.assertEqual(model["provider"], "anthropic")
-        self.assertEqual(model["model_id"], "claude-opus-5")
-
-    def test_worker_json_model_wins_over_envelope_model(self) -> None:
-        payload = {
-            "status": "implemented",
-            "change": "ex",
-            "model": {"provider": "worker-provider", "model_id": "worker-model"},
-        }
-        envelope = {
-            "type": "result",
-            "result": "...",
-            "model": {"provider": "anthropic", "model_id": "claude-opus-5"},
-        }
-        _, model = self.opsx_plan.extract_usage_and_model(
-            payload, None, envelope=envelope,
-        )
-        self.assertEqual(model["provider"], "worker-provider")
-        self.assertEqual(model["model_id"], "worker-model")
-
-    def test_streamed_intermediate_usage_does_not_displace_envelope_totals(self) -> None:
-        """The orchestrator passes the *selected* (final) envelope only, so an
-        intermediate streamed message's partial usage never reaches here."""
-        payload = {"status": "implemented", "change": "ex"}
-        final_envelope = {
-            "type": "result",
-            "result": "...",
-            "usage": {"input_tokens": 50, "output_tokens": 25},
-        }
-        usage, _ = self.opsx_plan.extract_usage_and_model(
-            payload, None, envelope=final_envelope,
-        )
-        self.assertEqual(usage["input_tokens"], 50)
-        self.assertEqual(usage["output_tokens"], 25)
-
-    def test_cache_creation_input_tokens_populates_cached_input(self) -> None:
-        payload = {"status": "implemented", "change": "ex"}
-        envelope = {
-            "type": "result",
-            "result": "...",
-            "usage": {
-                "input_tokens": 10,
-                "output_tokens": 5,
-                "cache_creation_input_tokens": 7,
-            },
-        }
-        usage, _ = self.opsx_plan.extract_usage_and_model(
-            payload, None, envelope=envelope,
-        )
-        self.assertEqual(usage["cached_input_tokens"], 7)
-
-    def test_real_envelope_model_usage_shape_resolves_model_identity(self) -> None:
-        """Regression test against the real Claude Code CLI envelope shape,
-        which carries model identity under `modelUsage` (keyed by canonical
-        model id), not a flat/nested `model` field."""
-        payload = {"status": "implemented", "change": "ex"}
-        envelope = {
-            "type": "result",
-            "result": "...",
-            "usage": {"input_tokens": 34, "output_tokens": 2515},
-            "modelUsage": {
-                "claude-haiku-4-5-20251001": {
-                    "inputTokens": 687,
-                    "outputTokens": 2528,
-                    "cacheReadInputTokens": 26178,
-                    "cacheCreationInputTokens": 11204,
-                    "canonicalModel": "claude-haiku-4-5",
-                    "provider": "firstParty",
-                }
-            },
-        }
-        _, model = self.opsx_plan.extract_usage_and_model(
-            payload, None, envelope=envelope,
-        )
-        self.assertEqual(model["provider"], "anthropic")
-        self.assertEqual(model["model_id"], "claude-haiku-4-5")
-
-    def test_real_envelope_model_usage_picks_highest_token_entry(self) -> None:
-        payload = {"status": "implemented", "change": "ex"}
-        envelope = {
-            "type": "result",
-            "result": "...",
-            "modelUsage": {
-                "claude-haiku-4-5-20251001": {
-                    "inputTokens": 10, "outputTokens": 5,
-                    "canonicalModel": "claude-haiku-4-5",
-                },
-                "claude-sonnet-4-5-20250929": {
-                    "inputTokens": 500, "outputTokens": 200,
-                    "canonicalModel": "claude-sonnet-4-5",
-                },
-            },
-        }
-        _, model = self.opsx_plan.extract_usage_and_model(
-            payload, None, envelope=envelope,
-        )
-        self.assertEqual(model["model_id"], "claude-sonnet-4-5")
-
-    def test_generic_model_field_still_wins_over_model_usage(self) -> None:
-        payload = {"status": "implemented", "change": "ex"}
-        envelope = {
-            "type": "result",
-            "result": "...",
-            "model": {"provider": "anthropic", "model_id": "claude-opus-5"},
-            "modelUsage": {
-                "claude-haiku-4-5-20251001": {
-                    "inputTokens": 999, "canonicalModel": "claude-haiku-4-5",
-                }
-            },
-        }
-        _, model = self.opsx_plan.extract_usage_and_model(
-            payload, None, envelope=envelope,
-        )
-        self.assertEqual(model["model_id"], "claude-opus-5")
-
-
-class DirectStageUsageIntegrationTests(unittest.TestCase):
-    """Integration tests that verify usage/model appear in telemetry records
-    written by the full run_direct_change pipeline."""
-
-    def setUp(self) -> None:
-        self.opsx_plan = load_opsx_plan()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.repo = Path(self.tmp.name)
-        git(self.repo, "init")
-        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
-        git(self.repo, "add", "tracked.txt")
-        git(
-            self.repo,
-            "-c",
-            "user.email=test@example.invalid",
-            "-c",
-            "user.name=Test User",
-            "commit",
-            "-m",
-            "init",
-        )
-        self.cid = "add-usage-integration"
-        self.plan_name = f"run-{self.cid}"
-        self.cfg = {
-            "name": self.plan_name,
-            "adapter": "opencode",
-            "implement_invoke": "opencode run --agent opsx-implementer",
-            "review_invoke": "opencode run --agent opsx-reviewer",
-            "archive_invoke": "opencode run --agent opsx-archiver",
-            "invoke": 'opencode run "/opsx-drive {change}"',
-            "state_file": ".opencode/opsx-controller/{change}.json",
-            "timeout_minutes": 1,
-            "max_attempts": 2,
-            "max_rounds": 2,
-            "no_progress_limit": 2,
-            "fast_checks": [],
-            "check_timeout_minutes": 1,
-            "require_clean_tracked": False,
-            "review_created": False,
-            "changes": {
-                self.cid: {
-                    "id": self.cid,
-                    "depends_on": [],
-                    "enabled": True,
-                    "pause_before": False,
-                    "timeout_minutes": 1,
-                    "max_attempts": 2,
-                    "create_invoke": "",
-                    "create_max_attempts": 1,
-                }
-            },
-            "order": [self.cid],
-            "created_check": "",
-            "plan_doc": "",
-            "create_timeout_minutes": 1,
-        }
-        self.state = {"plan": self.plan_name, "approvals": [], "changes": {}}
-        self._saved_invoke = self.opsx_plan.invoke_direct_stage
-        self._saved_checks = self.opsx_plan.run_fast_checks
-
-    def tearDown(self) -> None:
-        self.opsx_plan.invoke_direct_stage = self._saved_invoke
-        self.opsx_plan.run_fast_checks = self._saved_checks
-        self.tmp.cleanup()
-
-    def write_authored_change(self, cid: str) -> None:
-        cdir = self.repo / "openspec" / "changes" / cid
-        cdir.mkdir(parents=True)
-        (cdir / "proposal.md").write_text("## Why\n", encoding="utf-8")
-        (cdir / "tasks.md").write_text(
-            "## 1. Tasks\n\n- [ ] 1.1 Example task\n- [ ] 1.2 Example task\n",
-            encoding="utf-8",
-        )
-
-    def _read_telemetry(self) -> list[dict]:
-        jsonl = self.repo / ".opsx-plan" / "telemetry" / f"{self.plan_name}.jsonl"
-        if not jsonl.is_file():
-            return []
-        records: list[dict] = []
-        for line in jsonl.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                records.append(json.loads(line))
-        return records
-
-    # -- 4.1 integration: full usage in worker JSON -> telemetry record ----
-
-    def test_implement_with_full_usage_payload_produces_populated_record(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-
-        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
-            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            result = {
-                "status": "implemented",
-                "change": self.cid,
-                "round": 1,
-                "progress_made": True,
-                "completed_tasks": ["1.1"],
-                "remaining_tasks": ["1.2"],
-                "task_counts": {"complete": 1, "total": 2},
-                "files_touched": [],
-                "known_change_files": [],
-                "summary": "done",
-                "usage": {
-                    "input_tokens": 1500,
-                    "output_tokens": 300,
-                    "cached_input_tokens": 200,
-                    "reasoning_tokens": 100,
-                    "total_tokens": 2100,
-                },
-            }
-            log_path.write_text(json.dumps(result) + "\n", encoding="utf-8")
-            return "exited", log_path
-
-        self.opsx_plan.invoke_direct_stage = fake_invoke
-        # Second stage (review) must also execute; use timeout to stop.
-        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        records = self._read_telemetry()
-        impl = [r for r in records if r["stage"] == "implement"]
-        self.assertGreaterEqual(len(impl), 1)
-        u = impl[0]["usage"]
-        self.assertTrue(u["usage_available"])
-        self.assertEqual(u["usage_source"], "worker_json")
-        self.assertEqual(u["input_tokens"], 1500)
-        self.assertEqual(u["output_tokens"], 300)
-        self.assertEqual(u["cached_input_tokens"], 200)
-        self.assertEqual(u["reasoning_tokens"], 100)
-        self.assertEqual(u["total_tokens"], 2100)
-
-    # -- 4.5 integration: log metadata fallback in telemetry ----------------
-
-    def test_implement_with_log_usage_produces_populated_record(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-
-        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
-            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            # Worker JSON has no usage, but log contains usage metadata
-            log_body = (
-                "# worker run\n"
-                + '{"input_tokens": 800, "output_tokens": 150}\n'
-                + "# more log lines\n"
-                + '{"status":"implemented","change":"add-usage-integration","round":1,'
-                + '"progress_made":true,"completed_tasks":[],"remaining_tasks":[],'
-                + '"task_counts":{"complete":0,"total":2},"files_touched":[],'
-                + '"known_change_files":[],"summary":"done"}\n'
-            )
-            log_path.write_text(log_body, encoding="utf-8")
-            return "exited", log_path
-
-        self.opsx_plan.invoke_direct_stage = fake_invoke
-        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        records = self._read_telemetry()
-        impl = [r for r in records if r["stage"] == "implement"]
-        self.assertGreaterEqual(len(impl), 1)
-        u = impl[0]["usage"]
-        self.assertTrue(u["usage_available"])
-        self.assertEqual(u["usage_source"], "log_metadata")
-        self.assertEqual(u["input_tokens"], 800)
-        self.assertEqual(u["output_tokens"], 150)
-
-    # -- 4.9 integration: timeout preserves default-unavailable -------------
-
-    def test_timeout_keeps_default_unavailable_usage_in_telemetry(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-
-        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
-            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_path.write_text("# timeout\n", encoding="utf-8")
-            return "timeout", log_path
-
-        self.opsx_plan.invoke_direct_stage = fake_invoke
-        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        records = self._read_telemetry()
-        self.assertGreaterEqual(len(records), 1)
-        u = records[0]["usage"]
-        self.assertFalse(u["usage_available"])
-        self.assertIsNone(u["usage_source"])
-        self.assertIsNone(u["input_tokens"])
-        self.assertIsNone(u["output_tokens"])
-
-    def test_invalid_output_keeps_default_unavailable_usage_in_telemetry(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-
-        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
-            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_path.write_text("not json\nsecond line\n", encoding="utf-8")
-            return "exited", log_path
-
-        self.opsx_plan.invoke_direct_stage = fake_invoke
-        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        records = self._read_telemetry()
-        self.assertGreaterEqual(len(records), 1)
-        u = records[0]["usage"]
-        self.assertFalse(u["usage_available"])
-        self.assertIsNone(u["usage_source"])
-
-    # -- Model metadata integration -----------------------------------------
-
-    def test_implement_with_model_payload_produces_populated_record(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-
-        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
-            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            result = {
-                "status": "implemented",
-                "change": self.cid,
-                "round": 1,
-                "progress_made": True,
-                "completed_tasks": [],
-                "remaining_tasks": [],
-                "task_counts": {"complete": 0, "total": 2},
-                "files_touched": [],
-                "known_change_files": [],
-                "summary": "done",
-                "model": {
-                    "provider": "openai",
-                    "model_id": "gpt-5.5",
-                    "model_alias": "primary",
-                },
-            }
-            log_path.write_text(json.dumps(result) + "\n", encoding="utf-8")
-            return "exited", log_path
-
-        self.opsx_plan.invoke_direct_stage = fake_invoke
-        self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        records = self._read_telemetry()
-        impl = [r for r in records if r["stage"] == "implement"]
-        self.assertGreaterEqual(len(impl), 1)
-        m = impl[0]["model"]
-        self.assertEqual(m["provider"], "openai")
-        self.assertEqual(m["model_id"], "gpt-5.5")
-        self.assertEqual(m["model_alias"], "primary")
-
-    def test_implement_without_model_payload_uses_invoked_agent_model(self) -> None:
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-
-        fake_home = self.repo / "fake-home"
-        agent_dir = fake_home / ".config" / "opencode" / "agents"
-        agent_dir.mkdir(parents=True)
-        (agent_dir / "opsx-implementer.md").write_text(
-            "---\nmodel: \"deepseek/deepseek-v4-pro\"\n---\n",
-            encoding="utf-8",
-        )
-
-        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
-            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            if stage == "implement":
-                result = {
-                    "status": "implemented",
-                    "change": self.cid,
-                    "round": 1,
-                    "progress_made": True,
-                    "completed_tasks": [],
-                    "remaining_tasks": [],
-                    "task_counts": {"complete": 0, "total": 2},
-                    "files_touched": [],
-                    "known_change_files": [],
-                    "summary": "done",
-                }
-                log_path.write_text(
-                    "> opsx-implementer · deepseek-v4-pro\n"
-                    + json.dumps(result)
-                    + "\n",
-                    encoding="utf-8",
-                )
-                return "exited", log_path
-            log_path.write_text("# timeout\n", encoding="utf-8")
-            return "timeout", log_path
-
-        self.opsx_plan.invoke_direct_stage = fake_invoke
-        with mock.patch.dict(os.environ, {"HOME": str(fake_home)}, clear=False):
-            self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        records = self._read_telemetry()
-        impl = [r for r in records if r["stage"] == "implement"]
-        self.assertGreaterEqual(len(impl), 1)
-        m = impl[0]["model"]
-        self.assertEqual(m["provider"], "deepseek")
-        self.assertEqual(m["model_id"], "deepseek-v4-pro")
-        self.assertIsNone(m["model_alias"])
-
-    # -- Telemetry write resilience -----------------------------------------
-
-    def test_extraction_failure_does_not_block_telemetry_write(self) -> None:
-        """Verify that even if extraction raises, the telemetry record is
-        still written with default-unavailable usage."""
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-
-        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
-            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            result = {
-                "status": "implemented",
-                "change": self.cid,
-                "round": 1,
-                "progress_made": True,
-                "completed_tasks": [],
-                "remaining_tasks": [],
-                "task_counts": {"complete": 0, "total": 2},
-                "files_touched": [],
-                "known_change_files": [],
-                "summary": "done",
-            }
-            log_path.write_text(json.dumps(result) + "\n", encoding="utf-8")
-            return "exited", log_path
-
-        self.opsx_plan.invoke_direct_stage = fake_invoke
-
-        class ExtractionError(Exception):
-            pass
-
-        def bad_extraction(payload, log_path):
-            raise ExtractionError("simulated extraction failure")
-
-        with mock.patch.object(
-            self.opsx_plan, "extract_usage_and_model", side_effect=bad_extraction
-        ):
-            self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
-
-        records = self._read_telemetry()
-        self.assertGreaterEqual(len(records), 1)
-        u = records[0]["usage"]
-        # Must have default-unavailable (the try/except caught the error)
-        self.assertFalse(u["usage_available"])
-        self.assertIsNone(u["usage_source"])
-
-    # -- Sidecar → estimated-cost telemetry integration (task 4.1) ---------
-
-    def test_sidecar_usage_flows_to_telemetry_with_estimated_cost(self):
-        """Task 4.1: Prove that a valid final sidecar produces estimated cost
-        in the telemetry record when pricing is available."""
-        from lib.pricing import PricingCatalog, UnresolvedPrice
-
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-
-        # Set up pricing catalog so cost estimation produces a real estimate
-        catalog_toml = textwrap.dedent("""\
-            [catalog]
-            version = "1.0.0"
-            updated = "2026-01-01"
-
-            [[entries]]
-            provider = "openai"
-            model_id = "gpt-4o"
-            display_name = "GPT-4o"
-            billing_mode = "per_token"
-            currency = "USD"
-            input_price_per_mtok = 2.0
-            output_price_per_mtok = 8.0
-            effective_date = "2025-01-01"
-        """)
-        tmp_catalog = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".toml", delete=False, encoding="utf-8",
-        )
-        tmp_catalog.write(catalog_toml)
-        tmp_catalog.close()
-        catalog_path = Path(tmp_catalog.name)
-        saved_catalog = self.opsx_plan.cost_mod._cost_catalog
-        try:
-            self.opsx_plan.cost_mod._cost_catalog = (
-                PricingCatalog(catalog_path=catalog_path),
-                UnresolvedPrice,
-            )
-
-            def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
-                log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-
-                if stage == "implement":
-                    # Worker JSON has no usage or model — sidecar must provide both
-                    result = {
-                        "status": "implemented",
-                        "change": cid,
-                        "round": round_num,
-                        "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "done",
-                    }
-                    log_path.write_text(json.dumps(result) + "\n", encoding="utf-8")
-
-                    # Write sidecar file at the path prescribed by OPSX_USAGE_PATH
-                    sidecar_path_str = os.environ.get("OPSX_USAGE_PATH", "")
-                    if sidecar_path_str:
-                        sidecar_record = {
-                            "schema_version": 1,
-                            "event_type": "final",
-                            "emitted_at": "2026-07-01T10:00:05Z",
-                            "usage": {
-                                "input_tokens": 500000,
-                                "output_tokens": 100000,
-                            },
-                            "model": {
-                                "provider": "openai",
-                                "model_id": "gpt-4o",
-                            },
-                            "plan_name": os.environ.get("OPSX_PLAN_NAME", ""),
-                            "run_id": os.environ.get("OPSX_RUN_ID", ""),
-                            "change_id": os.environ.get("OPSX_CHANGE_ID", cid),
-                            "stage": os.environ.get("OPSX_STAGE", stage),
-                            "round": int(os.environ.get("OPSX_ROUND", str(round_num))),
-                        }
-                        Path(sidecar_path_str).write_text(
-                            json.dumps(sidecar_record) + "\n", encoding="utf-8"
-                        )
-                    return "exited", log_path
-
-                elif stage == "review":
-                    result = {
-                        "status": "reviewed",
-                        "change": cid,
-                        "round": round_num,
-                        "verdict": "pass",
-                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
-                        "summary": "review passed",
-                        "fix_prompt": "",
-                        "next_phase": "archive",
-                    }
-                    log_path.write_text(json.dumps(result) + "\n", encoding="utf-8")
-                    return "exited", log_path
-
-                else:
-                    # archive — will fail on missing repo archive evidence,
-                    # but implement telemetry is already written by this point
-                    log_path.write_text(json.dumps({
-                        "status": "archived",
-                        "change": cid,
-                        "archive_path": "",
-                        "spec_sync_status": "no-delta",
-                        "commit": "",
-                        "summary": "archive claimed without repo evidence",
-                    }) + "\n", encoding="utf-8")
-                    return "exited", log_path
-
-            saved_invoke = self.opsx_plan.invoke_direct_stage
-            try:
-                self.opsx_plan.invoke_direct_stage = fake_invoke
-                self.opsx_plan.run_direct_change(
-                    self.repo, self.cfg, self.state, self.cid
-                )
-            finally:
-                self.opsx_plan.invoke_direct_stage = saved_invoke
-
-            records = self._read_telemetry()
-            impl = [r for r in records if r["stage"] == "implement"]
-            self.assertGreaterEqual(len(impl), 1, "expected at least one implement record")
-
-            # Usage must come from the sidecar (worker JSON had none)
-            u = impl[0]["usage"]
-            self.assertTrue(u["usage_available"])
-            self.assertEqual(u["usage_source"], "opencode_plugin")
-            self.assertEqual(u["input_tokens"], 500000)
-            self.assertEqual(u["output_tokens"], 100000)
-
-            # Model identity must come from the sidecar
-            m = impl[0]["model"]
-            self.assertEqual(m["provider"], "openai")
-            self.assertEqual(m["model_id"], "gpt-4o")
-
-            # Cost must be estimated (pricing catalog was set up)
-            c = impl[0]["cost"]
-            self.assertEqual(c["status"], "estimated")
-            # 500k input × $2/mtok = $1.00, 100k output × $8/mtok = $0.80
-            self.assertEqual(c["estimated_cost"], 1.80)
-            self.assertEqual(c["pricing_catalog_version"], "1.0.0")
-            self.assertIsNotNone(c["price_snapshot"])
-        finally:
-            self.opsx_plan.cost_mod._cost_catalog = saved_catalog
-            catalog_path.unlink(missing_ok=True)
-
-    # -- Claude Code envelope -> telemetry integration (task 5.5) -----------
-
-    def test_claude_code_envelope_flows_to_telemetry_with_resolved_cost(self):
-        """A Claude Code stage's result envelope must resolve real cost, and
-        the resulting record must be renderable by report/dashboard without
-        any schema change (they read usage/model/cost generically)."""
-        from lib.pricing import PricingCatalog, UnresolvedPrice
-
-        self.cfg["adapter"] = "claude-code"
-        self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
-        record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
-            self.repo, self.cid
-        )
-
-        catalog_toml = textwrap.dedent("""\
-            [catalog]
-            version = "1.0.0"
-            updated = "2026-01-01"
-
-            [[entries]]
-            provider = "anthropic"
-            model_id = "claude-opus-5"
-            display_name = "Claude Opus 5"
-            billing_mode = "per_token"
-            currency = "USD"
-            input_price_per_mtok = 5.0
-            output_price_per_mtok = 25.0
-            effective_date = "2025-01-01"
-        """)
-        tmp_catalog = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".toml", delete=False, encoding="utf-8",
-        )
-        tmp_catalog.write(catalog_toml)
-        tmp_catalog.close()
-        catalog_path = Path(tmp_catalog.name)
-        saved_catalog = self.opsx_plan.cost_mod._cost_catalog
-        try:
-            self.opsx_plan.cost_mod._cost_catalog = (
-                PricingCatalog(catalog_path=catalog_path),
-                UnresolvedPrice,
-            )
-
-            def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
-                log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-
-                if stage == "implement":
-                    worker_json = json.dumps({
-                        "status": "implemented",
-                        "change": cid,
-                        "round": round_num,
-                        "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
-                        "files_touched": [],
-                        "known_change_files": [],
-                        "summary": "done",
-                    })
-                    envelope = {
-                        "type": "result",
-                        "result": f"Implemented the change.\n{worker_json}",
-                        "usage": {
-                            "input_tokens": 200000,
-                            "output_tokens": 40000,
-                        },
-                        "model": {
-                            "provider": "anthropic",
-                            "model_id": "claude-opus-5",
-                        },
-                    }
-                    log_path.write_text(json.dumps(envelope) + "\n", encoding="utf-8")
-                    return "exited", log_path
-
-                elif stage == "review":
-                    result = {
-                        "status": "reviewed",
-                        "change": cid,
-                        "round": round_num,
-                        "verdict": "pass",
-                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
-                        "summary": "review passed",
-                        "fix_prompt": "",
-                        "next_phase": "archive",
-                    }
-                    log_path.write_text(json.dumps(result) + "\n", encoding="utf-8")
-                    return "exited", log_path
-
-                else:
-                    log_path.write_text(json.dumps({
-                        "status": "archived",
-                        "change": cid,
-                        "archive_path": "",
-                        "spec_sync_status": "no-delta",
-                        "commit": "",
-                        "summary": "archive claimed without repo evidence",
-                    }) + "\n", encoding="utf-8")
-                    return "exited", log_path
-
-            saved_invoke = self.opsx_plan.invoke_direct_stage
-            try:
-                self.opsx_plan.invoke_direct_stage = fake_invoke
-                self.opsx_plan.run_direct_change(
-                    self.repo, self.cfg, self.state, self.cid
-                )
-            finally:
-                self.opsx_plan.invoke_direct_stage = saved_invoke
-
-            records = self._read_telemetry()
-            impl = [r for r in records if r["stage"] == "implement"]
-            self.assertGreaterEqual(len(impl), 1, "expected at least one implement record")
-
-            u = impl[0]["usage"]
-            self.assertTrue(u["usage_available"])
-            self.assertEqual(u["usage_source"], "claude_result_json")
-            self.assertEqual(u["input_tokens"], 200000)
-            self.assertEqual(u["output_tokens"], 40000)
-
-            m = impl[0]["model"]
-            self.assertEqual(m["provider"], "anthropic")
-            self.assertEqual(m["model_id"], "claude-opus-5")
-
-            c = impl[0]["cost"]
-            self.assertEqual(c["status"], "estimated")
-            # 200k input x $5/mtok = $1.00, 40k output x $25/mtok = $1.00
-            self.assertEqual(c["estimated_cost"], 2.00)
-
-            # report/dashboard consume telemetry generically (no adapter- or
-            # usage_source-specific branching), so aggregation must not choke
-            # on this record.
-            from lib.metrics.aggregator import aggregate
-            result = aggregate(self.repo, self.plan_name, None)
-            self.assertEqual(result.plan_metrics.plan_name, self.plan_name)
-        finally:
-            self.opsx_plan.cost_mod._cost_catalog = saved_catalog
-            catalog_path.unlink(missing_ok=True)
-
-
 class ActivePlanResolutionTests(unittest.TestCase):
     """Tests for active plan pointer: resolution, use, auto-activation, and
     status output (tasks 5.1–5.3)."""
@@ -8055,9 +3337,9 @@ class ActivePlanResolutionTests(unittest.TestCase):
             '[plan]\nname = "test"\nadapter = "opencode"\n\n'
             "[[changes]]\nid = \"c1\"\nphase = 1\n"
         )
-        original = self.opsx_plan.run_compile_client
+        original = self.opsx_plan.compiler.run_compile_client
         try:
-            self.opsx_plan.run_compile_client = lambda repo, adapter, model, prompt: (valid_toml, "")
+            self.opsx_plan.compiler.run_compile_client = lambda repo, adapter, model, prompt: (valid_toml, "")
             args = argparse.Namespace(repo=str(self.repo), source="plan.md",
                                       output=str(out), force=False)
             rc = self.opsx_plan.cmd_compile(args)
@@ -8066,7 +3348,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
             self.assertIsNotNone(pointer)
             self.assertEqual(Path(pointer), Path("out.toml"))
         finally:
-            self.opsx_plan.run_compile_client = original
+            self.opsx_plan.compiler.run_compile_client = original
 
     def test_run_explicit_auto_activates_after_successful_load(self) -> None:
         plan = self._write_plan_toml("my-plan.toml")
@@ -8311,7 +3593,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
         rc = self.opsx_plan.cmd_approve(args)
 
         self.assertEqual(rc, 0)
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
         self.assertIn("test-change", state["approvals"])
 
     def test_cmd_accept_resolves_via_active_pointer(self) -> None:
@@ -8335,7 +3617,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
         rc = self.opsx_plan.cmd_accept(args)
 
         self.assertEqual(rc, 0)
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
         self.assertTrue(state["changes"]["test-change"]["accepted"])
 
     def test_cmd_accept_phase_persists_successes_before_invalid_change(self) -> None:
@@ -8371,7 +3653,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
             "refusing to accept add-run-event-notifications",
             stderr.getvalue(),
         )
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
         for cid in (
             "add-cost-budget-run-flag",
             "batch-gate-and-reset-commands",
@@ -8392,7 +3674,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
         rc = self.opsx_plan.cmd_reset(args)
 
         self.assertEqual(rc, 0)
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
         self.assertEqual(state["changes"]["test-change"]["status"], "pending")
 
     def test_cmd_run_resolves_via_active_pointer(self) -> None:
@@ -8629,11 +3911,11 @@ class SpendBudgetTests(unittest.TestCase):
         }
         self.state = {"plan": self.plan_name, "approvals": [], "changes": {}}
         self._saved_invoke = self.opsx_plan.invoke_direct_stage
-        self._saved_checks = self.opsx_plan.run_fast_checks
+        self._saved_checks = self.opsx_plan.groundtruth.run_fast_checks
 
     def tearDown(self) -> None:
         self.opsx_plan.invoke_direct_stage = self._saved_invoke
-        self.opsx_plan.run_fast_checks = self._saved_checks
+        self.opsx_plan.groundtruth.run_fast_checks = self._saved_checks
         self.tmp.cleanup()
 
     def write_authored_change(self, cid: str) -> None:
@@ -8662,7 +3944,7 @@ class SpendBudgetTests(unittest.TestCase):
         estimated_cost: float | None,
     ) -> dict:
         return {
-            "schema_version": self.opsx_plan.TELEMETRY_SCHEMA_VERSION,
+            "schema_version": self.opsx_plan.telemetry.TELEMETRY_SCHEMA_VERSION,
             "uid": str(uuid.uuid4()),
             "plan_name": self.plan_name,
             "run_id": run_id,
@@ -8743,9 +4025,9 @@ class SpendBudgetTests(unittest.TestCase):
         """4.1: A run with --budget-usd stops dispatching after cumulative
         estimated spend reaches the cap, and leaves state resumable."""
         self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+        record["tracked_change_files"] = self.opsx_plan.state_mod.change_context_paths(
             self.repo, self.cid
         )
 
@@ -8810,7 +4092,7 @@ class SpendBudgetTests(unittest.TestCase):
         # First dispatch: spend 0.70 < 1.00 → implement runs.
         # After implement, loop checks again: spend 1.05 >= 1.00 → stop.
         self.assertEqual(result, "budget")
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         self.assertEqual(record["last_result"], "spend_budget_exhausted")
         # Status must be PENDING (resumable), not FAILED
         self.assertEqual(record["status"], self.opsx_plan.base.PENDING)
@@ -8821,9 +4103,9 @@ class SpendBudgetTests(unittest.TestCase):
     def test_run_completes_without_reaching_spend_cap(self) -> None:
         """4.2: A run with a high --budget-usd completes normally."""
         self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+        record["tracked_change_files"] = self.opsx_plan.state_mod.change_context_paths(
             self.repo, self.cid
         )
 
@@ -8922,15 +4204,15 @@ class SpendBudgetTests(unittest.TestCase):
             self.opsx_plan.compute_run_spend = original_compute
 
         self.assertEqual(result, self.opsx_plan.base.DONE)
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         self.assertEqual(record["status"], self.opsx_plan.base.DONE)
 
     def test_no_spend_check_when_budget_usd_is_zero(self) -> None:
         """budget_usd=0 (default/omitted) must not trigger spend checks."""
         self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+        record["tracked_change_files"] = self.opsx_plan.state_mod.change_context_paths(
             self.repo, self.cid
         )
 
@@ -9009,625 +4291,6 @@ class SpendBudgetTests(unittest.TestCase):
         # Run should proceed past implement and review; archive returns "stop"
         # because there's no real archive directory (expected)
         self.assertIn(result, ("continue", "stop"))
-
-
-class DoctorPreflightTests(unittest.TestCase):
-    """Tests for ``opsx-plan doctor`` preflight checks and run-start warnings
-    (tasks 4.1, 4.2, 4.3)."""
-
-    def setUp(self) -> None:
-        self.opsx_plan = load_opsx_plan()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.repo = Path(self.tmp.name)
-        git(self.repo, "init")
-        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
-        git(self.repo, "add", "tracked.txt")
-        git(
-            self.repo,
-            "-c", "user.email=test@example.invalid",
-            "-c", "user.name=Test User",
-            "commit", "-m", "init",
-        )
-        # Isolate model resolution from whatever the real machine's home
-        # directory happens to contain, so these tests are hermetic.
-        from lib.models import resolver as _resolver
-        self._models_patch = mock.patch.object(
-            _resolver, "USER_CONFIG_PATH", Path(self.tmp.name) / "unused-home" / "models.toml"
-        )
-        self._models_patch.start()
-        self.addCleanup(self._models_patch.stop)
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-
-    def _write_plan_toml(self, name: str = "doctor-test-plan",
-                         delivery: str = "") -> Path:
-        """Write a minimal plan TOML and return its absolute path."""
-        plan_content = (
-            f'[plan]\nname = "{name}"\nadapter = "opencode"\n'
-            f'timeout_minutes = 1\nmax_rounds = 5\n'
-            f'require_clean_tracked = false\n'
-        )
-        if delivery:
-            plan_content += f'delivery = "{delivery}"\n'
-        plan_content += (
-            '[[changes]]\nid = "ch-doctor"\n'
-        )
-        p = self.repo / f"{name}.toml"
-        p.write_text(plan_content, encoding="utf-8")
-        return p
-
-    # -- 4.1: failing check classes ---------------------------------------
-
-    def test_check_model_resolution_missing_reports_failures(self) -> None:
-        """Unresolved OPSX_*_MODEL roles should produce a failing check."""
-        saved_env = {}
-        for v in self.opsx_plan.ROLE_ENV.values():
-            saved_env[v] = os.environ.pop(v, None)
-        try:
-            passed, label, remediation = self.opsx_plan._check_model_resolution(
-                self.repo, "opencode"
-            )
-            self.assertFalse(passed)
-            self.assertIn("Unresolved role", remediation)
-        finally:
-            for v, val in saved_env.items():
-                if val is not None:
-                    os.environ[v] = val
-                elif v in os.environ:
-                    del os.environ[v]
-
-    def test_check_model_resolution_passes_when_all_set(self) -> None:
-        """When all OPSX_*_MODEL vars resolve, the check passes."""
-        saved_env = {}
-        for v in self.opsx_plan.ROLE_ENV.values():
-            saved_env[v] = os.environ.get(v)
-            os.environ[v] = "provider/test-model-value"
-        try:
-            passed, label, remediation = self.opsx_plan._check_model_resolution(
-                self.repo, "opencode"
-            )
-            self.assertTrue(passed, f"check failed: {remediation}")
-        finally:
-            for v, val in saved_env.items():
-                if val is not None:
-                    os.environ[v] = val
-                elif v in os.environ:
-                    del os.environ[v]
-
-    def test_check_model_identifier_syntax_fails_on_provider_prefix_for_claude_code(self) -> None:
-        """A provider-prefixed identifier under claude-code fails the syntax check."""
-        saved_env = {}
-        for v in self.opsx_plan.ROLE_ENV.values():
-            saved_env[v] = os.environ.get(v)
-            os.environ[v] = "deepseek/deepseek-v4-pro"
-        try:
-            passed, label, remediation = self.opsx_plan._check_model_identifier_syntax(
-                self.repo, "claude-code"
-            )
-            self.assertFalse(passed)
-            self.assertIn("provider-prefixed", remediation)
-        finally:
-            for v, val in saved_env.items():
-                if val is not None:
-                    os.environ[v] = val
-                elif v in os.environ:
-                    del os.environ[v]
-
-    def test_check_model_identifier_syntax_fails_on_bare_identifier_for_opencode(self) -> None:
-        """A bare identifier under opencode fails the syntax check."""
-        saved_env = {}
-        for v in self.opsx_plan.ROLE_ENV.values():
-            saved_env[v] = os.environ.get(v)
-            os.environ[v] = "gpt-5.4"
-        try:
-            passed, label, remediation = self.opsx_plan._check_model_identifier_syntax(
-                self.repo, "opencode"
-            )
-            self.assertFalse(passed)
-            self.assertIn("provider/", remediation)
-        finally:
-            for v, val in saved_env.items():
-                if val is not None:
-                    os.environ[v] = val
-                elif v in os.environ:
-                    del os.environ[v]
-
-    def test_check_model_identifier_syntax_passes_for_matching_syntax(self) -> None:
-        """A correctly-shaped identifier passes the syntax check."""
-        saved_env = {}
-        for v in self.opsx_plan.ROLE_ENV.values():
-            saved_env[v] = os.environ.get(v)
-            os.environ[v] = "provider/test-model-value"
-        try:
-            passed, label, remediation = self.opsx_plan._check_model_identifier_syntax(
-                self.repo, "opencode"
-            )
-            self.assertTrue(passed, f"check failed: {remediation}")
-        finally:
-            for v, val in saved_env.items():
-                if val is not None:
-                    os.environ[v] = val
-                elif v in os.environ:
-                    del os.environ[v]
-
-    def test_check_tracked_bytecode_no_false_positives_on_clean_tree(self) -> None:
-        """A clean tree without bytecode should pass."""
-        passed, label, remediation = self.opsx_plan._check_tracked_bytecode(self.repo)
-        self.assertTrue(passed, f"unexpected failure: {remediation}")
-
-    def test_check_tracked_bytecode_detects_tracked_pyc(self) -> None:
-        """Tracked .pyc files should be detected."""
-        pyc = self.repo / "cached.pyc"
-        pyc.write_text("fake", encoding="utf-8")
-        git(self.repo, "add", "cached.pyc")
-        git(
-            self.repo,
-            "-c", "user.email=test@example.invalid",
-            "-c", "user.name=Test User",
-            "commit", "-m", "add pyc",
-        )
-        passed, label, remediation = self.opsx_plan._check_tracked_bytecode(self.repo)
-        self.assertFalse(passed)
-        self.assertIn("cached.pyc", remediation)
-
-    def test_check_tracked_tree_clean_passes_on_clean_tree(self) -> None:
-        """A clean tree should pass the check."""
-        passed, label, remediation = self.opsx_plan._check_tracked_tree_clean(self.repo)
-        self.assertTrue(passed, f"unexpected failure: {remediation}")
-
-    def test_check_tracked_tree_clean_detects_dirty_tree(self) -> None:
-        """A dirty tracked tree should fail the check."""
-        (self.repo / "tracked.txt").write_text("modified\n", encoding="utf-8")
-        passed, label, remediation = self.opsx_plan._check_tracked_tree_clean(self.repo)
-        self.assertFalse(passed)
-        self.assertIn("uncommitted", remediation)
-
-    def test_check_plan_loads_passes_when_plan_is_valid(self) -> None:
-        """A valid plan should load successfully."""
-        plan_path = self._write_plan_toml()
-        plan_src = str(plan_path.relative_to(self.repo))
-        passed, label, remediation = self.opsx_plan._check_plan_loads(self.repo, plan_src)
-        self.assertTrue(passed, f"unexpected failure: {remediation}")
-
-    def test_check_plan_loads_fails_when_plan_is_invalid(self) -> None:
-        """An invalid plan should fail to load with a clear message."""
-        path = self.repo / "bad.toml"
-        path.write_text("not valid toml [[[", encoding="utf-8")
-        plan_src = str(path.relative_to(self.repo))
-        passed, label, remediation = self.opsx_plan._check_plan_loads(self.repo, plan_src)
-        self.assertFalse(passed)
-        self.assertIn("Plan load failed", remediation)
-
-    def test_check_plan_loads_skips_when_plan_src_is_none(self) -> None:
-        """No plan should be treated as a pass (skip)."""
-        passed, label, remediation = self.opsx_plan._check_plan_loads(self.repo, None)
-        self.assertTrue(passed)
-
-    def test_check_pr_delivery_skips_when_no_plan(self) -> None:
-        """When plan_src is None, PR check should skip (pass)."""
-        passed, label, remediation = self.opsx_plan._check_pr_delivery(self.repo, None)
-        self.assertTrue(passed)
-
-    def test_check_pr_delivery_fails_when_plan_load_fails(self) -> None:
-        """When the plan TOML cannot be loaded, PR check must FAIL, not pass."""
-        path = self.repo / "bad-pr.toml"
-        path.write_text("broken toml [[{", encoding="utf-8")
-        plan_src = str(path.relative_to(self.repo))
-        passed, label, remediation = self.opsx_plan._check_pr_delivery(self.repo, plan_src)
-        self.assertFalse(passed)
-        self.assertIn("Plan failed to load", remediation)
-
-    def test_check_pr_delivery_passes_when_delivery_is_not_pr(self) -> None:
-        """When delivery is not pull-request, the check passes."""
-        plan_path = self._write_plan_toml(delivery="none")
-        plan_src = str(plan_path.relative_to(self.repo))
-        passed, label, remediation = self.opsx_plan._check_pr_delivery(self.repo, plan_src)
-        self.assertTrue(passed)
-
-    def test_check_pr_delivery_fails_when_gh_missing(self) -> None:
-        """When delivery is pull-request but gh is missing, check fails."""
-        plan_path = self._write_plan_toml(delivery="pull-request")
-        plan_src = str(plan_path.relative_to(self.repo))
-        with mock.patch("shutil.which", return_value=None):
-            passed, label, remediation = self.opsx_plan._check_pr_delivery(self.repo, plan_src)
-        self.assertFalse(passed)
-        self.assertIn("gh", remediation.lower())
-
-    def test_check_pr_delivery_fails_when_no_git_remote(self) -> None:
-        """When delivery is pull-request, gh is present but no remote, check fails."""
-        plan_path = self._write_plan_toml(delivery="pull-request")
-        plan_src = str(plan_path.relative_to(self.repo))
-        # gh on PATH, but we have no remote (bare init)
-        with mock.patch("shutil.which", return_value="/usr/bin/gh"):
-            passed, label, remediation = self.opsx_plan._check_pr_delivery(self.repo, plan_src)
-        self.assertFalse(passed)
-        self.assertIn("No git remote", remediation)
-
-    # -- 4.1 (continued): missing failure-path tests for stale install,
-    #    missing openspec, and missing adapter client -----------------------
-
-    def test_check_stale_install_fails_when_hashes_differ(self) -> None:
-        """When the installed copy content differs from the repo copy, the
-        check must fail with a stale-install message."""
-        import hashlib
-
-        repo_copy = self.repo / "orchestrator" / "opsx-plan.py"
-        repo_copy.parent.mkdir(parents=True)
-        repo_copy.write_text("repo content", encoding="utf-8")
-
-        fake_home = Path(self.tmp.name) / "fake-home"
-        fake_home.mkdir(parents=True, exist_ok=True)
-        installed = fake_home / ".local" / "bin" / "opsx-plan"
-        installed.parent.mkdir(parents=True, exist_ok=True)
-        installed.write_text("different installed content", encoding="utf-8")
-
-        with mock.patch.object(Path, "home", return_value=fake_home):
-            passed, label, remediation = self.opsx_plan._check_stale_install(self.repo)
-
-        self.assertFalse(passed)
-        self.assertIn("stale", remediation.lower())
-
-    def test_check_stale_install_fails_when_installed_missing(self) -> None:
-        """When the installed copy does not exist at all, the check must fail."""
-        repo_copy = self.repo / "orchestrator" / "opsx-plan.py"
-        repo_copy.parent.mkdir(parents=True)
-        repo_copy.write_text("repo content", encoding="utf-8")
-
-        fake_home = Path(self.tmp.name) / "fake-home-missing"
-        fake_home.mkdir(parents=True, exist_ok=True)
-
-        with mock.patch.object(Path, "home", return_value=fake_home):
-            passed, label, remediation = self.opsx_plan._check_stale_install(self.repo)
-
-        self.assertFalse(passed)
-        self.assertIn("not found", remediation.lower())
-
-    def test_check_openspec_on_path_fails_when_openspec_missing(self) -> None:
-        """When openspec is not on PATH, the check must fail with an install hint."""
-        with mock.patch("shutil.which", return_value=None):
-            passed, label, remediation = self.opsx_plan._check_openspec_on_path()
-
-        self.assertFalse(passed)
-        self.assertIn("Install openspec", remediation)
-
-    def test_check_openspec_on_path_passes_when_found(self) -> None:
-        """When openspec is on PATH, the check must pass."""
-        with mock.patch("shutil.which", return_value="/usr/bin/openspec"):
-            passed, label, remediation = self.opsx_plan._check_openspec_on_path()
-
-        self.assertTrue(passed, f"unexpected failure: {remediation}")
-
-    def test_check_adapter_client_on_path_fails_when_client_missing(self) -> None:
-        """When the adapter client executable is not on PATH, the check must
-        fail with an install hint."""
-        with mock.patch("shutil.which", return_value=None):
-            passed, label, remediation = self.opsx_plan._check_adapter_client_on_path("opencode")
-
-        self.assertFalse(passed)
-        self.assertIn("opencode", label.lower())
-        self.assertIn("Install", remediation)
-
-    def test_check_adapter_client_on_path_passes_when_client_found(self) -> None:
-        """When the adapter client is on PATH, the check must pass."""
-        with mock.patch("shutil.which", return_value="/usr/bin/opencode"):
-            passed, label, remediation = self.opsx_plan._check_adapter_client_on_path("opencode")
-
-        self.assertTrue(passed, f"unexpected failure: {remediation}")
-
-    # -- 4.2: doctor with different plan states ----------------------------
-
-    def test_cmd_doctor_with_no_plan_runs_plan_independent_checks(self) -> None:
-        """Doctor without any plan should still run plan-independent checks and
-        surface failures."""
-        args = argparse.Namespace(repo=str(self.repo), plan=None)
-        stdout = io.StringIO()
-        # Simulate missing required env vars to force a failure
-        saved_env = {}
-        for v in self.opsx_plan.ROLE_ENV.values():
-            saved_env[v] = os.environ.pop(v, None)
-        try:
-            with mock.patch("sys.stdout", stdout):
-                rc = self.opsx_plan.cmd_doctor(args)
-        finally:
-            for v, val in saved_env.items():
-                if val is not None:
-                    os.environ[v] = val
-                elif v in os.environ:
-                    del os.environ[v]
-        # Should report plan as none
-        self.assertIn("(none", stdout.getvalue())
-        # Should exit non-zero due to missing env vars
-        self.assertEqual(rc, 1)
-
-    def test_cmd_doctor_with_explicit_plan_loads_plan_checks(self) -> None:
-        """Doctor with an explicit valid plan should run plan-dependent checks."""
-        plan_path = self._write_plan_toml()
-        plan_src = str(plan_path.relative_to(self.repo))
-        args = argparse.Namespace(repo=str(self.repo), plan=plan_src)
-        stdout = io.StringIO()
-        with mock.patch("sys.stdout", stdout):
-            rc = self.opsx_plan.cmd_doctor(args)
-        output = stdout.getvalue()
-        self.assertIn("opsx-plan doctor", output)
-        self.assertIn(plan_src, output)
-        # The plan-dependent checks are what this test is about. The overall
-        # exit code is not asserted: doctor also checks host installation state
-        # (~/.local/bin/opsx-plan, installed worker agents), which is absent on
-        # a clean checkout and on CI, so requiring rc == 0 would only pass on a
-        # machine where the installer had already been run.
-        self.assertIn("✓ Plan loads successfully", output)
-        self.assertIn("✓ Model roles resolve for the target adapter", output)
-        self.assertIsNotNone(rc)
-        # 4.2: each resolved role's source is reported alongside the model
-        self.assertIn("controller", output)
-        self.assertIn("ambient environment", output)
-
-    def test_cmd_doctor_with_missing_explicit_plan_exits_nonzero(self) -> None:
-        """Doctor with a non-existent explicit plan should fail hard."""
-        args = argparse.Namespace(repo=str(self.repo), plan="nonexistent.toml")
-        rc = self.opsx_plan.cmd_doctor(args)
-        self.assertEqual(rc, 2)
-
-    def test_cmd_doctor_with_stale_active_plan_warns_and_continues(self) -> None:
-        """When the active plan pointer references a missing file, doctor must
-        warn rather than silently swallow the error."""
-        # Write a stale active plan pointer
-        self.opsx_plan.write_active_plan(self.repo, "gone-plan.toml")
-        args = argparse.Namespace(repo=str(self.repo), plan=None)
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
-            rc = self.opsx_plan.cmd_doctor(args)
-        stderr_val = stderr.getvalue()
-        self.assertIn("active plan pointer references missing file", stderr_val)
-        self.assertIn("gone-plan.toml", stderr_val)
-        # Should still run plan-independent checks
-        self.assertIn("(none", stdout.getvalue())
-
-    def test_cmd_doctor_with_unloadable_active_plan_exits_nonzero(self) -> None:
-        """When the active plan file exists but cannot be loaded, doctor must
-        fail with a non-zero exit."""
-        # Write an active plan pointer to a file that exists but is invalid
-        bad_plan = self.repo / "bad-active.toml"
-        bad_plan.write_text("not valid toml {{{", encoding="utf-8")
-        self.opsx_plan.write_active_plan(self.repo, "bad-active.toml")
-        args = argparse.Namespace(repo=str(self.repo), plan=None)
-        stderr = io.StringIO()
-        with mock.patch("sys.stderr", stderr):
-            rc = self.opsx_plan.cmd_doctor(args)
-        self.assertEqual(rc, 2)
-        self.assertIn("cannot load plan", stderr.getvalue())
-        self.assertIn("bad-active.toml", stderr.getvalue())
-
-    # -- 4.3: run-start preflight is warning-only -----------------------
-
-    def test_run_preflight_warnings_never_blocks_dispatch(self) -> None:
-        """Run-start preflight warnings must not raise, exit, or block."""
-        try:
-            self.opsx_plan.run_preflight_warnings(self.repo, None)
-        except Exception as exc:
-            self.fail(f"run_preflight_warnings raised unexpectedly: {exc}")
-
-    def test_run_preflight_warnings_logs_stale_install_and_dirty_tree(self) -> None:
-        """Warnings should be logged for stale install and dirty tree, but
-        the function must always return None."""
-        (self.repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
-        logs: list[str] = []
-
-        def capture_log(msg: str) -> None:
-            logs.append(msg)
-
-        with mock.patch.object(self.opsx_plan.base, "log", side_effect=capture_log):
-            result = self.opsx_plan.run_preflight_warnings(self.repo, None)
-        self.assertIsNone(result)
-        # At least one warning about dirty tree should appear
-        warning_msgs = [m for m in logs if "Tracked tree is clean" in m or "uncommitted" in m.lower()]
-        self.assertTrue(warning_msgs, f"No dirty-tree warning in logs: {logs}")
-
-    def test_cmd_run_runs_preflight_warnings_without_changing_outcome(self) -> None:
-        """When cmd_run executes, preflight warnings fire but the run continues
-        normally."""
-        plan_path = self._write_plan_toml(name="preflight-run-plan")
-        plan_src = str(plan_path.relative_to(self.repo))
-
-        # Verify plan loads and run_preflight_warnings is called
-        preflight_called: list[bool] = []
-
-        def fake_preflight(repo, plan_src_, adapter, cfg=None):
-            preflight_called.append(True)
-
-        with mock.patch.object(
-            self.opsx_plan, "run_preflight_warnings",
-            side_effect=fake_preflight,
-        ):
-            args = argparse.Namespace(
-                repo=str(self.repo),
-                plan=plan_src,
-                dry_run=True,
-                only=None,
-                max_changes=0,
-                budget_minutes=0,
-                budget_usd=0,
-                create_only=False,
-            )
-            rc = self.opsx_plan.cmd_run(args)
-        self.assertTrue(preflight_called, "run_preflight_warnings was not called")
-
-    # -- doctor --adapter tests --
-
-    def test_doctor_planless_claude_selection(self) -> None:
-        """Doctor without a plan uses explicit --adapter."""
-        args = argparse.Namespace(
-            repo=str(self.repo),
-            plan=None,
-            adapter="claude-code",
-        )
-        with mock.patch.object(self.opsx_plan, "run_doctor_checks") as m_run:
-            m_run.return_value = 0
-            rc = self.opsx_plan.cmd_doctor(args)
-        self.assertEqual(rc, 0)
-        m_run.assert_called_once()
-        _, _, passed_adapter, _ = m_run.call_args[0]
-        self.assertEqual(passed_adapter, "claude-code",
-                         "plan-less doctor should propagate --adapter")
-
-    def test_doctor_plan_adapter_overrides_flag(self) -> None:
-        """A resolved plan's adapter is authoritative even when --adapter is given."""
-        plan_path = self._write_plan_toml(name="override-test")
-        plan_src = str(plan_path.relative_to(self.repo))
-        args = argparse.Namespace(
-            repo=str(self.repo),
-            plan=plan_src,
-            adapter="claude-code",
-        )
-        with mock.patch.object(self.opsx_plan, "run_doctor_checks") as m_run:
-            m_run.return_value = 0
-            rc = self.opsx_plan.cmd_doctor(args)
-        self.assertEqual(rc, 0)
-        _, _, passed_adapter, _ = m_run.call_args[0]
-        self.assertEqual(passed_adapter, "opencode",
-                         "plan's adapter must override --adapter flag")
-
-    def test_doctor_defaults_to_opencode_without_flag_or_plan(self) -> None:
-        """Doctor without --adapter and without plan defaults to opencode."""
-        args = argparse.Namespace(
-            repo=str(self.repo),
-            plan=None,
-        )
-        with mock.patch.object(self.opsx_plan, "run_doctor_checks") as m_run:
-            m_run.return_value = 0
-            rc = self.opsx_plan.cmd_doctor(args)
-        self.assertEqual(rc, 0)
-        _, _, passed_adapter, _ = m_run.call_args[0]
-        self.assertEqual(passed_adapter, "opencode")
-
-
-class DirectWorkerAgentDoctorCheckTests(unittest.TestCase):
-    """Tests for the doctor check that verifies worker agents are installed
-    for a direct-dispatch plan (task 7)."""
-
-    def setUp(self) -> None:
-        self.opsx_plan = load_opsx_plan()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.fake_home = Path(self.tmp.name) / "home"
-        self.fake_home.mkdir()
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-
-    def _direct_cfg(self, adapter: str = "claude-code") -> dict:
-        return {
-            "adapter": adapter,
-            "implement_invoke": "claude -p --agent opsx-implementer",
-            "review_invoke": "claude -p --agent opsx-reviewer",
-            "archive_invoke": "claude -p --agent opsx-archiver",
-        }
-
-    def _write_agents(self, agent_dir: Path, names: tuple[str, ...]) -> None:
-        agent_dir.mkdir(parents=True, exist_ok=True)
-        for name in names:
-            (agent_dir / f"{name}.md").write_text(
-                f"---\nname: {name}\n---\n", encoding="utf-8"
-            )
-
-    def test_reports_missing_agents_by_name_with_installer(self) -> None:
-        agent_dir = self.fake_home / ".claude" / "agents"
-        self._write_agents(agent_dir, ("opsx-implementer",))  # reviewer + archiver missing
-
-        with mock.patch.dict(os.environ, {"HOME": str(self.fake_home)}, clear=False):
-            passed, label, remediation = self.opsx_plan._check_direct_worker_agents(
-                self._direct_cfg()
-            )
-
-        self.assertFalse(passed)
-        self.assertIn("opsx-reviewer", remediation)
-        self.assertIn("opsx-archiver", remediation)
-        self.assertNotIn("opsx-implementer", remediation)
-        self.assertIn("adapters/claude-code/install.sh", remediation)
-
-    def test_passes_when_all_worker_agents_present(self) -> None:
-        agent_dir = self.fake_home / ".claude" / "agents"
-        self._write_agents(
-            agent_dir, ("opsx-implementer", "opsx-reviewer", "opsx-archiver")
-        )
-
-        with mock.patch.dict(os.environ, {"HOME": str(self.fake_home)}, clear=False):
-            passed, label, remediation = self.opsx_plan._check_direct_worker_agents(
-                self._direct_cfg()
-            )
-
-        self.assertTrue(passed, remediation)
-
-    def test_skipped_when_no_plan_resolved(self) -> None:
-        passed, label, remediation = self.opsx_plan._check_direct_worker_agents(None)
-        self.assertTrue(passed)
-        self.assertEqual(remediation, "")
-
-    def test_skipped_when_plan_does_not_use_direct_dispatch(self) -> None:
-        cfg = self._direct_cfg()
-        cfg["archive_invoke"] = ""  # fewer than three invokes -> nested-controller path
-
-        with mock.patch.dict(os.environ, {"HOME": str(self.fake_home)}, clear=False):
-            passed, label, remediation = self.opsx_plan._check_direct_worker_agents(cfg)
-
-        self.assertTrue(passed)
-
-    def test_opencode_direct_plan_checks_opencode_agent_directory(self) -> None:
-        agent_dir = self.fake_home / ".config" / "opencode" / "agents"
-        self._write_agents(
-            agent_dir, ("opsx-implementer", "opsx-reviewer", "opsx-archiver")
-        )
-        cfg = self._direct_cfg(adapter="opencode")
-
-        with mock.patch.dict(os.environ, {"HOME": str(self.fake_home)}, clear=False):
-            passed, label, remediation = self.opsx_plan._check_direct_worker_agents(cfg)
-
-        self.assertTrue(passed, remediation)
-
-    def test_passes_when_agents_only_in_repo_local_install(self) -> None:
-        repo = Path(self.tmp.name) / "repo"
-        agent_dir = repo / ".claude" / "agents"
-        self._write_agents(
-            agent_dir, ("opsx-implementer", "opsx-reviewer", "opsx-archiver")
-        )
-
-        with mock.patch.dict(os.environ, {"HOME": str(self.fake_home)}, clear=False):
-            passed, label, remediation = self.opsx_plan._check_direct_worker_agents(
-                self._direct_cfg(), repo
-            )
-
-        self.assertTrue(passed, remediation)
-
-    def test_passes_when_agents_only_in_home_install_with_repo_given(self) -> None:
-        repo = Path(self.tmp.name) / "repo"
-        repo.mkdir()
-        agent_dir = self.fake_home / ".claude" / "agents"
-        self._write_agents(
-            agent_dir, ("opsx-implementer", "opsx-reviewer", "opsx-archiver")
-        )
-
-        with mock.patch.dict(os.environ, {"HOME": str(self.fake_home)}, clear=False):
-            passed, label, remediation = self.opsx_plan._check_direct_worker_agents(
-                self._direct_cfg(), repo
-            )
-
-        self.assertTrue(passed, remediation)
-
-    def test_fails_naming_missing_agents_when_in_neither_location(self) -> None:
-        repo = Path(self.tmp.name) / "repo"
-        repo.mkdir()
-
-        with mock.patch.dict(os.environ, {"HOME": str(self.fake_home)}, clear=False):
-            passed, label, remediation = self.opsx_plan._check_direct_worker_agents(
-                self._direct_cfg(), repo
-            )
-
-        self.assertFalse(passed)
-        self.assertIn("opsx-implementer", remediation)
-        self.assertIn("opsx-reviewer", remediation)
-        self.assertIn("opsx-archiver", remediation)
-        self.assertIn("adapters/claude-code/install.sh", remediation)
 
 
 class BatchGateAndResetCommandTests(unittest.TestCase):
@@ -9736,7 +4399,7 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("Approved: gated-a, gated-b", stdout.getvalue())
 
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
         self.assertIn("gated-a", state["approvals"])
         self.assertIn("gated-b", state["approvals"])
         self.assertNotIn("no-gate", state["approvals"])
@@ -9762,9 +4425,9 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
     def test_approve_all_does_not_affect_already_approved(self) -> None:
         plan = self._plan_with_gated_changes()
         self._activate_plan(str(plan.relative_to(self.repo)))
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
         state["approvals"].append("gated-a")
-        self.opsx_plan.save_state(self.repo, "test-plan", state)
+        self.opsx_plan.state_mod.save_state(self.repo, "test-plan", state)
 
         stdout = io.StringIO()
         args = argparse.Namespace(
@@ -9778,18 +4441,18 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("Approved: gated-b", stdout.getvalue())
 
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
         self.assertEqual(state["approvals"].count("gated-a"), 1)
         self.assertIn("gated-b", state["approvals"])
 
     def test_accept_all_accepts_awaiting_acceptance_changes(self) -> None:
         plan = self._plan_with_created_changes()
         self._activate_plan(str(plan.relative_to(self.repo)))
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
         for cid in ("created-a", "created-b"):
-            r = self.opsx_plan.rec(state, cid)
+            r = self.opsx_plan.state_mod.rec(state, cid)
             r["created_by_orchestrator"] = True
-        self.opsx_plan.save_state(self.repo, "test-plan", state)
+        self.opsx_plan.state_mod.save_state(self.repo, "test-plan", state)
 
         stdout = io.StringIO()
         args = argparse.Namespace(
@@ -9803,7 +4466,7 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("Accepted: created-a, created-b", stdout.getvalue())
 
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
         self.assertTrue(state["changes"]["created-a"]["accepted"])
         self.assertTrue(state["changes"]["created-b"]["accepted"])
 
@@ -9826,12 +4489,12 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
     def test_accept_all_skips_non_awaiting_changes(self) -> None:
         plan = self._plan_with_created_changes()
         self._activate_plan(str(plan.relative_to(self.repo)))
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
         # Only make created-a awaiting acceptance
-        r = self.opsx_plan.rec(state, "created-a")
+        r = self.opsx_plan.state_mod.rec(state, "created-a")
         r["created_by_orchestrator"] = True
         # created-b not created by orchestrator, so not awaiting acceptance
-        self.opsx_plan.save_state(self.repo, "test-plan", state)
+        self.opsx_plan.state_mod.save_state(self.repo, "test-plan", state)
 
         stdout = io.StringIO()
         args = argparse.Namespace(
@@ -9845,19 +4508,19 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("Accepted: created-a", stdout.getvalue())
 
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
         self.assertTrue(state["changes"]["created-a"]["accepted"])
         self.assertFalse(state["changes"]["created-b"]["accepted"])
 
     def test_reset_failed_resets_all_failed_changes(self) -> None:
         plan = self._plan_with_gated_changes()
         self._activate_plan(str(plan.relative_to(self.repo)))
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
-        self.opsx_plan.set_status(state, "gated-a", self.opsx_plan.base.FAILED, "test failure")
-        self.opsx_plan.set_status(state, "gated-b", self.opsx_plan.base.FAILED, "another failure")
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
+        self.opsx_plan.state_mod.set_status(state, "gated-a", self.opsx_plan.base.FAILED, "test failure")
+        self.opsx_plan.state_mod.set_status(state, "gated-b", self.opsx_plan.base.FAILED, "another failure")
         # no-gate stays done
-        self.opsx_plan.set_status(state, "no-gate", self.opsx_plan.base.DONE, "already done")
-        self.opsx_plan.save_state(self.repo, "test-plan", state)
+        self.opsx_plan.state_mod.set_status(state, "no-gate", self.opsx_plan.base.DONE, "already done")
+        self.opsx_plan.state_mod.save_state(self.repo, "test-plan", state)
 
         stdout = io.StringIO()
         args = argparse.Namespace(
@@ -9871,7 +4534,7 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("Reset: gated-a, gated-b", stdout.getvalue())
 
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
         self.assertEqual(state["changes"]["gated-a"]["status"], self.opsx_plan.base.PENDING)
         self.assertEqual(state["changes"]["gated-b"]["status"], self.opsx_plan.base.PENDING)
         self.assertEqual(state["changes"]["no-gate"]["status"], self.opsx_plan.base.DONE)
@@ -9895,10 +4558,10 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
     def test_reset_failed_does_not_affect_non_failed_changes(self) -> None:
         plan = self._plan_with_gated_changes()
         self._activate_plan(str(plan.relative_to(self.repo)))
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
         # Only gated-a failed, gated-b is awaiting approval
-        self.opsx_plan.set_status(state, "gated-a", self.opsx_plan.base.FAILED, "test failure")
-        self.opsx_plan.save_state(self.repo, "test-plan", state)
+        self.opsx_plan.state_mod.set_status(state, "gated-a", self.opsx_plan.base.FAILED, "test failure")
+        self.opsx_plan.state_mod.save_state(self.repo, "test-plan", state)
 
         stdout = io.StringIO()
         args = argparse.Namespace(
@@ -9913,7 +4576,7 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
         self.assertIn("Reset: gated-a", stdout.getvalue())
         self.assertNotIn("gated-b", stdout.getvalue())
 
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
         self.assertEqual(state["changes"]["gated-a"]["status"], self.opsx_plan.base.PENDING)
         # gated-b was awaiting_approval, its state shouldn't be fully replaced
         self.assertNotEqual(
@@ -9925,7 +4588,7 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
         plan = self._plan_with_gated_changes()
         self._activate_plan(str(plan.relative_to(self.repo)))
         cfg = self.opsx_plan.planref.load_plan(plan)
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
 
         import io as _io
         buf = _io.StringIO()
@@ -9940,10 +4603,10 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
         plan = self._plan_with_gated_changes()
         self._activate_plan(str(plan.relative_to(self.repo)))
         cfg = self.opsx_plan.planref.load_plan(plan)
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
-        self.opsx_plan.set_status(state, "gated-a", self.opsx_plan.base.FAILED, "test failure")
-        self.opsx_plan.set_status(state, "gated-b", self.opsx_plan.base.FAILED, "another failure")
-        self.opsx_plan.save_state(self.repo, "test-plan", state)
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
+        self.opsx_plan.state_mod.set_status(state, "gated-a", self.opsx_plan.base.FAILED, "test failure")
+        self.opsx_plan.state_mod.set_status(state, "gated-b", self.opsx_plan.base.FAILED, "another failure")
+        self.opsx_plan.state_mod.save_state(self.repo, "test-plan", state)
 
         import io as _io
         buf = _io.StringIO()
@@ -9958,7 +4621,7 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
         plan = self._plan_with_gated_changes()
         # Don't activate; provide explicit plan path
         cfg = self.opsx_plan.planref.load_plan(plan)
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
 
         import io as _io
         buf = _io.StringIO()
@@ -9981,18 +4644,18 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
         rc = self.opsx_plan.cmd_approve(args)
         self.assertEqual(rc, 0)
 
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
         self.assertIn("gated-a", state["approvals"])
         self.assertNotIn("gated-b", state["approvals"])
 
     def test_single_change_reset_still_works(self) -> None:
         plan = self._plan_with_gated_changes()
         self._activate_plan(str(plan.relative_to(self.repo)))
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
-        self.opsx_plan.set_status(state, "gated-a", self.opsx_plan.base.FAILED, "test failure")
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
+        self.opsx_plan.state_mod.set_status(state, "gated-a", self.opsx_plan.base.FAILED, "test failure")
         # Ensure gated-b has a record in state (needed after save/load roundtrip)
-        self.opsx_plan.rec(state, "gated-b")
-        self.opsx_plan.save_state(self.repo, "test-plan", state)
+        self.opsx_plan.state_mod.rec(state, "gated-b")
+        self.opsx_plan.state_mod.save_state(self.repo, "test-plan", state)
 
         args = argparse.Namespace(
             repo=str(self.repo),
@@ -10003,7 +4666,7 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
         rc = self.opsx_plan.cmd_reset(args)
         self.assertEqual(rc, 0)
 
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
         self.assertEqual(state["changes"]["gated-a"]["status"], self.opsx_plan.base.PENDING)
         self.assertEqual(state["changes"]["gated-b"]["status"], self.opsx_plan.base.PENDING)
 
@@ -10027,11 +4690,11 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
         plan = self._plan_with_created_changes()
         self._activate_plan(str(plan.relative_to(self.repo)))
         cfg = self.opsx_plan.planref.load_plan(plan)
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
         for cid in ("created-a", "created-b"):
-            r = self.opsx_plan.rec(state, cid)
+            r = self.opsx_plan.state_mod.rec(state, cid)
             r["created_by_orchestrator"] = True
-        self.opsx_plan.save_state(self.repo, "test-plan", state)
+        self.opsx_plan.state_mod.save_state(self.repo, "test-plan", state)
 
         import io as _io
         buf = _io.StringIO()
@@ -10040,568 +4703,6 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
         output = buf.getvalue()
         self.assertIn("\u2192 opsx-plan accept created-a", output)
         self.assertIn("\u2192 opsx-plan accept created-b", output)
-
-
-class LogsCommandTests(unittest.TestCase):
-    """Tests for ``opsx-plan logs`` command: log selection, filtering,
-    listing, follow-mode selection, and missing-log handling."""
-
-    def setUp(self) -> None:
-        self.opsx_plan = load_opsx_plan()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.repo = Path(self.tmp.name)
-        git(self.repo, "init")
-        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
-        git(self.repo, "add", "tracked.txt")
-        git(
-            self.repo,
-            "-c",
-            "user.email=test@example.invalid",
-            "-c",
-            "user.name=Test User",
-            "commit",
-            "-m",
-            "init",
-        )
-        self.cid = "add-logs-test"
-        self.plan_name = "run-add-logs-test"
-        self.cfg = {
-            "name": self.plan_name,
-            "adapter": "opencode",
-            "implement_invoke": "opencode run --agent opsx-implementer",
-            "review_invoke": "opencode run --agent opsx-reviewer",
-            "archive_invoke": "opencode run --agent opsx-archiver",
-            "invoke": 'opencode run "/opsx-drive {change}"',
-            "state_file": ".opencode/opsx-controller/{change}.json",
-            "timeout_minutes": 1,
-            "max_attempts": 2,
-            "max_rounds": 2,
-            "no_progress_limit": 2,
-            "fast_checks": [],
-            "check_timeout_minutes": 1,
-            "require_clean_tracked": False,
-            "review_created": False,
-            "changes": {
-                self.cid: {
-                    "id": self.cid,
-                    "depends_on": [],
-                    "enabled": True,
-                    "pause_before": False,
-                    "timeout_minutes": 1,
-                    "max_attempts": 2,
-                    "create_invoke": "",
-                    "create_max_attempts": 1,
-                }
-            },
-            "order": [self.cid],
-            "created_check": "",
-            "plan_doc": "",
-            "create_timeout_minutes": 1,
-        }
-        # Write the plan TOML so opsx-plan can resolve it for the logs subcommand
-        self._write_plan_toml()
-
-        # Create a writable .opsx-plan/logs/ dir
-        self.log_dir = self.repo / ".opsx-plan" / "logs"
-        self.log_dir.mkdir(parents=True)
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-
-    def _write_plan_toml(self) -> None:
-        plan_dir = self.repo
-        toml_path = plan_dir / f"{self.plan_name}.toml"
-        toml_path.write_text(
-            textwrap.dedent(f"""\
-                [plan]
-                name = "{self.plan_name}"
-                adapter = "opencode"
-                implement_invoke = "opencode run --agent opsx-implementer"
-                review_invoke = "opencode run --agent opsx-reviewer"
-                archive_invoke = "opencode run --agent opsx-archiver"
-
-                [[changes]]
-                id = "{self.cid}"
-            """),
-            encoding="utf-8",
-        )
-        self.plan_path = toml_path
-
-    def _make_log(self, filename: str, content: str = "log content\n") -> Path:
-        p = self.log_dir / filename
-        p.write_text(content, encoding="utf-8")
-        return p
-
-    # -- 3.1 Default latest-log selection from recorded state metadata --------
-
-    def test_default_selects_log_from_state_last_stage(self) -> None:
-        log = self._make_log(f"{self.cid}.implement.r1.1.log", "implement output\n")
-        state = self.opsx_plan.load_state(self.repo, self.plan_name)
-        rec = self.opsx_plan.rec(state, self.cid)
-        rec["last_stage"] = {
-            "name": "implement",
-            "round": 1,
-            "outcome": "exited",
-            "log_path": str(log),
-            "updated_at": self.opsx_plan.base.utcnow(),
-        }
-        self.opsx_plan.save_state(self.repo, self.plan_name, state)
-
-        selected = self.opsx_plan._select_log_from_state(
-            self.repo, self.plan_name, None, None,
-        )
-        self.assertIsNotNone(selected)
-        self.assertIn("implement", selected["path"])
-        self.assertEqual(selected["change"], self.cid)
-        self.assertEqual(selected["stage"], "implement")
-
-    def test_state_selection_ignores_deleted_log(self) -> None:
-        log = self._make_log(f"{self.cid}.review.r1.1.log", "review notes\n")
-        state = self.opsx_plan.load_state(self.repo, self.plan_name)
-        rec = self.opsx_plan.rec(state, self.cid)
-        rec["last_stage"] = {
-            "name": "review",
-            "round": 1,
-            "outcome": "exited",
-            "log_path": str(log),
-            "updated_at": self.opsx_plan.base.utcnow(),
-        }
-        self.opsx_plan.save_state(self.repo, self.plan_name, state)
-
-        # Delete the log file on disk
-        log.unlink()
-
-        selected = self.opsx_plan._select_log_from_state(
-            self.repo, self.plan_name, None, None,
-        )
-        self.assertIsNone(selected)
-
-    def test_state_selection_picks_newest_across_multi_change(self) -> None:
-        """When multiple changes have recorded last_stage logs, the newest
-        (highest mtime / round / seq) is selected, not the first dict entry."""
-        # Simulate two changes: older change comes first in state dict,
-        # newer change comes second but has a fresher log.
-        older_log = self._make_log("older-change.implement.r1.1.log", "older\n")
-        newer_log = self._make_log("newer-change.implement.r2.1.log", "newer\n")
-
-        state = self.opsx_plan.load_state(self.repo, self.plan_name)
-
-        # Older change inserted first (so it appears first in iterations)
-        rec_older = self.opsx_plan.rec(state, "older-change")
-        rec_older["last_stage"] = {
-            "name": "implement",
-            "round": 1,
-            "outcome": "exited",
-            "log_path": str(older_log),
-            "updated_at": self.opsx_plan.base.utcnow(),
-        }
-
-        # Newer change inserted second but has a higher round (newer)
-        rec_newer = self.opsx_plan.rec(state, "newer-change")
-        rec_newer["last_stage"] = {
-            "name": "implement",
-            "round": 2,
-            "outcome": "exited",
-            "log_path": str(newer_log),
-            "updated_at": self.opsx_plan.base.utcnow(),
-        }
-
-        self.opsx_plan.save_state(self.repo, self.plan_name, state)
-
-        # Without filters: should pick the newest (newer-change.r2)
-        selected = self.opsx_plan._select_log_from_state(
-            self.repo, self.plan_name, None, None,
-        )
-        self.assertIsNotNone(selected)
-        self.assertEqual(selected["change"], "newer-change")
-        self.assertEqual(selected["stage"], "implement")
-        self.assertEqual(selected["round"], 2)
-
-        # With a change filter: still picks the right one even when it
-        # is not the newest across all changes.
-        selected = self.opsx_plan._select_log_from_state(
-            self.repo, self.plan_name, "older-change", None,
-        )
-        self.assertIsNotNone(selected)
-        self.assertEqual(selected["change"], "older-change")
-        self.assertEqual(selected["round"], 1)
-
-    # -- 3.1a Plan-scoped state selection (regression for out-of-plan state entries) --
-
-    def test_state_selection_scoped_to_plan_change_ids(self) -> None:
-        """When no change_filter is given, _select_log_from_state only
-        considers changes that belong to the plan's own change ids."""
-        plan_cid = self.cid
-        plan_change_ids = {plan_cid}
-        plan_log = self._make_log(f"{plan_cid}.implement.r1.1.log", "plan\n")
-        foreign_log = self._make_log("foreign-change.implement.r1.1.log", "foreign\n")
-
-        state = self.opsx_plan.load_state(self.repo, self.plan_name)
-
-        # Record last_stage for the plan change
-        rec_plan = self.opsx_plan.rec(state, plan_cid)
-        rec_plan["last_stage"] = {
-            "name": "implement",
-            "round": 1,
-            "outcome": "exited",
-            "log_path": str(plan_log),
-            "updated_at": self.opsx_plan.base.utcnow(),
-        }
-
-        # Record last_stage for a foreign change not in the plan
-        rec_foreign = self.opsx_plan.rec(state, "foreign-change")
-        rec_foreign["last_stage"] = {
-            "name": "implement",
-            "round": 1,
-            "outcome": "exited",
-            "log_path": str(foreign_log),
-            "updated_at": self.opsx_plan.base.utcnow(),
-        }
-
-        self.opsx_plan.save_state(self.repo, self.plan_name, state)
-
-        # When scoped to plan change ids: only the plan change matches
-        selected = self.opsx_plan._select_log_from_state(
-            self.repo, self.plan_name, None, None,
-            plan_change_ids=plan_change_ids,
-        )
-        self.assertIsNotNone(selected)
-        self.assertEqual(selected["change"], plan_cid)
-
-    def test_state_selection_with_explicit_change_bypasses_plan_scoping(self) -> None:
-        """An explicit --change filter in state selection ignores plan scoping
-        and matches any change id exactly."""
-        plan_change_ids = {self.cid}
-        foreign_log = self._make_log("foreign-change.implement.r1.1.log", "foreign\n")
-
-        state = self.opsx_plan.load_state(self.repo, self.plan_name)
-        rec = self.opsx_plan.rec(state, "foreign-change")
-        rec["last_stage"] = {
-            "name": "implement",
-            "round": 1,
-            "outcome": "exited",
-            "log_path": str(foreign_log),
-            "updated_at": self.opsx_plan.base.utcnow(),
-        }
-        self.opsx_plan.save_state(self.repo, self.plan_name, state)
-
-        selected = self.opsx_plan._select_log_from_state(
-            self.repo, self.plan_name, "foreign-change", None,
-            plan_change_ids=plan_change_ids,
-        )
-        self.assertIsNotNone(selected)
-        self.assertEqual(selected["change"], "foreign-change")
-
-    # -- 3.2 Fallback latest-log selection by log-directory ordering -----------
-
-    def test_fallback_selects_newest_log_by_mtime(self) -> None:
-        older = self._make_log(f"{self.cid}.implement.r1.1.log", "older\n")
-        import time as _time
-        _time.sleep(0.01)
-        new_path = self._make_log(f"{self.cid}.review.r1.1.log", "newer\n")
-
-        selected = self.opsx_plan._select_log_from_directory(
-            self.repo, None, None,
-        )
-        self.assertIsNotNone(selected)
-        self.assertIn("review", selected["path"])
-        self.assertEqual(selected["change"], self.cid)
-        self.assertEqual(selected["stage"], "review")
-
-    def test_fallback_handles_empty_log_dir(self) -> None:
-        selected = self.opsx_plan._select_log_from_directory(
-            self.repo, None, None,
-        )
-        self.assertIsNone(selected)
-
-    def test_fallback_ignores_non_log_files(self) -> None:
-        (self.log_dir / "readme.txt").write_text("not a log\n", encoding="utf-8")
-        selected = self.opsx_plan._select_log_from_directory(
-            self.repo, None, None,
-        )
-        self.assertIsNone(selected)
-
-    # -- 3.3 Change-id and stage filter combinations ---------------------------
-
-    def test_filter_by_change_id_only(self) -> None:
-        self._make_log("change-a.implement.r1.1.log", "a\n")
-        self._make_log("change-b.implement.r1.1.log", "b\n")
-
-        selected = self.opsx_plan._select_log(
-            self.repo, self.plan_name, "change-a", None,
-        )
-        self.assertIsNotNone(selected)
-        self.assertEqual(selected["change"], "change-a")
-
-    def test_filter_by_stage_only(self) -> None:
-        self._make_log(f"{self.cid}.implement.r1.1.log", "impl\n")
-        self._make_log(f"{self.cid}.review.r1.1.log", "rev\n")
-
-        selected = self.opsx_plan._select_log(
-            self.repo, self.plan_name, None, "review",
-        )
-        self.assertIsNotNone(selected)
-        self.assertEqual(selected["stage"], "review")
-
-    def test_filter_by_change_and_stage(self) -> None:
-        self._make_log("change-a.review.r1.1.log", "a rev\n")
-        self._make_log("change-b.review.r1.1.log", "b rev\n")
-
-        selected = self.opsx_plan._select_log(
-            self.repo, self.plan_name, "change-b", "review",
-        )
-        self.assertIsNotNone(selected)
-        self.assertEqual(selected["change"], "change-b")
-        self.assertEqual(selected["stage"], "review")
-
-    def test_filters_applied_across_state_and_directory(self) -> None:
-        """Filters work the same whether selection came from state or directory."""
-        log = self._make_log("change-x.implement.r1.1.log", "x\n")
-        state = self.opsx_plan.load_state(self.repo, self.plan_name)
-        rec = self.opsx_plan.rec(state, "change-x")
-        rec["last_stage"] = {
-            "name": "implement",
-            "round": 1,
-            "outcome": "exited",
-            "log_path": str(log),
-            "updated_at": self.opsx_plan.base.utcnow(),
-        }
-        self.opsx_plan.save_state(self.repo, self.plan_name, state)
-
-        # State-backed match
-        selected = self.opsx_plan._select_log(
-            self.repo, self.plan_name, "change-x", "implement",
-        )
-        self.assertIsNotNone(selected)
-
-        # State-backed filter: wrong change -> should fall through to directory (no match)
-        selected = self.opsx_plan._select_log(
-            self.repo, self.plan_name, "no-such-change", None,
-        )
-        self.assertIsNone(selected)
-
-    # -- 3.4 List output and follow-mode target selection ----------------------
-
-    def test_list_output_shows_matching_logs(self) -> None:
-        self._make_log(f"{self.cid}.implement.r1.1.log", "impl\n")
-        self._make_log(f"{self.cid}.review.r1.1.log", "rev\n")
-        self._make_log("other-change.implement.r1.1.log", "other\n")
-
-        entries = self.opsx_plan._collect_filtered_logs(
-            self.repo, self.cid, None,
-        )
-        self.assertEqual(len(entries), 2)
-        for e in entries:
-            self.assertEqual(e["change"], self.cid)
-
-    def test_list_output_empty_when_no_match(self) -> None:
-        entries = self.opsx_plan._collect_filtered_logs(
-            self.repo, "nonexistent", None,
-        )
-        self.assertEqual(len(entries), 0)
-
-    # -- 3.4a Plan-scoped directory fallback (regression for out-of-plan logs) --
-
-    def test_directory_fallback_scoped_to_plan_change_ids(self) -> None:
-        """When no change_filter is given, the directory fallback only considers
-        logs that belong to the plan's own changes."""
-        plan_cid = self.cid
-        plan_change_ids = {plan_cid}
-        self._make_log(f"{plan_cid}.implement.r1.1.log", "plan log\n")
-        self._make_log("other-plan-change.implement.r1.1.log", "foreign log\n")
-
-        selected = self.opsx_plan._select_log_from_directory(
-            self.repo, None, None, plan_change_ids=plan_change_ids,
-        )
-        self.assertIsNotNone(selected)
-        self.assertEqual(selected["change"], plan_cid)
-
-    def test_directory_fallback_with_change_filter_still_exact(self) -> None:
-        """An explicit --change filter selects even out-of-plan logs."""
-        plan_change_ids = {self.cid}
-        foreign_log = self._make_log("foreign-change.implement.r1.1.log", "foreign\n")
-
-        selected = self.opsx_plan._select_log_from_directory(
-            self.repo, "foreign-change", None, plan_change_ids=plan_change_ids,
-        )
-        self.assertIsNotNone(selected)
-        self.assertEqual(selected["change"], "foreign-change")
-
-    def test_directory_fallback_no_plan_logs_returns_none(self) -> None:
-        """When only out-of-plan logs exist, the directory fallback returns None."""
-        plan_change_ids = {self.cid}
-        self._make_log("foreign-change.review.r1.1.log", "foreign\n")
-
-        selected = self.opsx_plan._select_log_from_directory(
-            self.repo, None, None, plan_change_ids=plan_change_ids,
-        )
-        self.assertIsNone(selected)
-
-    def test_list_collection_scoped_to_plan_change_ids(self) -> None:
-        """--list mode only shows logs that belong to the plan's changes."""
-        plan_cid = self.cid
-        plan_change_ids = {plan_cid}
-        self._make_log(f"{plan_cid}.implement.r1.1.log", "plan\n")
-        self._make_log(f"{plan_cid}.review.r1.1.log", "plan review\n")
-        self._make_log("other-change.implement.r1.1.log", "other\n")
-
-        entries = self.opsx_plan._collect_filtered_logs(
-            self.repo, None, None, plan_change_ids=plan_change_ids,
-        )
-        self.assertEqual(len(entries), 2)
-        for e in entries:
-            self.assertEqual(e["change"], plan_cid)
-
-    def test_list_collection_with_change_filter_ignores_plan_scoping(self) -> None:
-        """Explicit --change filter in --list mode still matches exactly."""
-        plan_change_ids = {self.cid}
-        self._make_log("foreign.implement.r1.1.log", "foreign\n")
-
-        entries = self.opsx_plan._collect_filtered_logs(
-            self.repo, "foreign", None, plan_change_ids=plan_change_ids,
-        )
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0]["change"], "foreign")
-
-    def test_cmd_logs_list_mode_excludes_out_of_plan_logs(self) -> None:
-        """End-to-end: opsx-plan logs --list only shows plan-scoped logs."""
-        self._make_log(f"{self.cid}.implement.r1.1.log", "plan log\n")
-        self._make_log("other-plan-change.review.r1.1.log", "foreign log\n")
-
-        args = argparse.Namespace(
-            repo=str(self.repo),
-            plan=str(self.plan_path),
-            change=None,
-            stage=None,
-            list=True,
-            follow=False,
-        )
-        rc = self.opsx_plan.cmd_logs(args)
-        self.assertEqual(rc, 0)
-
-    def test_cmd_logs_default_excludes_out_of_plan_logs(self) -> None:
-        """Default log selection should not surface a log from another plan."""
-        # Create only foreign log — no plan logs exist
-        self._make_log("foreign-change.implement.r1.1.log", "foreign\n")
-
-        args = argparse.Namespace(
-            repo=str(self.repo),
-            plan=str(self.plan_path),
-            change=None,
-            stage=None,
-            list=False,
-            follow=False,
-        )
-        rc = self.opsx_plan.cmd_logs(args)
-        # Should exit nonzero because no plan-scoped log matches
-        self.assertEqual(rc, 1)
-
-    def test_follow_mode_selects_same_log_as_default(self) -> None:
-        log = self._make_log(f"{self.cid}.implement.r1.1.log", "in progress\n")
-        log.touch()
-
-        state = self.opsx_plan.load_state(self.repo, self.plan_name)
-        rec = self.opsx_plan.rec(state, self.cid)
-        rec["last_stage"] = {
-            "name": "implement",
-            "round": 1,
-            "outcome": "exited",
-            "log_path": str(log),
-            "updated_at": self.opsx_plan.base.utcnow(),
-        }
-        self.opsx_plan.save_state(self.repo, self.plan_name, state)
-
-        # --follow mode uses the same _select_log as default
-        selected = self.opsx_plan._select_log(
-            self.repo, self.plan_name, None, None,
-        )
-        self.assertIsNotNone(selected)
-        self.assertEqual(selected["stage"], "implement")
-
-    # -- 3.5 Missing-log handling ----------------------------------------------
-
-    def test_select_log_returns_none_when_no_logs_exist(self) -> None:
-        selected = self.opsx_plan._select_log(
-            self.repo, self.plan_name, None, None,
-        )
-        self.assertIsNone(selected)
-
-    def test_select_log_returns_none_when_filter_matches_nothing(self) -> None:
-        self._make_log(f"{self.cid}.implement.r1.1.log", "impl\n")
-
-        selected = self.opsx_plan._select_log(
-            self.repo, self.plan_name, None, "archive",
-        )
-        self.assertIsNone(selected)
-
-    def test_cmd_logs_exits_nonzero_for_missing_log(self) -> None:
-        args = argparse.Namespace(
-            repo=str(self.repo),
-            plan=str(self.plan_path),
-            change=None,
-            stage=None,
-            list=False,
-            follow=False,
-        )
-        rc = self.opsx_plan.cmd_logs(args)
-        self.assertEqual(rc, 1)
-
-    # -- CLI dispatch ----------------------------------------------------------
-
-    def test_logs_subcommand_routes_to_cmd_logs(self) -> None:
-        calls: list[argparse.Namespace] = []
-
-        def fake_cmd_logs(args: argparse.Namespace) -> int:
-            calls.append(args)
-            return 42
-
-        with mock.patch.object(
-            self.opsx_plan, "cmd_logs", side_effect=fake_cmd_logs
-        ) as cmd_logs, mock.patch.object(
-            self.opsx_plan.sys,
-            "argv",
-            ["opsx-plan", "--repo", str(self.repo),
-             "logs", str(self.plan_path)],
-        ):
-            rc = self.opsx_plan.main()
-        self.assertEqual(rc, 42)
-        cmd_logs.assert_called_once()
-
-    def test_logs_list_mode_cli(self) -> None:
-        self._make_log(f"{self.cid}.implement.r1.1.log", "impl\n")
-
-        args = argparse.Namespace(
-            repo=str(self.repo),
-            plan=str(self.plan_path),
-            change=None,
-            stage=None,
-            list=True,
-            follow=False,
-        )
-        rc = self.opsx_plan.cmd_logs(args)
-        self.assertEqual(rc, 0)
-
-    # -- Legacy log filename pattern -------------------------------------------
-
-    def test_parse_legacy_log_name(self) -> None:
-        result = self.opsx_plan._parse_log_name("change-a.drive1.log")
-        self.assertIsNotNone(result)
-        self.assertEqual(result["change"], "change-a")
-        self.assertEqual(result["stage"], "drive")
-        self.assertEqual(result["round"], 0)
-        self.assertEqual(result["seq"], 1)
-
-    def test_parse_direct_log_name(self) -> None:
-        result = self.opsx_plan._parse_log_name("change-a.implement.r2.3.log")
-        self.assertIsNotNone(result)
-        self.assertEqual(result["change"], "change-a")
-        self.assertEqual(result["stage"], "implement")
-        self.assertEqual(result["round"], 2)
-        self.assertEqual(result["seq"], 3)
-
-    def test_parse_unknown_log_name_returns_none(self) -> None:
-        result = self.opsx_plan._parse_log_name("not-a-log.txt")
-        self.assertIsNone(result)
 
 
 class GitDeliveryConfigParsingTests(unittest.TestCase):
@@ -10645,1234 +4746,6 @@ class GitDeliveryConfigParsingTests(unittest.TestCase):
         })
         self.assertEqual(cfg["branch"], "")
         self.assertEqual(cfg["base_ref"], "")
-
-
-class GitDeliveryBranchNameResolutionTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.opsx_plan = load_opsx_plan()
-
-    def test_configured_branch_is_used(self) -> None:
-        git_delivery_cfg = {"branch": "opsx/my-branch"}
-        name = self.opsx_plan.resolve_delivery_branch_name("my-plan", git_delivery_cfg)
-        self.assertEqual(name, "opsx/my-branch")
-
-    def test_derives_from_plan_name_when_unconfigured(self) -> None:
-        git_delivery_cfg = {"branch": ""}
-        name = self.opsx_plan.resolve_delivery_branch_name("operator-workflow-upgrades", git_delivery_cfg)
-        self.assertEqual(name, "opsx/operator-workflow-upgrades")
-
-    def test_whitespace_only_treated_as_unconfigured(self) -> None:
-        git_delivery_cfg = {"branch": "   "}
-        name = self.opsx_plan.resolve_delivery_branch_name("my-plan", git_delivery_cfg)
-        self.assertEqual(name, "opsx/my-plan")
-
-
-class GitDeliveryBaseRefResolutionTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.opsx_plan = load_opsx_plan()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.repo = Path(self.tmp.name)
-        subprocess.run(["git", "init"], cwd=self.repo, check=True, capture_output=True, text=True)
-        subprocess.run(
-            ["git", "-c", "user.email=t@t", "-c", "user.name=T",
-             "commit", "--allow-empty", "-m", "init"],
-            cwd=self.repo, check=True, capture_output=True, text=True,
-        )
-        self.default_branch = self.opsx_plan._git_current_branch(self.repo)
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-
-    def test_configured_base_ref_is_used(self) -> None:
-        git_delivery_cfg = {"base_ref": "release/next"}
-        base_ref, err = self.opsx_plan.resolve_delivery_base_ref(self.repo, git_delivery_cfg)
-        self.assertIsNone(err)
-        self.assertEqual(base_ref, "release/next")
-
-    def test_defaults_to_current_branch(self) -> None:
-        git_delivery_cfg = {"base_ref": ""}
-        base_ref, err = self.opsx_plan.resolve_delivery_base_ref(self.repo, git_delivery_cfg)
-        self.assertIsNone(err)
-        self.assertEqual(base_ref, self.default_branch)
-
-
-class GitDeliveryEnsureBranchTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.opsx_plan = load_opsx_plan()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.repo = Path(self.tmp.name)
-        subprocess.run(["git", "init"], cwd=self.repo, check=True, capture_output=True, text=True)
-        subprocess.run(
-            ["git", "-c", "user.email=t@t", "-c", "user.name=T",
-             "commit", "--allow-empty", "-m", "init"],
-            cwd=self.repo, check=True, capture_output=True, text=True,
-        )
-        self.default_branch = self.opsx_plan._git_current_branch(self.repo)
-        self.cfg = {
-            "name": "test-plan",
-            "git_delivery": {
-                "enabled": True,
-                "branch": "",
-                "base_ref": "",
-                "create_pull_request": False,
-            },
-        }
-        self.state = {"plan": "test-plan", "approvals": [], "changes": {},
-                       "git_delivery": self.opsx_plan._default_git_delivery_state()}
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-
-    # 3.1
-    def test_first_run_creates_configured_delivery_branch(self) -> None:
-        self.cfg["git_delivery"]["branch"] = "opsx/custom-delivery"
-        self.cfg["git_delivery"]["base_ref"] = self.default_branch
-
-        proceed, err = self.opsx_plan.ensure_delivery_branch(
-            self.repo, self.cfg, self.state,
-        )
-        self.assertTrue(proceed, f"expected proceed, got error: {err}")
-        self.assertIsNone(err)
-        gd = self.state["git_delivery"]
-        self.assertEqual(gd["base_ref"], self.default_branch)
-        self.assertEqual(gd["branch_name"], "opsx/custom-delivery")
-        self.assertEqual(gd["delivery_status"], "branch_ready")
-        # Verify branch was created
-        self.assertTrue(self.opsx_plan._git_branch_exists(self.repo, "opsx/custom-delivery"))
-        self.assertTrue(self.opsx_plan._git_current_head_on_branch(self.repo, "opsx/custom-delivery"))
-
-    # 3.2
-    def test_first_run_derives_branch_and_default_base_ref(self) -> None:
-        proceed, err = self.opsx_plan.ensure_delivery_branch(
-            self.repo, self.cfg, self.state,
-        )
-        self.assertTrue(proceed, f"expected proceed, got error: {err}")
-        gd = self.state["git_delivery"]
-        self.assertEqual(gd["base_ref"], self.default_branch)
-        self.assertEqual(gd["branch_name"], "opsx/test-plan")
-        self.assertTrue(self.opsx_plan._git_branch_exists(self.repo, "opsx/test-plan"))
-
-    # 3.3
-    def test_resume_on_recorded_branch_proceeds(self) -> None:
-        # First create the branch and record state
-        self.state["git_delivery"]["branch_name"] = "opsx/test-plan"
-        self.state["git_delivery"]["base_ref"] = self.default_branch
-        self.state["git_delivery"]["delivery_status"] = "branch_ready"
-        subprocess.run(
-            ["git", "checkout", "-b", "opsx/test-plan"],
-            cwd=self.repo, check=True, capture_output=True, text=True,
-        )
-
-        proceed, err = self.opsx_plan.ensure_delivery_branch(
-            self.repo, self.cfg, self.state,
-        )
-        self.assertTrue(proceed, f"expected proceed, got error: {err}")
-        self.assertIsNone(err)
-        # State should be unchanged
-        self.assertEqual(self.state["git_delivery"]["branch_name"], "opsx/test-plan")
-
-    def test_refuse_on_wrong_branch(self) -> None:
-        self.state["git_delivery"]["branch_name"] = "opsx/test-plan"
-        self.state["git_delivery"]["base_ref"] = self.default_branch
-        self.state["git_delivery"]["delivery_status"] = "branch_ready"
-
-        proceed, err = self.opsx_plan.ensure_delivery_branch(
-            self.repo, self.cfg, self.state,
-        )
-        self.assertFalse(proceed)
-        self.assertIn("expected delivery branch", err)
-        self.assertIn(self.default_branch, err)
-
-    # 3.4
-    def test_dirty_tracked_tree_blocks_branch_creation(self) -> None:
-        # Add and commit a tracked file, then dirty it
-        (self.repo / "tracked.txt").write_text("clean\n", encoding="utf-8")
-        subprocess.run(
-            ["git", "add", "tracked.txt"], cwd=self.repo, check=True, capture_output=True, text=True,
-        )
-        subprocess.run(
-            ["git", "-c", "user.email=t@t", "-c", "user.name=T",
-             "commit", "-m", "add tracked"],
-            cwd=self.repo, check=True, capture_output=True, text=True,
-        )
-        (self.repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
-
-        proceed, err = self.opsx_plan.ensure_delivery_branch(
-            self.repo, self.cfg, self.state,
-        )
-        self.assertFalse(proceed)
-        self.assertIn("dirty", err)
-        self.assertIsNone(self.state["git_delivery"]["branch_name"])
-
-    # 3.5
-    def test_no_branch_skips_first_run_creation(self) -> None:
-        proceed, err = self.opsx_plan.ensure_delivery_branch(
-            self.repo, self.cfg, self.state, no_branch=True,
-        )
-        self.assertTrue(proceed, f"expected proceed, got error: {err}")
-        self.assertIsNone(err)
-        self.assertIsNone(self.state["git_delivery"]["branch_name"])
-        self.assertEqual(self.state["git_delivery"]["delivery_status"], "disabled")
-
-    def test_no_branch_rejected_when_branch_already_recorded(self) -> None:
-        self.state["git_delivery"]["branch_name"] = "opsx/test-plan"
-        self.state["git_delivery"]["base_ref"] = self.default_branch
-        self.state["git_delivery"]["delivery_status"] = "branch_ready"
-        subprocess.run(
-            ["git", "checkout", "-b", "opsx/test-plan"],
-            cwd=self.repo, check=True, capture_output=True, text=True,
-        )
-
-        proceed, err = self.opsx_plan.ensure_delivery_branch(
-            self.repo, self.cfg, self.state, no_branch=True,
-        )
-        self.assertFalse(proceed)
-        self.assertIn("cannot use --no-branch", err)
-        self.assertIn("already been recorded", err)
-
-    # 3.6
-    def test_plan_without_git_delivery_proceeds_normally(self) -> None:
-        self.cfg["git_delivery"] = {"enabled": False, "branch": "", "base_ref": "", "create_pull_request": False}
-        proceed, err = self.opsx_plan.ensure_delivery_branch(
-            self.repo, self.cfg, self.state,
-        )
-        self.assertTrue(proceed)
-        self.assertIsNone(err)
-        self.assertEqual(self.state["git_delivery"]["delivery_status"], "disabled")
-
-    def test_disabled_no_git_operations_performed(self) -> None:
-        self.cfg["git_delivery"]["enabled"] = False
-        branches_before = subprocess.run(
-            ["git", "branch"], cwd=self.repo, check=True,
-            capture_output=True, text=True,
-        ).stdout
-        proceed, err = self.opsx_plan.ensure_delivery_branch(
-            self.repo, self.cfg, self.state,
-        )
-        self.assertTrue(proceed)
-        branches_after = subprocess.run(
-            ["git", "branch"], cwd=self.repo, check=True,
-            capture_output=True, text=True,
-        ).stdout
-        self.assertEqual(branches_before, branches_after)
-
-    def test_existing_branch_with_unrecorded_state_transitions(self) -> None:
-        """When branch exists on disk but state doesn't record it, the branch
-        is adopted and state is updated (handles interrupted first runs)."""
-        subprocess.run(
-            ["git", "checkout", "-b", "opsx/test-plan"],
-            cwd=self.repo, check=True, capture_output=True, text=True,
-        )
-        # Switch back to default so the "first run" doesn't see branch as checked out
-        subprocess.run(
-            ["git", "checkout", self.default_branch],
-            cwd=self.repo, check=True, capture_output=True, text=True,
-        )
-
-        proceed, err = self.opsx_plan.ensure_delivery_branch(
-            self.repo, self.cfg, self.state,
-        )
-        self.assertTrue(proceed, f"expected proceed, got error: {err}")
-        self.assertIsNone(err)
-        gd = self.state["git_delivery"]
-        self.assertEqual(gd["branch_name"], "opsx/test-plan")
-        self.assertEqual(gd["base_ref"], self.default_branch)
-        self.assertEqual(gd["delivery_status"], "branch_ready")
-        # Branch should now be checked out
-        self.assertTrue(self.opsx_plan._git_current_head_on_branch(self.repo, "opsx/test-plan"))
-
-
-class GitDeliveryCmdRunIntegrationTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.opsx_plan = load_opsx_plan()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.repo = Path(self.tmp.name)
-        subprocess.run(["git", "init"], cwd=self.repo, check=True, capture_output=True, text=True)
-        subprocess.run(
-            ["git", "-c", "user.email=t@t", "-c", "user.name=T",
-             "commit", "--allow-empty", "-m", "init"],
-            cwd=self.repo, check=True, capture_output=True, text=True,
-        )
-        # Create a minimal plan TOML
-        self.plan_path = self.repo / "test.toml"
-        self.plan_path.write_text(textwrap.dedent("""\
-            [plan]
-            name = "test-gd"
-            adapter = "opencode"
-
-            [plan.git_delivery]
-            enabled = true
-
-            [[changes]]
-            id = "test-change"
-        """), encoding="utf-8")
-        # Create the authored change directory so the orchestrator can drive it
-        cdir = self.repo / "openspec" / "changes" / "test-change"
-        cdir.mkdir(parents=True)
-        (cdir / "proposal.md").write_text("## Why\n", encoding="utf-8")
-        (cdir / "tasks.md").write_text("## 1. Tasks\n\n- [ ] 1.1 Task\n", encoding="utf-8")
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-
-    def test_cmd_run_creates_delivery_branch(self) -> None:
-        writes: list[str] = []
-
-        def fake_write_active(repo, rel):
-            writes.append(rel)
-
-        def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None, budget_usd=0.0):
-            return self.opsx_plan.base.DONE
-
-        def fake_reconcile(repo, cfg, state):
-            pass
-
-        def fake_preflight(repo, plan_src, adapter, cfg=None):
-            pass
-
-        def fake_cmd_status_inner(cfg, state, header="", plan_arg=None):
-            return 0
-
-        with mock.patch.object(self.opsx_plan, "write_active_plan", side_effect=fake_write_active), \
-             mock.patch.object(self.opsx_plan, "run_direct_change", side_effect=fake_run_direct_change), \
-             mock.patch.object(self.opsx_plan, "reconcile", side_effect=fake_reconcile), \
-             mock.patch.object(self.opsx_plan, "run_preflight_warnings", side_effect=fake_preflight), \
-             mock.patch.object(self.opsx_plan, "cmd_status_inner", side_effect=fake_cmd_status_inner):
-
-            args = argparse.Namespace(
-                repo=str(self.repo),
-                plan="test.toml",
-                dry_run=False,
-                only=None,
-                max_changes=0,
-                budget_minutes=0,
-                budget_usd=0,
-                create_only=False,
-                no_branch=False,
-            )
-            rc = self.opsx_plan.cmd_run(args)
-            self.assertEqual(rc, 0)
-            # Branch should have been created
-            self.assertTrue(self.opsx_plan._git_branch_exists(self.repo, "opsx/test-gd"))
-
-    def test_cmd_run_with_no_branch_skips_creation(self) -> None:
-        def fake_run_direct_change(repo, cfg, state, cid, budget_deadline=None, budget_usd=0.0):
-            return self.opsx_plan.base.DONE
-
-        def fake_reconcile(repo, cfg, state):
-            pass
-
-        def fake_preflight(repo, plan_src, adapter, cfg=None):
-            pass
-
-        def fake_cmd_status_inner(cfg, state, header="", plan_arg=None):
-            return 0
-
-        with mock.patch.object(self.opsx_plan, "write_active_plan"), \
-             mock.patch.object(self.opsx_plan, "run_direct_change", side_effect=fake_run_direct_change), \
-             mock.patch.object(self.opsx_plan, "reconcile", side_effect=fake_reconcile), \
-             mock.patch.object(self.opsx_plan, "run_preflight_warnings", side_effect=fake_preflight), \
-             mock.patch.object(self.opsx_plan, "cmd_status_inner", side_effect=fake_cmd_status_inner):
-
-            args = argparse.Namespace(
-                repo=str(self.repo),
-                plan="test.toml",
-                dry_run=False,
-                only=None,
-                max_changes=0,
-                budget_minutes=0,
-                budget_usd=0,
-                create_only=False,
-                no_branch=True,
-            )
-            rc = self.opsx_plan.cmd_run(args)
-            self.assertEqual(rc, 0)
-            # Branch should NOT have been created
-            self.assertFalse(self.opsx_plan._git_branch_exists(self.repo, "opsx/test-gd"))
-
-    def test_cmd_run_refuses_with_delivery_error(self) -> None:
-        """When ensure_delivery_branch returns an error, cmd_run exits early."""
-        # Make the worktree dirty by adding and modifying a tracked file
-        (self.repo / "tracked.txt").write_text("clean\n", encoding="utf-8")
-        subprocess.run(
-            ["git", "add", "tracked.txt"], cwd=self.repo, check=True, capture_output=True, text=True,
-        )
-        subprocess.run(
-            ["git", "-c", "user.email=t@t", "-c", "user.name=T",
-             "commit", "-m", "add tracked"],
-            cwd=self.repo, check=True, capture_output=True, text=True,
-        )
-        (self.repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
-
-        def fake_reconcile(repo, cfg, state):
-            pass
-
-        def fake_preflight(repo, plan_src, adapter, cfg=None):
-            pass
-
-        with mock.patch.object(self.opsx_plan, "write_active_plan"), \
-             mock.patch.object(self.opsx_plan, "reconcile", side_effect=fake_reconcile), \
-             mock.patch.object(self.opsx_plan, "run_preflight_warnings", side_effect=fake_preflight):
-
-            args = argparse.Namespace(
-                repo=str(self.repo),
-                plan="test.toml",
-                dry_run=False,
-                only=None,
-                max_changes=0,
-                budget_minutes=0,
-                budget_usd=0,
-                create_only=False,
-                no_branch=False,
-            )
-            rc = self.opsx_plan.cmd_run(args)
-            self.assertEqual(rc, 2)
-
-    def test_cmd_run_dry_run_does_not_create_branch(self) -> None:
-        """Dry-run must not create or record a delivery branch."""
-        def fake_reconcile(repo, cfg, state):
-            pass
-
-        def fake_preflight(repo, plan_src, adapter, cfg=None):
-            pass
-
-        def fake_cmd_status_inner(cfg, state, header="", plan_arg=None):
-            return 0
-
-        with mock.patch.object(self.opsx_plan, "write_active_plan"), \
-             mock.patch.object(self.opsx_plan, "reconcile", side_effect=fake_reconcile), \
-             mock.patch.object(self.opsx_plan, "run_preflight_warnings", side_effect=fake_preflight), \
-             mock.patch.object(self.opsx_plan, "cmd_status_inner", side_effect=fake_cmd_status_inner):
-
-            args = argparse.Namespace(
-                repo=str(self.repo),
-                plan="test.toml",
-                dry_run=True,
-                only=None,
-                max_changes=0,
-                budget_minutes=0,
-                budget_usd=0,
-                create_only=False,
-                no_branch=False,
-            )
-            rc = self.opsx_plan.cmd_run(args)
-            self.assertEqual(rc, 0)
-            # Branch must NOT have been created
-            self.assertFalse(self.opsx_plan._git_branch_exists(self.repo, "opsx/test-gd"))
-            # State must NOT have a recorded delivery branch
-            state = self.opsx_plan.load_state(self.repo, "test-gd")
-            gd = state.get("git_delivery", {})
-            self.assertIsNone(gd.get("branch_name"))
-            self.assertEqual(gd.get("delivery_status"), "disabled")
-
-
-class GitDeliveryStatePersistenceTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.opsx_plan = load_opsx_plan()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.repo = Path(self.tmp.name)
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-
-    def test_load_state_adds_default_git_delivery(self) -> None:
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
-        self.assertIn("git_delivery", state)
-        gd = state["git_delivery"]
-        self.assertEqual(gd["base_ref"], None)
-        self.assertEqual(gd["branch_name"], None)
-        self.assertEqual(gd["delivery_status"], "disabled")
-
-    def test_load_state_preserves_existing_git_delivery(self) -> None:
-        state_path = self.opsx_plan.state_path(self.repo, "test-plan")
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        existing = {
-            "plan": "test-plan",
-            "approvals": [],
-            "changes": {},
-            "git_delivery": {
-                "base_ref": "main",
-                "branch_name": "opsx/test-plan",
-                "delivery_status": "branch_ready",
-            },
-        }
-        state_path.write_text(json.dumps(existing), encoding="utf-8")
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
-        gd = state["git_delivery"]
-        self.assertEqual(gd["base_ref"], "main")
-        self.assertEqual(gd["branch_name"], "opsx/test-plan")
-        self.assertEqual(gd["delivery_status"], "branch_ready")
-
-    def test_load_state_merges_missing_git_delivery_keys(self) -> None:
-        state_path = self.opsx_plan.state_path(self.repo, "test-plan")
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        existing = {
-            "plan": "test-plan",
-            "approvals": [],
-            "changes": {},
-            "git_delivery": {"base_ref": "release/next"},
-        }
-        state_path.write_text(json.dumps(existing), encoding="utf-8")
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
-        gd = state["git_delivery"]
-        self.assertEqual(gd["base_ref"], "release/next")
-        self.assertEqual(gd["branch_name"], None)
-        self.assertEqual(gd["delivery_status"], "disabled")
-
-    def test_load_state_handles_non_dict_git_delivery(self) -> None:
-        state_path = self.opsx_plan.state_path(self.repo, "test-plan")
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        existing = {
-            "plan": "test-plan",
-            "approvals": [],
-            "changes": {},
-            "git_delivery": "bad-value",
-        }
-        state_path.write_text(json.dumps(existing), encoding="utf-8")
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
-        gd = state["git_delivery"]
-        self.assertIsInstance(gd, dict)
-        self.assertEqual(gd["delivery_status"], "disabled")
-
-
-class GitDeliveryDefaultOffTests(unittest.TestCase):
-    """Verify that plans without git_delivery config behave exactly as today."""
-    def setUp(self) -> None:
-        self.opsx_plan = load_opsx_plan()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.repo = Path(self.tmp.name)
-        subprocess.run(["git", "init"], cwd=self.repo, check=True, capture_output=True, text=True)
-        subprocess.run(
-            ["git", "-c", "user.email=t@t", "-c", "user.name=T",
-             "commit", "--allow-empty", "-m", "init"],
-            cwd=self.repo, check=True, capture_output=True, text=True,
-        )
-        self.cfg = {
-            "name": "default-off-plan",
-            "git_delivery": self.opsx_plan.planref._parse_git_delivery_config({}),
-        }
-        self.state = {"plan": "default-off-plan", "approvals": [], "changes": {},
-                       "git_delivery": self.opsx_plan._default_git_delivery_state()}
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-
-    def test_disabled_by_default_proceeds_without_branch_creation(self) -> None:
-        proceed, err = self.opsx_plan.ensure_delivery_branch(
-            self.repo, self.cfg, self.state,
-        )
-        self.assertTrue(proceed)
-        self.assertIsNone(err)
-        self.assertIsNone(self.state["git_delivery"]["branch_name"])
-
-    def test_build_single_change_config_has_disabled_git_delivery(self) -> None:
-        cdir = self.repo / "openspec" / "changes" / "test-change"
-        cdir.mkdir(parents=True)
-        (cdir / "proposal.md").write_text("## Why\n", encoding="utf-8")
-        (cdir / "tasks.md").write_text("## 1. Tasks\n\n- [ ] 1.1 Task\n", encoding="utf-8")
-        cfg = self.opsx_plan.build_single_change_config(self.repo, "test-change")
-        self.assertIn("git_delivery", cfg)
-        self.assertFalse(cfg["git_delivery"]["enabled"])
-
-
-class PRDeliveryTests(unittest.TestCase):
-    """Tests for PR delivery: preflight, creation, idempotency, --no-pr,
-    body generation, and fail-closed behaviour."""
-
-    def setUp(self) -> None:
-        self.opsx_plan = load_opsx_plan()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.repo = Path(self.tmp.name)
-        git(self.repo, "init")
-        git(
-            self.repo,
-            "remote", "add", "origin",
-            "git@github.com:example/repo.git",
-        )
-        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
-        git(self.repo, "add", "tracked.txt")
-        git(
-            self.repo,
-            "-c", "user.email=test@example.invalid",
-            "-c", "user.name=Test User",
-            "commit", "-m", "init",
-        )
-        self._saved_which = self.opsx_plan.shutil.which
-
-    def tearDown(self) -> None:
-        self.opsx_plan.shutil.which = self._saved_which
-        self.tmp.cleanup()
-
-    def _cfg_with_pr_delivery(self, enabled=True, create_pr=True):
-        return {
-            "name": "test-plan",
-            "adapter": "opencode",
-            "git_delivery": {
-                "enabled": enabled,
-                "branch": "",
-                "base_ref": "main",
-                "create_pull_request": create_pr,
-            },
-        }
-
-    def _state_with_delivery(self, branch_name="opsx/test-plan",
-                              base_ref="main", delivery_status="branch_ready",
-                              pull_request_url=None):
-        return {
-            "plan": "test-plan",
-            "approvals": [],
-            "changes": {},
-            "git_delivery": {
-                "base_ref": base_ref,
-                "branch_name": branch_name,
-                "delivery_status": delivery_status,
-                "pull_request_url": pull_request_url,
-            },
-        }
-
-    # -- Preflight tests ---------------------------------------------------
-
-    def test_pr_preflight_passes_when_gh_and_remote_exist(self) -> None:
-        self.opsx_plan.shutil.which = lambda cmd: cmd == "gh"
-        cfg = self._cfg_with_pr_delivery()
-        ok, err, remote = self.opsx_plan.check_pr_delivery_prerequisites(self.repo, cfg)
-        self.assertTrue(ok, err)
-        self.assertIsNone(err)
-        self.assertEqual(remote, "origin")
-
-    def test_pr_preflight_fails_when_gh_missing(self) -> None:
-        self.opsx_plan.shutil.which = lambda cmd: False
-        cfg = self._cfg_with_pr_delivery()
-        ok, err, remote = self.opsx_plan.check_pr_delivery_prerequisites(self.repo, cfg)
-        self.assertFalse(ok)
-        self.assertIsNotNone(err)
-        self.assertIsNone(remote)
-        self.assertIn("gh", err.lower())
-
-    def test_pr_preflight_skipped_when_create_pr_false(self) -> None:
-        self.opsx_plan.shutil.which = lambda cmd: False
-        cfg = self._cfg_with_pr_delivery(create_pr=False)
-        ok, err, remote = self.opsx_plan.check_pr_delivery_prerequisites(self.repo, cfg)
-        self.assertTrue(ok, err)
-        self.assertIsNone(err)
-        self.assertIsNone(remote)
-
-    def test_pr_preflight_fails_when_no_remote(self) -> None:
-        self.opsx_plan.shutil.which = lambda cmd: cmd == "gh"
-        git(self.repo, "remote", "remove", "origin")
-        cfg = self._cfg_with_pr_delivery()
-        ok, err, remote = self.opsx_plan.check_pr_delivery_prerequisites(self.repo, cfg)
-        self.assertFalse(ok)
-        self.assertIsNotNone(err)
-        self.assertIsNone(remote)
-        self.assertIn("remote", err.lower())
-
-    def test_pr_preflight_resolves_non_origin_remote(self) -> None:
-        """Preflight must pick up a non-origin remote and return its name."""
-        self.opsx_plan.shutil.which = lambda cmd: cmd == "gh"
-        git(self.repo, "remote", "remove", "origin")
-        git(self.repo, "remote", "add", "upstream",
-            "git@github.com:example/repo.git")
-        cfg = self._cfg_with_pr_delivery()
-        ok, err, remote = self.opsx_plan.check_pr_delivery_prerequisites(self.repo, cfg)
-        self.assertTrue(ok, f"preflight should pass with non-origin remote: {err}")
-        self.assertIsNone(err)
-        self.assertEqual(remote, "upstream")
-
-    def test_pr_preflight_prefers_origin_when_multiple_remotes(self) -> None:
-        """When multiple remotes exist, preflight must prefer 'origin'."""
-        self.opsx_plan.shutil.which = lambda cmd: cmd == "gh"
-        git(self.repo, "remote", "add", "upstream",
-            "git@github.com:example/upstream.git")
-        cfg = self._cfg_with_pr_delivery()
-        ok, err, remote = self.opsx_plan.check_pr_delivery_prerequisites(self.repo, cfg)
-        self.assertTrue(ok, err)
-        self.assertIsNone(err)
-        self.assertEqual(remote, "origin",
-                         "must prefer origin when multiple remotes exist")
-
-    # -- --no-pr tests -----------------------------------------------------
-
-    def test_no_pr_skips_preflight(self) -> None:
-        """Even when gh is missing, --no-pr should skip the preflight
-        check because it suppresses PR delivery entirely."""
-        self.opsx_plan.shutil.which = lambda cmd: False
-        # The pgm-level test: cmd_run should not call preflight when no_pr
-        cfg = self._cfg_with_pr_delivery()
-        state = self._state_with_delivery()
-        # Unit test the attempt_pr_delivery function directly
-        ok, err = self.opsx_plan.attempt_pr_delivery(
-            self.repo, cfg, state, no_pr=True,
-        )
-        self.assertTrue(ok)
-        self.assertIsNone(err)
-        # PR URL should not be set
-        self.assertIsNone(state["git_delivery"]["pull_request_url"])
-
-    # -- Push tests --------------------------------------------------------
-
-    def test_push_delivery_branch_succeeds(self) -> None:
-        cfg = self._cfg_with_pr_delivery()
-        state = self._state_with_delivery(branch_name="opsx/test-plan")
-
-        real_git = self.opsx_plan.git
-
-        def fake_git(repo, *args):
-            if args[0] == "push":
-                result = mock.Mock()
-                result.returncode = 0
-                result.stderr = ""
-                return result
-            return real_git(repo, *args)
-
-        with mock.patch.object(self.opsx_plan, "git", side_effect=fake_git):
-            ok, err = self.opsx_plan.push_delivery_branch(self.repo, cfg, state)
-        self.assertTrue(ok, err)
-        self.assertIsNone(err)
-
-    def test_push_delivery_branch_fails_closed(self) -> None:
-        cfg = self._cfg_with_pr_delivery()
-        state = self._state_with_delivery(branch_name="opsx/test-plan")
-
-        real_git = self.opsx_plan.git
-
-        def fake_git(repo, *args):
-            if args[0] == "push":
-                result = mock.Mock()
-                result.returncode = 1
-                result.stderr = "push rejected: permission denied"
-                return result
-            return real_git(repo, *args)
-
-        with mock.patch.object(self.opsx_plan, "git", side_effect=fake_git):
-            ok, err = self.opsx_plan.push_delivery_branch(self.repo, cfg, state)
-        self.assertFalse(ok)
-        self.assertIsNotNone(err)
-        self.assertIn("failed", err.lower())
-
-    def test_push_uses_remote_from_state_instead_of_hardcoding_origin(self) -> None:
-        """push_delivery_branch must use the remote_name stored in state,
-        not hardcode 'origin'."""
-        cfg = self._cfg_with_pr_delivery()
-        state = self._state_with_delivery(branch_name="opsx/test-plan")
-        state["git_delivery"]["remote_name"] = "upstream"
-
-        push_args: list[tuple] = []
-
-        def fake_git(repo, *args):
-            if args[0] == "push":
-                push_args.append(tuple(args))
-                result = mock.Mock()
-                result.returncode = 0
-                result.stderr = ""
-                return result
-            return self.opsx_plan.git(repo, *args)
-
-        with mock.patch.object(self.opsx_plan, "git", side_effect=fake_git):
-            ok, err = self.opsx_plan.push_delivery_branch(self.repo, cfg, state)
-        self.assertTrue(ok, err)
-        self.assertIsNone(err)
-        self.assertGreaterEqual(len(push_args), 1)
-        # The remote in the push command must be "upstream", not "origin"
-        self.assertIn("upstream", push_args[0])
-        self.assertNotIn("origin", push_args[0])
-
-    # -- gh pr create tests ------------------------------------------------
-
-    def test_create_pr_succeeds_and_records_url(self) -> None:
-        cfg = self._cfg_with_pr_delivery()
-        state = self._state_with_delivery(branch_name="opsx/test-plan")
-
-        real_run = subprocess.run
-
-        def fake_run(cmd, **kwargs):
-            if cmd[0] == "gh" and cmd[1] == "pr":
-                result = mock.Mock()
-                result.returncode = 0
-                result.stdout = "https://github.com/example/repo/pull/42"
-                result.stderr = ""
-                return result
-            return real_run(cmd, **kwargs)
-
-        with mock.patch("subprocess.run", side_effect=fake_run):
-            ok, err, pr_url = self.opsx_plan.create_github_pull_request(
-                self.repo, cfg, state, "test body",
-            )
-        self.assertTrue(ok, err)
-        self.assertIsNone(err)
-        self.assertEqual(pr_url, "https://github.com/example/repo/pull/42")
-
-    def test_create_pr_fails_closed_on_gh_error(self) -> None:
-        cfg = self._cfg_with_pr_delivery()
-        state = self._state_with_delivery(branch_name="opsx/test-plan")
-
-        real_run = subprocess.run
-
-        def fake_run(cmd, **kwargs):
-            if cmd[0] == "gh" and cmd[1] == "pr":
-                result = mock.Mock()
-                result.returncode = 1
-                result.stdout = ""
-                result.stderr = "pull request already exists"
-                return result
-            return real_run(cmd, **kwargs)
-
-        with mock.patch("subprocess.run", side_effect=fake_run):
-            ok, err, pr_url = self.opsx_plan.create_github_pull_request(
-                self.repo, cfg, state, "test body",
-            )
-        self.assertFalse(ok)
-        self.assertIsNotNone(err)
-        self.assertIsNone(pr_url)
-        self.assertIn("failed", err.lower())
-
-    # -- Idempotency tests ------------------------------------------------
-
-    def test_idempotent_rerun_skips_pr_when_already_recorded(self) -> None:
-        cfg = self._cfg_with_pr_delivery()
-        pr_url = "https://github.com/example/repo/pull/99"
-        state = self._state_with_delivery(
-            branch_name="opsx/test-plan",
-            delivery_status="pr_opened",
-            pull_request_url=pr_url,
-        )
-
-        # Mock push to ensure it's NOT called (idempotency should skip)
-        with mock.patch.object(
-            self.opsx_plan, "push_delivery_branch",
-        ) as mock_push:
-            ok, err = self.opsx_plan.attempt_pr_delivery(
-                self.repo, cfg, state,
-            )
-        self.assertTrue(ok)
-        self.assertIsNone(err)
-        mock_push.assert_not_called()
-        # PR URL must remain unchanged
-        self.assertEqual(state["git_delivery"]["pull_request_url"], pr_url)
-
-    # -- Full delivery flow tests -----------------------------------------
-
-    def test_full_delivery_flow_records_pr(self) -> None:
-        cfg = {
-            "name": "test-plan",
-            "adapter": "opencode",
-            "git_delivery": {
-                "enabled": True,
-                "branch": "",
-                "base_ref": "main",
-                "create_pull_request": True,
-            },
-            "order": [],
-            "changes": {},
-        }
-        state = self._state_with_delivery(branch_name="opsx/test-plan")
-
-        call_count = {"push": 0, "pr": 0}
-        real_run = subprocess.run
-        real_git = self.opsx_plan.git
-
-        def fake_git(repo, *args):
-            if args[0] == "push":
-                call_count["push"] += 1
-                result = mock.Mock()
-                result.returncode = 0
-                result.stderr = ""
-                return result
-            return real_git(repo, *args)
-
-        def fake_run(cmd, **kwargs):
-            if cmd[0] == "gh" and cmd[1] == "pr":
-                call_count["pr"] += 1
-                result = mock.Mock()
-                result.returncode = 0
-                result.stdout = "https://github.com/example/repo/pull/123"
-                result.stderr = ""
-                return result
-            return real_run(cmd, **kwargs)
-
-        with mock.patch.object(self.opsx_plan, "git", side_effect=fake_git), \
-             mock.patch("subprocess.run", side_effect=fake_run):
-            ok, err = self.opsx_plan.attempt_pr_delivery(
-                self.repo, cfg, state,
-            )
-
-        self.assertTrue(ok)
-        self.assertIsNone(err)
-        self.assertEqual(call_count["push"], 1)
-        self.assertEqual(call_count["pr"], 1)
-        self.assertEqual(
-            state["git_delivery"]["pull_request_url"],
-            "https://github.com/example/repo/pull/123",
-        )
-        self.assertEqual(state["git_delivery"]["delivery_status"], "pr_opened")
-
-    def test_push_failure_leaves_state_unambiguous(self) -> None:
-        cfg = self._cfg_with_pr_delivery()
-        state = self._state_with_delivery(branch_name="opsx/test-plan")
-
-        real_git = self.opsx_plan.git
-
-        def fake_git(repo, *args):
-            if args[0] == "push":
-                result = mock.Mock()
-                result.returncode = 1
-                result.stderr = "push rejected"
-                return result
-            return real_git(repo, *args)
-
-        with mock.patch.object(self.opsx_plan, "git", side_effect=fake_git):
-            ok, err = self.opsx_plan.attempt_pr_delivery(
-                self.repo, cfg, state,
-            )
-
-        self.assertFalse(ok)
-        self.assertIsNotNone(err)
-        # State must NOT claim PR opened
-        self.assertIsNone(state["git_delivery"]["pull_request_url"])
-        self.assertNotEqual(state["git_delivery"]["delivery_status"], "pr_opened")
-
-    def test_pr_creation_failure_after_push_leaves_state_unambiguous(self) -> None:
-        cfg = {
-            "name": "test-plan",
-            "adapter": "opencode",
-            "git_delivery": {
-                "enabled": True,
-                "branch": "",
-                "base_ref": "main",
-                "create_pull_request": True,
-            },
-            "order": [],
-            "changes": {},
-        }
-        state = self._state_with_delivery(branch_name="opsx/test-plan")
-
-        real_git = self.opsx_plan.git
-        real_run = subprocess.run
-
-        def fake_git(repo, *args):
-            if args[0] == "push":
-                result = mock.Mock()
-                result.returncode = 0
-                result.stderr = ""
-                return result
-            return real_git(repo, *args)
-
-        def fake_run(cmd, **kwargs):
-            if cmd[0] == "gh" and cmd[1] == "pr":
-                result = mock.Mock()
-                result.returncode = 1
-                result.stdout = ""
-                result.stderr = "pull request creation failed"
-                return result
-            return real_run(cmd, **kwargs)
-
-        with mock.patch.object(self.opsx_plan, "git", side_effect=fake_git), \
-             mock.patch("subprocess.run", side_effect=fake_run):
-            ok, err = self.opsx_plan.attempt_pr_delivery(
-                self.repo, cfg, state,
-            )
-
-        self.assertFalse(ok)
-        self.assertIsNotNone(err)
-        # State must NOT claim PR opened
-        self.assertIsNone(state["git_delivery"]["pull_request_url"])
-        self.assertNotEqual(state["git_delivery"]["delivery_status"], "pr_opened")
-
-    # -- Body generation tests --------------------------------------------
-
-    def test_generate_pr_body_includes_change_summary(self) -> None:
-        cfg = {
-            "name": "test-plan",
-            "adapter": "opencode",
-            "git_delivery": {"create_pull_request": True},
-            "order": [],
-            "changes": {},
-        }
-        state = {"changes": {}}
-        body = self.opsx_plan.generate_pr_body(self.repo, cfg, state)
-        self.assertIn("test-plan", body)
-        self.assertIn("opsx-plan", body)
-
-    def test_pr_body_fallback_lists_per_change_status_when_no_telemetry(self) -> None:
-        """When metrics aggregator is unavailable, the fallback path must
-        list per-change status and mention the plan name."""
-        cfg = {
-            "name": "test-plan",
-            "adapter": "opencode",
-            "git_delivery": {"create_pull_request": True},
-            "order": ["add-example", "fix-bug"],
-            "changes": {
-                "add-example": {"id": "add-example", "enabled": True},
-                "fix-bug": {"id": "fix-bug", "enabled": True},
-            },
-        }
-        state = {
-            "changes": {
-                "add-example": {"status": "done"},
-                "fix-bug": {"status": "running"},
-            },
-        }
-        body = self.opsx_plan.generate_pr_body(self.repo, cfg, state)
-        self.assertIn("test-plan", body)
-        self.assertIn("add-example", body)
-        self.assertIn("done", body.lower())
-        self.assertIn("fix-bug", body)
-        self.assertIn("running", body.lower())
-
-    def test_pr_body_fallback_excludes_disabled_changes(self) -> None:
-        """Fallback body must not list disabled changes."""
-        cfg = {
-            "name": "test-plan",
-            "adapter": "opencode",
-            "git_delivery": {"create_pull_request": True},
-            "order": ["enabled-change", "disabled-change"],
-            "changes": {
-                "enabled-change": {"id": "enabled-change", "enabled": True},
-                "disabled-change": {"id": "disabled-change", "enabled": False},
-            },
-        }
-        state = {
-            "changes": {
-                "enabled-change": {"status": "done"},
-                "disabled-change": {"status": "pending"},
-            },
-        }
-        body = self.opsx_plan.generate_pr_body(self.repo, cfg, state)
-        self.assertIn("enabled-change", body)
-        self.assertNotIn("disabled-change", body)
-
-    def test_pr_body_with_telemetry_includes_table_and_cost(self) -> None:
-        """When metrics aggregator returns change data with cost, the PR
-        body must include the summary table and total cost estimate."""
-        cfg = {
-            "name": "test-plan",
-            "adapter": "opencode",
-            "git_delivery": {"create_pull_request": True},
-            "order": ["add-example"],
-            "changes": {
-                "add-example": {"id": "add-example", "enabled": True},
-            },
-        }
-        state = {"changes": {}}
-
-        # Build a fake AggregationError for the except clause fallback,
-        # and a fake change metric for the imported path.
-        FakeChangeMetric = mock.MagicMock()
-        FakeChangeMetric.change_id = "add-example"
-        FakeChangeMetric.status = "done"
-        FakeChangeMetric.total_rounds = 3
-        FakeChangeMetric.duration_ms = 125000  # 2m5s
-        FakeChangeMetric.tokens = 1_500_000  # 1.5M
-        FakeChangeMetric.cost_status = "estimated"
-        FakeChangeMetric.estimated_cost = 0.42
-
-        def fake_read_telemetry(repo, plan_name):
-            return ([], None)
-
-        def fake_select_run(records, run_id):
-            return [], None, None
-
-        def fake_read_state(repo, plan_name):
-            return state, None
-
-        def fake_change_aggregation(state_for_cm, selected_records,
-                                    plan_name, extra):
-            return [FakeChangeMetric], None
-
-        fake_aggregator = mock.MagicMock()
-        fake_aggregator.AggregationError = type("AggregationError", (Exception,), {})
-        fake_aggregator._change_aggregation = fake_change_aggregation
-        fake_aggregator._read_state = fake_read_state
-        fake_aggregator._read_telemetry = fake_read_telemetry
-        fake_aggregator._select_run = fake_select_run
-
-        with mock.patch.dict(
-            "sys.modules",
-            {"lib.metrics": mock.MagicMock(), "lib.metrics.aggregator": fake_aggregator},
-        ):
-            body = self.opsx_plan.generate_pr_body(self.repo, cfg, state)
-
-        self.assertIn("Change Summary", body)
-        self.assertIn("add-example", body)
-        self.assertIn("done", body)
-        self.assertIn("3", body)  # rounds
-        self.assertIn("2m5s", body)  # duration
-        self.assertIn("1.5M", body)  # tokens
-        self.assertIn("$0.42", body)  # cost
-        self.assertIn("Total estimated cost", body)
-
-    def test_pr_body_with_telemetry_handles_unresolved_cost(self) -> None:
-        """When cost is unresolved, the body must show 'unresolved' in the
-        cost column and note 'partial' on the total cost line."""
-        cfg = {
-            "name": "test-plan",
-            "adapter": "opencode",
-            "git_delivery": {"create_pull_request": True},
-            "order": ["add-example"],
-            "changes": {
-                "add-example": {"id": "add-example", "enabled": True},
-            },
-        }
-        state = {"changes": {}}
-
-        FakeChangeMetric = mock.MagicMock()
-        FakeChangeMetric.change_id = "add-example"
-        FakeChangeMetric.status = "done"
-        FakeChangeMetric.total_rounds = 1
-        FakeChangeMetric.duration_ms = None
-        FakeChangeMetric.tokens = None
-        FakeChangeMetric.cost_status = "unresolved"
-        FakeChangeMetric.estimated_cost = None
-
-        fake_aggregator = mock.MagicMock()
-        fake_aggregator.AggregationError = type("AggregationError", (Exception,), {})
-        fake_aggregator._change_aggregation = lambda *a, **kw: ([FakeChangeMetric], None)
-        fake_aggregator._read_state = lambda *a, **kw: (state, None)
-        fake_aggregator._read_telemetry = lambda *a, **kw: ([], None)
-        fake_aggregator._select_run = lambda *a, **kw: ([], None, None)
-
-        with mock.patch.dict(
-            "sys.modules",
-            {"lib.metrics": mock.MagicMock(), "lib.metrics.aggregator": fake_aggregator},
-        ):
-            body = self.opsx_plan.generate_pr_body(self.repo, cfg, state)
-
-        self.assertIn("unresolved", body)
-        self.assertNotIn("Total estimated cost", body)
-
-    def test_pr_body_with_telemetry_handles_partial_cost(self) -> None:
-        """When cost_status is 'partial' (mixed estimated + unresolved),
-        the body must show the estimated cost amount with '(partial)' in the
-        per-change column, include it in the total, and mark the total as
-        partial."""
-        cfg = {
-            "name": "test-plan",
-            "adapter": "opencode",
-            "git_delivery": {"create_pull_request": True},
-            "order": ["add-example", "fix-bug"],
-            "changes": {
-                "add-example": {"id": "add-example", "enabled": True},
-                "fix-bug": {"id": "fix-bug", "enabled": True},
-            },
-        }
-        state = {"changes": {}}
-
-        PartialMetric = mock.MagicMock()
-        PartialMetric.change_id = "add-example"
-        PartialMetric.status = "done"
-        PartialMetric.total_rounds = 3
-        PartialMetric.duration_ms = 125000
-        PartialMetric.tokens = 1_500_000
-        PartialMetric.cost_status = "partial"
-        PartialMetric.estimated_cost = 0.42
-
-        UnresolvedMetric = mock.MagicMock()
-        UnresolvedMetric.change_id = "fix-bug"
-        UnresolvedMetric.status = "done"
-        UnresolvedMetric.total_rounds = 2
-        UnresolvedMetric.duration_ms = None
-        UnresolvedMetric.tokens = None
-        UnresolvedMetric.cost_status = "unresolved"
-        UnresolvedMetric.estimated_cost = None
-
-        cm_list = [PartialMetric, UnresolvedMetric]
-
-        fake_aggregator = mock.MagicMock()
-        fake_aggregator.AggregationError = type("AggregationError", (Exception,), {})
-        fake_aggregator._change_aggregation = lambda *a, **kw: (cm_list, None)
-        fake_aggregator._read_state = lambda *a, **kw: (state, None)
-        fake_aggregator._read_telemetry = lambda *a, **kw: ([], None)
-        fake_aggregator._select_run = lambda *a, **kw: ([], None, None)
-
-        with mock.patch.dict(
-            "sys.modules",
-            {"lib.metrics": mock.MagicMock(), "lib.metrics.aggregator": fake_aggregator},
-        ):
-            body = self.opsx_plan.generate_pr_body(self.repo, cfg, state)
-
-        # Per-change column: partial change shows dollar amount with "(partial)"
-        self.assertIn("$0.42 (partial)", body)
-        # Pure unresolved still shows "unresolved"
-        self.assertIn("unresolved", body)
-        # Total cost line appears with "(partial)" marker
-        self.assertIn("Total estimated cost (partial):", body)
-        self.assertIn("$0.42", body)
-
-    def test_pr_body_with_telemetry_excludes_disabled_changes(self) -> None:
-        """Telemetry-backed PR body must not render disabled changes or include
-        their cost in the total."""
-        cfg = {
-            "name": "test-plan",
-            "adapter": "opencode",
-            "git_delivery": {"create_pull_request": True},
-            "order": ["enabled-change", "disabled-change"],
-            "changes": {
-                "enabled-change": {"id": "enabled-change", "enabled": True},
-                "disabled-change": {"id": "disabled-change", "enabled": False},
-            },
-        }
-        state = {"changes": {}}
-
-        EnabledMetric = mock.MagicMock()
-        EnabledMetric.change_id = "enabled-change"
-        EnabledMetric.status = "done"
-        EnabledMetric.total_rounds = 2
-        EnabledMetric.duration_ms = 90000
-        EnabledMetric.tokens = 500_000
-        EnabledMetric.cost_status = "estimated"
-        EnabledMetric.estimated_cost = 0.25
-
-        DisabledMetric = mock.MagicMock()
-        DisabledMetric.change_id = "disabled-change"
-        DisabledMetric.status = "skipped"
-        DisabledMetric.total_rounds = 0
-        DisabledMetric.duration_ms = None
-        DisabledMetric.tokens = None
-        DisabledMetric.cost_status = "unavailable"
-        DisabledMetric.estimated_cost = None
-
-        cm_list = [EnabledMetric, DisabledMetric]
-
-        fake_aggregator = mock.MagicMock()
-        fake_aggregator.AggregationError = type("AggregationError", (Exception,), {})
-        fake_aggregator._change_aggregation = lambda *a, **kw: (cm_list, None)
-        fake_aggregator._read_state = lambda *a, **kw: (state, None)
-        fake_aggregator._read_telemetry = lambda *a, **kw: ([], None)
-        fake_aggregator._select_run = lambda *a, **kw: ([], None, None)
-
-        with mock.patch.dict(
-            "sys.modules",
-            {"lib.metrics": mock.MagicMock(), "lib.metrics.aggregator": fake_aggregator},
-        ):
-            body = self.opsx_plan.generate_pr_body(self.repo, cfg, state)
-
-        self.assertIn("enabled-change", body)
-        self.assertNotIn("disabled-change", body)
-        self.assertIn("$0.25", body)
-        self.assertIn("Total estimated cost", body)
-        # Total cost must be only the enabled change's cost
-        self.assertIn("$0.25", body)
-
-    # -- Delivery skipped when disabled -----------------------------------
-
-    def test_attempt_pr_delivery_skips_when_create_pr_false(self) -> None:
-        cfg = self._cfg_with_pr_delivery(create_pr=False)
-        state = self._state_with_delivery(branch_name="opsx/test-plan")
-        with mock.patch.object(
-            self.opsx_plan, "push_delivery_branch",
-        ) as mock_push:
-            ok, err = self.opsx_plan.attempt_pr_delivery(
-                self.repo, cfg, state,
-            )
-        self.assertTrue(ok)
-        mock_push.assert_not_called()
-
-    # -- Default delivery state includes pull_request_url -----------------
-
-    def test_default_git_delivery_state_includes_pull_request_url(self) -> None:
-        state = self.opsx_plan._default_git_delivery_state()
-        self.assertIn("pull_request_url", state)
-        self.assertIsNone(state["pull_request_url"])
 
 
 class RunEventNotificationTests(unittest.TestCase):
@@ -11940,18 +4813,18 @@ class RunEventNotificationTests(unittest.TestCase):
         }
         self.state = {"plan": self.plan_name, "approvals": [], "notified_events": {}, "changes": {}}
         self.write_authored_change(self.cid)
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         record["max_rounds"] = self.cfg["max_rounds"]
-        record["tracked_change_files"] = self.opsx_plan.change_context_paths(
+        record["tracked_change_files"] = self.opsx_plan.state_mod.change_context_paths(
             self.repo, self.cid
         )
         self._saved_invoke = self.opsx_plan.invoke_direct_stage
-        self._saved_checks = self.opsx_plan.run_fast_checks
+        self._saved_checks = self.opsx_plan.groundtruth.run_fast_checks
         self._notification_calls: list[tuple[str, str | None, str]] = []
 
     def tearDown(self) -> None:
         self.opsx_plan.invoke_direct_stage = self._saved_invoke
-        self.opsx_plan.run_fast_checks = self._saved_checks
+        self.opsx_plan.groundtruth.run_fast_checks = self._saved_checks
         self.tmp.cleanup()
 
     def write_authored_change(self, cid: str) -> None:
@@ -12144,7 +5017,7 @@ class RunEventNotificationTests(unittest.TestCase):
     def test_notify_emitted_on_review_max_rounds(self) -> None:
         self._patch_notify()
         self.cfg["max_rounds"] = 1
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         record["max_rounds"] = 1
 
         def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
@@ -12327,7 +5200,7 @@ class RunEventNotificationTests(unittest.TestCase):
         result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
 
         self.assertEqual(result, self.opsx_plan.base.DONE)
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         self.assertEqual(record["status"], self.opsx_plan.base.DONE)
 
     def test_notify_cmd_not_set_preserves_behavior(self) -> None:
@@ -12378,7 +5251,7 @@ class RunEventNotificationTests(unittest.TestCase):
         result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
 
         self.assertEqual(result, self.opsx_plan.base.DONE)
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         self.assertEqual(record["status"], self.opsx_plan.base.DONE)
 
     def test_build_notification_payload_has_required_fields(self) -> None:
@@ -12421,7 +5294,7 @@ class RunEventNotificationTests(unittest.TestCase):
         )
 
         # Pre-populate state: change created by orchestrator but not accepted
-        state_path = self.opsx_plan.state_path(self.repo, self.plan_name)
+        state_path = self.opsx_plan.state_mod.state_path(self.repo, self.plan_name)
         state_path.parent.mkdir(parents=True, exist_ok=True)
         initial_state = {
             "plan": self.plan_name,
@@ -12438,9 +5311,9 @@ class RunEventNotificationTests(unittest.TestCase):
                     "last_result": "",
                     "task_counts": {"complete": 0, "total": 2},
                     "tracked_change_files": [],
-                    "context_cache": self.opsx_plan.default_context_cache(),
-                    "last_review": self.opsx_plan.default_last_review(),
-                    "archive": self.opsx_plan.default_archive_state(),
+                    "context_cache": self.opsx_plan.state_mod.default_context_cache(),
+                    "last_review": self.opsx_plan.state_mod.default_last_review(),
+                    "archive": self.opsx_plan.state_mod.default_archive_state(),
                     "history": [],
                     "telemetry": {"latest_telemetry": ""},
                     "change": self.cid,
@@ -12450,7 +5323,7 @@ class RunEventNotificationTests(unittest.TestCase):
                     "create_attempts": 0,
                     "created_by_orchestrator": True,
                     "accepted": False,
-                    "last_stage": self.opsx_plan.default_last_stage(),
+                    "last_stage": self.opsx_plan.state_mod.default_last_stage(),
                     "last_log": "",
                 }
             },
@@ -12478,7 +5351,7 @@ class RunEventNotificationTests(unittest.TestCase):
         self.assertEqual(accepting[0][1], self.cid)
 
         # Verify state persisted with notified_events
-        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        state = self.opsx_plan.state_mod.load_state(self.repo, self.plan_name)
         ne = state.get("notified_events", {})
         self.assertIn(self.cid, ne, f"notified_events missing {self.cid}: {ne}")
         self.assertIn("awaiting_acceptance", ne[self.cid])
@@ -12500,7 +5373,7 @@ class RunEventNotificationTests(unittest.TestCase):
         )
 
         # Pre-populate state: change is done with valid archive evidence
-        state_path = self.opsx_plan.state_path(self.repo, self.plan_name)
+        state_path = self.opsx_plan.state_mod.state_path(self.repo, self.plan_name)
         state_path.parent.mkdir(parents=True, exist_ok=True)
         initial_state = {
             "plan": self.plan_name,
@@ -12517,15 +5390,15 @@ class RunEventNotificationTests(unittest.TestCase):
                     "last_result": "archive_passed",
                     "task_counts": {"complete": 2, "total": 2},
                     "tracked_change_files": [],
-                    "context_cache": self.opsx_plan.default_context_cache(),
-                    "last_review": self.opsx_plan.default_last_review(),
+                    "context_cache": self.opsx_plan.state_mod.default_context_cache(),
+                    "last_review": self.opsx_plan.state_mod.default_last_review(),
                     "archive": {
                         "status": "passed",
                         "path": archive_path,
                         "commit": commit,
                         "reason": "",
                         "spec_sync_status": "no-delta",
-                        "triage": self.opsx_plan.default_archive_state()["triage"],
+                        "triage": self.opsx_plan.state_mod.default_archive_state()["triage"],
                     },
                     "history": [],
                     "telemetry": {"latest_telemetry": ""},
@@ -12536,7 +5409,7 @@ class RunEventNotificationTests(unittest.TestCase):
                     "create_attempts": 0,
                     "created_by_orchestrator": False,
                     "accepted": False,
-                    "last_stage": self.opsx_plan.default_last_stage(),
+                    "last_stage": self.opsx_plan.state_mod.default_last_stage(),
                     "last_log": "",
                 }
             },
@@ -12564,7 +5437,7 @@ class RunEventNotificationTests(unittest.TestCase):
                          f"expected 1 plan_complete, got {calls}")
 
         # Verify state persisted with notified_events._plan_
-        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        state = self.opsx_plan.state_mod.load_state(self.repo, self.plan_name)
         ne = state.get("notified_events", {})
         self.assertIn("_plan_", ne, f"notified_events missing _plan_: {ne}")
         self.assertIn("plan_complete", ne["_plan_"])
@@ -12587,7 +5460,7 @@ class RunEventNotificationTests(unittest.TestCase):
         )
 
         # Pre-populate state: change is done with valid archive evidence
-        state_path = self.opsx_plan.state_path(self.repo, self.plan_name)
+        state_path = self.opsx_plan.state_mod.state_path(self.repo, self.plan_name)
         state_path.parent.mkdir(parents=True, exist_ok=True)
         initial_state = {
             "plan": self.plan_name,
@@ -12604,15 +5477,15 @@ class RunEventNotificationTests(unittest.TestCase):
                     "last_result": "archive_passed",
                     "task_counts": {"complete": 2, "total": 2},
                     "tracked_change_files": [],
-                    "context_cache": self.opsx_plan.default_context_cache(),
-                    "last_review": self.opsx_plan.default_last_review(),
+                    "context_cache": self.opsx_plan.state_mod.default_context_cache(),
+                    "last_review": self.opsx_plan.state_mod.default_last_review(),
                     "archive": {
                         "status": "passed",
                         "path": archive_path,
                         "commit": commit,
                         "reason": "",
                         "spec_sync_status": "no-delta",
-                        "triage": self.opsx_plan.default_archive_state()["triage"],
+                        "triage": self.opsx_plan.state_mod.default_archive_state()["triage"],
                     },
                     "history": [],
                     "telemetry": {"latest_telemetry": ""},
@@ -12623,7 +5496,7 @@ class RunEventNotificationTests(unittest.TestCase):
                     "create_attempts": 0,
                     "created_by_orchestrator": False,
                     "accepted": False,
-                    "last_stage": self.opsx_plan.default_last_stage(),
+                    "last_stage": self.opsx_plan.state_mod.default_last_stage(),
                     "last_log": "",
                 }
             },
@@ -12652,7 +5525,7 @@ class RunEventNotificationTests(unittest.TestCase):
             return True, None
 
         with mock.patch.object(self.opsx_plan, "_try_notify", side_effect=capture_notify), \
-             mock.patch.object(self.opsx_plan, "attempt_pr_delivery", side_effect=fake_attempt_pr_delivery):
+             mock.patch.object(self.opsx_plan.delivery, "attempt_pr_delivery", side_effect=fake_attempt_pr_delivery):
             args = argparse.Namespace(
                 repo=str(self.repo), plan=str(plan_rel),
                 dry_run=False, max_changes=None, budget_minutes=None,
@@ -12668,7 +5541,7 @@ class RunEventNotificationTests(unittest.TestCase):
         self.assertIn(pr_url, pr_events[0][2])
 
         # Verify state persisted with notified_events._plan_
-        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        state = self.opsx_plan.state_mod.load_state(self.repo, self.plan_name)
         ne = state.get("notified_events", {})
         self.assertIn("_plan_", ne, f"notified_events missing _plan_: {ne}")
         self.assertIn("pull_request_opened", ne["_plan_"])
@@ -12743,7 +5616,7 @@ class RunEventNotificationTests(unittest.TestCase):
         self.assertEqual(awaiting[0][1], self.cid)
 
         # Verify state persisted with notified_events
-        state = self.opsx_plan.load_state(self.repo, self.plan_name)
+        state = self.opsx_plan.state_mod.load_state(self.repo, self.plan_name)
         ne = state.get("notified_events", {})
         self.assertIn(self.cid, ne, f"notified_events missing {self.cid}: {ne}")
         self.assertIn("awaiting_approval", ne[self.cid])
@@ -12764,7 +5637,7 @@ class RunEventNotificationTests(unittest.TestCase):
         )
 
         # Pre-populate state: change is done, plan_complete already notified
-        state_path = self.opsx_plan.state_path(self.repo, self.plan_name)
+        state_path = self.opsx_plan.state_mod.state_path(self.repo, self.plan_name)
         state_path.parent.mkdir(parents=True, exist_ok=True)
         initial_state = {
             "plan": self.plan_name,
@@ -12784,15 +5657,15 @@ class RunEventNotificationTests(unittest.TestCase):
                     "last_result": "archive_passed",
                     "task_counts": {"complete": 2, "total": 2},
                     "tracked_change_files": [],
-                    "context_cache": self.opsx_plan.default_context_cache(),
-                    "last_review": self.opsx_plan.default_last_review(),
+                    "context_cache": self.opsx_plan.state_mod.default_context_cache(),
+                    "last_review": self.opsx_plan.state_mod.default_last_review(),
                     "archive": {
                         "status": "passed",
                         "path": archive_path,
                         "commit": commit,
                         "reason": "",
                         "spec_sync_status": "no-delta",
-                        "triage": self.opsx_plan.default_archive_state()["triage"],
+                        "triage": self.opsx_plan.state_mod.default_archive_state()["triage"],
                     },
                     "history": [],
                     "telemetry": {"latest_telemetry": ""},
@@ -12803,7 +5676,7 @@ class RunEventNotificationTests(unittest.TestCase):
                     "create_attempts": 0,
                     "created_by_orchestrator": False,
                     "accepted": False,
-                    "last_stage": self.opsx_plan.default_last_stage(),
+                    "last_stage": self.opsx_plan.state_mod.default_last_stage(),
                     "last_log": "",
                 }
             },
@@ -12847,7 +5720,7 @@ class RunEventNotificationTests(unittest.TestCase):
         )
 
         # Pre-populate state: change is done, PR already notified
-        state_path = self.opsx_plan.state_path(self.repo, self.plan_name)
+        state_path = self.opsx_plan.state_mod.state_path(self.repo, self.plan_name)
         state_path.parent.mkdir(parents=True, exist_ok=True)
         initial_state = {
             "plan": self.plan_name,
@@ -12874,15 +5747,15 @@ class RunEventNotificationTests(unittest.TestCase):
                     "last_result": "archive_passed",
                     "task_counts": {"complete": 2, "total": 2},
                     "tracked_change_files": [],
-                    "context_cache": self.opsx_plan.default_context_cache(),
-                    "last_review": self.opsx_plan.default_last_review(),
+                    "context_cache": self.opsx_plan.state_mod.default_context_cache(),
+                    "last_review": self.opsx_plan.state_mod.default_last_review(),
                     "archive": {
                         "status": "passed",
                         "path": archive_path,
                         "commit": commit,
                         "reason": "",
                         "spec_sync_status": "no-delta",
-                        "triage": self.opsx_plan.default_archive_state()["triage"],
+                        "triage": self.opsx_plan.state_mod.default_archive_state()["triage"],
                     },
                     "history": [],
                     "telemetry": {"latest_telemetry": ""},
@@ -12893,7 +5766,7 @@ class RunEventNotificationTests(unittest.TestCase):
                     "create_attempts": 0,
                     "created_by_orchestrator": False,
                     "accepted": False,
-                    "last_stage": self.opsx_plan.default_last_stage(),
+                    "last_stage": self.opsx_plan.state_mod.default_last_stage(),
                     "last_log": "",
                 }
             },
@@ -13006,9 +5879,9 @@ class SingleChangeManifestTests(unittest.TestCase):
 
         def fake_run_dc(repo, cfg, state, cid, budget_usd=0.0):
             self.assertEqual(cid, self.cid)
-            r = self.opsx_plan.rec(state, cid)
+            r = self.opsx_plan.state_mod.rec(state, cid)
             r["phase"] = "done"
-            self.opsx_plan.set_status(state, cid, self.opsx_plan.base.DONE, "done")
+            self.opsx_plan.state_mod.set_status(state, cid, self.opsx_plan.base.DONE, "done")
             return self.opsx_plan.base.DONE
 
         with mock.patch.object(
@@ -13075,9 +5948,9 @@ class SingleChangeManifestTests(unittest.TestCase):
         args = argparse.Namespace(repo=str(self.repo), change=self.cid)
 
         def fake_run_dc(repo, cfg, state, cid, budget_usd=0.0):
-            r = self.opsx_plan.rec(state, cid)
+            r = self.opsx_plan.state_mod.rec(state, cid)
             r["phase"] = "done"
-            self.opsx_plan.set_status(state, cid, self.opsx_plan.base.DONE, "done")
+            self.opsx_plan.state_mod.set_status(state, cid, self.opsx_plan.base.DONE, "done")
             return self.opsx_plan.base.DONE
 
         with mock.patch.object(
@@ -13496,555 +6369,6 @@ class ArchivePlanCommandTests(unittest.TestCase):
             self.opsx_plan.planref.read_active_plan(self.repo), rel_b,
             "active-plan pointer referencing a different plan must be preserved",
         )
-
-
-class CompileOptionalOutputTests(unittest.TestCase):
-    """7.8–7.9: compile default output and discover_template_pairs ordering."""
-
-    def setUp(self) -> None:
-        self.opsx_plan = load_opsx_plan()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.repo = Path(self.tmp.name)
-        git(self.repo, "init")
-        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
-        git(self.repo, "add", "tracked.txt")
-        git(
-            self.repo,
-            "-c",
-            "user.email=test@example.invalid",
-            "-c",
-            "user.name=Test User",
-            "commit",
-            "-m",
-            "init",
-        )
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-
-    def test_discover_template_pairs_includes_archived(self):
-        """7.9"""
-        plans_dir = self.repo / "openspec" / "plans"
-        plans_dir.mkdir(parents=True)
-        archived_dir = plans_dir / "archived"
-        archived_dir.mkdir(parents=True)
-
-        (plans_dir / "active.md").write_text("# active\n", encoding="utf-8")
-        (plans_dir / "active.toml").write_text("", encoding="utf-8")
-        (archived_dir / "done.md").write_text("# done\n", encoding="utf-8")
-        (archived_dir / "done.toml").write_text("", encoding="utf-8")
-
-        pairs = self.opsx_plan.discover_template_pairs(self.repo)
-        self.assertEqual(len(pairs), 2)
-        # The active pair must come first
-        first_md = pairs[0][0]
-        self.assertIn("active.md", str(first_md))
-        second_md = pairs[1][0]
-        self.assertIn("done.md", str(second_md))
-
-
-class SamplePlanTests(unittest.TestCase):
-    """7.10–7.13: Canonical sample plan pair."""
-
-    def setUp(self) -> None:
-        self.opsx_plan = load_opsx_plan()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.repo = Path(self.tmp.name)
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-
-    def test_sample_toml_loads(self):
-        """7.10 — load_plan preserves pause_before gates and dependency edges"""
-        sample_dir = (
-            Path(__file__).resolve().parents[2] / "orchestrator" / "samples"
-        )
-        toml_path = sample_dir / "sample-plan.toml"
-        md_path = sample_dir / "sample-plan.md"
-        self.assertTrue(toml_path.is_file(), f"sample not found: {toml_path}")
-        self.assertTrue(md_path.is_file())
-
-        cfg = self.opsx_plan.planref.load_plan(toml_path)
-        self.assertEqual(cfg["name"], "sample-implementation-plan")
-        self.assertEqual(cfg["adapter"], "opencode")
-
-        changes = cfg["changes"]
-        expected_ids = {
-            "add-input-validation", "add-unit-tests",
-            "fix-tax-calculation", "add-discount-code-verification",
-            "integrate-payment-gateway-v2",
-        }
-        self.assertEqual(set(changes.keys()), expected_ids)
-
-        # Dependency edges
-        self.assertEqual(
-            set(changes["fix-tax-calculation"]["depends_on"]),
-            {"add-unit-tests"},
-        )
-        self.assertEqual(
-            set(changes["integrate-payment-gateway-v2"]["depends_on"]),
-            {"add-input-validation", "add-discount-code-verification"},
-        )
-        self.assertEqual(
-            changes["add-unit-tests"]["depends_on"], [],
-        )
-
-        # pause_before gates
-        self.assertTrue(
-            changes["add-input-validation"]["pause_before"],
-            "add-input-validation must have pause_before = true",
-        )
-        self.assertTrue(
-            changes["integrate-payment-gateway-v2"]["pause_before"],
-            "integrate-payment-gateway-v2 must have pause_before = true",
-        )
-        self.assertFalse(
-            changes["add-unit-tests"]["pause_before"],
-            "add-unit-tests must have pause_before = false",
-        )
-        gated = cfg["order"][0]
-        self.assertEqual(gated, "add-input-validation")
-
-    def test_sample_exercises_full_surface(self):
-        """7.11"""
-        import tomllib
-        sample_dir = (
-            Path(__file__).resolve().parents[2] / "orchestrator" / "samples"
-        )
-        toml_path = sample_dir / "sample-plan.toml"
-        raw = tomllib.loads(toml_path.read_text(encoding="utf-8"))
-
-        plan = raw["plan"]
-        # Every plan key the loader reads (except adapter defaults) must be present
-        plan_keys = set(plan.keys())
-        # The loader silently drops unknown keys — we assert the sample carries
-        # no keys the loader ignores
-        known_plan_keys = {
-            "name", "adapter", "invoke", "state_file",
-            "implement_invoke", "review_invoke", "archive_invoke",
-            "timeout_minutes", "max_attempts", "max_rounds", "no_progress_limit",
-            "escalate_after_review_fails", "finding_recurrence_limit",
-            "fast_checks", "check_timeout_minutes", "require_clean_tracked",
-            "skip_warning", "skip_suggestion",
-            "notify_cmd", "plan_doc", "create_invoke",
-            "create_timeout_minutes", "create_max_attempts",
-            "review_created", "created_check", "git_delivery",
-        }
-        unknown = plan_keys - known_plan_keys
-        self.assertEqual(
-            unknown, set(),
-            f"sample carries keys the loader ignores: {unknown}",
-        )
-        # Assert every known plan key is present in the sample
-        missing_plan = known_plan_keys - plan_keys
-        self.assertEqual(
-            missing_plan, set(),
-            f"sample is missing plan keys the loader reads: {missing_plan}",
-        )
-
-        known_change_keys = {
-            "id", "phase", "depends_on", "pause_before", "enabled",
-            "timeout_minutes", "max_attempts", "create_invoke", "create_max_attempts",
-        }
-        all_change_keys: set[str] = set()
-        for change in raw["changes"]:
-            unknown = set(change.keys()) - known_change_keys
-            self.assertEqual(
-                unknown, set(),
-                f"change {change.get('id')} carries keys the loader ignores: {unknown}",
-            )
-            all_change_keys |= set(change.keys())
-        # Assert all known change keys appear in at least one change entry
-        missing_change = known_change_keys - all_change_keys
-        self.assertEqual(
-            missing_change, set(),
-            f"sample is missing change keys the loader reads: {missing_change}",
-        )
-
-    def test_sample_files_resolve_via_helper(self):
-        """7.13"""
-        pair = self.opsx_plan.resolve_sample_plan_pair()
-        self.assertIsNotNone(pair, "resolve_sample_plan_pair must find the canonical pair")
-        md, toml = pair
-        self.assertTrue(toml.is_file())
-        self.assertTrue(md.is_file())
-
-    def test_build_compile_prompt_includes_sample(self):
-        """7.12 — with no repo plans, sample appears and no 'no pairs' text"""
-        prompt = self.opsx_plan.build_compile_prompt(
-            "# Source\n", Path("docs/test.md"), self.repo, adapter="opencode",
-        )
-        self.assertIn("Sample plan (canonical)", prompt)
-        self.assertIn("Sample manifest (canonical)", prompt)
-        self.assertNotIn("No `openspec/plans/*.md` template plan pairs were found", prompt)
-
-    def test_sample_pair_ordered_before_repo_pairs(self):
-        """7.13"""
-        plans_dir = self.repo / "openspec" / "plans"
-        plans_dir.mkdir(parents=True)
-        (plans_dir / "repo-plan.md").write_text("# repo\n", encoding="utf-8")
-        (plans_dir / "repo-plan.toml").write_text("", encoding="utf-8")
-
-        prompt = self.opsx_plan.build_compile_prompt(
-            "# Source\n", Path("docs/test.md"), self.repo, adapter="opencode",
-        )
-        sample_idx = prompt.find("Sample plan (canonical)")
-        repo_idx = prompt.find("Repository template plans")
-        self.assertNotEqual(sample_idx, -1)
-        self.assertNotEqual(repo_idx, -1)
-        self.assertLess(sample_idx, repo_idx,
-                        "canonical sample must appear before repo pairs")
-
-    def test_installed_samples_preferred_over_checkout(self):
-        """Lifecycle/drift: installed samples take precedence over checkout
-        when both exist.  The installed copy is the one the operator actually
-        deployed, so it must be authoritative."""
-        import pathlib
-        import unittest.mock as um
-
-        # Create an installed samples directory with distinct content.
-        fake_home = self.repo / ".fake-home"
-        installed_samples = (
-            fake_home / ".local" / "lib" / "opsx-controller" / "samples"
-        )
-        installed_samples.mkdir(parents=True)
-        installed_md = installed_samples / "sample-plan.md"
-        installed_toml = installed_samples / "sample-plan.toml"
-        installed_md.write_text("# installed sample precedence\n", encoding="utf-8")
-        installed_toml.write_text(
-            '[plan]\nname = "installed-precedence"\nadapter = "opencode"\n\n'
-            '[[changes]]\nid = "precedence-ch"\n',
-            encoding="utf-8",
-        )
-
-        # Patch Path.home() so the installed probe returns our fake home.
-        # The function checks installed first, so it should return the
-        # installed pair even when checkout samples also exist.
-        with um.patch.object(pathlib.Path, "home", return_value=fake_home):
-            pair = self.opsx_plan.resolve_sample_plan_pair()
-            self.assertIsNotNone(
-                pair, "resolve_sample_plan_pair must find installed sample"
-            )
-            md, toml = pair
-            self.assertIn(
-                "installed sample precedence",
-                md.read_text(encoding="utf-8"),
-                "must prefer installed sample content",
-            )
-
-    def test_checkout_fallback_when_installed_absent(self):
-        """Lifecycle/drift: when installed samples are absent, fall back to
-        the checkout copy."""
-        import pathlib
-        import unittest.mock as um
-
-        temp_home = self.repo / ".empty-home"
-        temp_home.mkdir(parents=True)
-        # Ensure the installed samples path exists but is empty.
-        (temp_home / ".local" / "lib" / "opsx-controller" / "samples").mkdir(
-            parents=True
-        )
-
-        with um.patch.object(pathlib.Path, "home", return_value=temp_home):
-            pair = self.opsx_plan.resolve_sample_plan_pair()
-            self.assertIsNotNone(
-                pair, "must fall back to checkout sample when installed is absent"
-            )
-
-    def test_resolve_sample_plan_pair_none_when_both_missing(self):
-        """Lifecycle: resolve_sample_plan_pair returns None when neither
-        installed nor checkout locations hold samples."""
-        import pathlib
-        import unittest.mock as um
-
-        temp_home = self.repo / ".no-samples-home"
-        temp_home.mkdir(parents=True)
-        (temp_home / ".local" / "lib" / "opsx-controller" / "samples").mkdir(
-            parents=True
-        )
-
-        # Patch _RUNTIME_ROOTS to point at a directory without samples.
-        fake_root = self.repo / ".fake-orchestrator-root"
-        fake_root.mkdir(parents=True)
-        (fake_root / "orchestrator").mkdir(parents=True)
-        # No samples/ dir under orchestrator/.
-
-        with um.patch.object(pathlib.Path, "home", return_value=temp_home):
-            with um.patch.object(
-                self.opsx_plan, "_RUNTIME_ROOTS", (fake_root,),
-            ):
-                pair = self.opsx_plan.resolve_sample_plan_pair()
-                self.assertIsNone(
-                    pair, "must return None when no sample pair exists"
-                )
-
-    def test_both_sample_gates_load_and_exercise_full_surface(self):
-        """Assert the canonical sample pair passes load_plan + field surface
-        checks from both the installed and checkout resolution gates."""
-        import pathlib
-        import tomllib
-        import unittest.mock as um
-
-        checkout_dir = (
-            Path(__file__).resolve().parents[2] / "orchestrator" / "samples"
-        )
-        checkout_toml = checkout_dir / "sample-plan.toml"
-        checkout_md = checkout_dir / "sample-plan.md"
-
-        known_plan_keys = {
-            "name", "adapter", "invoke", "state_file",
-            "implement_invoke", "review_invoke", "archive_invoke",
-            "timeout_minutes", "max_attempts", "max_rounds",
-            "no_progress_limit", "escalate_after_review_fails",
-            "finding_recurrence_limit",
-            "fast_checks", "check_timeout_minutes",
-            "require_clean_tracked", "skip_warning", "skip_suggestion",
-            "notify_cmd", "plan_doc",
-            "create_invoke", "create_timeout_minutes", "create_max_attempts",
-            "review_created", "created_check", "git_delivery",
-        }
-
-        def _assert_sample_surface(toml_path, label):
-            """Gate: load_plan succeeds and no loader-ignored keys exist."""
-            cfg = self.opsx_plan.planref.load_plan(toml_path)
-            self.assertEqual(cfg["name"], "sample-implementation-plan",
-                             f"{label}: plan name mismatch")
-            raw = tomllib.loads(toml_path.read_text(encoding="utf-8"))
-            unknown = set(raw["plan"].keys()) - known_plan_keys
-            self.assertEqual(unknown, set(),
-                             f"{label}: carries unknown plan keys: {unknown}")
-
-        # --- Gate 1: checkout fallback (always available) ---
-        empty_home = self.repo / ".empty-home-for-gate1"
-        empty_home.mkdir(parents=True)
-        (empty_home / ".local" / "lib" / "opsx-controller" / "samples").mkdir(
-            parents=True
-        )
-        with um.patch.object(pathlib.Path, "home", return_value=empty_home):
-            pair = self.opsx_plan.resolve_sample_plan_pair()
-            self.assertIsNotNone(pair, "checkout fallback must resolve")
-            md, toml = pair
-            _assert_sample_surface(toml, "checkout gate")
-
-        # --- Gate 2: installed samples (deterministic) ---
-        fake_home = self.repo / ".fake-home-for-gate2"
-        fake_home.mkdir(parents=True)
-        installed_samples = (
-            fake_home / ".local" / "lib" / "opsx-controller" / "samples"
-        )
-        installed_samples.mkdir(parents=True)
-        # Copy the real sample files into the fake installed location so
-        # the gate exercises identical content.
-        import shutil
-        shutil.copy2(checkout_toml, installed_samples / "sample-plan.toml")
-        shutil.copy2(checkout_md, installed_samples / "sample-plan.md")
-
-        with um.patch.object(pathlib.Path, "home", return_value=fake_home):
-            pair = self.opsx_plan.resolve_sample_plan_pair()
-            self.assertIsNotNone(pair, "installed gate must resolve")
-            md, toml = pair
-            self.assertIn(
-                str(fake_home), str(toml),
-                "installed gate must return the installed path, not checkout",
-            )
-            _assert_sample_surface(toml, "installed gate")
-
-    def test_installer_deploys_samples(self):
-        """Verify the installer deploys sample files to the runtime
-        samples directory."""
-        import pathlib
-        import shutil
-        from unittest import mock as um
-
-        fake_home = self.repo / ".fake-home-install"
-        fake_home.mkdir()
-
-        installer = (
-            Path(__file__).resolve().parents[2]
-            / "scripts" / "install-orchestrator.sh"
-        )
-        checkout = Path(__file__).resolve().parents[2]
-
-        env = {**os.environ, "HOME": str(fake_home)}
-        result = subprocess.run(
-            ["bash", str(installer), str(checkout)],
-            cwd=str(self.repo),
-            capture_output=True,
-            text=True,
-            env=env,
-        )
-        self.assertEqual(
-            result.returncode, 0,
-            f"installer failed: {result.stderr}",
-        )
-
-        samples_dir = (
-            fake_home / ".local" / "lib" / "opsx-controller" / "samples"
-        )
-        self.assertTrue(
-            (samples_dir / "sample-plan.md").is_file(),
-            "installer must deploy sample-plan.md",
-        )
-        self.assertTrue(
-            (samples_dir / "sample-plan.toml").is_file(),
-            "installer must deploy sample-plan.toml",
-        )
-
-    def test_installer_refreshes_samples(self):
-        """Verify re-running the installer replaces previously installed
-        sample files (refresh, not append)."""
-        fake_home = self.repo / ".fake-home-refresh"
-        fake_home.mkdir()
-
-        installer = (
-            Path(__file__).resolve().parents[2]
-            / "scripts" / "install-orchestrator.sh"
-        )
-        checkout = Path(__file__).resolve().parents[2]
-        env = {**os.environ, "HOME": str(fake_home)}
-
-        # First install.
-        result1 = subprocess.run(
-            ["bash", str(installer), str(checkout)],
-            cwd=str(self.repo),
-            capture_output=True,
-            text=True,
-            env=env,
-        )
-        self.assertEqual(result1.returncode, 0)
-
-        samples_dir = (
-            fake_home / ".local" / "lib" / "opsx-controller" / "samples"
-        )
-        toml_path = samples_dir / "sample-plan.toml"
-        original = toml_path.read_text(encoding="utf-8")
-
-        # Corrupt the installed sample.
-        toml_path.write_text("# corrupted\n", encoding="utf-8")
-
-        # Re-install (refresh).
-        result2 = subprocess.run(
-            ["bash", str(installer), str(checkout)],
-            cwd=str(self.repo),
-            capture_output=True,
-            text=True,
-            env=env,
-        )
-        self.assertEqual(result2.returncode, 0)
-
-        restored = toml_path.read_text(encoding="utf-8")
-        self.assertEqual(
-            restored, original,
-            "re-running the installer must restore the original sample content",
-        )
-
-
-class EscalationStateMigrationTests(unittest.TestCase):
-    """Verify that pre-escalation state files are migrated with defaults."""
-
-    def setUp(self) -> None:
-        self.opsx_plan = load_opsx_plan()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.repo = Path(self.tmp.name)
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-
-    def test_load_state_adds_default_escalation_fields(self) -> None:
-        """Load a state file that lacks the escalation key; verify defaults."""
-        state_path = self.opsx_plan.state_path(self.repo, "test-plan")
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        existing = {
-            "plan": "test-plan",
-            "approvals": [],
-            "changes": {
-                "c1": {
-                    "status": self.opsx_plan.base.DONE,
-                    "phase": "done",
-                    "round": 2,
-                    "max_rounds": 3,
-                    "no_progress_streak": 0,
-                    "latest_fix_prompt": "",
-                    "last_result": "review_passed",
-                    "task_counts": {"complete": 2, "total": 2},
-                    "tracked_change_files": [],
-                    "context_cache": self.opsx_plan.default_context_cache(),
-                    "last_review": self.opsx_plan.default_last_review(),
-                    "archive": self.opsx_plan.default_archive_state(),
-                    "history": [],
-                    "telemetry": {"latest_telemetry": ""},
-                    "change": "c1",
-                    "attempts": 0,
-                    "reason": "",
-                    "updated_at": "",
-                    "create_attempts": 0,
-                    "created_by_orchestrator": False,
-                    "accepted": False,
-                    "last_stage": self.opsx_plan.default_last_stage(),
-                    "last_log": "",
-                    # NOTE: no "escalation" key — pre-escalation state
-                }
-            },
-        }
-        state_path.write_text(json.dumps(existing), encoding="utf-8")
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
-        rec = state["changes"]["c1"]
-        self.assertIn("escalation", rec,
-                      "merge_defaults must add escalation key")
-        esc = rec["escalation"]
-        self.assertIsInstance(esc, dict)
-        self.assertFalse(esc["active"])
-        self.assertEqual(esc["activated_round"], 0)
-        self.assertEqual(esc["model"], "")
-
-    def test_load_state_preserves_existing_escalation_fields(self) -> None:
-        """Load a state file that already has active escalation; verify preserved."""
-        state_path = self.opsx_plan.state_path(self.repo, "test-plan")
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        existing = {
-            "plan": "test-plan",
-            "approvals": [],
-            "changes": {
-                "c1": {
-                    "status": self.opsx_plan.base.RUNNING,
-                    "phase": "implement",
-                    "round": 4,
-                    "max_rounds": 5,
-                    "no_progress_streak": 0,
-                    "latest_fix_prompt": "",
-                    "last_result": "",
-                    "task_counts": {"complete": 4, "total": 10},
-                    "tracked_change_files": [],
-                    "context_cache": self.opsx_plan.default_context_cache(),
-                    "last_review": self.opsx_plan.default_last_review(),
-                    "archive": self.opsx_plan.default_archive_state(),
-                    "history": [],
-                    "telemetry": {"latest_telemetry": ""},
-                    "escalation": {
-                        "active": True,
-                        "activated_round": 3,
-                        "model": "deepseek/v4-ultra",
-                    },
-                    "change": "c1",
-                    "attempts": 0,
-                    "reason": "",
-                    "updated_at": "",
-                    "create_attempts": 0,
-                    "created_by_orchestrator": False,
-                    "accepted": False,
-                    "last_stage": self.opsx_plan.default_last_stage(),
-                    "last_log": "",
-                }
-            },
-        }
-        state_path.write_text(json.dumps(existing), encoding="utf-8")
-        state = self.opsx_plan.load_state(self.repo, "test-plan")
-        esc = state["changes"]["c1"]["escalation"]
-        self.assertTrue(esc["active"])
-        self.assertEqual(esc["activated_round"], 3)
-        self.assertEqual(esc["model"], "deepseek/v4-ultra")
-
-
 class ModelsCommandTests(unittest.TestCase):
     """5.4: cmd_models_show/env/init handle the optional escalation role."""
 
@@ -14255,7 +6579,7 @@ class ReviewGateSkipSeverityTests(unittest.TestCase):
         action = self.opsx_plan.apply_review_result(
             self.repo, cfg, self.state, self.cid, payload
         )
-        return action, self.opsx_plan.rec(self.state, self.cid)
+        return action, self.opsx_plan.state_mod.rec(self.state, self.cid)
 
     def test_default_gate_requires_all_counts_zero(self) -> None:
         _, record = self._apply(self._cfg(), self._review("fail", 0, 1, 0))
@@ -14309,7 +6633,7 @@ class ReviewGateSkipSeverityTests(unittest.TestCase):
 
     def test_review_history_records_counts_regardless_of_gate(self) -> None:
         self._apply(self._cfg(skip_warning=True), self._review("fail", 0, 2, 1))
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         entry = record["history"][-1]
         self.assertEqual(entry["phase"], "review")
         self.assertEqual(
@@ -14466,7 +6790,7 @@ class FindingRecurrenceDetectionTests(unittest.TestCase):
         # Real dispatch syncs r["max_rounds"] from cfg before every stage
         # (see run_direct_change); direct apply_review_result calls in these
         # tests must do the same or the state-default max_rounds=5 governs.
-        r = self.opsx_plan.rec(self.state, self.cid)
+        r = self.opsx_plan.state_mod.rec(self.state, self.cid)
         r["max_rounds"] = cfg["max_rounds"]
         return self.opsx_plan.apply_review_result(
             self.repo, cfg, self.state, self.cid, payload
@@ -14479,7 +6803,7 @@ class FindingRecurrenceDetectionTests(unittest.TestCase):
         cfg = self._cfg(finding_recurrence_limit=3)
         citing_rounds = {4, 5, 7, 8}
         for round_num in range(1, 9):
-            r = self.opsx_plan.rec(self.state, self.cid)
+            r = self.opsx_plan.state_mod.rec(self.state, self.cid)
             self.assertEqual(r["round"], round_num)
             pairs = (
                 [("critical", "src/widget.py")]
@@ -14487,7 +6811,7 @@ class FindingRecurrenceDetectionTests(unittest.TestCase):
                 else [("critical", f"src/other{round_num}.py")]
             )
             action = self._apply(cfg, self._review(round_num, pairs))
-            record = self.opsx_plan.rec(self.state, self.cid)
+            record = self.opsx_plan.state_mod.rec(self.state, self.cid)
             if round_num == 7:
                 self.assertEqual(action, "stop")
                 self.assertEqual(record["last_result"], "finding_recurrence_exceeded")
@@ -14511,7 +6835,7 @@ class FindingRecurrenceDetectionTests(unittest.TestCase):
             ]
             action = self._apply(cfg, self._review(round_num, pairs))
             self.assertEqual(action, "continue")
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         self.assertEqual(record["last_result"], "review_failed")
         self.assertNotEqual(record["status"], self.opsx_plan.base.FAILED)
 
@@ -14543,7 +6867,7 @@ class FindingRecurrenceDetectionTests(unittest.TestCase):
             "next_phase": "archive",
         }
         action = self._apply(cfg, pass_payload)
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         self.assertEqual(action, "continue")
         self.assertEqual(record["last_result"], "review_passed")
         self.assertEqual(record["phase"], "archive")
@@ -14554,13 +6878,13 @@ class FindingRecurrenceDetectionTests(unittest.TestCase):
         cfg = self._cfg(finding_recurrence_limit=0, max_rounds=4)
         for round_num in range(1, 5):
             action = self._apply(cfg, self._review(round_num, [("critical", "src/widget.py")]))
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         self.assertEqual(record["last_result"], "max_rounds_reached")
 
     def test_prior_finding_loci_present_and_empty_on_first_round(self) -> None:
         """6.2: PRIOR_FINDING_LOCI is present and explicitly empty for a
         change's first review round."""
-        r = self.opsx_plan.rec(self.state, self.cid)
+        r = self.opsx_plan.state_mod.rec(self.state, self.cid)
         block = self.opsx_plan.build_worker_input(
             self.repo, self._cfg(), self.state, self.cid, stage="review"
         )
@@ -14598,7 +6922,7 @@ class FindingRecurrenceDetectionTests(unittest.TestCase):
         cfg = self._cfg(finding_recurrence_limit=2)
         for round_num in (1, 2):
             action = self._apply(cfg, self._review(round_num, [("critical", "src/widget.py")]))
-        record = self.opsx_plan.rec(self.state, self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         self.assertEqual(action, "stop")
         self.assertEqual(record["last_result"], "finding_recurrence_exceeded")
 
