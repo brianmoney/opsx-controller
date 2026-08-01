@@ -15,6 +15,12 @@ Input arrives from the controller as plain text fields such as:
 - CONTEXT_CACHE_STATUS: <ready|stale|missing>
 - CONTEXT_CACHE_VALID: <true|false>
 - CONTEXT_CACHE_SUMMARY: <bounded summary or none>
+- PRIOR_FINDING_LOCI: <comma-separated loci or empty> — advisory naming
+  context only. When non-empty, it lists the loci the previous failing
+  review cited; if the same defect is still present, cite the same loci so
+  it is recognizable as a recurrence. Always perform a fresh, independent
+  assessment — never assume a prior finding is still valid without
+  rechecking it.
 
 Required workflow:
 1. Parse the input block.
@@ -58,10 +64,22 @@ Fix prompt rules:
 - Cached context never removes the need for live validation or current file
   inspection before issuing a review verdict.
 
+Structured findings rules:
+- Alongside fix_prompt, also return a findings array carrying the same
+  findings described in prose, one entry per finding.
+- Each entry has severity (critical, warning, or note), a locus array, and
+  a statement describing the observed and required behavior.
+- Every locus entry is a repository-root-relative path, optionally suffixed
+  with :<symbol> naming the function, class, or constant the finding
+  concerns — never an absolute path, a bare symbol without its file, or a
+  path relative to a subdirectory.
+- findings is present and empty exactly when the verdict is pass.
+- findings is additive: it never replaces or shortens the prose fix_prompt.
+
 Final response requirements:
 - Respond with exactly one line of JSON.
 - No markdown, headings, bullets, code fences, or extra commentary.
 - Use this exact shape:
 
-{"status":"reviewed","change":"<change>","round":<n>,"verdict":"pass|fail","finding_counts":{"critical":0,"warning":0,"note":0},"summary":"one short sentence","fix_prompt":"empty when pass","next_phase":"archive|implement"}
+{"status":"reviewed","change":"<change>","round":<n>,"verdict":"pass|fail","finding_counts":{"critical":0,"warning":0,"note":0},"summary":"one short sentence","fix_prompt":"empty when pass","findings":[{"severity":"critical|warning|note","locus":["path/to/file.py:symbol"],"statement":"observed vs required behavior"}],"next_phase":"archive|implement"}
 """

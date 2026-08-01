@@ -58,6 +58,40 @@ def _run_installer(installer: Path, home: Path, env: dict[str, str]) -> None:
     )
 
 
+def _run_installer_project(
+    installer: Path, project: Path, home: Path, env: dict[str, str]
+) -> subprocess.CompletedProcess:
+    """Run a project installer pointing at *project* with *home* as HOME.
+
+    Returns the ``CompletedProcess`` so callers can inspect stdout/stderr.
+    """
+    return subprocess.run(
+        ["bash", str(installer), "--project", str(project)],
+        cwd=_REPO,
+        env={**os.environ, **env},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _run_installer_verify(
+    installer: Path, home: Path, env: dict[str, str]
+) -> subprocess.CompletedProcess:
+    """Run a global installer with --verify.
+
+    Returns the ``CompletedProcess`` so callers can inspect stdout and
+    return code (verification failures produce non-zero exits).
+    """
+    return subprocess.run(
+        ["bash", str(installer), "--global", "--verify"],
+        cwd=_REPO,
+        env={**os.environ, **env},
+        capture_output=True,
+        text=True,
+    )
+
+
 class SharedInstallerHelperTests(unittest.TestCase):
     """Exercise the shared helper directly."""
 
@@ -204,6 +238,483 @@ class AdapterInstallerTests(unittest.TestCase):
         _run_installer(_CODEX_INSTALLER, Path(self.home.name), self.env)
         self._assert_executables_installed()
         self._assert_runtime_libraries_installed()
+
+    # -- plan-authoring reference global install assertions -------------------
+
+    def _assert_plan_authoring_reference_in_shared_lib(self) -> None:
+        """The shared orchestrator must deploy the reference to
+        ``~/.local/lib/opsx-controller/plan-authoring.md``."""
+        ref = (
+            Path(self.home.name) / ".local" / "lib"
+            / "opsx-controller" / "plan-authoring.md"
+        )
+        self.assertTrue(ref.is_file(),
+                        f"shared plan-authoring reference missing at {ref}")
+        source = _REPO / "core" / "plan-authoring.md"
+        self.assertEqual(
+            hashlib.sha256(source.read_bytes()).digest(),
+            hashlib.sha256(ref.read_bytes()).digest(),
+            f"shared plan-authoring reference content differs from source",
+        )
+
+    def _assert_opencode_support_has_reference(self) -> None:
+        ref = Path(self.home.name) / ".config" / "opencode" / "opsx-controller" / "plan-authoring.md"
+        self.assertTrue(ref.is_file(),
+                        f"OpenCode plan-authoring reference missing at {ref}")
+        source = _REPO / "core" / "plan-authoring.md"
+        self.assertEqual(
+            hashlib.sha256(source.read_bytes()).digest(),
+            hashlib.sha256(ref.read_bytes()).digest(),
+        )
+
+    def _assert_claude_support_has_reference(self) -> None:
+        ref = Path(self.home.name) / ".claude" / "opsx-controller" / "plan-authoring.md"
+        self.assertTrue(ref.is_file(),
+                        f"Claude Code plan-authoring reference missing at {ref}")
+        source = _REPO / "core" / "plan-authoring.md"
+        self.assertEqual(
+            hashlib.sha256(source.read_bytes()).digest(),
+            hashlib.sha256(ref.read_bytes()).digest(),
+        )
+
+    def _assert_codex_support_has_reference(self) -> None:
+        ref = Path(self.home.name) / ".codex" / "opsx-controller" / "plan-authoring.md"
+        self.assertTrue(ref.is_file(),
+                        f"Codex CLI plan-authoring reference missing at {ref}")
+        source = _REPO / "core" / "plan-authoring.md"
+        self.assertEqual(
+            hashlib.sha256(source.read_bytes()).digest(),
+            hashlib.sha256(ref.read_bytes()).digest(),
+        )
+
+    def test_opencode_global_deploys_plan_authoring_reference(self) -> None:
+        _run_installer(_OPENCODE_INSTALLER, Path(self.home.name), self.env)
+        self._assert_plan_authoring_reference_in_shared_lib()
+        self._assert_opencode_support_has_reference()
+
+    def test_claude_global_deploys_plan_authoring_reference(self) -> None:
+        _run_installer(_CLAUDE_INSTALLER, Path(self.home.name), self.env)
+        self._assert_plan_authoring_reference_in_shared_lib()
+        self._assert_claude_support_has_reference()
+
+    def test_codex_global_deploys_plan_authoring_reference(self) -> None:
+        _run_installer(_CODEX_INSTALLER, Path(self.home.name), self.env)
+        self._assert_plan_authoring_reference_in_shared_lib()
+        self._assert_codex_support_has_reference()
+
+    def test_opencode_global_output_mentions_reference(self) -> None:
+        proc = subprocess.run(
+            ["bash", str(_OPENCODE_INSTALLER), "--global"],
+            cwd=_REPO,
+            env={**os.environ, **self.env},
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        output = proc.stdout + proc.stderr
+        self.assertIn("plan-authoring reference", output,
+                      "OpenCode installer output must mention the plan-authoring reference")
+
+    def test_claude_global_output_mentions_reference(self) -> None:
+        proc = subprocess.run(
+            ["bash", str(_CLAUDE_INSTALLER), "--global"],
+            cwd=_REPO,
+            env={**os.environ, **self.env},
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        output = proc.stdout + proc.stderr
+        self.assertIn("plan-authoring reference", output,
+                      "Claude Code installer output must mention the plan-authoring reference")
+
+    def test_codex_global_output_mentions_reference(self) -> None:
+        proc = subprocess.run(
+            ["bash", str(_CODEX_INSTALLER), "--global"],
+            cwd=_REPO,
+            env={**os.environ, **self.env},
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        output = proc.stdout + proc.stderr
+        self.assertIn("plan-authoring reference", output,
+                      "Codex CLI installer output must mention the plan-authoring reference")
+
+    def test_opencode_verify_succeeds_with_reference(self) -> None:
+        _run_installer(_OPENCODE_INSTALLER, Path(self.home.name), self.env)
+        proc = _run_installer_verify(_OPENCODE_INSTALLER, Path(self.home.name), self.env)
+        self.assertEqual(proc.returncode, 0,
+                         f"OpenCode verify must succeed with reference deployed: {proc.stderr}")
+        self.assertIn("plan-authoring reference deployed and matches source", proc.stdout)
+
+    def test_claude_verify_succeeds_with_reference(self) -> None:
+        _run_installer(_CLAUDE_INSTALLER, Path(self.home.name), self.env)
+        proc = _run_installer_verify(_CLAUDE_INSTALLER, Path(self.home.name), self.env)
+        self.assertEqual(proc.returncode, 0,
+                         f"Claude Code verify must succeed with reference deployed: {proc.stderr}")
+        self.assertIn("plan-authoring reference deployed and matches source", proc.stdout)
+
+    def test_codex_verify_succeeds_with_reference(self) -> None:
+        _run_installer(_CODEX_INSTALLER, Path(self.home.name), self.env)
+        proc = _run_installer_verify(_CODEX_INSTALLER, Path(self.home.name), self.env)
+        self.assertEqual(proc.returncode, 0,
+                         f"Codex CLI verify must succeed with reference deployed: {proc.stderr}")
+        self.assertIn("plan-authoring reference deployed and matches source", proc.stdout)
+
+    def test_repeat_install_replaces_stale_reference_opencode(self) -> None:
+        """A modified reference must be replaced by the source on repeat install."""
+        home = Path(self.home.name)
+        support_dir = home / ".config" / "opencode" / "opsx-controller"
+        support_dir.mkdir(parents=True)
+        (support_dir / "plan-authoring.md").write_text("stale content\n", encoding="utf-8")
+
+        _run_installer(_OPENCODE_INSTALLER, home, self.env)
+
+        installed = support_dir / "plan-authoring.md"
+        source = _REPO / "core" / "plan-authoring.md"
+        self.assertEqual(
+            hashlib.sha256(source.read_bytes()).digest(),
+            hashlib.sha256(installed.read_bytes()).digest(),
+            "repeat install must replace stale plan-authoring reference",
+        )
+
+    def test_repeat_install_replaces_stale_reference_claude(self) -> None:
+        home = Path(self.home.name)
+        support_dir = home / ".claude" / "opsx-controller"
+        support_dir.mkdir(parents=True)
+        (support_dir / "plan-authoring.md").write_text("stale content\n", encoding="utf-8")
+
+        _run_installer(_CLAUDE_INSTALLER, home, self.env)
+
+        installed = support_dir / "plan-authoring.md"
+        source = _REPO / "core" / "plan-authoring.md"
+        self.assertEqual(
+            hashlib.sha256(source.read_bytes()).digest(),
+            hashlib.sha256(installed.read_bytes()).digest(),
+            "repeat install must replace stale plan-authoring reference",
+        )
+
+    def test_repeat_install_replaces_stale_reference_codex(self) -> None:
+        home = Path(self.home.name)
+        support_dir = home / ".codex" / "opsx-controller"
+        support_dir.mkdir(parents=True)
+        (support_dir / "plan-authoring.md").write_text("stale content\n", encoding="utf-8")
+
+        _run_installer(_CODEX_INSTALLER, home, self.env)
+
+        installed = support_dir / "plan-authoring.md"
+        source = _REPO / "core" / "plan-authoring.md"
+        self.assertEqual(
+            hashlib.sha256(source.read_bytes()).digest(),
+            hashlib.sha256(installed.read_bytes()).digest(),
+            "repeat install must replace stale plan-authoring reference",
+        )
+
+    def test_verify_reports_stale_reference_divergence_opencode(self) -> None:
+        """After install, verify must detect a reference that diverged post-install
+        and report it when the installer is re-run (which replaces and reports)."""
+        home = Path(self.home.name)
+        _run_installer(_OPENCODE_INSTALLER, home, self.env)
+
+        # Corrupt the installed reference post-install
+        support_dir = home / ".config" / "opencode" / "opsx-controller"
+        (support_dir / "plan-authoring.md").write_text("post-install corruption\n", encoding="utf-8")
+
+        # Re-install: must replace the corrupted reference and succeed
+        proc = _run_installer_verify(_OPENCODE_INSTALLER, home, self.env)
+        self.assertEqual(proc.returncode, 0,
+                         f"OpenCode verify must succeed after reinstall fixes stale reference: {proc.stderr}")
+        self.assertIn("plan-authoring reference deployed and matches source", proc.stdout)
+
+        # Confirm the reference was actually replaced
+        source = _REPO / "core" / "plan-authoring.md"
+        installed = support_dir / "plan-authoring.md"
+        self.assertEqual(
+            hashlib.sha256(source.read_bytes()).digest(),
+            hashlib.sha256(installed.read_bytes()).digest(),
+            "reinstall must replace post-install-corrupted reference",
+        )
+
+    def test_verify_reports_stale_reference_divergence_claude(self) -> None:
+        home = Path(self.home.name)
+        _run_installer(_CLAUDE_INSTALLER, home, self.env)
+        support_dir = home / ".claude" / "opsx-controller"
+        (support_dir / "plan-authoring.md").write_text("post-install corruption\n", encoding="utf-8")
+        proc = _run_installer_verify(_CLAUDE_INSTALLER, home, self.env)
+        self.assertEqual(proc.returncode, 0,
+                         f"Claude Code verify must succeed after reinstall: {proc.stderr}")
+        self.assertIn("plan-authoring reference deployed and matches source", proc.stdout)
+
+    def test_verify_reports_stale_reference_divergence_codex(self) -> None:
+        home = Path(self.home.name)
+        _run_installer(_CODEX_INSTALLER, home, self.env)
+        support_dir = home / ".codex" / "opsx-controller"
+        (support_dir / "plan-authoring.md").write_text("post-install corruption\n", encoding="utf-8")
+        proc = _run_installer_verify(_CODEX_INSTALLER, home, self.env)
+        self.assertEqual(proc.returncode, 0,
+                         f"Codex CLI verify must succeed after reinstall: {proc.stderr}")
+        self.assertIn("plan-authoring reference deployed and matches source", proc.stdout)
+
+    def test_opencode_install_removes_stale_legacy_commands(self) -> None:
+        """Global reinstall must remove previously-deployed legacy command
+        files that are no longer shipped."""
+        home = Path(self.home.name)
+        cmds = home / ".config" / "opencode" / "commands"
+        cmds.mkdir(parents=True)
+        for legacy in ("opsx-author.md", "opsx-archive-no-prompt.md",
+                       "opsx-verify-auto.md", "opsx-review.md",
+                       "opsx-drive.md"):
+            (cmds / legacy).write_text("stale legacy command\n", encoding="utf-8")
+
+        _run_installer(_OPENCODE_INSTALLER, home, self.env)
+
+        for legacy in ("opsx-author.md", "opsx-archive-no-prompt.md",
+                       "opsx-verify-auto.md", "opsx-review.md",
+                       "opsx-drive.md"):
+            self.assertFalse(
+                (cmds / legacy).exists(),
+                f"stale legacy command {legacy} must be removed by installer",
+            )
+        self.assertTrue(
+            (cmds / "opsx-plan.md").is_file(),
+            "supported command opsx-plan must survive",
+        )
+
+    def test_opencode_install_removes_stale_nested_agent(self) -> None:
+        """Global reinstall must remove the previously-deployed nested
+        opsx-controller agent."""
+        home = Path(self.home.name)
+        agents = home / ".config" / "opencode" / "agents"
+        agents.mkdir(parents=True)
+        (agents / "opsx-controller.md").write_text("stale\n", encoding="utf-8")
+
+        _run_installer(_OPENCODE_INSTALLER, home, self.env)
+
+        self.assertFalse(
+            (agents / "opsx-controller.md").exists(),
+            "stale nested controller agent must be removed",
+        )
+        self.assertTrue(
+            (agents / "opsx-implementer.md").is_file(),
+            "supported worker agent must survive",
+        )
+
+    def test_claude_install_removes_stale_opsx_drive_skill(self) -> None:
+        """Global reinstall must remove previously-deployed opsx-drive skill."""
+        home = Path(self.home.name)
+        drive_dir = home / ".claude" / "skills" / "opsx-drive"
+        drive_dir.mkdir(parents=True)
+        (drive_dir / "SKILL.md").write_text("stale skill\n", encoding="utf-8")
+
+        _run_installer(_CLAUDE_INSTALLER, home, self.env)
+
+        self.assertFalse(
+            drive_dir.exists(),
+            "stale opsx-drive skill must be removed by installer",
+        )
+        self.assertTrue(
+            (home / ".claude" / "skills" / "opsx-plan" / "SKILL.md").is_file(),
+            "supported opsx-plan skill must survive",
+        )
+
+    def test_codex_install_removes_stale_opsx_drive_skill(self) -> None:
+        """Global reinstall must remove previously-deployed opsx-drive skill."""
+        home = Path(self.home.name)
+        drive_dir = home / ".agents" / "skills" / "opsx-drive"
+        drive_dir.mkdir(parents=True)
+        (drive_dir / "SKILL.md").write_text("stale\n", encoding="utf-8")
+
+        _run_installer(_CODEX_INSTALLER, home, self.env)
+
+        self.assertFalse(
+            drive_dir.exists(),
+            "stale opsx-drive skill must be removed by Codex installer",
+        )
+
+    def test_codex_plugin_excludes_stale_opsx_drive(self) -> None:
+        """Codex --plugin output must not contain opsx-drive."""
+        subprocess.run(
+            ["bash", str(_CODEX_INSTALLER), "--plugin"],
+            cwd=_REPO,
+            env={**os.environ, **self.env},
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        plugin_dir = _CODEX_INSTALLER.parent / "plugin"
+        self.assertFalse(
+            (plugin_dir / "skills" / "opsx-drive").exists(),
+            "plugin bundle must not contain opsx-drive",
+        )
+        self.assertTrue(
+            (plugin_dir / "agents").is_dir(),
+            "plugin bundle must contain agent directory",
+        )
+
+    def test_codex_global_install_deploys_opsx_plan_skill(self) -> None:
+        """Codex --global must deploy the opsx-plan skill."""
+        _run_installer(_CODEX_INSTALLER, Path(self.home.name), self.env)
+        skill_path = (
+            Path(self.home.name) / ".agents" / "skills" / "opsx-plan" / "SKILL.md"
+        )
+        self.assertTrue(
+            skill_path.is_file(),
+            f"opsx-plan skill must exist at {skill_path}",
+        )
+        content = skill_path.read_text(encoding="utf-8")
+        self.assertIn("plan-authoring.md", content,
+                       "opsx-plan skill must reference plan-authoring reference")
+
+    def test_codex_plugin_includes_opsx_plan_skill(self) -> None:
+        """Codex --plugin must include the opsx-plan skill."""
+        subprocess.run(
+            ["bash", str(_CODEX_INSTALLER), "--plugin"],
+            cwd=_REPO,
+            env={**os.environ, **self.env},
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        plugin_dir = _CODEX_INSTALLER.parent / "plugin"
+        skill_path = plugin_dir / "skills" / "opsx-plan" / "SKILL.md"
+        self.assertTrue(
+            skill_path.is_file(),
+            "plugin bundle must contain opsx-plan skill",
+        )
+        content = skill_path.read_text(encoding="utf-8")
+        self.assertIn("plan-authoring.md", content,
+                       "plugin opsx-plan skill must reference plan-authoring reference")
+        self.assertIn("unsupported", content,
+                       "Codex opsx-plan skill must state plan-run is unsupported")
+
+
+class ProjectInstallerTests(unittest.TestCase):
+    """Verify that project-level installs deploy the plan-authoring reference."""
+
+    def setUp(self) -> None:
+        self.home = tempfile.TemporaryDirectory()
+        self.project = tempfile.TemporaryDirectory()
+        self.env = {**_model_env(), "HOME": self.home.name}
+
+    def tearDown(self) -> None:
+        self.home.cleanup()
+        self.project.cleanup()
+
+    def _assert_project_reference(self, ref: Path) -> None:
+        self.assertTrue(ref.is_file(),
+                        f"plan-authoring reference missing at {ref}")
+        source = _REPO / "core" / "plan-authoring.md"
+        self.assertEqual(
+            hashlib.sha256(source.read_bytes()).digest(),
+            hashlib.sha256(ref.read_bytes()).digest(),
+            f"project reference content differs from source at {ref}",
+        )
+
+    def test_opencode_project_deploys_reference(self) -> None:
+        proc = _run_installer_project(
+            _OPENCODE_INSTALLER, Path(self.project.name), Path(self.home.name),
+            self.env,
+        )
+        ref = (
+            Path(self.project.name) / ".opencode" / "opsx-controller"
+            / "plan-authoring.md"
+        )
+        self._assert_project_reference(ref)
+        self.assertIn("plan-authoring reference", proc.stdout,
+                      "OpenCode project install output must mention the reference")
+
+    def test_claude_project_deploys_reference(self) -> None:
+        proc = _run_installer_project(
+            _CLAUDE_INSTALLER, Path(self.project.name), Path(self.home.name),
+            self.env,
+        )
+        ref = (
+            Path(self.project.name) / ".claude" / "opsx-controller"
+            / "plan-authoring.md"
+        )
+        self._assert_project_reference(ref)
+        self.assertIn("plan-authoring reference", proc.stdout,
+                      "Claude Code project install output must mention the reference")
+
+    def test_codex_project_deploys_reference(self) -> None:
+        proc = _run_installer_project(
+            _CODEX_INSTALLER, Path(self.project.name), Path(self.home.name),
+            self.env,
+        )
+        ref = (
+            Path(self.project.name) / ".codex" / "opsx-controller"
+            / "plan-authoring.md"
+        )
+        self._assert_project_reference(ref)
+        self.assertIn("plan-authoring reference", proc.stdout,
+                      "Codex CLI project install output must mention the reference")
+
+    def test_codex_plugin_includes_reference(self) -> None:
+        """Codex --plugin output must contain plan-authoring.md."""
+        subprocess.run(
+            ["bash", str(_CODEX_INSTALLER), "--plugin"],
+            cwd=_REPO,
+            env={**os.environ, **self.env},
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        plugin_dir = _CODEX_INSTALLER.parent / "plugin"
+        ref = plugin_dir / "opsx-controller" / "plan-authoring.md"
+        self.assertTrue(
+            ref.is_file(),
+            "plugin bundle must contain plan-authoring.md",
+        )
+        source = _REPO / "core" / "plan-authoring.md"
+        self.assertEqual(
+            hashlib.sha256(source.read_bytes()).digest(),
+            hashlib.sha256(ref.read_bytes()).digest(),
+            "plugin bundle plan-authoring.md content must match source",
+        )
+
+    def test_project_repeat_install_replaces_stale_reference(self) -> None:
+        """A stale project reference must be replaced on repeat install."""
+        support_dir = (
+            Path(self.project.name) / ".opencode" / "opsx-controller"
+        )
+        support_dir.mkdir(parents=True)
+        (support_dir / "plan-authoring.md").write_text(
+            "stale project content\n", encoding="utf-8"
+        )
+
+        _run_installer_project(
+            _OPENCODE_INSTALLER, Path(self.project.name), Path(self.home.name),
+            self.env,
+        )
+
+        installed = support_dir / "plan-authoring.md"
+        source = _REPO / "core" / "plan-authoring.md"
+        self.assertEqual(
+            hashlib.sha256(source.read_bytes()).digest(),
+            hashlib.sha256(installed.read_bytes()).digest(),
+            "repeat project install must replace stale plan-authoring reference",
+        )
+
+    def test_codex_project_deploys_opsx_plan_skill(self) -> None:
+        """Codex --project must deploy the opsx-plan skill."""
+        proc = _run_installer_project(
+            _CODEX_INSTALLER, Path(self.project.name), Path(self.home.name),
+            self.env,
+        )
+        skill_path = (
+            Path(self.project.name) / ".agents" / "skills"
+            / "opsx-plan" / "SKILL.md"
+        )
+        self.assertTrue(
+            skill_path.is_file(),
+            f"project opsx-plan skill must exist at {skill_path}",
+        )
+        content = skill_path.read_text(encoding="utf-8")
+        self.assertIn("plan-authoring.md", content,
+                       "project opsx-plan skill must reference plan-authoring reference")
+        self.assertIn("skills", proc.stdout,
+                       "Codex project install output must mention skills")
 
 
 class StaleInstallDetectionTests(unittest.TestCase):

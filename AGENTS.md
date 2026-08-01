@@ -11,6 +11,11 @@ core contract (`core/`) plus client-specific adapters (`adapters/opencode/`,
 (`orchestrator/opsx-plan.py`). Start from `core/controller-contract.md`,
 `core/state-schema.md`, and `core/phase-protocol.md`.
 
+For implementation plans that feed `opsx-plan compile`, the single
+client-neutral reference is `core/plan-authoring.md`. Plan-authoring agents
+and operators should follow that document; adapter-specific surfaces should
+point to it rather than restating authoring rules.
+
 ## Validation
 
 - Tests: `python3 -m unittest discover -t . -s tests` and `node

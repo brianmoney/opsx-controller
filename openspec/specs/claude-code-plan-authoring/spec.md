@@ -27,9 +27,12 @@ generic `build` agent or expose a second `/opsx-author` command.
 
 ### Requirement: Claude-authored plans follow the shared machine-read convention
 
-Before writing a document, the authoring agent SHALL read available `CLAUDE.md`
-and `AGENTS.md` guidance, all source material referenced by the request,
-existing capabilities, and active and archived OpenSpec change IDs.
+Before writing a document, the authoring agent SHALL read the installed
+`plan-authoring.md` reference from the project controller support directory,
+falling back to the global controller support directory, in addition to
+available `CLAUDE.md` and `AGENTS.md` guidance, source material referenced by
+the request, existing capabilities, and active and archived OpenSpec change
+IDs.
 
 Unless the request supplies a path, the agent SHALL write to
 `docs/plans/<kebab-case-topic>-plan.md`. It SHALL refuse to overwrite an
@@ -87,21 +90,11 @@ TOML compilation.
 The standalone Claude adapter SHALL package the `opsx-plan` skill and
 `opsx-plan-author` agent. The standalone Claude plugin SHALL package equivalent
 artifacts and expose `/opsx-controller:opsx-plan <planning request>` with
-namespaced agent delegation.
-
-The existing generic Claude installer SHALL install the new skill through its
-directory-copy behavior without feature-specific installer logic. The Claude
-global installer SHALL install the common `opsx-plan` and `opsx-run`
-executables in addition to its adapter artifacts. Host-project, repository, and
-plugin documentation SHALL state the authoring command, retain `/opsx-drive
-<change-id>` for accepted single-change control, and document Claude-selected
-compilation.
-
-#### Scenario: Global and project installs include plan authoring
-
-- **WHEN** the Claude adapter is installed globally or into a project
-- **THEN** its installed skills include both `opsx-drive` and `opsx-plan`, and
-  its installed agents include `opsx-plan-author`
+namespaced agent delegation. These surfaces SHALL defer plan conventions to
+the installed shared reference and SHALL direct per-change propose, apply,
+archive, and verify work to upstream OpenSpec. They SHALL use `opsx-run` only
+for the supported manual single-change loop and SHALL not teach the deleted
+`opsx-drive` workflow.
 
 #### Scenario: Plugin exposes the namespaced authoring command
 
@@ -109,7 +102,16 @@ compilation.
 - **THEN** the plugin exposes `/opsx-controller:opsx-plan` and delegates its
   authoring request to the plugin-scoped `opsx-plan-author` agent
 
+#### Scenario: Guidance defers per-change work upstream
+
+- **WHEN** an operator asks a Claude plan-authoring surface how to create or
+  execute an individual change
+- **THEN** it points to upstream OpenSpec per-change commands and reserves
+  controller commands for plan compile, plan run, and the supported `opsx-run`
+  manual loop
+
 #### Scenario: Global Claude install includes orchestrator commands
 
 - **WHEN** an operator installs the Claude adapter globally
-- **THEN** `opsx-plan` and `opsx-run` are available from the shared user-level executable location
+- **THEN** `opsx-plan` and `opsx-run` are available from the shared user-level
+  executable location

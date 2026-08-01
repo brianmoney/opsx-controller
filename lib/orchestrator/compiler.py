@@ -176,7 +176,6 @@ def build_schema_guidance(adapter: str = "opencode") -> str:
     """
     default_adapter = adapter
     defaults = base.ADAPTER_DEFAULTS[default_adapter]
-    invoke = defaults.get("invoke", "")
     state_file = defaults.get("state_file", "")
     impl_invoke = defaults.get("implement_invoke", "")
     review_invoke = defaults.get("review_invoke", "")
@@ -193,13 +192,11 @@ def build_schema_guidance(adapter: str = "opencode") -> str:
         "|-------|------|---------|-------------|\n"
         "| name | string | stems from filename | plan display name |\n"
         f"| adapter | string | ``\"{default_adapter}\"`` | adapter key (``ADAPTER_DEFAULTS``) |\n"
-        f"| invoke | string | ``{invoke}`` | legacy drive command |\n"
         f"| state_file | string | ``{state_file}`` | controller state path |\n"
         f"| implement_invoke | string | ``{impl_invoke}`` | direct implement command |\n"
         f"| review_invoke | string | ``{review_invoke}`` | direct review command |\n"
         f"| archive_invoke | string | ``{archive_invoke}`` | direct archive command |\n"
         "| timeout_minutes | float | ``90`` | per-change stage timeout |\n"
-        "| max_attempts | int | ``2`` | legacy drive retry ceiling |\n"
         "| max_rounds | int | ``5`` | implement-review loop ceiling |\n"
         "| no_progress_limit | int | ``2`` | consecutive no-progress rounds before failing |\n"
         "| escalate_after_review_fails | int | ``0`` | promote implement to escalation model after N failed reviews; round=(N+1) first escalates; 0 disables |\n"
@@ -226,7 +223,6 @@ def build_schema_guidance(adapter: str = "opencode") -> str:
         "| pause_before | bool | ``false`` | wait for ``opsx-plan approve`` before running |\n"
         "| enabled | bool | ``true`` | set ``false`` to defer a change |\n"
         "| timeout_minutes | float | plan-level timeout | per-change stage timeout override |\n"
-        "| max_attempts | int | plan-level max_attempts | legacy drive attempt override |\n"
         "| create_invoke | string | ``\"\"`` | per-change authoring command override |\n"
         "| create_max_attempts | int | plan-level value | per-change create attempt override |\n"
         "\n"
@@ -257,7 +253,6 @@ def build_schema_guidance(adapter: str = "opencode") -> str:
         "```toml\n"
         f"[plan]\n"
         f"adapter = \"{default_adapter}\"\n"
-        f"invoke = \"{_escape_toml_value(defaults['invoke'])}\"\n"
         f"state_file = \"{_escape_toml_value(defaults['state_file'])}\"\n"
         f"implement_invoke = \"{_escape_toml_value(defaults['implement_invoke'])}\"\n"
         f"review_invoke = \"{_escape_toml_value(defaults['review_invoke'])}\"\n"

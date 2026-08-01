@@ -132,8 +132,11 @@ stdlib-only.
 
 > **OpenCode and Claude Code can compile plans; all three adapters install the
 > orchestrator to `~/.local/bin/`.**  `opsx-plan compile` supports `--adapter
-> opencode` (the default) and `--adapter claude-code`.  Every adapter installs
-> `opsx-plan` / `opsx-run` to `~/.local/bin/` via a shared installer helper.
+> opencode` (the default) and `--adapter claude-code`.  Every adapter's global
+> installer deploys `opsx-plan` and `opsx-run` to `~/.local/bin/` via a shared
+> installer helper.  `opsx-run` is supported on OpenCode and Claude Code only;
+> Codex CLI has no default stage invokes and cannot drive
+> single-change `opsx-run` without a hand-written plan manifest.
 > See [docs/adapters.md](docs/adapters.md#choosing-an-adapter).
 
 **1. Clone and configure models.**
@@ -195,6 +198,7 @@ already-authored change, skip the plan manifest entirely with
 | Guide | What it covers |
 |---|---|
 | [Operator Workflow](docs/opsx-plan-operator-workflow.md) | The full operator loop: activation, `doctor`, budgets, manual gates, logs, notifications, branch/PR delivery |
+| [Plan-Authoring Reference](core/plan-authoring.md) | How to write compilable markdown implementation plans for `opsx-plan compile` |
 | [Adapter Reference](docs/adapters.md) | Per-client install and packaging for OpenCode, Claude Code, and Codex CLI |
 | [Orchestrator Reference](orchestrator/README.md) | Manifest schema, execution model, retry policy, adapter invocation |
 | [Model Efficiency Workflow](core/model-efficiency-workflow.md) | Benchmarking model choices with telemetry, reports, and dashboards |

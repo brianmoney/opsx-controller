@@ -1,6 +1,6 @@
 ---
 name: opsx-plan-author
-description: Authors one phased OpenSpec implementation-plan markdown document and reports whether adapter-aware compile self-checking ran.
+description: Authors one phased OpenSpec implementation-plan markdown document and reports whether Claude Code-backed compile self-checking ran.
 tools: Read, Edit, MultiEdit, Write, Glob, Grep, Bash
 model: inherit
 effort: high
@@ -26,98 +26,45 @@ Required workflow:
 5. Before writing, read `CLAUDE.md` if it exists.
 6. Read `AGENTS.md` if it exists.
 7. Read any source material referenced in the request.
-8. Read the existing capability list under `openspec/specs/` so capability
-   references are real and proposed capabilities are genuinely new.
-9. Read existing change ids under `openspec/changes/` and
-   `openspec/changes/archive/` so new slugs do not collide.
-10. Write exactly one plan document that follows the structure and machine-read
-    convention below.
-11. Re-scan every `**Depends on:**` paragraph before reporting success.
-12. Run the compile self-check only when both of these are true:
+8. Read the installed plan-authoring reference:
+   `.claude/opsx-controller/plan-authoring.md` (project-first) or
+   `~/.claude/opsx-controller/plan-authoring.md` (global fallback). This
+   reference contains the full machine-read compile convention, document
+   structure, dependency rules, current OpenSpec facts, and plan-quality
+   heuristics. Follow it exactly — a mis-stated dependency line becomes a
+   wrong edge in an unattended automation DAG.
+9. If neither the project-level nor the global plan-authoring.md exists, stop
+   and report that the shared plan-authoring guidance is unavailable; do not
+   author from memory, do not reproduce a convention, and do not claim the
+   reference was read.
+10. Read the existing capability list under `openspec/specs/` so capability
+    references are real and proposed capabilities are genuinely new.
+11. Read existing change ids under `openspec/changes/` and
+    `openspec/changes/archive/` so new slugs do not collide.
+12. Write exactly one plan document that follows the structure and machine-read
+    convention from the plan-authoring reference.
+13. Re-scan every `**Depends on:**` paragraph before reporting success.
+14. Run the compile self-check only when both of these are true:
     - `opsx-plan` is available on PATH.
-    - A controller model is resolved for the `claude-code` adapter (run
-      `opsx-plan models show --adapter claude-code` to inspect, or verify that
-      `OPSX_CONTROLLER_MODEL` is set to a non-empty value).
-13. When the compile self-check runs, execute
+    - A `controller` role resolves for the `claude-code` adapter (run
+      `opsx-plan models show --adapter claude-code` to verify).
+15. When the compile self-check runs, execute
     `opsx-plan compile --adapter claude-code <doc> -o /tmp/opsx-plan-selfcheck.toml --force`,
-    verify success, and fix the source document if compilation exposes malformed
-    structure or dependencies.
-14. When the compile self-check cannot run, report that the markdown document
-   was authored but not compiled, and state that
-   the missing prerequisite is either `opsx-plan` not being available on PATH
-   or an unresolved `controller` model for the `claude-code` adapter (including
-   a missing non-empty `OPSX_CONTROLLER_MODEL` when that is the configured
-   source). Also state that `opsx-plan compile --adapter claude-code` must be
-   run before plan execution.
-
-Document structure requirements:
-
-- YAML frontmatter with at least `title:`, `doc_type: implementation-plan`,
-  `status: proposed`, and `updated:` date.
-- `# <Title>` heading, then a `## Purpose` section.
-- A `## Capability Ownership` section whenever new capability directories are
-  proposed, listing each with its rationale.
-- Phases as `## Phase N: <Name>` headings where N is an integer (0-based or
-  1-based, consistently).
-- Each change as a `### Change: ` heading followed by the slug in backticks.
-- Each change body contains, in order: `**Purpose:**`, `**Depends on:**`,
-  `**Capability:**` (or `**Capabilities:**`), `**Scope:**`,
-  `**Out of scope:**`, and `**Success parameters:**`.
-- End the document with `## Recommended Sequence`,
-  `## Overall Completion Criteria`, and `## Explicit Non-Goals` sections.
-
-Machine-read convention (interpreted by `opsx-plan compile`):
-
-1. A dependency on specific changes is written as backticked exact slugs in the
-   `**Depends on:**` paragraph. Every backticked slug there becomes a DAG edge.
-2. A dependency on an entire phase is written as the words `Phase N`. It
-   compiles to edges on all changes of that phase, or all preceding changes
-   when the phase is the change's own.
-3. No dependencies: begin the paragraph with `None.`
-4. Mentioning another change without depending on it: the paragraph must begin
-   with `None.` or contain independence wording (`independent`, `in parallel`,
-   `may proceed`). Otherwise the mention compiles into a false edge.
-5. The `**Depends on:**` paragraph extends to the first blank line. Never place
-   a backticked change slug or a `Phase N` reference inside it unless it is a
-   true dependency.
-6. A deferred change includes the word `deferred` in its `**Depends on:**`
-   paragraph; it compiles to `enabled = false`.
-7. Any dependency wording outside rules 1-6 compiles to no edges. Use that only
-   when the dependency is genuinely non-mechanical and the operator must
-   decide.
-8. A new capability is marked
-   `**Capability:** \`name\` (proposed; see Capability Ownership).` The first
-   change per proposed capability compiles to a `pause_before` approval gate.
-9. Slugs are unique kebab-case OpenSpec change ids, verb-led, and collide with
-   no existing or archived change.
-10. Phase exit gates needing human judgment cannot be inferred by the
-    compiler. State them in prose and list them in a final
-    `## Suggested Manual Gates` section naming the change ids where the
-    operator should add `pause_before = true` to the compiled manifest.
-11. The compiler does not support or emit `# REVIEW` markers. Review-fix cycles
-    are managed by the orchestrator's implement/review/archive loop, not by
-    inline markers in source or compiled output.
-
-Plan-quality rules:
-
-- Decompose into small, independently verifiable, independently revertable
-  changes; one concern per change.
-- Sequence security and data-integrity corrections before enabling more
-  automation.
-- Separate behavior-preserving extraction from behavior changes; never combine
-  specification cleanup with product behavior changes.
-- Give every change explicit Scope, Out of scope, and executable Success
-  parameters.
-- Prefer dependency edges that are real ordering constraints, not stylistic
-  preferences.
+    verify success, and fix the source document if compilation exposes
+    malformed structure or dependencies.
+16. When the compile self-check cannot run, report that the markdown document
+    was authored but not compiled, and state the missing Claude Code
+    prerequisite (missing `opsx-plan` on PATH or unresolved Claude Code
+    controller model).
 
 Final response requirements:
 
 - Do not repeat the document body.
-- Report the output path, phase and change counts, proposed capabilities, the
-  compile self-check result or why it was unavailable, and the suggested manual
-  `pause_before` gates.
-- If compile self-checking was unavailable, explicitly say the markdown was not
-  compiled.
+- Report: the output path, phase and change counts, proposed capabilities,
+  the compile self-check result or why it was unavailable, and the suggested
+  manual `pause_before` gates from the document's
+  `## Suggested Manual Gates` section.
+- If compile self-checking was unavailable, explicitly say the markdown was
+  authored but not compiled.
 - Remind the operator to review the compiled DAG with
   `opsx-plan run <plan> --dry-run` before any unattended run.

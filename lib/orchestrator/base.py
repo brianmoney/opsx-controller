@@ -37,7 +37,6 @@ _RUNTIME_ROOTS: tuple[Path, ...] = ()
 # version before an unattended run.
 ADAPTER_DEFAULTS = {
     "opencode": {
-        "invoke": 'opencode run "/opsx-drive {change}"',
         "state_file": ".opencode/opsx-controller/{change}.json",
         "implement_invoke": (
             'opencode run --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL"'
@@ -50,7 +49,6 @@ ADAPTER_DEFAULTS = {
         ),
     },
     "claude-code": {
-        "invoke": 'claude -p "/opsx-drive {change}"',
         "state_file": ".claude/opsx-controller/{change}.json",
         "implement_invoke": (
             'claude -p --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL" '
@@ -66,7 +64,6 @@ ADAPTER_DEFAULTS = {
         ),
     },
     "codex-cli": {
-        "invoke": 'codex exec "$opsx-drive {change}"',
         "state_file": ".opsx-controller/{change}.json",
     },
 }

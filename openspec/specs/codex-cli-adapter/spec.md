@@ -6,55 +6,6 @@ single change through the implement, review, and archive loop.
 
 ## Requirements
 
-### Requirement: Skill entrypoint for controller orchestration
-
-The adapter SHALL provide a Codex skill at `skills/opsx-drive/SKILL.md` that serves as the user-facing entrypoint for starting or resuming the OpenSpec controller workflow for exactly one change.
-
-The skill SHALL instruct the hosting Codex agent to:
-- Parse exactly one change-id argument from user input
-- Initialize or resume durable state at `.opsx-controller/<change-id>.json`
-- Read repository guidance from `AGENTS.md` if it exists
-- Run `openspec status --change "<change>" --json` and `openspec instructions apply --change "<change>" --json`
-- Manage a `context_cache` with source signatures derived from repository guidance and OpenSpec context files
-- Manage a deduplicated `tracked_change_files` list seeded from accepted change artifacts and current dirty worktree
-- Dispatch phase agents (`opsx-implementer`, `opsx-reviewer`, `opsx-archiver`) in strict order using `spawn_agent` and `wait_agent`
-- Provide each phase agent a compact plaintext input block with fields: CHANGE, ROUND, STATE_FILE, LATEST_FIX_PROMPT, TASK_COUNTS, CONTEXT_CACHE_STATUS, CONTEXT_CACHE_VALID, CONTEXT_CACHE_SUMMARY
-- Parse single-line JSON output from each phase agent
-- Loop from review back to implement when review returns any non-zero finding count
-- Archive only after a fresh clean review (all finding counts zero, verdict=pass)
-- Stop after `max_rounds` (5) failed review rounds or `no_progress_streak` (2) consecutive no-progress rounds
-- Persist state after initialization, after every phase result, and before any blocked or completed exit
-
-#### Scenario: Fresh controller run with valid change
-
-- **WHEN** user invokes the skill with a valid change-id and the change exists in `openspec/changes/<id>/` with pending tasks
-- **THEN** the controller initializes a fresh state file, seeds context cache, seeds tracked files, dispatches implementer, review succeeds, and archiver completes — resulting in `status=completed` and `phase=done`
-
-#### Scenario: Resume after interrupted run
-
-- **WHEN** user invokes the skill for a change with an existing state file at `phase=implement` and `round=2`
-- **THEN** the controller loads existing state, validates context cache signature, and resumes from the current phase with the persisted `latest_fix_prompt`
-
-#### Scenario: Missing change-id argument
-
-- **WHEN** user invokes the skill without providing a change-id
-- **THEN** the controller stops and reports that a change-id is required
-
-#### Scenario: Review failure triggers re-implementation
-
-- **WHEN** reviewer returns `verdict=fail` with non-zero `finding_counts` and `round < max_rounds`
-- **THEN** the controller persists `latest_fix_prompt`, increments round, sets `phase=implement`, and dispatches implementer again
-
-#### Scenario: Max rounds reached
-
-- **WHEN** reviewer returns `verdict=fail` and `round` equals `max_rounds`
-- **THEN** the controller persists `status=blocked` and `last_result=max_rounds_reached` and stops
-
-#### Scenario: Consecutive no-progress stops
-
-- **WHEN** implementer returns `progress_made=false` for 2 consecutive rounds
-- **THEN** the controller persists `status=blocked` and stops
-
 ### Requirement: Implementer phase agent
 
 The adapter SHALL provide a Codex custom agent at `agents/opsx-implementer.toml` with:
@@ -199,32 +150,55 @@ The archiver agent SHALL:
 
 ### Requirement: Install script
 
-The adapter SHALL provide an install script at `install.sh` supporting three modes:
-- `--global`: Copies skill to `$HOME/.agents/skills/opsx-drive/`, agents to `$HOME/.codex/agents/`, and support files to `$HOME/.codex/opsx-controller/`
-- `--project <path>`: Copies skill to `<path>/.agents/skills/opsx-drive/`, agents to `<path>/.codex/agents/`, support files to `<path>/.codex/opsx-controller/`, and creates/updates `.codex/.gitignore` to ignore `opsx-controller/*.json`
-- `--plugin`: Creates plugin bundle directory structure with `.codex-plugin/plugin.json` and copies skill and agent files
+The adapter SHALL provide an install script at `install.sh` supporting three
+modes:
+- `--global`: copies the `opsx-plan` skill, supported skills, agents, and
+  support files to the global Codex locations.
+- `--project <path>`: copies the `opsx-plan` skill, supported skills, agents,
+  and support files to the project Codex locations and creates or updates
+  `.codex/.gitignore` to ignore `opsx-controller/*.json`.
+- `--plugin`: creates a plugin bundle directory structure with
+  `.codex-plugin/plugin.json` and copies the `opsx-plan` skill, supported
+  agents, and skills.
 
-The install script SHALL fail with a usage message when no valid mode is provided.
+The installed Codex plan-authoring skill SHALL read
+`plan-authoring.md` from the project controller support directory first and
+the global controller support directory second. It SHALL state that Codex
+plan-run is unsupported, direct per-change propose, apply, archive, and verify
+work to upstream OpenSpec, and report honestly when no compile adapter is
+configured.
 
-#### Scenario: Global install succeeds
+The install script SHALL fail with a usage message when no valid mode is
+provided.
 
-- **WHEN** user runs `bash install.sh --global` from the adapter directory
-- **THEN** skill files appear in `$HOME/.agents/skills/opsx-drive/`, agent TOML files in `$HOME/.codex/agents/`, and support README in `$HOME/.codex/opsx-controller/`
+#### Scenario: Global install includes plan authoring
 
-#### Scenario: Project install succeeds
+- **WHEN** a user runs `bash install.sh --global` from the adapter directory
+- **THEN** the installed Codex support files include the `opsx-plan` skill and
+  the shared plan-authoring reference path is discoverable
 
-- **WHEN** user runs `bash install.sh --project /path/to/project`
-- **THEN** files appear in the project's `.agents/skills/`, `.codex/agents/`, and `.codex/opsx-controller/` directories
+#### Scenario: Project install includes plan authoring
 
-#### Scenario: Plugin install creates bundle
+- **WHEN** a user runs `bash install.sh --project /path/to/project`
+- **THEN** the project receives the `opsx-plan` skill and support files that
+  make the project-level reference the first lookup location
 
-- **WHEN** user runs `bash install.sh --plugin`
-- **THEN** a self-contained plugin directory is created with `.codex-plugin/plugin.json`, `skills/`, and `agents/`
+#### Scenario: Plugin install packages plan authoring
+
+- **WHEN** a user runs `bash install.sh --plugin`
+- **THEN** the self-contained plugin includes the `opsx-plan` skill and no
+  plan-run entrypoint is advertised for Codex
+
+#### Scenario: No compile adapter is configured
+
+- **WHEN** the Codex plan-authoring skill cannot resolve a compile adapter
+- **THEN** it reports that the Markdown plan may be authored but compilation
+  was not performed and names the missing configuration
 
 #### Scenario: No mode specified
 
-- **WHEN** user runs `bash install.sh` with no arguments
-- **THEN** script prints usage message and exits with non-zero code
+- **WHEN** a user runs `bash install.sh` with no arguments
+- **THEN** the script prints a usage message and exits with non-zero code
 
 ### Requirement: Plugin manifest for marketplace distribution
 
@@ -233,10 +207,12 @@ The adapter SHALL provide a plugin manifest at `plugin/.codex-plugin/plugin.json
 - `skills` pointing to `./skills/`
 - `interface` with `displayName`, `shortDescription`, `category`, and `capabilities`
 
+The manifest SHALL NOT register or describe `opsx-drive`.
+
 #### Scenario: Plugin manifest is valid
 
 - **WHEN** Codex loads the plugin manifest
-- **THEN** the `opsx-drive` skill is registered and discoverable in the Codex plugin/skill browser
+- **THEN** no `opsx-drive` skill is registered or discoverable in the Codex plugin/skill browser
 
 ### Requirement: Durable state file
 

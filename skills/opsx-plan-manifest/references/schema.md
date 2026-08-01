@@ -39,7 +39,6 @@ All optional; defaults shown.
 | `name` | string | filename stem | Plan display name; also names the state file |
 | `adapter` | string | `"opencode"` | `opencode`, `claude-code`, or `codex-cli` |
 | `timeout_minutes` | float | `90` | Per-change stage timeout |
-| `max_attempts` | int | `2` | Legacy drive retry ceiling |
 | `max_rounds` | int | `5` | Implement–review loop ceiling |
 | `no_progress_limit` | int | `2` | Consecutive no-progress rounds before failing |
 | `escalate_after_review_fails` | int | `0` | Promote implement to escalation model after N failed reviews (round N+1) |
@@ -53,15 +52,15 @@ All optional; defaults shown.
 | `create_max_attempts` | int | `2` | Create retry ceiling |
 | `review_created` | bool | `true` | Require `opsx-plan accept` before driving a created change |
 | `created_check` | string | `"openspec validate {change} --strict"` | Post-create validation |
-| `invoke` | string | adapter default | Legacy single-command controller invocation |
 | `state_file` | string | adapter default | Controller state file path |
 | `implement_invoke` | string | adapter default | Direct implement command |
 | `review_invoke` | string | adapter default | Direct review command |
 | `archive_invoke` | string | adapter default | Direct archive command |
 | `git_delivery` | table | `{}` | See below |
 
-An unknown `adapter` is only an error when `invoke` and `state_file` are not
-both supplied; with both, any adapter name works.
+An unknown `adapter` is only an error when `implement_invoke` / `review_invoke`
+/ `archive_invoke` and `state_file` are not all supplied; with all four, any
+adapter name works.
 
 ## `[[changes]]` entries
 
@@ -73,7 +72,6 @@ both supplied; with both, any adapter name works.
 | `pause_before` | bool | `false` | Wait for `opsx-plan approve` before running |
 | `enabled` | bool | `true` | `false` defers the change; shows as `skipped` |
 | `timeout_minutes` | float | plan-level | Per-change override |
-| `max_attempts` | int | plan-level | Per-change override |
 | `create_invoke` | string | plan-level | Per-change authoring override |
 | `create_max_attempts` | int | plan-level | Per-change override |
 
@@ -92,13 +90,15 @@ fail loudly.
 
 ## Adapter defaults
 
-From `ADAPTER_DEFAULTS`:
+From `ADAPTER_DEFAULTS`. All adapters use direct dispatch through
+`implement_invoke` / `review_invoke` / `archive_invoke`; there is no
+legacy single-command fallback.
 
-| Adapter | `invoke` | `state_file` |
-|---|---|---|
-| `opencode` | `opencode run "/opsx-drive {change}"` | `.opencode/opsx-controller/{change}.json` |
-| `claude-code` | `claude -p "/opsx-drive {change}"` | `.claude/opsx-controller/{change}.json` |
-| `codex-cli` | `codex exec "$opsx-drive {change}"` | `.opsx-controller/{change}.json` |
+| Adapter | `state_file` |
+|---|---|
+| `opencode` | `.opencode/opsx-controller/{change}.json` |
+| `claude-code` | `.claude/opsx-controller/{change}.json` |
+| `codex-cli` | `.opsx-controller/{change}.json` |
 
 Both `opencode` and `claude-code` define `implement_invoke` / `review_invoke`
 / `archive_invoke`, so a plan using either adapter takes the direct
@@ -110,21 +110,16 @@ implement-review-archive path with no manifest changes:
   "$OPSX_{IMPLEMENTER,REVIEWER,ARCHIVER}_MODEL" --permission-mode
   bypassPermissions --output-format json`
 
-`codex-cli` defines neither and falls back to the single-command `invoke`
-path (`/opsx-drive`), so a `codex-cli` plan runs the legacy nested-controller
-loop rather than the direct stage loop unless an operator hand-writes all
-three stage invokes in `[plan]`. The `$OPSX_*_MODEL` references in both sets
-of defaults are resolved once per adapter when the plan loads, from
-`~/.config/opsx-controller/models.toml` — see
-`docs/opsx-plan-operator-workflow.md`'s Model Configuration section.
-
-`/opsx-drive` is **deprecated**; `opsx-plan` logs a warning when a resolved
-plan takes the nested-controller path.
+`codex-cli` defines no stage invokes. A plan missing one or more of the
+three stage invokes fails at load time with a `PlanError` naming all three
+required keys — there is no fallback execution path. An operator can opt
+`codex-cli` into direct dispatch by hand-writing all three invokes in `[plan]`.
+The `$OPSX_*_MODEL` references in both sets of defaults are resolved once per
+adapter when the plan loads, from `~/.config/opsx-controller/models.toml` —
+see `docs/opsx-plan-operator-workflow.md`'s Model Configuration section.
 
 For direct plan runs, `.opsx-plan/<plan-name>.state.json` is the
-authoritative durable state — not `.opencode/opsx-controller/<change>.json`
-or `.claude/opsx-controller/<change>.json`, which belong to manual
-`/opsx-drive` invocations.
+authoritative durable state.
 
 ## Dependency semantics
 

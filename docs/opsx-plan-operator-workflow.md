@@ -9,6 +9,11 @@ This document covers the full lifecycle: compile, activate, preflight with
 `report`/`dashboard`, receive notifications, and finish on a delivery branch
 that opens a pull request.
 
+> **Plan authoring**: For writing compilable markdown implementation plans, see
+> [`core/plan-authoring.md`](../core/plan-authoring.md) — the single
+> client-neutral reference for plan structure, dependency forms, and compile
+> conventions.
+
 ---
 
 ## Quick Start
@@ -190,7 +195,6 @@ The plan manifest is a TOML file with a `[plan]` table and one or more
 | `name` | string | filename stem | Plan display name |
 | `adapter` | string | `"opencode"` | Client adapter: `opencode`, `claude-code`, or `codex-cli` |
 | `timeout_minutes` | float | `90` | Per-change stage timeout |
-| `max_attempts` | int | `2` | Legacy drive retry ceiling |
 | `max_rounds` | int | `5` | Implement-review loop ceiling |
 | `no_progress_limit` | int | `2` | Consecutive no-progress rounds before failing |
 | `escalate_after_review_fails` | int | `0` | Promote implement to escalation model after *N* failed reviews. First escalates in round *N*+1 (`N=2` escalates round 3). `0` disables. |
@@ -204,7 +208,6 @@ The plan manifest is a TOML file with a `[plan]` table and one or more
 | `create_max_attempts` | int | `2` | Create retry ceiling |
 | `review_created` | bool | `true` | Require operator `accept` before driving created changes |
 | `created_check` | string | `"openspec validate {change} --strict"` | Post-create validation |
-| `invoke` | string | adapter default | Legacy single-command controller invocation |
 | `state_file` | string | adapter default | Controller state file path |
 | `implement_invoke` | string | adapter default | Direct implement command |
 | `review_invoke` | string | adapter default | Direct review command |
@@ -220,7 +223,6 @@ The plan manifest is a TOML file with a `[plan]` table and one or more
 | `pause_before` | bool | `false` | Wait for `opsx-plan approve` before running |
 | `enabled` | bool | `true` | Set `false` to defer a change |
 | `timeout_minutes` | float | plan-level timeout | Per-change stage timeout override |
-| `max_attempts` | int | plan-level max_attempts | Legacy drive attempt override |
 | `create_invoke` | string | plan-level create_invoke | Per-change authoring command override |
 | `create_max_attempts` | int | plan-level value | Per-change create attempt override |
 
@@ -243,8 +245,9 @@ worker subprocesses, plan-owned round control, stage logs under
 `.opsx-plan/logs/`, and telemetry — whenever all three of `implement_invoke`,
 `review_invoke`, and `archive_invoke` resolve to a non-empty command. This is
 a configuration test only; it does not depend on which `adapter` is
-configured. A plan missing one or more of the three stage invokes instead
-launches the legacy `invoke` command as a nested controller (`/opsx-drive`).
+configured. A plan missing one or more of the three stage invokes fails at
+load time with a `PlanError` naming all three keys (`implement_invoke`,
+`review_invoke`, `archive_invoke`) — there is no fallback execution path.
 
 `ADAPTER_DEFAULTS` supplies all three stage invokes for both `opencode` and
 `claude-code`, so plans using either adapter take the direct path with no
@@ -397,11 +400,10 @@ opsx-plan run --create-only
   Untracked leftovers are allowed.
 - **Reconciliation on startup**: The orchestrator reconciles recorded state
   against the repository. A stale `running` status from a killed run is
-  recovered to `pending`. For the legacy nested-controller path, changes
-  archived outside plan control may be verified and marked done. For direct
-  dispatch (any adapter with all three stage invokes configured), when
-  repository archive evidence exists but the plan state lacks matching archive
-  worker evidence, the change is marked as failed (fail-closed).
+  recovered to `pending`. For direct dispatch (any adapter with all three
+  stage invokes configured), when repository archive evidence exists but the
+  plan state lacks matching archive worker evidence, the change is marked as
+  failed (fail-closed).
 
 ### `--only` flag
 

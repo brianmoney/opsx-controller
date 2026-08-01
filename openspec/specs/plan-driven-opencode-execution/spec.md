@@ -8,7 +8,21 @@ per-phase state and logs instead of delegating to a nested controller.
 
 ### Requirement: `opsx-plan` directly dispatches OpenCode phase workers
 
-For plan runs where all three of `implement_invoke`, `review_invoke`, and `archive_invoke` are configured, `opsx-plan` SHALL execute each ready accepted change as a sequence of bounded implement, review, and archive worker invocations instead of launching `/opsx-drive` as a nested controller. Direct dispatch SHALL be determined by this configuration alone and SHALL NOT be conditioned on adapter identity. The OpenCode adapter defaults supply all three invokes, so OpenCode plan runs take this path without manifest changes.
+For plan runs where all three of `implement_invoke`, `review_invoke`, and
+`archive_invoke` are configured, `opsx-plan` SHALL execute each ready accepted
+change as a sequence of bounded implement, review, and archive worker
+invocations instead of launching `/opsx-drive` as a nested controller. Direct
+dispatch SHALL be determined by this configuration alone and SHALL NOT be
+conditioned on adapter identity. The OpenCode adapter defaults supply all three
+invokes, so OpenCode plan runs take this path without manifest changes.
+
+The orchestrator SHALL reject a plan before dispatch when any direct stage
+invoke is missing. The error SHALL name all three required keys so the operator
+can correct the manifest without relying on a deprecated fallback.
+
+The OpenCode adapter SHALL expose the supported plan-level command and worker
+surfaces without installing the removed legacy commands or nested controller
+agent. Direct dispatch SHALL remain independent of those removed surfaces.
 
 The orchestrator SHALL:
 - invoke at most one phase worker per subprocess
@@ -20,9 +34,16 @@ The orchestrator SHALL:
 - **WHEN** a ready accepted change is selected in an OpenCode-backed plan run
 - **THEN** `opsx-plan` dispatches implement, then review, then archive as separate worker invocations without calling `/opsx-drive`
 
-#### Scenario: Plan without a full set of stage invokes uses the nested controller
+#### Scenario: Incomplete direct configuration fails closed
 - **WHEN** a ready accepted change is selected in a plan that configures fewer than all three stage invokes
-- **THEN** `opsx-plan` launches the configured `invoke` command as a nested controller instead of dispatching phase workers
+- **THEN** `opsx-plan` refuses to dispatch and reports all three required keys in its configuration error
+
+#### Scenario: Reinstall removes legacy OpenCode files
+
+- **WHEN** an operator reinstalls the OpenCode adapter into a global or project
+  destination that contains previously deployed legacy files
+- **THEN** the installer removes the deprecated command files and nested
+  controller agent while retaining supported commands and worker agents
 
 ### Requirement: OpenCode direct stage invokes select the stage model explicitly
 
@@ -51,30 +72,23 @@ Each default SHALL remain overridable in the plan `[plan]` table.
 
 ### Requirement: `/opsx-drive` is deprecated in favor of direct dispatch
 
-The `/opsx-drive` nested-controller surface SHALL be deprecated.
+The OpenCode adapter SHALL NOT ship or install `/opsx-drive`, `/opsx-author`,
+`/opsx-verify-auto`, `/opsx-archive-no-prompt`, or the nested
+`opsx-controller` agent. `opsx-plan` SHALL NOT use `/opsx-drive` in its own
+execution path. The supported plan-level `opsx-plan` command, `opsx-run`
+executable, and phase worker agents SHALL remain available.
 
-`opsx-plan` SHALL NOT use `/opsx-drive` in its own execution path for plans that configure a full set of stage invokes.
+#### Scenario: Removed OpenCode files are absent
 
-The `/opsx-drive` surface SHALL remain functional for operators who still depend on it, and SHALL NOT be removed by this change.
+- **WHEN** the repository and a fresh adapter installation are inspected
+- **THEN** none of the deprecated OpenCode command files or nested controller
+  agent exists
 
-Documentation for `/opsx-drive` across every adapter SHALL mark the surface as deprecated and SHALL direct operators to `opsx-run <change-id>` as the supported way to drive exactly one change outside a plan run.
+#### Scenario: Supported OpenCode surfaces remain installed
 
-When a resolved plan takes the nested-controller path because it configures fewer than all three stage invokes, `opsx-plan` SHALL emit a deprecation warning naming the nested-controller path and pointing at direct dispatch, and SHALL still execute the run.
-
-#### Scenario: Nested-controller plan warns and still runs
-
-- **WHEN** a plan that configures fewer than all three stage invokes is run
-- **THEN** `opsx-plan` emits a deprecation warning about the nested-controller path and still executes the plan through that path
-
-#### Scenario: Direct-dispatch plan emits no deprecation warning
-
-- **WHEN** a plan configures all three stage invokes and takes the direct-dispatch path
-- **THEN** no `/opsx-drive` deprecation warning is emitted
-
-#### Scenario: Manual `/opsx-drive` use still works
-
-- **WHEN** an operator manually invokes `/opsx-drive <change-id>` after this change lands
-- **THEN** the single-change controller path still functions, and its documentation identifies it as deprecated and names `opsx-run <change-id>` as the supported replacement
+- **WHEN** the OpenCode adapter is installed
+- **THEN** `opsx-plan`, `opsx-run`, and the implementer, reviewer, and archiver
+  worker surfaces remain available
 
 ### Requirement: Review failures loop inside `opsx-plan`
 

@@ -2,25 +2,23 @@
 
 ## Adapter capability matrix
 
-`opsx-plan` runs a plan's changes through either the legacy nested-controller
-path (`invoke`, one `/opsx-drive` subprocess per change) or the direct
-implement-review-archive path (one bounded worker subprocess per stage,
-plan-owned round control, stage logs, and telemetry). Direct dispatch is
-gated purely on configuration — a plan takes it whenever `implement_invoke`,
-`review_invoke`, and `archive_invoke` are all set, regardless of adapter.
+`opsx-plan` runs a plan's changes through the direct implement-review-archive
+path: one bounded worker subprocess per stage, plan-owned round control, stage
+logs, and telemetry. Direct dispatch is gated purely on configuration — a plan
+takes it whenever `implement_invoke`, `review_invoke`, and `archive_invoke` are
+all set, regardless of adapter. A plan missing any of the three stage invokes
+fails at load time with a `PlanError`; there is no fallback execution path.
 
-The nested-controller `/opsx-drive` path is **deprecated** in favor of direct
-dispatch. For manual single-change control outside a plan run, use
+For manual single-change control outside a plan run, use
 `opsx-run <change-id>` (equivalently `opsx-plan run-one <change-id>`)
-instead of `/opsx-drive <change-id>` — it drives the same loop with no
-manifest required. `opsx-plan` emits a deprecation warning when a resolved
-plan still takes the nested-controller path.
+on OpenCode and Claude Code — it drives the same implement-review-archive loop
+with no manifest required. Codex CLI does not support single-change `opsx-run`.
 
-| Adapter | Nested-controller (`invoke`) | Direct dispatch defaults | Usage/model source |
-|---|---|---|---|
-| `opencode` | Supported | Supported (`ADAPTER_DEFAULTS`) | OpenCode plugin sidecar (`opencode_plugin`), plus worker JSON and log metadata |
-| `claude-code` | Supported | Supported (`ADAPTER_DEFAULTS`) | Claude Code result envelope (`claude_result_json`), plus worker JSON and log metadata |
-| `codex-cli` | Supported | Reachable by configuration, but has no `ADAPTER_DEFAULTS` invokes and is unvalidated — an operator must hand-write all three stage invokes in `[plan]` | Worker JSON and log metadata only (no dedicated envelope/sidecar source) |
+| Adapter | Direct dispatch defaults | Usage/model source |
+|---|---|---|
+| `opencode` | Supported (`ADAPTER_DEFAULTS`) | OpenCode plugin sidecar (`opencode_plugin`), plus worker JSON and log metadata |
+| `claude-code` | Supported (`ADAPTER_DEFAULTS`) | Claude Code result envelope (`claude_result_json`), plus worker JSON and log metadata |
+| `codex-cli` | Reachable by configuration, but has no `ADAPTER_DEFAULTS` invokes and is unvalidated — an operator must hand-write all three stage invokes in `[plan]` | Worker JSON and log metadata only (no dedicated envelope/sidecar source) |
 
 Worker JSON parsed from the stage's own one-line JSON result always takes
 precedence over any adapter-specific source. See

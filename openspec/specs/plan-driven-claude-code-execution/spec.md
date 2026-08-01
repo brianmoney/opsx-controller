@@ -20,9 +20,32 @@ The orchestrator SHALL apply the same plan-owned round control, retry budgets, n
 - **WHEN** the Claude Code review worker returns a non-zero finding count and the change is below the round ceiling
 - **THEN** `opsx-plan` persists the fix prompt, increments the round, and dispatches another implement worker itself
 
+### Requirement: Claude Code installation excludes the legacy drive skill
+
+The Claude Code adapter SHALL NOT ship or install the superseded `opsx-drive`
+skill. Reinstalling globally or into a project SHALL remove a previously
+deployed `opsx-drive` skill directory while preserving supported skills,
+agents, and plan-level support files.
+
+#### Scenario: Global reinstall removes the legacy skill
+
+- **WHEN** the Claude Code installer runs in global mode against a home
+  directory containing a previously deployed `opsx-drive` skill
+- **THEN** that skill directory is removed and supported Claude Code surfaces
+  are installed
+
+#### Scenario: Project reinstall removes the legacy skill
+
+- **WHEN** the Claude Code installer runs in project mode against a project
+  containing a previously deployed `opsx-drive` skill
+- **THEN** that skill directory is removed and supported project surfaces are
+  installed
+
 ### Requirement: The `claude-code` adapter supplies direct stage invoke defaults
 
-`ADAPTER_DEFAULTS` for `claude-code` SHALL provide `implement_invoke`, `review_invoke`, and `archive_invoke` in addition to `invoke` and `state_file`.
+`ADAPTER_DEFAULTS` for `claude-code` SHALL provide
+`implement_invoke`, `review_invoke`, and `archive_invoke` and SHALL NOT provide
+the legacy `invoke` fallback.
 
 Each default SHALL invoke the Claude Code CLI in print mode against the corresponding installed worker agent (`opsx-implementer`, `opsx-reviewer`, `opsx-archiver`), select the stage model from the corresponding `OPSX_*_MODEL` environment variable, and request a machine-readable result envelope.
 
@@ -34,6 +57,11 @@ Each default SHALL be overridable in the plan `[plan]` table.
 
 - **WHEN** a plan sets `adapter = "claude-code"` and configures no stage invokes
 - **THEN** the plan resolves all three stage invokes from adapter defaults and takes the direct dispatch path
+
+#### Scenario: Legacy invoke configuration is not a fallback
+
+- **WHEN** a Claude Code plan provides an `invoke` value without a complete set of direct stage invokes
+- **THEN** the plan fails closed and reports the missing direct stage keys instead of launching the legacy command
 
 #### Scenario: Stage model is the Claude Code value, not a shared one
 

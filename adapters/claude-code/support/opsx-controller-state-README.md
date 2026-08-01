@@ -1,7 +1,9 @@
 # Opsx Controller State
 
-`/opsx-drive <change-id>` persists durable per-change controller state in this
-directory.
+`opsx-plan` persists durable per-change controller state for direct plan
+execution in `.opsx-plan/<plan-name>.state.json`. Phase workers
+(`opsx-implementer`, `opsx-reviewer`, `opsx-archiver`) receive
+compatibility worker-state snapshots under `.opsx-plan/workers/`.
 
 This file can live in either location:
 

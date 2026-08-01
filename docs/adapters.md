@@ -19,16 +19,21 @@ in the plan compilation and authoring capabilities that vary by adapter:
 
 | | OpenCode | Claude Code | Codex CLI |
 |---|---|---|---|
-| implement / review / archive loop | yes | yes | yes |
+| implement / review / archive loop (plan-level) | yes | yes | opt-in (hand-written stage invokes) |
 | `opsx-plan` + `opsx-run` on `PATH` | installed to `~/.local/bin` | installed to `~/.local/bin` | installed to `~/.local/bin` |
+| single-change `opsx-run` | yes | no (OpenCode-pinned) | no (OpenCode-pinned) |
 | `opsx-plan compile` (markdown plan → TOML) | yes (OpenCode controller model) | yes (Claude Code controller model) | needs OpenCode or Claude Code |
 | plan authoring skill (`/opsx-plan`) | yes | yes | — |
 
 All three adapters install `opsx-plan` and `opsx-run` to `~/.local/bin/`
 via the shared installer helper. The Codex CLI adapter does not support
-plan compilation (`opsx-plan compile`) but its global installer still
-deploys the orchestrator executables — use `opsx-plan` or
-`opsx-run` from `PATH` as you would with any other adapter.
+plan compilation (`opsx-plan compile`) or single-change `opsx-run`, but its
+global installer still deploys the orchestrator executables — use
+`opsx-plan` from `PATH` as you would with any other adapter.
+Single-change `opsx-run` is OpenCode-pinned: `run-one` has no `--adapter` flag
+and always uses the OpenCode adapter. Claude Code and Codex CLI operators run
+single changes via a hand-written plan manifest with `adapter = "claude-code"`
+and `opsx-plan run` instead.
 
 `opsx-plan compile` supports OpenCode (the default) and Claude Code (via
 `--adapter claude-code`). Each requires a `controller` model resolved for
@@ -65,16 +70,10 @@ resolves.
 
 What it contains:
 
-- `adapters/opencode/commands/opsx-drive.md`: main slash command entrypoint
-- `adapters/opencode/agents/opsx-controller.md`: controller/orchestrator
+- `adapters/opencode/commands/opsx-plan.md`: plan-authoring slash command
 - `adapters/opencode/agents/opsx-implementer.md`: implementation round agent
 - `adapters/opencode/agents/opsx-reviewer.md`: strict reviewer agent
 - `adapters/opencode/agents/opsx-archiver.md`: non-interactive archiver agent
-- `adapters/opencode/commands/opsx-review.md`: review prompt used by the
-  controller's strict review phase
-- `adapters/opencode/commands/opsx-archive-no-prompt.md`: deprecated archive
-  helper stub that fails closed and points users to `/opsx-drive`
-- `adapters/opencode/commands/opsx-verify-auto.md`: legacy verifier helper
 - `adapters/opencode/support/opsx-controller-state-README.md`: state contract
 - `adapters/opencode/templates/project/`: host-project setup snippets
 - `adapters/opencode/install.sh`: OpenCode installer
@@ -85,8 +84,6 @@ Requirements:
 - OpenSpec CLI available in the shell
 - a host project that already uses OpenSpec
 - repo-specific guidance in the host project's `AGENTS.md`
-- global OpenSpec phase prompts already installed as OpenCode slash commands:
-  `/opsx-apply`, `/opsx-verify`, `/opsx-archive`
 
 Install:
 
@@ -114,12 +111,8 @@ If the project already has `opencode.json`, `opencode.jsonc`, or
 `.opencode/opencode.json`, merge
 `adapters/opencode/templates/project/opencode.json.snippet.json` manually.
 
-The installer resolves each agent's `model` value through the resolver and
-writes concrete `provider/model` values into the installed Markdown agent
-files. That baked value is only used by the deprecated `/opsx-drive`
-nested-controller path — direct dispatch, the default execution path, reads
-`models.toml` fresh at every plan load and needs no reinstall. Re-run the
-installer only if you still depend on `/opsx-drive`.
+Model changes take effect on the next `opsx-plan run` — no installer re-run
+needed for direct dispatch.
 
 To advertise the controller path in the host repo's instructions, merge
 `adapters/opencode/templates/project/AGENTS.snippet.md` into its `AGENTS.md`.
@@ -128,8 +121,6 @@ To advertise the controller path in the host repo's instructions, merge
 
 What it contains:
 
-- `adapters/claude-code/skills/opsx-drive/SKILL.md`: main Claude Code slash
-  command entrypoint
 - `adapters/claude-code/skills/opsx-plan/SKILL.md`: implementation-plan
   authoring skill
 - `adapters/claude-code/agents/opsx-implementer.md`: implementation phase agent
@@ -182,10 +173,8 @@ To advertise the controller path in the host repo's instructions, merge
 
 What it contains:
 
-- `adapters/codex-cli/skills/opsx-drive/SKILL.md`: controller skill with
+- `adapters/codex-cli/skills/opsx-plan/SKILL.md`: plan-authoring skill with
   required YAML frontmatter
-- `adapters/codex-cli/skills/opsx-drive/agents/openai.yaml`: optional Codex UI
-  metadata
 - `adapters/codex-cli/agents/opsx-implementer.toml`: implementation phase agent
 - `adapters/codex-cli/agents/opsx-reviewer.toml`: strict review phase agent
 - `adapters/codex-cli/agents/opsx-archiver.toml`: archive phase agent
@@ -211,7 +200,7 @@ bash adapters/codex-cli/install.sh --project /path/to/project
 
 Project install behavior:
 
-- copies skill into `<project>/.agents/skills/opsx-drive/`
+- copies skill into `<project>/.agents/skills/opsx-plan/`
 - copies agents into `<project>/.codex/agents/`
 - installs the controller state contract at
   `<project>/.codex/opsx-controller/README.md`
@@ -278,19 +267,17 @@ It is a guidance package, not a full cross-client automated installer.
 
 ## Deprecation notes
 
-`/opsx-drive` (the nested-controller single-change path, available per-adapter
+`/opsx-drive` (the legacy nested-controller single-change path, available per-adapter
 as `/opsx-drive`, `/opsx-controller:opsx-drive`, or `$opsx-drive`) is
-**deprecated**. Direct dispatch has been the default execution path for both
-the `opencode` and `claude-code` adapters since their stage invokes were added,
-and `/opsx-drive` is now the only remaining consumer of install-time model
-baking.
+**removed**. Direct dispatch has been the only execution path since the stage
+invokes were introduced; the nested-controller path is no longer available.
 
-Use `opsx-run <change-id>` (equivalently `opsx-plan run-one <change-id>`)
-instead: it drives the same implement/review/archive loop with the same retry,
-no-progress, and archive-verification gates, and requires no plan manifest.
-`/opsx-drive` continues to work during the deprecation period — `opsx-plan`
-logs a warning when a resolved plan still takes the nested-controller path —
-but it will be removed in a later change.
+Use `opsx-run <change-id>` (equivalently `opsx-plan run-one <change-id>`) for
+single-change execution: it is OpenCode-pinned (`run-one` has no `--adapter`
+flag) and drives the implement/review/archive loop with the same retry,
+no-progress, and archive-verification gates. Claude Code and Codex CLI users
+run single changes via a plan manifest with `adapter = "claude-code"` and
+`opsx-plan run`.
 
 ## Adding another adapter
 

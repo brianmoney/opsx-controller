@@ -1,11 +1,7 @@
 # Opsx Controller State
 
-`/opsx-drive <change-id>` persists durable per-change controller state in this
-directory.
-
-`opsx-plan` no longer depends on these files for OpenCode-backed plan runs.
-Direct plan execution keeps the authoritative phase, round, review, archive,
-and retry state in `.opsx-plan/<plan-name>.state.json`, and may synthesize
+`opsx-plan` persists durable per-change controller state for direct plan
+execution in `.opsx-plan/<plan-name>.state.json`, and may synthesize
 compatibility worker-state snapshots under `.opsx-plan/workers/` before
 dispatching `opsx-implementer`, `opsx-reviewer`, or `opsx-archiver`.
 
@@ -61,22 +57,22 @@ Expected JSON fields:
 
 Resume semantics:
 - If `context_cache.source_signature` still matches the required global
-  `/opsx-*` prompt set and the current OpenSpec `contextFiles`, `/opsx-drive`
+  prompt set and the current OpenSpec `contextFiles`, the controller
   reuses the cached background summary instead of forcing each phase to reread
   every background artifact.
 - If `tracked_change_files` is missing, stale, or obviously narrower than the
-  current accepted change plus successful implement history, `/opsx-drive`
+  current accepted change plus successful implement history, the controller
   rebuilds that archive-scope evidence before trusting a resumed archive retry.
 - When `tracked_change_files` remains valid, a later archive retry can reuse
   that evidence instead of depending only on the latest narrow fix round.
 - If the tracked prompt paths, `contextFiles` list, or tracked artifact
-  fingerprints change, `/opsx-drive` marks `context_cache` stale, rebuilds it
+  fingerprints change, the controller marks `context_cache` stale, rebuilds it
   before the next phase dispatch, and persists the new signature in the same
   state file.
 - `opsx-implementer` may return an optional cache-enrichment payload. The
   controller remains the only writer of the authoritative state file and merges
   that update into `context_cache` with implementer provenance.
-- If the state file says `completed`, `/opsx-drive` trusts it only when the
+- If the state file says `completed`, the controller trusts it only when the
   archive metadata and on-disk archive path still match. Otherwise it downgrades
   the run to blocked archive state instead of reporting false success.
 - If the state file says `blocked` and `phase=implement`, the controller resumes
@@ -103,5 +99,6 @@ Safety rules:
 Operational note:
 - After changing `opencode.json`, `.opencode/commands/`, or `.opencode/agents/`,
   restart OpenCode so the updated controller workflow is loaded.
-- `opsx-plan` no longer nests `/opsx-drive` for OpenCode execution; manual
-  `/opsx-drive <change-id>` remains the supported single-change controller path.
+- `opsx-plan` dispatches implement, review, and archive as direct stage
+  invocations (`opsx-implementer`, `opsx-reviewer`, `opsx-archiver`) — there is
+  no nested-controller path.

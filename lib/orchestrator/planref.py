@@ -31,17 +31,19 @@ def load_plan(path: Path, repo: Path | None = None) -> dict:
 
     adapter = plan.get("adapter", "opencode")
     if adapter not in base.ADAPTER_DEFAULTS and not (
-        plan.get("invoke") and plan.get("state_file")
+        plan.get("implement_invoke")
+        and plan.get("review_invoke")
+        and plan.get("archive_invoke")
+        and plan.get("state_file")
     ):
         raise base.PlanError(
-            f"unknown adapter '{adapter}' and no invoke/state_file overrides given"
+            f"unknown adapter '{adapter}' and no stage invoke/state_file overrides given"
         )
     defaults = base.ADAPTER_DEFAULTS.get(adapter, {})
 
     cfg = {
         "name": plan.get("name") or path.stem,
         "adapter": adapter,
-        "invoke": plan.get("invoke", defaults.get("invoke")),
         "state_file": plan.get("state_file", defaults.get("state_file")),
         "implement_invoke": plan.get(
             "implement_invoke", defaults.get("implement_invoke", "")
@@ -53,7 +55,6 @@ def load_plan(path: Path, repo: Path | None = None) -> dict:
             "archive_invoke", defaults.get("archive_invoke", "")
         ),
         "timeout_minutes": float(plan.get("timeout_minutes", 90)),
-        "max_attempts": int(plan.get("max_attempts", 2)),
         "max_rounds": int(plan.get("max_rounds", 5)),
         "no_progress_limit": int(plan.get("no_progress_limit", 2)),
         "fast_checks": list(plan.get("fast_checks", [])),
@@ -98,7 +99,6 @@ def load_plan(path: Path, repo: Path | None = None) -> dict:
             "timeout_minutes": float(
                 c.get("timeout_minutes", cfg["timeout_minutes"])
             ),
-            "max_attempts": int(c.get("max_attempts", cfg["max_attempts"])),
             "create_invoke": c.get("create_invoke", cfg["create_invoke"]),
             "create_max_attempts": int(
                 c.get("create_max_attempts", cfg["create_max_attempts"])
@@ -118,12 +118,15 @@ def load_plan(path: Path, repo: Path | None = None) -> dict:
     except ModelConfigError as exc:
         raise base.PlanError(str(exc)) from exc
 
-    if not is_direct_mode(cfg):
-        base.log(
-            f"warning: plan '{cfg['name']}' resolves to the deprecated nested-controller "
-            f"'/opsx-drive' path (fewer than all three stage invokes configured); "
-            f"direct dispatch (opsx-run <change-id> or full implement/review/archive "
-            f"stage invokes) is the supported replacement"
+    missing = []
+    for key in ("implement_invoke", "review_invoke", "archive_invoke"):
+        if not cfg.get(key):
+            missing.append(key)
+    if missing:
+        raise base.PlanError(
+            f"plan '{cfg['name']}' is missing required stage invoke(s): "
+            f"{', '.join(missing)}; all three direct stage invokes "
+            f"(implement_invoke, review_invoke, archive_invoke) are required"
         )
 
     return cfg

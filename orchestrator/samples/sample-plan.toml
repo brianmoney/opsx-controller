@@ -5,7 +5,6 @@
 [plan]
 name = "sample-implementation-plan"
 adapter = "opencode"
-invoke = 'opencode run "/opsx-drive {change}"'
 state_file = ".opencode/opsx-controller/{change}.json"
 implement_invoke = 'opencode run --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL"'
 review_invoke = 'opencode run --agent opsx-reviewer --model "$OPSX_REVIEWER_MODEL"'
@@ -18,7 +17,6 @@ create_max_attempts = 2
 review_created = true
 created_check = "openspec validate {change} --strict"
 timeout_minutes = 90
-max_attempts = 2
 max_rounds = 5
 no_progress_limit = 2
 escalate_after_review_fails = 0
@@ -43,7 +41,6 @@ phase = 1
 pause_before = true  # first change in proposed shared-validation capability
 enabled = true
 timeout_minutes = 90
-max_attempts = 2
 create_invoke = ""
 create_max_attempts = 2
 
@@ -69,5 +66,4 @@ depends_on = ["add-input-validation", "add-discount-code-verification"]
 pause_before = true  # talks to a real payment processor — human review gate
 enabled = true
 timeout_minutes = 120
-max_attempts = 3
 create_max_attempts = 2

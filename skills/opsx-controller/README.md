@@ -12,8 +12,12 @@ SKILL_BASE_URL="https://github.com/brianmoney/opsx-controller/tree/main" \
 
 Contents:
 
-- `SKILL.md`: main skill entrypoint
-- `references/`: self-contained controller contract and adapter notes
+- `SKILL.md`: main skill entrypoint covering plan-level orchestration and the
+  per-change controller loop
+- `references/`: self-contained controller contract, adapter notes, state schema,
+  and phase protocol
 
-This package is guidance-focused. For automated installation into a specific
-client, use the source repository's adapter installers.
+For authoring compilable markdown implementation plans, see the shared reference
+at `core/plan-authoring.md` in the source repository. This package is
+guidance-focused. For automated installation into a specific client, use the
+source repository's adapter installers.
