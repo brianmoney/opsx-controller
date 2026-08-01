@@ -296,6 +296,9 @@ def load_plan(path: Path, repo: Path | None = None) -> dict:
         "escalate_after_review_fails": _parse_escalation_threshold(
             plan.get("escalate_after_review_fails", 0)
         ),
+        "finding_recurrence_limit": _parse_finding_recurrence_limit(
+            plan.get("finding_recurrence_limit", 0)
+        ),
         "skip_warning": bool(plan.get("skip_warning", False)),
         "skip_suggestion": bool(plan.get("skip_suggestion", False)),
         # --- run-event notifications ---
@@ -397,6 +400,7 @@ def build_single_change_config(repo: Path, change_id: str) -> dict:
         "check_timeout_minutes": 15,
         "require_clean_tracked": True,
         "escalate_after_review_fails": 0,
+        "finding_recurrence_limit": 0,
         "skip_warning": False,
         "skip_suggestion": False,
         "notify_cmd": "",
@@ -471,6 +475,7 @@ def render_single_change_manifest(cfg: dict) -> str:
     lines.append(f"max_rounds = {int(cfg.get('max_rounds', 5))}")
     lines.append(f"no_progress_limit = {int(cfg.get('no_progress_limit', 2))}")
     lines.append(f"escalate_after_review_fails = {int(cfg.get('escalate_after_review_fails', 0))}")
+    lines.append(f"finding_recurrence_limit = {int(cfg.get('finding_recurrence_limit', 0))}")
     lines.append(f"check_timeout_minutes = {float(cfg.get('check_timeout_minutes', 15))}")
     lines.append(f"create_timeout_minutes = {float(cfg.get('create_timeout_minutes', 30))}")
     lines.append(f"create_max_attempts = {int(cfg.get('create_max_attempts', 2))}")
@@ -574,7 +579,7 @@ def _compare_configs(
         "name", "adapter", "invoke", "state_file",
         "implement_invoke", "review_invoke", "archive_invoke",
         "timeout_minutes", "max_attempts", "max_rounds", "no_progress_limit",
-        "escalate_after_review_fails",
+        "escalate_after_review_fails", "finding_recurrence_limit",
         "fast_checks", "check_timeout_minutes", "require_clean_tracked",
         "skip_warning", "skip_suggestion",
         "notify_cmd", "plan_doc", "create_invoke",
@@ -700,6 +705,21 @@ def _parse_escalation_threshold(value: object) -> int:
             f"got {threshold}"
         )
     return threshold
+
+
+def _parse_finding_recurrence_limit(value: object) -> int:
+    """Parse ``finding_recurrence_limit`` into a non-negative integer.
+
+    Raises ``PlanError`` naming the key on a negative value. ``0`` disables
+    recurrence halting.
+    """
+    limit = int(value)
+    if limit < 0:
+        raise PlanError(
+            "finding_recurrence_limit must be >= 0, "
+            f"got {limit}"
+        )
+    return limit
 
 
 def _parse_git_delivery_config(raw: dict) -> dict:
@@ -1140,22 +1160,47 @@ def single_line(value: str) -> str:
     return compact if compact else "none"
 
 
-def build_worker_input(repo: Path, cfg: dict, state: dict, cid: str) -> str:
+def _prior_finding_loci(r: dict, cfg: dict) -> list[str]:
+    """Return the most recently completed review round's blocking-finding loci.
+
+    Empty for a change with no completed review round yet, and empty when
+    that review reported no blocking findings (or no structured findings at
+    all).
+    """
+    blocking = _blocking_severities(cfg)
+    for entry in reversed(r["history"]):
+        if entry.get("phase") != "review":
+            continue
+        seen: set[str] = set()
+        loci: list[str] = []
+        for finding in entry.get("findings", []) or []:
+            if finding.get("severity") not in blocking:
+                continue
+            for locus in finding.get("locus", []) or []:
+                if locus not in seen:
+                    seen.add(locus)
+                    loci.append(locus)
+        return loci
+    return []
+
+
+def build_worker_input(repo: Path, cfg: dict, state: dict, cid: str, stage: str = "") -> str:
     r = rec(state, cid)
     update_task_counts(repo, state, cid)
     cache = r["context_cache"]
-    return "\n".join(
-        [
-            f"CHANGE: {cid}",
-            f"ROUND: {r['round']}",
-            f"STATE_FILE: {worker_state_path(repo, cfg['name'], cid)}",
-            f"LATEST_FIX_PROMPT: {single_line(r['latest_fix_prompt'])}",
-            f"TASK_COUNTS: {r['task_counts']['complete']}/{r['task_counts']['total']}",
-            f"CONTEXT_CACHE_STATUS: {cache['status']}",
-            f"CONTEXT_CACHE_VALID: {'true' if cache['valid'] else 'false'}",
-            f"CONTEXT_CACHE_SUMMARY: {single_line(cache['change_summary'])}",
-        ]
-    )
+    lines = [
+        f"CHANGE: {cid}",
+        f"ROUND: {r['round']}",
+        f"STATE_FILE: {worker_state_path(repo, cfg['name'], cid)}",
+        f"LATEST_FIX_PROMPT: {single_line(r['latest_fix_prompt'])}",
+        f"TASK_COUNTS: {r['task_counts']['complete']}/{r['task_counts']['total']}",
+        f"CONTEXT_CACHE_STATUS: {cache['status']}",
+        f"CONTEXT_CACHE_VALID: {'true' if cache['valid'] else 'false'}",
+        f"CONTEXT_CACHE_SUMMARY: {single_line(cache['change_summary'])}",
+    ]
+    if stage == "review":
+        lines.append(f"PRIOR_FINDING_LOCI: {', '.join(_prior_finding_loci(r, cfg))}")
+    return "\n".join(lines)
 
 
 def next_stage_log_path(repo: Path, cid: str, stage: str, round_num: int) -> Path:
@@ -2682,6 +2727,84 @@ def normalize_finding_counts(payload: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Finding locus normalization (recurrence detection)
+# ---------------------------------------------------------------------------
+
+_TRACKED_FILES_CACHE: dict[str, list[str]] = {}
+
+
+def tracked_files(repo: Path) -> list[str]:
+    """Return ``git ls-files`` output for *repo*, cached per repo for the run.
+
+    Locus normalization resolves against tracked files once per finding, so
+    this cache keeps the process from shelling out to git once per locus.
+    """
+    key = str(repo)
+    if key not in _TRACKED_FILES_CACHE:
+        res = git(repo, "ls-files")
+        _TRACKED_FILES_CACHE[key] = (
+            [line for line in res.stdout.splitlines() if line]
+            if res.returncode == 0
+            else []
+        )
+    return _TRACKED_FILES_CACHE[key]
+
+
+_LOCUS_WRAP_CHARS = " \t\r\n`"
+_LOCUS_TRAILING_PUNCT = ".,;:!?)]}\"'`"
+
+
+def _resolve_locus_path(path: str, files: list[str]) -> str:
+    """Resolve *path* to the one tracked file it is a unique suffix of.
+
+    Returns *path* unchanged when it matches no tracked file, or matches more
+    than one (an ambiguous suffix) — an unresolvable or ambiguous locus is
+    still retained, in trimmed form, so it can participate in comparison.
+    """
+    if not path:
+        return path
+    matches = [f for f in files if f == path or f.endswith("/" + path)]
+    return matches[0] if len(matches) == 1 else path
+
+
+def normalize_finding_locus(raw: str, files: list[str]) -> str:
+    """Normalize one reviewer-reported locus string for identity comparison.
+
+    Trims surrounding whitespace, backticks, and trailing punctuation,
+    converts path separators to POSIX form, and splits the optional
+    ``:<symbol>`` suffix. The path portion is resolved against *files* (see
+    ``_resolve_locus_path``); the symbol portion, if present, is compared
+    exactly and is not itself normalized.
+    """
+    text = (raw or "").strip(_LOCUS_WRAP_CHARS)
+    text = text.rstrip(_LOCUS_TRAILING_PUNCT)
+    text = text.replace("\\", "/")
+    if ":" in text:
+        path_part, _, symbol_part = text.rpartition(":")
+    else:
+        path_part, symbol_part = text, ""
+    resolved = _resolve_locus_path(path_part.strip(), files)
+    return f"{resolved}:{symbol_part}" if symbol_part else resolved
+
+
+def normalize_finding_loci(finding: dict, files: list[str]) -> list[str]:
+    """Return the normalized, de-duplicated, order-preserving loci for one finding."""
+    raw_loci = finding.get("locus", [])
+    if not isinstance(raw_loci, list):
+        return []
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for entry in raw_loci:
+        if not isinstance(entry, str) or not entry.strip():
+            continue
+        norm = normalize_finding_locus(entry, files)
+        if norm and norm not in seen:
+            seen.add(norm)
+            normalized.append(norm)
+    return normalized
+
+
 _ENV_VAR_RE = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
 
 
@@ -2876,6 +2999,77 @@ def apply_implement_result(
     return "continue"
 
 
+_VALID_FINDING_SEVERITIES = {"critical", "warning", "note"}
+
+
+def normalize_review_findings(payload: dict, files: list[str]) -> list[dict]:
+    """Extract and normalize the reviewer's ``findings`` array for persistence.
+
+    Tolerates a missing or malformed ``findings`` array (returns ``[]``,
+    contributing no recurrence evidence) so legacy review payloads keep
+    driving the loop exactly as before. Individual malformed entries within
+    an otherwise valid list are skipped rather than discarding the round.
+    """
+    raw_findings = payload.get("findings")
+    if not isinstance(raw_findings, list):
+        return []
+    normalized: list[dict] = []
+    for finding in raw_findings:
+        if not isinstance(finding, dict):
+            continue
+        severity = finding.get("severity")
+        if severity not in _VALID_FINDING_SEVERITIES:
+            continue
+        locus = normalize_finding_loci(finding, files)
+        if not locus:
+            continue
+        normalized.append(
+            {
+                "severity": severity,
+                "locus": locus,
+                "statement": str(finding.get("statement", "")),
+            }
+        )
+    return normalized
+
+
+def _blocking_severities(cfg: dict) -> set[str]:
+    """Return the finding severities that gate the review verdict.
+
+    Mirrors the ``skip_warning``/``skip_suggestion`` gate in
+    ``apply_review_result`` so recurrence composes with it rather than
+    duplicating separate logic.
+    """
+    skip_warning = cfg.get("skip_warning", False)
+    skip_suggestion = cfg.get("skip_suggestion", False) or skip_warning
+    severities = {"critical"}
+    if not skip_warning:
+        severities.add("warning")
+    if not skip_suggestion:
+        severities.add("note")
+    return severities
+
+
+def _locus_recurrence_rounds(history: list[dict], blocking: set[str]) -> dict[str, set[int]]:
+    """Map each normalized locus to the distinct review rounds that cited it.
+
+    Only findings whose severity is in *blocking* contribute. Multiple
+    blocking findings citing the same locus within one round contribute that
+    round once, since the map value is a set.
+    """
+    locus_rounds: dict[str, set[int]] = {}
+    for entry in history:
+        if entry.get("phase") != "review":
+            continue
+        round_num = entry.get("round")
+        for finding in entry.get("findings", []) or []:
+            if finding.get("severity") not in blocking:
+                continue
+            for locus in finding.get("locus", []) or []:
+                locus_rounds.setdefault(locus, set()).add(round_num)
+    return locus_rounds
+
+
 def apply_review_result(repo: Path, cfg: dict, state: dict, cid: str, payload: dict) -> str:
     r = rec(state, cid)
     if payload.get("status") != "reviewed":
@@ -2893,6 +3087,7 @@ def apply_review_result(repo: Path, cfg: dict, state: dict, cid: str, payload: d
     summary = payload.get("summary", "review completed")
     fix_prompt = payload.get("fix_prompt", "")
     update_task_counts(repo, state, cid)
+    findings = normalize_review_findings(payload, tracked_files(repo))
     r["last_review"] = {
         "verdict": verdict,
         "finding_counts": counts,
@@ -2908,6 +3103,7 @@ def apply_review_result(repo: Path, cfg: dict, state: dict, cid: str, payload: d
             "status": verdict,
             "summary": summary,
             "finding_counts": counts,
+            "findings": findings,
         },
     )
     if verdict not in {"pass", "fail"}:
@@ -2939,6 +3135,20 @@ def apply_review_result(repo: Path, cfg: dict, state: dict, cid: str, payload: d
         set_status(state, cid, PENDING, summary)
         return "continue"
     r["latest_fix_prompt"] = fix_prompt
+    recurrence_limit = cfg.get("finding_recurrence_limit", 0)
+    if recurrence_limit > 0:
+        locus_rounds = _locus_recurrence_rounds(r["history"], _blocking_severities(cfg))
+        for locus, rounds in locus_rounds.items():
+            if len(rounds) >= recurrence_limit:
+                rounds_desc = ", ".join(str(n) for n in sorted(rounds))
+                reason = (
+                    f"finding recurrence ceiling reached: locus '{locus}' cited by a "
+                    f"blocking finding in rounds {rounds_desc}"
+                )
+                r["last_result"] = "finding_recurrence_exceeded"
+                set_status(state, cid, FAILED, reason)
+                _try_notify(cfg, "change_failed", reason, change_id=cid)
+                return "stop"
     if r["round"] >= r["max_rounds"]:
         r["last_result"] = "max_rounds_reached"
         set_status(state, cid, FAILED, "review retry budget exhausted")
@@ -3102,7 +3312,7 @@ def run_direct_change(
             r["phase"] = "implement"
             stage = "implement"
 
-        input_block = build_worker_input(repo, cfg, state, cid)
+        input_block = build_worker_input(repo, cfg, state, cid, stage=stage)
         set_status(state, cid, RUNNING, f"{stage} round {round_num}")
         persist_direct_state(repo, cfg, state, cid)
 
@@ -4208,7 +4418,7 @@ def run_preflight_warnings(repo: Path, plan_src: str | None,
 # re-invoking /opsx-drive can plausibly succeed.
 # ---------------------------------------------------------------------------
 
-NO_RETRY_RESULTS = {"max_rounds_reached", "no_progress"}
+NO_RETRY_RESULTS = {"max_rounds_reached", "no_progress", "finding_recurrence_exceeded"}
 
 
 def retry_makes_sense(controller_state: dict | None) -> tuple[bool, str]:
@@ -4595,6 +4805,7 @@ def build_schema_guidance(adapter: str = "opencode") -> str:
         "| max_rounds | int | ``5`` | implement-review loop ceiling |\n"
         "| no_progress_limit | int | ``2`` | consecutive no-progress rounds before failing |\n"
         "| escalate_after_review_fails | int | ``0`` | promote implement to escalation model after N failed reviews; round=(N+1) first escalates; 0 disables |\n"
+        "| finding_recurrence_limit | int | ``0`` | halt a change when one locus is cited by a blocking finding in this many distinct rounds; 0 disables |\n"
         "| fast_checks | list[str] | ``[]`` | post-archive CLI checks |\n"
         "| check_timeout_minutes | float | ``15`` | fast-check timeout |\n"
         "| require_clean_tracked | bool | ``true`` | refuse to run when tracked tree is dirty |\n"

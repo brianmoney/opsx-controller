@@ -2652,6 +2652,25 @@ class ModelResolutionWiringTests(unittest.TestCase):
             self.opsx_plan.load_plan(plan, repo=self.repo)
         self.assertIn("escalate_after_review_fails", str(ctx.exception))
 
+    def test_finding_recurrence_limit_defaults_to_zero(self) -> None:
+        """4.1: absent key -> 0 (recurrence halting disabled)"""
+        plan = self._write_plan("plan.toml", "opencode")
+        cfg = self.opsx_plan.load_plan(plan, repo=self.repo)
+        self.assertEqual(cfg["finding_recurrence_limit"], 0)
+
+    def test_finding_recurrence_limit_negative_value_raises(self) -> None:
+        """4.1: negative value raises PlanError naming the key"""
+        plan = self.repo / "neg-recurrence.toml"
+        plan.write_text(
+            '[plan]\nname = "neg-recurrence"\nadapter = "opencode"\n'
+            'finding_recurrence_limit = -1\n\n'
+            '[[changes]]\nid = "c1"\n',
+            encoding="utf-8",
+        )
+        with self.assertRaises(self.opsx_plan.PlanError) as ctx:
+            self.opsx_plan.load_plan(plan, repo=self.repo)
+        self.assertIn("finding_recurrence_limit", str(ctx.exception))
+
     def test_apply_model_env_succeeds_with_unresolved_escalation_and_threshold_zero(self) -> None:
         """3.3: escalation unresolved + threshold 0 → no error"""
         os.environ.pop("OPSX_IMPLEMENTER_ESCALATION_MODEL", None)
@@ -15874,6 +15893,19 @@ class SingleChangeManifestTests(unittest.TestCase):
         # Round-trip through render → load → compare — must not raise.
         self.opsx_plan.write_single_change_manifest(self.repo, self.cid, cfg)
 
+    def test_round_trip_with_nonzero_finding_recurrence_limit(self):
+        """4.4: non-zero finding_recurrence_limit survives round-trip"""
+        self.write_authored_change(self.cid)
+        cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
+        cfg["finding_recurrence_limit"] = 3
+        # Round-trip through render → load → compare — must not raise.
+        self.opsx_plan.write_single_change_manifest(self.repo, self.cid, cfg)
+        reloaded = self.opsx_plan.load_plan(
+            self.opsx_plan.single_change_manifest_path(self.repo, self.cid),
+            repo=self.repo,
+        )
+        self.assertEqual(reloaded["finding_recurrence_limit"], 3)
+
 
 
 class ForChangeReportTests(unittest.TestCase):
@@ -16385,7 +16417,7 @@ class SamplePlanTests(unittest.TestCase):
             "name", "adapter", "invoke", "state_file",
             "implement_invoke", "review_invoke", "archive_invoke",
             "timeout_minutes", "max_attempts", "max_rounds", "no_progress_limit",
-            "escalate_after_review_fails",
+            "escalate_after_review_fails", "finding_recurrence_limit",
             "fast_checks", "check_timeout_minutes", "require_clean_tracked",
             "skip_warning", "skip_suggestion",
             "notify_cmd", "plan_doc", "create_invoke",
@@ -16558,6 +16590,7 @@ class SamplePlanTests(unittest.TestCase):
             "implement_invoke", "review_invoke", "archive_invoke",
             "timeout_minutes", "max_attempts", "max_rounds",
             "no_progress_limit", "escalate_after_review_fails",
+            "finding_recurrence_limit",
             "fast_checks", "check_timeout_minutes",
             "require_clean_tracked", "skip_warning", "skip_suggestion",
             "notify_cmd", "plan_doc",
@@ -17077,6 +17110,291 @@ class ReviewGateSkipSeverityTests(unittest.TestCase):
             entry["finding_counts"], {"critical": 0, "warning": 2, "note": 1}
         )
         self.assertEqual(record["last_review"]["verdict"], "fail")
+
+    def test_legacy_payload_without_findings_array_drives_loop_unchanged(self) -> None:
+        """3.3/3.4: a review payload with no `findings` array (legacy shape)
+        must not fail the change, and must record that the round contributed
+        no recurrence evidence."""
+        _, record = self._apply(self._cfg(), self._review("fail", 1, 0, 0))
+        self.assertEqual(record["last_result"], "review_failed")
+        self.assertEqual(record["phase"], "implement")
+        entry = record["history"][-1]
+        self.assertEqual(entry["findings"], [])
+
+
+class LocusNormalizationTests(unittest.TestCase):
+    """normalize_finding_locus / tracked_files (finding-recurrence-detection change)."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+
+    def test_varying_path_depth_resolves_to_one_identity(self) -> None:
+        """2.4: a short suffix and a deeper suffix of the same unique tracked
+        file normalize to the same identity."""
+        files = ["orchestrator/agents/executors/result_contract.py"]
+        short = self.opsx_plan.normalize_finding_locus("result_contract.py", files)
+        deep = self.opsx_plan.normalize_finding_locus(
+            "agents/executors/result_contract.py", files
+        )
+        self.assertEqual(short, deep)
+        self.assertEqual(short, "orchestrator/agents/executors/result_contract.py")
+
+    def test_ambiguous_suffix_is_retained_trimmed(self) -> None:
+        """2.4: a suffix matching more than one tracked file is retained as-is."""
+        files = ["a/widget.py", "b/widget.py"]
+        result = self.opsx_plan.normalize_finding_locus("widget.py", files)
+        self.assertEqual(result, "widget.py")
+
+    def test_unresolvable_path_is_retained_trimmed(self) -> None:
+        """2.4: a path matching no tracked file is retained, not discarded."""
+        files = ["a/widget.py"]
+        result = self.opsx_plan.normalize_finding_locus("ghost.py", files)
+        self.assertEqual(result, "ghost.py")
+
+    def test_exact_symbol_comparison(self) -> None:
+        """2.4: the :<symbol> suffix is compared exactly, case included."""
+        files = ["src/intake.py"]
+        a = self.opsx_plan.normalize_finding_locus("src/intake.py:_apply_outcome", files)
+        b = self.opsx_plan.normalize_finding_locus("src/intake.py:_apply_Outcome", files)
+        self.assertEqual(a, "src/intake.py:_apply_outcome")
+        self.assertNotEqual(a, b)
+
+    def test_trims_whitespace_backticks_and_trailing_punctuation(self) -> None:
+        files = ["src/intake.py"]
+        result = self.opsx_plan.normalize_finding_locus(
+            " `src/intake.py:_apply_outcome`. ", files
+        )
+        self.assertEqual(result, "src/intake.py:_apply_outcome")
+
+    def test_converts_backslash_separators_to_posix(self) -> None:
+        files = ["src/intake.py"]
+        result = self.opsx_plan.normalize_finding_locus("src\\intake.py", files)
+        self.assertEqual(result, "src/intake.py")
+
+    def test_bare_trailing_colon_collapses_to_path_only(self) -> None:
+        files = ["src/intake.py"]
+        result = self.opsx_plan.normalize_finding_locus("src/intake.py:", files)
+        self.assertEqual(result, "src/intake.py")
+
+    def test_tracked_files_cached_per_repo_for_the_run(self) -> None:
+        """2.3: tracked_files() shells out once per repo per process."""
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            repo = Path(tmp.name)
+            git(repo, "init")
+            (repo / "a.txt").write_text("x\n", encoding="utf-8")
+            git(repo, "add", "a.txt")
+            git(
+                repo,
+                "-c", "user.email=test@example.invalid",
+                "-c", "user.name=Test User",
+                "commit", "-m", "init",
+            )
+            first = self.opsx_plan.tracked_files(repo)
+            (repo / "b.txt").write_text("y\n", encoding="utf-8")
+            git(repo, "add", "b.txt")
+            second = self.opsx_plan.tracked_files(repo)
+            self.assertEqual(
+                first, second,
+                "tracked_files must be cached per run, not re-shelled per call",
+            )
+        finally:
+            tmp.cleanup()
+
+
+class FindingRecurrenceDetectionTests(unittest.TestCase):
+    """The finding_recurrence_limit ceiling in apply_review_result."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        git(self.repo, "init")
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "widget.py").write_text("# widget\n", encoding="utf-8")
+        git(self.repo, "add", "src/widget.py")
+        git(
+            self.repo,
+            "-c", "user.email=test@example.invalid",
+            "-c", "user.name=Test User",
+            "commit", "-m", "init",
+        )
+        self.cid = "add-thing"
+        self.state = {"changes": {}}
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _cfg(self, **overrides) -> dict:
+        cfg = {
+            "name": "recurrence-plan",
+            "max_rounds": 10,
+            "skip_warning": False,
+            "skip_suggestion": False,
+            "finding_recurrence_limit": 0,
+        }
+        cfg.update(overrides)
+        return cfg
+
+    def _review(self, round_num: int, severity_locus_pairs: list[tuple[str, str]]) -> dict:
+        findings = [
+            {"severity": sev, "locus": [locus], "statement": "still broken"}
+            for sev, locus in severity_locus_pairs
+        ]
+        counts = {"critical": 0, "warning": 0, "note": 0}
+        for sev, _ in severity_locus_pairs:
+            counts[sev] += 1
+        return {
+            "status": "reviewed",
+            "change": self.cid,
+            "round": round_num,
+            "verdict": "fail",
+            "finding_counts": counts,
+            "summary": "still broken",
+            "fix_prompt": "CHANGE: add-thing ...",
+            "findings": findings,
+            "next_phase": "implement",
+        }
+
+    def _apply(self, cfg: dict, payload: dict) -> str:
+        # Real dispatch syncs r["max_rounds"] from cfg before every stage
+        # (see run_direct_change); direct apply_review_result calls in these
+        # tests must do the same or the state-default max_rounds=5 governs.
+        r = self.opsx_plan.rec(self.state, self.cid)
+        r["max_rounds"] = cfg["max_rounds"]
+        return self.opsx_plan.apply_review_result(
+            self.repo, cfg, self.state, self.cid, payload
+        )
+
+    def test_nonconsecutive_recurrence_halts_before_max_rounds(self) -> None:
+        """7.1: a locus cited by a blocking finding in rounds 4, 5, 7, and 8
+        (never three rounds in a row) halts at round 7 with a ceiling of 3,
+        rather than running out the max_rounds budget."""
+        cfg = self._cfg(finding_recurrence_limit=3)
+        citing_rounds = {4, 5, 7, 8}
+        for round_num in range(1, 9):
+            r = self.opsx_plan.rec(self.state, self.cid)
+            self.assertEqual(r["round"], round_num)
+            pairs = (
+                [("critical", "src/widget.py")]
+                if round_num in citing_rounds
+                else [("critical", f"src/other{round_num}.py")]
+            )
+            action = self._apply(cfg, self._review(round_num, pairs))
+            record = self.opsx_plan.rec(self.state, self.cid)
+            if round_num == 7:
+                self.assertEqual(action, "stop")
+                self.assertEqual(record["last_result"], "finding_recurrence_exceeded")
+                self.assertEqual(record["status"], self.opsx_plan.FAILED)
+                self.assertIn("src/widget.py", record["reason"])
+                self.assertIn("4", record["reason"])
+                self.assertIn("5", record["reason"])
+                self.assertIn("7", record["reason"])
+                return
+            self.assertEqual(action, "continue")
+        self.fail("expected the recurrence ceiling to halt at round 7")
+
+    def test_non_blocking_severity_never_triggers_halt(self) -> None:
+        """7.2: a locus cited only by a skipped (non-blocking) severity never
+        accumulates recurrence, however many rounds cite it."""
+        cfg = self._cfg(finding_recurrence_limit=2, skip_suggestion=True)
+        for round_num in range(1, 6):
+            pairs = [
+                ("critical", f"src/other{round_num}.py"),
+                ("note", "src/widget.py"),
+            ]
+            action = self._apply(cfg, self._review(round_num, pairs))
+            self.assertEqual(action, "continue")
+        record = self.opsx_plan.rec(self.state, self.cid)
+        self.assertEqual(record["last_result"], "review_failed")
+        self.assertNotEqual(record["status"], self.opsx_plan.FAILED)
+
+    def test_passing_review_is_unaffected_by_recurrence_history(self) -> None:
+        """Ceiling scenario: a locus reaches the ceiling's round count on the
+        very round whose verdict passes the gate — recurrence halting is
+        evaluated only after a failing verdict, so a passing round's own
+        findings can never trigger it, however they read.
+
+        Round 1 fails, citing the locus once. Round 2's finding_counts are
+        all zero (so the gate passes) even though its `findings` array still
+        names the same locus, bringing its persisted citation count to the
+        `finding_recurrence_limit` of 2 — proving the ceiling never even runs
+        the check on a passing round."""
+        cfg = self._cfg(finding_recurrence_limit=2)
+        action = self._apply(cfg, self._review(1, [("critical", "src/widget.py")]))
+        self.assertEqual(action, "continue")
+        pass_payload = {
+            "status": "reviewed",
+            "change": self.cid,
+            "round": 2,
+            "verdict": "pass",
+            "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+            "summary": "clean",
+            "fix_prompt": "",
+            "findings": [
+                {"severity": "critical", "locus": ["src/widget.py"], "statement": "was flaky"}
+            ],
+            "next_phase": "archive",
+        }
+        action = self._apply(cfg, pass_payload)
+        record = self.opsx_plan.rec(self.state, self.cid)
+        self.assertEqual(action, "continue")
+        self.assertEqual(record["last_result"], "review_passed")
+        self.assertEqual(record["phase"], "archive")
+
+    def test_disabled_ceiling_never_halts(self) -> None:
+        """finding_recurrence_limit = 0 (default) disables recurrence halting
+        even when the same locus recurs every round."""
+        cfg = self._cfg(finding_recurrence_limit=0, max_rounds=4)
+        for round_num in range(1, 5):
+            action = self._apply(cfg, self._review(round_num, [("critical", "src/widget.py")]))
+        record = self.opsx_plan.rec(self.state, self.cid)
+        self.assertEqual(record["last_result"], "max_rounds_reached")
+
+    def test_prior_finding_loci_present_and_empty_on_first_round(self) -> None:
+        """6.2: PRIOR_FINDING_LOCI is present and explicitly empty for a
+        change's first review round."""
+        r = self.opsx_plan.rec(self.state, self.cid)
+        block = self.opsx_plan.build_worker_input(
+            self.repo, self._cfg(), self.state, self.cid, stage="review"
+        )
+        self.assertIn("PRIOR_FINDING_LOCI: ", block)
+        lines = {line.split(": ", 1)[0]: line.split(": ", 1)[1] for line in block.splitlines()}
+        self.assertEqual(lines["PRIOR_FINDING_LOCI"], "")
+
+    def test_prior_finding_loci_carries_previous_round_blocking_loci(self) -> None:
+        """6.1: the second review dispatch carries the first round's
+        blocking-finding loci."""
+        cfg = self._cfg()
+        self._apply(
+            cfg,
+            self._review(1, [("critical", "src/widget.py"), ("warning", "src/other.py")]),
+        )
+        block = self.opsx_plan.build_worker_input(
+            self.repo, cfg, self.state, self.cid, stage="review"
+        )
+        lines = {line.split(": ", 1)[0]: line.split(": ", 1)[1] for line in block.splitlines()}
+        prior = [loc.strip() for loc in lines["PRIOR_FINDING_LOCI"].split(",")]
+        self.assertEqual(set(prior), {"src/widget.py", "src/other.py"})
+
+    def test_prior_finding_loci_absent_from_implement_dispatch(self) -> None:
+        """6.1: PRIOR_FINDING_LOCI is a review-dispatch-only field."""
+        block = self.opsx_plan.build_worker_input(
+            self.repo, self._cfg(), self.state, self.cid, stage="implement"
+        )
+        self.assertNotIn("PRIOR_FINDING_LOCI", block)
+
+    def test_recurrence_accounting_unaffected_when_reviewer_ignores_prior_loci(self) -> None:
+        """6.3: recurrence accounting comes from the orchestrator's own
+        normalization regardless of whether PRIOR_FINDING_LOCI is echoed
+        back — simulated by never referencing it in review payloads, which
+        every other test in this class already does."""
+        cfg = self._cfg(finding_recurrence_limit=2)
+        for round_num in (1, 2):
+            action = self._apply(cfg, self._review(round_num, [("critical", "src/widget.py")]))
+        record = self.opsx_plan.rec(self.state, self.cid)
+        self.assertEqual(action, "stop")
+        self.assertEqual(record["last_result"], "finding_recurrence_exceeded")
 
 
 if __name__ == "__main__":
