@@ -91,9 +91,19 @@ install_agents_with_models() {
 # Role names as they appear in OPSX_<ROLE>_MODEL, matching lib/models/types.py ROLES.
 OPSX_MODEL_ROLES=(CONTROLLER IMPLEMENTER REVIEWER ARCHIVER)
 
-# Line-based {env:OPSX_<ROLE>_MODEL} substitution. Works for any text agent
-# format (OpenCode's .md frontmatter, Codex's .toml) since it only ever
-# rewrites matching placeholder tokens on each line.
+# Built-in reasoning-variant defaults per role, used when no
+# OPSX_<ROLE>_VARIANT is resolved from models.toml or the environment.
+# These match the historical hardcoded `variant:` frontmatter values.
+OPSX_VARIANT_DEFAULT_CONTROLLER=high
+OPSX_VARIANT_DEFAULT_IMPLEMENTER=high
+OPSX_VARIANT_DEFAULT_REVIEWER=xhigh
+OPSX_VARIANT_DEFAULT_ARCHIVER=high
+
+# Line-based {env:OPSX_<ROLE>_MODEL} / {env:OPSX_<ROLE>_VARIANT}
+# substitution. Works for any text agent format (OpenCode's .md frontmatter,
+# Codex's .toml) since it only ever rewrites matching placeholder tokens on
+# each line. An unset variant resolves to the role's built-in default so the
+# installed file always carries a concrete value.
 install_agent() {
   local src="$1"
   local dest="$2"
@@ -101,10 +111,14 @@ install_agent() {
   tmp="$(mktemp)"
 
   while IFS= read -r line || [[ -n "$line" ]]; do
-    local role var
+    local role var variant_var default_var variant_value
     for role in "${OPSX_MODEL_ROLES[@]}"; do
       var="OPSX_${role}_MODEL"
       line="${line//\{env:${var}\}/${!var}}"
+      variant_var="OPSX_${role}_VARIANT"
+      default_var="OPSX_VARIANT_DEFAULT_${role}"
+      variant_value="${!variant_var:-${!default_var}}"
+      line="${line//\{env:${variant_var}\}/${variant_value}}"
     done
     printf '%s\n' "$line"
   done <"$src" >"$tmp"

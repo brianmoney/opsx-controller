@@ -500,6 +500,33 @@ class AdapterInstallerTests(unittest.TestCase):
             "supported worker agent must survive",
         )
 
+    def test_opencode_agent_variant_defaults_when_unset(self) -> None:
+        """With no OPSX_<ROLE>_VARIANT configured, installed agents carry the
+        built-in defaults (reviewer: xhigh, others: high)."""
+        home = Path(self.home.name)
+        _run_installer(_OPENCODE_INSTALLER, home, self.env)
+        agents = home / ".config" / "opencode" / "agents"
+        reviewer = (agents / "opsx-reviewer.md").read_text(encoding="utf-8")
+        implementer = (agents / "opsx-implementer.md").read_text(encoding="utf-8")
+        archiver = (agents / "opsx-archiver.md").read_text(encoding="utf-8")
+        self.assertIn('variant: "xhigh"', reviewer)
+        self.assertIn('variant: "high"', implementer)
+        self.assertIn('variant: "high"', archiver)
+        for name, text in (("reviewer", reviewer), ("implementer", implementer), ("archiver", archiver)):
+            self.assertNotIn("{env:", text, f"unsubstituted placeholder left in {name}")
+
+    def test_opencode_agent_variant_override_from_env(self) -> None:
+        """An OPSX_<ROLE>_VARIANT override lands in the installed agent
+        frontmatter (e.g. models whose effort labels exclude xhigh)."""
+        home = Path(self.home.name)
+        env = {**self.env, "OPSX_REVIEWER_VARIANT": "max"}
+        _run_installer(_OPENCODE_INSTALLER, home, env)
+        agents = home / ".config" / "opencode" / "agents"
+        reviewer = (agents / "opsx-reviewer.md").read_text(encoding="utf-8")
+        implementer = (agents / "opsx-implementer.md").read_text(encoding="utf-8")
+        self.assertIn('variant: "max"', reviewer)
+        self.assertIn('variant: "high"', implementer)
+
     def test_claude_install_removes_stale_opsx_drive_skill(self) -> None:
         """Global reinstall must remove previously-deployed opsx-drive skill."""
         home = Path(self.home.name)

@@ -315,22 +315,133 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
         self.assertEqual(payload["archive"]["status"], "passed")
 
     def test_parse_failure_blocks_direct_stage(self) -> None:
-        self.stage_runner(
+        # Default invalid_output_retries=2: the stage is attempted three
+        # times (initial + two retries) before the change fails.
+        calls, inputs = self.stage_runner(
             [
                 {
                     "stage": "implement",
                     "lines": "not json\nsecond line\n",
-                }
+                },
+                {
+                    "stage": "implement",
+                    "lines": "still not json\n",
+                },
+                {
+                    "stage": "implement",
+                    "lines": "prose again\n",
+                },
             ]
         )
 
         result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
 
         self.assertEqual(result, "failed")
+        self.assertEqual(len(calls), 3)
+        # Retry attempts carry the corrective hint; the first does not.
+        self.assertNotIn("RETRY_CORRECTION", inputs[0])
+        self.assertIn("RETRY_CORRECTION", inputs[1])
+        self.assertIn("RETRY_CORRECTION", inputs[2])
         record = self.opsx_plan.state_mod.rec(self.state, self.cid)
         self.assertEqual(record["last_result"], "subagent_output_invalid")
         self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
         self.assertIn("output invalid", record["reason"])
+
+    def test_invalid_output_retry_recovers_and_continues(self) -> None:
+        valid_implement = {
+            "status": "implemented",
+            "change": self.cid,
+            "round": 1,
+            "progress_made": True,
+            "completed_tasks": ["1.1"],
+            "remaining_tasks": ["1.2"],
+            "task_counts": {"complete": 1, "total": 2},
+            "files_touched": ["orchestrator/opsx-plan.py"],
+            "known_change_files": [f"openspec/changes/{self.cid}/tasks.md"],
+            "summary": "implemented first round",
+            "cache_update": {
+                "change_summary": "direct execution change summary",
+                "refresh_reason": "initial direct round",
+                "source_paths": [f"openspec/changes/{self.cid}/tasks.md"],
+                "scope_hint": "opsx-plan direct orchestration",
+            },
+        }
+        calls, inputs = self.stage_runner(
+            [
+                {"stage": "implement", "lines": "a prose summary, no JSON\n"},
+                {"stage": "implement", "result": valid_implement},
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 1,
+                        "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "review passed",
+                        "fix_prompt": "",
+                        "next_phase": "archive",
+                    },
+                },
+                {
+                    "stage": "archive",
+                    "archive_repo": True,
+                    "result": {
+                        "status": "archived",
+                        "change": self.cid,
+                        "archive_path": "",
+                        "spec_sync_status": "no-delta",
+                        "commit": "",
+                        "summary": "archive succeeded",
+                    },
+                },
+            ]
+        )
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, self.opsx_plan.base.DONE)
+        self.assertEqual([stage for stage, _, _ in calls], ["implement", "implement", "review", "archive"])
+        self.assertNotIn("RETRY_CORRECTION", inputs[0])
+        self.assertIn("RETRY_CORRECTION", inputs[1])
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
+        self.assertEqual(record["status"], self.opsx_plan.base.DONE)
+
+    def test_invalid_output_retries_zero_disables_retry(self) -> None:
+        self.cfg["invalid_output_retries"] = 0
+        calls, _ = self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "lines": "not json\n",
+                },
+            ]
+        )
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, "failed")
+        self.assertEqual(len(calls), 1)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
+        self.assertEqual(record["last_result"], "subagent_output_invalid")
+
+    def test_permission_rejection_is_not_retried(self) -> None:
+        calls, _ = self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "lines": "The user rejected permission for tool X\n",
+                },
+            ]
+        )
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, "failed")
+        self.assertEqual(len(calls), 1)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
+        self.assertEqual(record["last_result"], "subagent_output_invalid")
+        self.assertIn("permission denied", record["reason"])
 
     def test_transcript_log_with_final_json_line_is_accepted(self) -> None:
         calls, _ = self.stage_runner(

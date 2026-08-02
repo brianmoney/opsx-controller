@@ -70,3 +70,20 @@ collision). Missing file is a no-op.
   file is a no-op, user file with only metadata still works.
 - `tests/orchestrator/test_cost.py` — end-to-end test with a temp user
   override file wired through `_get_catalog` / `_set_catalog`.
+
+## Use OpenCode structured stage output
+
+Add `--format json` to OpenCode implement/review/archive invocations and teach
+the controller to parse the resulting JSONL event stream before applying the
+existing worker JSON contract. The flag makes transport output machine-readable
+but does not itself enforce the worker's final response schema; retain retries
+for missing or malformed worker JSON and consider a true OpenCode JSON-schema
+request path separately.
+
+### Places needing change
+
+- `lib/orchestrator/base.py:39-49` — OpenCode stage invoke defaults
+- `orchestrator/opsx-plan.py:867-895` — JSONL event parsing and final worker
+  response extraction
+- `tests/orchestrator/test_opsx_plan.py` — OpenCode JSONL parsing and malformed
+  output retry tests

@@ -242,6 +242,57 @@ class PrecedenceLadderTests(TempDirCase):
         self.assertIsNone(entry.model)
         self.assertEqual(entry.source, "unresolved")
 
+    def test_variant_resolves_from_adapter_table(self) -> None:
+        _write(
+            self.user_config,
+            """\
+            [adapters.opencode]
+            reviewer = "moonshotai/kimi-k3"
+            reviewer_variant = "max"
+            """,
+        )
+        resolved = resolve("opencode", repo=self.repo, environ={})
+        entry = resolved["reviewer"]
+        self.assertEqual(entry.model, "moonshotai/kimi-k3")
+        self.assertEqual(entry.variant, "max")
+        self.assertIn(str(self.user_config), entry.variant_source)
+
+    def test_variant_resolves_from_defaults_table(self) -> None:
+        _write(
+            self.user_config,
+            """\
+            [defaults]
+            implementer_variant = "low"
+            """,
+        )
+        resolved = resolve("opencode", repo=self.repo, environ={})
+        self.assertEqual(resolved["implementer"].variant, "low")
+
+    def test_variant_resolves_from_ambient_environment(self) -> None:
+        resolved = resolve("opencode", repo=self.repo,
+                           environ={"OPSX_REVIEWER_VARIANT": "max"})
+        entry = resolved["reviewer"]
+        self.assertEqual(entry.variant, "max")
+        self.assertEqual(entry.variant_source, "ambient environment")
+
+    def test_variant_unresolved_everywhere_is_none(self) -> None:
+        resolved = resolve("opencode", repo=self.repo, environ={})
+        entry = resolved["reviewer"]
+        self.assertIsNone(entry.variant)
+        self.assertEqual(entry.variant_source, "unresolved")
+
+    def test_variant_adapter_table_wins_over_ambient(self) -> None:
+        _write(
+            self.user_config,
+            """\
+            [adapters.opencode]
+            reviewer_variant = "max"
+            """,
+        )
+        resolved = resolve("opencode", repo=self.repo,
+                           environ={"OPSX_REVIEWER_VARIANT": "low"})
+        self.assertEqual(resolved["reviewer"].variant, "max")
+
     def test_validate_reports_escalation_syntax_violation_for_opencode(self) -> None:
         resolved = {
             "implementer_escalation": ResolvedModel(

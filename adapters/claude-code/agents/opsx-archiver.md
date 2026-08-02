@@ -85,3 +85,8 @@ Success:
 
 Blocked:
 `{"status":"blocked","change":"<change>","reason":"short reason","archive_path":"empty when restored or not moved","spec_sync_status":"not_started|synced|already-synced|no-delta","commit":"","summary":"one short sentence","triage":{"scope_basis":"short basis","in_scope_files":["path"],"ambiguous_files":["path"],"retry_guidance":"short next step","retry_outlook":"same_failure|may_succeed|unknown"}}`
+
+Before finishing, validate that the final assistant message is exactly one
+line, the JSON parses, and there are no characters before "{" or after "}".
+Never end with a prose summary — the JSON object line IS the result. Output
+that ends in prose is discarded in full by the controller.

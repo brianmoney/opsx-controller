@@ -42,6 +42,7 @@ All optional; defaults shown.
 | `max_rounds` | int | `5` | Implement–review loop ceiling |
 | `no_progress_limit` | int | `2` | Consecutive no-progress rounds before failing |
 | `escalate_after_review_fails` | int | `0` | Promote implement to escalation model after N failed reviews (round N+1) |
+| `invalid_output_retries` | int | `2` | In-place retries when a stage ends without its final JSON envelope (contract miss, transient provider error); 0 disables |
 | `fast_checks` | list[str] | `[]` | Post-archive commands; all must pass |
 | `check_timeout_minutes` | float | `15` | Timeout per fast check |
 | `require_clean_tracked` | bool | `true` | Refuse to start on a dirty tracked tree |

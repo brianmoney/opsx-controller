@@ -13,7 +13,7 @@ import tomllib
 from pathlib import Path
 from typing import Mapping, Optional
 
-from lib.models.types import ROLE_ENV, ROLES, ALL_ROLES, ResolvedModel
+from lib.models.types import ROLE_ENV, ROLE_VARIANT_ENV, ROLES, ALL_ROLES, ResolvedModel
 
 USER_CONFIG_PATH = Path.home() / ".config" / "opsx-controller" / "models.toml"
 REPO_CONFIG_RELATIVE = Path(".opsx-plan") / "models.toml"
@@ -99,41 +99,72 @@ def resolve(
 
     resolved: dict[str, ResolvedModel] = {}
     for role in ALL_ROLES:
-        model: Optional[str] = None
-        source = "unresolved"
-
-        if repo_local is not None:
-            path, data = repo_local
-            value = _table_value(data, "adapters", adapter, role)
-            if value is not None:
-                model, source = value, f"repo-local config ({path})"
-
-        if model is None:
-            path, data = user_global
-            value = _table_value(data, "adapters", adapter, role)
-            if value is not None:
-                model, source = value, f"user-global config ({path})"
-
-        if model is None and repo_local is not None:
-            path, data = repo_local
-            value = _table_value(data, "defaults", role)
-            if value is not None:
-                model, source = value, f"repo-local config ({path}, [defaults])"
-
-        if model is None:
-            path, data = user_global
-            value = _table_value(data, "defaults", role)
-            if value is not None:
-                model, source = value, f"user-global config ({path}, [defaults])"
-
-        if model is None:
-            env_value = (environ.get(ROLE_ENV[role]) or "").strip()
-            if env_value:
-                model, source = env_value, "ambient environment"
-
-        resolved[role] = ResolvedModel(role=role, model=model, source=source)
+        model, source = _resolve_key(
+            role, adapter, repo_local, user_global, environ, ROLE_ENV[role]
+        )
+        variant, variant_source = _resolve_key(
+            f"{role}_variant",
+            adapter,
+            repo_local,
+            user_global,
+            environ,
+            ROLE_VARIANT_ENV[role],
+        )
+        resolved[role] = ResolvedModel(
+            role=role,
+            model=model,
+            source=source,
+            variant=variant,
+            variant_source=variant_source,
+        )
 
     return resolved
+
+
+def _resolve_key(
+    key: str,
+    adapter: str,
+    repo_local: Optional[tuple],
+    user_global: tuple,
+    environ: Mapping[str, str],
+    env_name: str,
+) -> tuple[Optional[str], str]:
+    """Resolve one config *key* through the standard precedence ladder.
+
+    Precedence, highest first:
+      1. ``[adapters.<adapter>].<key>`` in the repository-local file
+      2. ``[adapters.<adapter>].<key>`` in the user-global file
+      3. ``[defaults].<key>`` in the repository-local file, then user-global
+      4. the ambient *env_name* environment variable
+      5. ``(None, "unresolved")``
+    """
+    if repo_local is not None:
+        path, data = repo_local
+        value = _table_value(data, "adapters", adapter, key)
+        if value is not None:
+            return value, f"repo-local config ({path})"
+
+    path, data = user_global
+    value = _table_value(data, "adapters", adapter, key)
+    if value is not None:
+        return value, f"user-global config ({path})"
+
+    if repo_local is not None:
+        path, data = repo_local
+        value = _table_value(data, "defaults", key)
+        if value is not None:
+            return value, f"repo-local config ({path}, [defaults])"
+
+    path, data = user_global
+    value = _table_value(data, "defaults", key)
+    if value is not None:
+        return value, f"user-global config ({path}, [defaults])"
+
+    env_value = (environ.get(env_name) or "").strip()
+    if env_value:
+        return env_value, "ambient environment"
+
+    return None, "unresolved"
 
 
 def validate(adapter: str, resolved: Mapping[str, ResolvedModel]) -> list[str]:

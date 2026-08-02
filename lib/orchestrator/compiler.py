@@ -201,6 +201,7 @@ def build_schema_guidance(adapter: str = "opencode") -> str:
         "| no_progress_limit | int | ``2`` | consecutive no-progress rounds before failing |\n"
         "| escalate_after_review_fails | int | ``0`` | promote implement to escalation model after N failed reviews; round=(N+1) first escalates; 0 disables |\n"
         "| finding_recurrence_limit | int | ``0`` | halt a change when one locus is cited by a blocking finding in this many distinct rounds; 0 disables |\n"
+        "| invalid_output_retries | int | ``2`` | in-place retries when a stage ends without its final JSON envelope (contract miss, transient provider error); 0 disables |\n"
         "| fast_checks | list[str] | ``[]`` | post-archive CLI checks |\n"
         "| check_timeout_minutes | float | ``15`` | fast-check timeout |\n"
         "| require_clean_tracked | bool | ``true`` | refuse to run when tracked tree is dirty |\n"

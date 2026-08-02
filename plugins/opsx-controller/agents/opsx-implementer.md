@@ -49,3 +49,8 @@ Success:
 
 Blocked:
 `{"status":"blocked","change":"<change>","round":<n>,"reason":"short reason","progress_made":false,"completed_tasks":[],"remaining_tasks":["2.1"],"task_counts":{"complete":1,"total":11},"files_touched":[],"known_change_files":[],"summary":"one short sentence"}`
+
+Before finishing, validate that the final assistant message is exactly one
+line, the JSON parses, and there are no characters before "{" or after "}".
+Never end with a prose summary — the JSON object line IS the result. Output
+that ends in prose is discarded in full by the controller.

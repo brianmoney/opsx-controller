@@ -75,3 +75,8 @@ Final response requirements:
 - No markdown or commentary.
 
 `{"status":"reviewed","change":"<change>","round":<n>,"verdict":"pass|fail","finding_counts":{"critical":0,"warning":0,"note":0},"summary":"one short sentence","fix_prompt":"empty when pass","findings":[{"severity":"critical|warning|note","locus":["path/to/file.py:symbol"],"statement":"observed vs required behavior"}],"next_phase":"archive|implement"}`
+
+Before finishing, validate that the final assistant message is exactly one
+line, the JSON parses, and there are no characters before "{" or after "}".
+Never end with a prose summary — the JSON object line IS the result. Output
+that ends in prose is discarded in full by the controller.
