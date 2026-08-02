@@ -2273,7 +2273,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             # clear a pure untracked scaffold to let the author command start
             # clean; refuse if the dir holds authored or tracked content.
             if groundtruth.change_dir(repo, cid).is_dir():
-                if scaffold_is_clearable(repo, cid):
+                if groundtruth.scaffold_is_clearable(repo, cid):
                     shutil.rmtree(groundtruth.change_dir(repo, cid))
                     base.log(f"  removed incomplete scaffold openspec/changes/{cid}/ "
                         f"before re-create")
