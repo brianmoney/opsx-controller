@@ -15,6 +15,14 @@
 # Roles: controller, implementer, reviewer, archiver (all required).
 #        implementer_escalation (optional, used by escalate_after_review_fails).
 #
+# Optional reasoning variants: a `<role>_variant` key pins the reasoning
+# effort written into installed opencode agent frontmatter (`variant:`).
+# Variants are model-specific labels — check which efforts your model
+# actually supports (e.g. moonshotai/kimi-k3 accepts low/high/max, NOT
+# xhigh). When unset, the installer keeps each agent's built-in default
+# (reviewer: xhigh, all others: high). Re-run the adapter install script
+# after changing a variant.
+#
 # Identifier syntax is adapter-specific:
 #   - opencode requires "provider/model" (e.g. "deepseek/deepseek-v4-pro")
 #   - claude-code requires a bare Anthropic alias (e.g. "claude-sonnet-5")
@@ -34,6 +42,7 @@ controller = "github-copilot/gpt-5.4"
 implementer = "deepseek/deepseek-v4-pro"
 # implementer_escalation = "deepseek/deepseek-v4-ultra"  # optional, for escalate_after_review_fails
 reviewer = "github-copilot/gpt-5.4"
+# reviewer_variant = "max"  # optional, e.g. when the reviewer model lacks "xhigh"
 archiver = "github-copilot/gpt-5.4"
 
 [adapters.claude-code]

@@ -63,7 +63,7 @@ try:
     from lib.models.resolver import USER_CONFIG_PATH, ModelConfigError
     from lib.models.resolver import resolve as resolve_models
     from lib.models.resolver import validate as validate_models
-    from lib.models.types import ROLE_ENV, ROLES, ALL_ROLES
+    from lib.models.types import ROLE_ENV, ROLE_VARIANT_ENV, ROLES, ALL_ROLES
 except ModuleNotFoundError as exc:  # pragma: no cover
     sys.exit(f"opsx-plan requires the lib.models runtime package: {exc}")
 
@@ -205,6 +205,7 @@ def build_single_change_config(repo: Path, change_id: str) -> dict:
         "require_clean_tracked": True,
         "escalate_after_review_fails": 0,
         "finding_recurrence_limit": 0,
+        "invalid_output_retries": 2,
         "skip_warning": False,
         "skip_suggestion": False,
         "notify_cmd": "",
@@ -277,6 +278,7 @@ def render_single_change_manifest(cfg: dict) -> str:
     lines.append(f"no_progress_limit = {int(cfg.get('no_progress_limit', 2))}")
     lines.append(f"escalate_after_review_fails = {int(cfg.get('escalate_after_review_fails', 0))}")
     lines.append(f"finding_recurrence_limit = {int(cfg.get('finding_recurrence_limit', 0))}")
+    lines.append(f"invalid_output_retries = {int(cfg.get('invalid_output_retries', 2))}")
     lines.append(f"check_timeout_minutes = {float(cfg.get('check_timeout_minutes', 15))}")
     lines.append(f"create_timeout_minutes = {float(cfg.get('create_timeout_minutes', 30))}")
     lines.append(f"create_max_attempts = {int(cfg.get('create_max_attempts', 2))}")
@@ -380,6 +382,7 @@ def _compare_configs(
         "implement_invoke", "review_invoke", "archive_invoke",
         "timeout_minutes", "max_rounds", "no_progress_limit",
         "escalate_after_review_fails", "finding_recurrence_limit",
+        "invalid_output_retries",
         "fast_checks", "check_timeout_minutes", "require_clean_tracked",
         "skip_warning", "skip_suggestion",
         "notify_cmd", "plan_doc", "create_invoke",
@@ -893,6 +896,29 @@ def parse_stage_json(log_path: Path) -> tuple[dict | None, str, dict | None]:
     if marker_reason:
         return None, marker_reason, None
     return None, f"expected a final JSON object line, got {len(lines)} non-comment lines", None
+
+
+# Appended to the worker input when a stage is retried after producing no
+# usable result envelope.  The hint restates the output contract without
+# prescribing stage-specific content.
+_INVALID_OUTPUT_RETRY_HINT = (
+    "RETRY_CORRECTION: the previous attempt at this stage ended without the "
+    "required machine-readable result. Re-run the stage from scratch. Your "
+    "final message must be exactly one line containing a single JSON object "
+    "in the required shape — no prose, summary, markdown, or code fences "
+    "before or after it."
+)
+
+
+def _is_retriable_invalid_output(parse_why: str) -> bool:
+    """Return True when a parse failure is worth retrying in-place.
+
+    Generic "no final JSON" failures — model contract misses, truncated
+    streams, transient provider 5xx pages — may succeed on a fresh attempt.
+    Permission rejections and billing/quota provider failures are named by
+    their marker reason and stay terminal: retrying them never helps.
+    """
+    return parse_why.startswith("expected a final JSON object line")
 
 
 def record_archive_evidence(repo: Path, record: dict, cid: str) -> bool:
@@ -1601,13 +1627,29 @@ def run_direct_change(
         sidecar_path: Path | None = None
         extra_env: dict[str, str] | None = None
         saved_env: dict[str, str] = {}
-        if plan_name and run_id:
+
+        def _arm_usage_sidecar() -> None:
+            """Create a fresh per-attempt sidecar and export its OPSX_* env."""
+            nonlocal sidecar_path, extra_env
+            if not (plan_name and run_id):
+                return
             sidecar_path = _build_usage_sidecar_path(repo, plan_name, cid, stage, round_num)
             sidecar_path.parent.mkdir(parents=True, exist_ok=True)
             extra_env = _build_usage_sidecar_env(plan_name, run_id, cid, stage, round_num, sidecar_path)
             for key, value in extra_env.items():
-                saved_env[key] = os.environ.get(key, "")
+                if key not in saved_env:
+                    saved_env[key] = os.environ.get(key, "")
                 os.environ[key] = value
+
+        def _restore_usage_sidecar() -> None:
+            if not extra_env:
+                return
+            for key in extra_env:
+                os.environ.pop(key, None)
+                if key in saved_env:
+                    os.environ[key] = saved_env[key]
+
+        _arm_usage_sidecar()
 
         def _write_telemetry(telemetry_status: str, error_message: str | None) -> None:
             """Write a telemetry record. Logs a warning on failure; never raises."""
@@ -1654,53 +1696,76 @@ def run_direct_change(
                         "model": "",
                     }
 
-        outcome, log_path = invoke_direct_stage(repo, cfg, cid, stage, round_num, input_block)
-
-        # ---- restore os.environ after subprocess invocation ----
-        if extra_env:
-            for key in extra_env:
-                os.environ.pop(key, None)
-                if key in saved_env:
-                    os.environ[key] = saved_env[key]
-        record_stage_log(state, cid, stage, round_num, outcome, log_path)
-
-        # 3.2 Capture ended_at, compute duration, determine telemetry status
-        ended_at = base.utcnow()
-        duration_ms = telemetry.compute_duration_ms(started_at, ended_at)
+        # ---- stage dispatch with bounded retry on invalid worker output ----
+        # A worker that finishes but never emits its final JSON envelope
+        # (model contract miss, transient provider 5xx, truncated stream)
+        # used to fail the whole change on the spot, discarding the work it
+        # did.  Generic parse failures are retried in-place up to
+        # ``invalid_output_retries`` times with a corrective hint appended to
+        # the worker input.  Permission rejections and billing/quota provider
+        # failures stay terminal — retrying those never helps.
+        invalid_retries_max = max(0, int(cfg.get("invalid_output_retries", 2)))
+        invalid_attempt = 0
+        attempt_input = input_block
         payload: dict | None = None
         parse_why = ""
         envelope: dict | None = None
+        while True:
+            outcome, log_path = invoke_direct_stage(repo, cfg, cid, stage, round_num, attempt_input)
 
-        if outcome == "env_error":
-            reason = log_path.read_text(encoding="utf-8").splitlines()[0].split(": ", 1)[-1]
-            _write_telemetry("spawn_error", reason)
-            state_mod.rec(state, cid)["last_result"] = f"{stage}_env_error"
-            state_mod.set_status(state, cid, base.FAILED, reason)
-            _try_notify(cfg, "change_failed", reason, change_id=cid)
-            persist_direct_state(repo, cfg, state, cid)
-            return "spawn_error"
+            # ---- restore os.environ after subprocess invocation ----
+            _restore_usage_sidecar()
+            record_stage_log(state, cid, stage, round_num, outcome, log_path)
 
-        if outcome == "spawn_error":
-            _write_telemetry(
-                "spawn_error",
-                f"could not spawn {stage}: {cfg[f'{stage}_invoke']}",
-            )
-            state_mod.rec(state, cid)["last_result"] = f"{stage}_spawn_error"
-            state_mod.set_status(state, cid, base.FAILED, f"could not spawn {stage}: {cfg[f'{stage}_invoke']}")
-            _try_notify(cfg, "change_failed", f"could not spawn {stage}", change_id=cid)
-            persist_direct_state(repo, cfg, state, cid)
-            return "spawn_error"
+            # 3.2 Capture ended_at, compute duration, determine telemetry status
+            ended_at = base.utcnow()
+            duration_ms = telemetry.compute_duration_ms(started_at, ended_at)
+            payload = None
+            parse_why = ""
+            envelope = None
 
-        if outcome == "timeout":
-            _write_telemetry("timeout", f"{stage} timed out")
-            state_mod.rec(state, cid)["last_result"] = f"{stage}_timeout"
-            state_mod.set_status(state, cid, base.FAILED, f"{stage} timed out")
-            _try_notify(cfg, "change_failed", f"{stage} timed out", change_id=cid)
-            persist_direct_state(repo, cfg, state, cid)
-            return "failed"
+            if outcome == "env_error":
+                reason = log_path.read_text(encoding="utf-8").splitlines()[0].split(": ", 1)[-1]
+                _write_telemetry("spawn_error", reason)
+                state_mod.rec(state, cid)["last_result"] = f"{stage}_env_error"
+                state_mod.set_status(state, cid, base.FAILED, reason)
+                _try_notify(cfg, "change_failed", reason, change_id=cid)
+                persist_direct_state(repo, cfg, state, cid)
+                return "spawn_error"
 
-        payload, parse_why, envelope = parse_stage_json(log_path)
-        if payload is None:
+            if outcome == "spawn_error":
+                _write_telemetry(
+                    "spawn_error",
+                    f"could not spawn {stage}: {cfg[f'{stage}_invoke']}",
+                )
+                state_mod.rec(state, cid)["last_result"] = f"{stage}_spawn_error"
+                state_mod.set_status(state, cid, base.FAILED, f"could not spawn {stage}: {cfg[f'{stage}_invoke']}")
+                _try_notify(cfg, "change_failed", f"could not spawn {stage}", change_id=cid)
+                persist_direct_state(repo, cfg, state, cid)
+                return "spawn_error"
+
+            if outcome == "timeout":
+                _write_telemetry("timeout", f"{stage} timed out")
+                state_mod.rec(state, cid)["last_result"] = f"{stage}_timeout"
+                state_mod.set_status(state, cid, base.FAILED, f"{stage} timed out")
+                _try_notify(cfg, "change_failed", f"{stage} timed out", change_id=cid)
+                persist_direct_state(repo, cfg, state, cid)
+                return "failed"
+
+            payload, parse_why, envelope = parse_stage_json(log_path)
+            if payload is not None:
+                break
+            if _is_retriable_invalid_output(parse_why) and invalid_attempt < invalid_retries_max:
+                invalid_attempt += 1
+                _write_telemetry("invalid_output", parse_why)
+                base.log(
+                    f"  {stage} round {round_num}: output invalid ({parse_why}); "
+                    f"retrying ({invalid_attempt}/{invalid_retries_max})"
+                )
+                # Re-arm a fresh usage sidecar for the retry attempt.
+                _arm_usage_sidecar()
+                attempt_input = input_block + "\n" + _INVALID_OUTPUT_RETRY_HINT
+                continue
             _write_telemetry("invalid_output", parse_why)
             state_mod.rec(state, cid)["last_result"] = "subagent_output_invalid"
             if stage == "archive":
@@ -2914,6 +2979,8 @@ def cmd_models_show(args: argparse.Namespace) -> int:
         entry = resolved[role]
         value = entry.model if entry.model else "(unresolved)"
         print(f"  {role:<12} {value}  [{entry.source}]")
+        if entry.variant:
+            print(f"  {'':<12} variant: {entry.variant}  [{entry.variant_source}]")
 
     warnings = validate_models(adapter, resolved)
     if warnings:
@@ -2953,6 +3020,12 @@ def cmd_models_env(args: argparse.Namespace) -> int:
     esc_entry = resolved.get("implementer_escalation")
     if esc_entry and esc_entry.model:
         print(f"export {ROLE_ENV['implementer_escalation']}={shlex.quote(esc_entry.model)}")
+    # Emit reasoning-variant exports only when resolved; the installer keeps
+    # the agent file's built-in default when no variant is configured.
+    for role in ALL_ROLES:
+        entry = resolved.get(role)
+        if entry and entry.variant:
+            print(f"export {ROLE_VARIANT_ENV[role]}={shlex.quote(entry.variant)}")
     return 0
 
 

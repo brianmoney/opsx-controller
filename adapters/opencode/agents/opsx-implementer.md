@@ -3,7 +3,7 @@ description: Implements one OpenSpec controller round using the global /opsx-app
 mode: all
 hidden: true
 model: "{env:OPSX_IMPLEMENTER_MODEL}"
-variant: high
+variant: "{env:OPSX_IMPLEMENTER_VARIANT}"
 permission:
   read: allow
   edit: allow
@@ -148,4 +148,4 @@ Before producing the final assistant message, internally validate:
 - JSON parses
 - final message contains no characters before "{" or after "}"
 
-If validation fails, correct the JSON silently. The final assistant message must still be exactly one JSON object line.
+If validation fails, correct the JSON silently. The final assistant message must still be exactly one JSON object line — never a prose summary. Output that ends in prose is discarded in full by the controller.

@@ -66,6 +66,9 @@ def load_plan(path: Path, repo: Path | None = None) -> dict:
         "finding_recurrence_limit": _parse_finding_recurrence_limit(
             plan.get("finding_recurrence_limit", 0)
         ),
+        "invalid_output_retries": _parse_invalid_output_retries(
+            plan.get("invalid_output_retries", 2)
+        ),
         "skip_warning": bool(plan.get("skip_warning", False)),
         "skip_suggestion": bool(plan.get("skip_suggestion", False)),
         # --- run-event notifications ---
@@ -264,6 +267,21 @@ def _parse_finding_recurrence_limit(value: object) -> int:
             f"got {limit}"
         )
     return limit
+
+
+def _parse_invalid_output_retries(value: object) -> int:
+    """Parse ``invalid_output_retries`` into a non-negative integer.
+
+    Raises ``PlanError`` naming the key on a negative value. ``0`` disables
+    in-place retries, restoring the historic fail-on-first-invalid behavior.
+    """
+    retries = int(value)
+    if retries < 0:
+        raise base.PlanError(
+            "invalid_output_retries must be >= 0, "
+            f"got {retries}"
+        )
+    return retries
 
 
 def _parse_git_delivery_config(raw: dict) -> dict:

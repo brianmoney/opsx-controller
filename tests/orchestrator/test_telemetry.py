@@ -528,6 +528,7 @@ class DirectStageTelemetryTests(unittest.TestCase):
 
     # 6.6
     def test_invalid_worker_json_produces_invalid_output_record(self) -> None:
+        self.cfg["invalid_output_retries"] = 0
         self.write_authored_change(self.cid)
         record = state_mod.rec(self.state, self.cid)
         record["max_rounds"] = self.cfg["max_rounds"]
@@ -551,6 +552,40 @@ class DirectStageTelemetryTests(unittest.TestCase):
         self.assertEqual(r["status"], "invalid_output")
         self.assertIsNotNone(r["result"]["error_message"])
         self.assertIsNone(r["result"]["stage_status"])
+
+    def test_invalid_output_retry_emits_record_per_attempt(self) -> None:
+        """Each failed parse writes its own invalid_output telemetry record;
+        a recovering retry then records the definitive stage outcome."""
+        self.write_authored_change(self.cid)
+        record = state_mod.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = state_mod.change_context_paths(
+            self.repo, self.cid
+        )
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "lines": "not json\nsecond line\n",
+                },
+                {
+                    "stage": "implement",
+                    "lines": "still prose\n",
+                },
+                {
+                    "stage": "implement",
+                    "lines": "prose again\n",
+                },
+            ]
+        )
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, "failed")
+        records = self._read_telemetry()
+        invalid = [r for r in records if r["status"] == "invalid_output"]
+        # initial attempt + two bounded retries each record the parse failure
+        self.assertEqual(len(invalid), 3)
 
     # 6.7
     def test_telemetry_record_appended_to_correct_plan_jsonl(self) -> None:

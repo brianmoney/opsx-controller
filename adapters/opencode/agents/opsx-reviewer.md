@@ -3,7 +3,7 @@ description: Reviews one OpenSpec controller round with a strict zero-finding ga
 mode: all
 hidden: true
 model: "{env:OPSX_REVIEWER_MODEL}"
-variant: xhigh
+variant: "{env:OPSX_REVIEWER_VARIANT}"
 permission:
   read: allow
   glob: allow
@@ -111,3 +111,13 @@ Final response requirements:
 - Use this exact shape:
 
 `{"status":"reviewed","change":"<change>","round":<n>,"verdict":"pass|fail","finding_counts":{"critical":0,"warning":0,"note":0},"summary":"one short sentence","fix_prompt":"empty when pass","findings":[{"severity":"critical|warning|note","locus":["path/to/file.py:symbol"],"statement":"observed vs required behavior"}],"next_phase":"archive|implement"}`
+
+Before finishing, validate:
+- the final assistant message is exactly one line
+- JSON parses
+- no characters before "{" or after "}"
+- no prose summary, headings, or markdown anywhere in the final message
+
+If validation fails, correct the JSON silently. Never end with a prose
+summary of the review — the JSON object line IS the review. A review that
+ends in prose is discarded in full by the controller.

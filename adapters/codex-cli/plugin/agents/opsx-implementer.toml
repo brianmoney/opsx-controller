@@ -125,4 +125,9 @@ Before producing the final message, internally validate:
 - final message contains no characters before "{" or after "}"
 
 If validation fails, correct the JSON silently. The final message must still be exactly one JSON object line.
+
+Before finishing, validate that the final assistant message is exactly one
+line, the JSON parses, and there are no characters before "{" or after "}".
+Never end with a prose summary — the JSON object line IS the result. Output
+that ends in prose is discarded in full by the controller.
 """
