@@ -215,8 +215,9 @@ already-authored change, skip the plan manifest entirely with
   `opencode`, `claude-code`, and `codex-cli`
 - `plugins/opsx-controller/`: Claude Code plugin package for `--plugin-dir` and
   marketplace packaging
-- `skills/opsx-controller/`: Vercel `npx skill` package for discovery and
-  guided use
+- `skills/`: Vercel `npx skill` packages — `opsx-controller` (discovery and
+  guided use), `opsx-plan-manifest` (authoring/auditing plan TOMLs), and
+  `opsx-plan-ops` (operating, triaging, and recovering `opsx-plan` runs)
 
 ## Running the tests
 
