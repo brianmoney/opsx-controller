@@ -38,6 +38,18 @@ for arg in "$@"; do
 done
 set -- "${args[@]}"
 
+install_skills() {
+  local dest_root="$1"
+  mkdir -p "$dest_root"
+  local skill_dir skill_name
+  for skill_dir in "$ROOT_DIR/skills"/*; do
+    [[ -d "$skill_dir" ]] || continue
+    skill_name="$(basename "$skill_dir")"
+    mkdir -p "$dest_root/$skill_name"
+    cp -R "$skill_dir"/. "$dest_root/$skill_name/"
+  done
+}
+
 install_commands() {
   local dest_dir="$1"
   mkdir -p "$dest_dir"
@@ -171,6 +183,7 @@ install_global() {
   load_model_env opencode
 
   local config_root="$HOME/.config/opencode"
+  install_skills "$config_root/skills"
   install_commands "$config_root/commands"
   install_agents "$config_root/agents"
   install_plugins "$config_root/plugins"
@@ -178,6 +191,7 @@ install_global() {
   install_plan_authoring_reference "$config_root/opsx-controller"
   install_orchestrator
   printf '%s\n' \
+    "Installed skills to $config_root/skills" \
     "Installed commands to $config_root/commands" \
     "Installed agents to $config_root/agents" \
     "Installed plugins to $config_root/plugins" \
@@ -201,6 +215,7 @@ install_project() {
 
   load_model_env opencode
 
+  install_skills "$project_dir/.opencode/skills"
   install_commands "$project_dir/.opencode/commands"
   install_agents "$project_dir/.opencode/agents"
   install_plugins "$project_dir/.opencode/plugins"
@@ -210,6 +225,7 @@ install_project() {
   ensure_project_config "$project_dir"
 
   printf '%s\n' \
+    "Installed skills to $project_dir/.opencode/skills" \
     "Installed commands to $project_dir/.opencode/commands" \
     "Installed agents to $project_dir/.opencode/agents" \
     "Installed plugins to $project_dir/.opencode/plugins" \

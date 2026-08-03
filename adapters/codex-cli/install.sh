@@ -46,6 +46,12 @@ install_skills() {
     mkdir -p "$dest_root/$skill_name"
     cp -R "$skill_dir"/. "$dest_root/$skill_name/"
   done
+  for skill_dir in "$ROOT_DIR/skills"/*; do
+    [[ -d "$skill_dir" ]] || continue
+    skill_name="$(basename "$skill_dir")"
+    mkdir -p "$dest_root/$skill_name"
+    cp -R "$skill_dir"/. "$dest_root/$skill_name/"
+  done
 }
 
 install_agents() {
@@ -183,6 +189,12 @@ install_plugin() {
   local skill_dir skill_name
   rm -rf "$plugin_dir/skills"/*
   for skill_dir in "$SCRIPT_DIR/skills"/*; do
+    [[ -d "$skill_dir" ]] || continue
+    skill_name="$(basename "$skill_dir")"
+    mkdir -p "$plugin_dir/skills/$skill_name"
+    cp -R "$skill_dir"/. "$plugin_dir/skills/$skill_name/"
+  done
+  for skill_dir in "$ROOT_DIR/skills"/*; do
     [[ -d "$skill_dir" ]] || continue
     skill_name="$(basename "$skill_dir")"
     mkdir -p "$plugin_dir/skills/$skill_name"
