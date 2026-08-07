@@ -49,7 +49,9 @@ Required workflow:
    implement history `files_touched` and `known_change_files` only when that
    tracked list is missing.
 7. Run `openspec status --change "<change>" --json`.
-8. Read the change tasks file and fail closed if any `- [ ]` tasks remain.
+8. Read the change tasks file and fail closed if any unchecked `- [ ]` task
+   remains whose line does not end in `(manual)`. An unchecked task marked
+   `(manual)` does not block archive.
 9. Run `openspec validate <change> --strict`.
 10. Run `git status --short --untracked-files=all`,
    `git diff --cached --name-only`, and `git log --oneline -1`.

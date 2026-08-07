@@ -1296,6 +1296,51 @@ def apply_implement_result(
         state_mod.set_status(state, cid, base.FAILED, "no progress ceiling reached")
         _try_notify(cfg, "change_failed", "no progress ceiling reached", change_id=cid)
         return "stop"
+    # Completeness gate: `implemented` means every automatable task is
+    # checked in the tasks file (ground truth, not the worker's advisory
+    # remaining_tasks). Unchecked automatable tasks re-enter implement with a
+    # controller-generated corrective prompt naming them, consuming the
+    # change's normal round budget; only when every remaining task is manual
+    # does the change advance to review.
+    remaining = state_mod.remaining_automatable_tasks(repo, cid)
+    if remaining:
+        task_ids = ", ".join(remaining)
+        task_locus = f"openspec/changes/{cid}/tasks.md"
+        r["latest_fix_prompt"] = (
+            f"CHANGE: {cid}\n"
+            f"FINDINGS:\n"
+            f"- [critical] {task_locus}: these automatable tasks are still "
+            f"unchecked: {task_ids}\n"
+            f"  → complete them and mark each task line complete in tasks.md\n"
+            f"CORRECTIVE GUIDANCE: Finish the remaining automatable work for "
+            f"the change and check each task in {task_locus} "
+            f"(- [ ] → - [x]). Tasks whose line ends in (manual) are "
+            f"operator-only and may stay unchecked.\n"
+            f"VERIFY: reread {task_locus} and confirm every non-(manual) task "
+            f"is checked before reporting implemented."
+        )
+        append_history(
+            state,
+            cid,
+            {
+                "round": r["round"],
+                "phase": "implement",
+                "status": "incomplete",
+                "summary": f"implemented with automatable tasks remaining: {task_ids}",
+                "remaining_tasks": remaining,
+            },
+        )
+        if r["round"] >= r["max_rounds"]:
+            r["last_result"] = "max_rounds_reached"
+            reason = f"implement retry budget exhausted; automatable tasks still unchecked: {task_ids}"
+            state_mod.set_status(state, cid, base.FAILED, reason)
+            _try_notify(cfg, "change_failed", reason, change_id=cid)
+            return "stop"
+        r["last_result"] = "implement_incomplete"
+        r["round"] += 1
+        r["phase"] = "implement"
+        state_mod.set_status(state, cid, base.PENDING, f"automatable tasks remaining: {task_ids}")
+        return "continue"
     r["phase"] = "review"
     state_mod.set_status(state, cid, base.PENDING, payload.get("summary", "implementation complete"))
     return "continue"
@@ -1524,6 +1569,7 @@ def apply_archive_result(repo: Path, cfg: dict, state: dict, cid: str, payload: 
             "summary": payload.get("summary", "archive completed"),
             "archive_path": archive["path"],
             "commit": archive["commit"],
+            "manual_tasks_pending": state_mod.pending_manual_tasks(repo, cid),
         },
     )
     r["last_result"] = "archive_passed"
@@ -1551,6 +1597,9 @@ def apply_archive_result(repo: Path, cfg: dict, state: dict, cid: str, payload: 
         _try_notify(cfg, "change_failed", f"post-archive {clean_why}", change_id=cid)
         return "stop"
     r["phase"] = "done"
+    # After the archive move, tasks.md lives in the archive directory; parse
+    # it there for the operator's post-archive manual checklist.
+    r["manual_tasks_pending"] = state_mod.pending_manual_tasks(repo, cid)
     state_mod.set_status(state, cid, base.DONE, "verified + checks passed")
     _try_notify(cfg, "change_done", f"change {cid} completed", change_id=cid)
     return "done"
@@ -2461,6 +2510,10 @@ def cmd_status_inner(cfg: dict, state: dict, header: str,
                 print(f"    \u2192 opsx-plan reset {plan_arg} {cid}")
             else:
                 print(f"    \u2192 opsx-plan reset {cid}")
+        if status == base.DONE and r.get("manual_tasks_pending"):
+            print("    manual follow-up (operator checklist):")
+            for task in r["manual_tasks_pending"]:
+                print(f"      - {single_line(task)}")
     return 1 if failed else 0
 
 

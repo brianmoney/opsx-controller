@@ -78,6 +78,50 @@ def git(repo: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True)
 
 
+def apply_completed_tasks(repo: Path, cid: str, completed_tasks: list[str] | None) -> None:
+    """Mirror a real implementer's checkbox edits on the change tasks file.
+
+    Stage harnesses call this for each simulated `implemented` round so the
+    controller's task-completeness gate sees the on-disk ground truth that a
+    worker would have produced. Only the task ids the worker claims are
+    checked off, so a payload that reports `implemented` while leaving
+    automatable tasks unchecked still trips the gate.
+    """
+    tasks_path = repo / "openspec" / "changes" / cid / "tasks.md"
+    if not tasks_path.is_file():
+        return
+    lines = tasks_path.read_text(encoding="utf-8").splitlines()
+    changed = False
+    for i, line in enumerate(lines):
+        for tid in completed_tasks or []:
+            if tid and line.startswith(f"- [ ] {tid}"):
+                lines[i] = line.replace("- [ ]", "- [x]", 1)
+                changed = True
+                break
+    if changed:
+        tasks_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def extract_result_json(body: str) -> dict:
+    """Best-effort parse of a stage log body into its result dict.
+
+    Mirrors ``parse_stage_json``'s tolerance for transcript noise by using the
+    last line that parses as a JSON object, so harnesses can simulate checkbox
+    edits for noisy logs too.
+    """
+    for line in reversed(body.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                return json.loads(stripped)
+            except ValueError:
+                continue
+    try:
+        return json.loads(body)
+    except ValueError:
+        return {}
+
+
 class DirectOpenCodeExecutionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.opsx_plan = load_opsx_plan()
@@ -231,6 +275,10 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
                 body = json.dumps(payload["result"]) + "\n"
             else:
                 body = lines
+            if stage == "implement":
+                parsed = extract_result_json(body)
+                if parsed.get("status") == "implemented":
+                    apply_completed_tasks(repo, cid, parsed.get("completed_tasks"))
             log_path.write_text(body, encoding="utf-8")
             return payload.get("outcome", "exited"), log_path
 
@@ -247,9 +295,9 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
                         "change": self.cid,
                         "round": 1,
                         "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
+                        "completed_tasks": ["1.1", "1.2"],
+                        "remaining_tasks": [],
+                        "task_counts": {"complete": 2, "total": 2},
                         "files_touched": ["orchestrator/opsx-plan.py"],
                         "known_change_files": [
                             f"openspec/changes/{self.cid}/tasks.md",
@@ -353,9 +401,9 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
             "change": self.cid,
             "round": 1,
             "progress_made": True,
-            "completed_tasks": ["1.1"],
-            "remaining_tasks": ["1.2"],
-            "task_counts": {"complete": 1, "total": 2},
+            "completed_tasks": ["1.1", "1.2"],
+            "remaining_tasks": [],
+            "task_counts": {"complete": 2, "total": 2},
             "files_touched": ["orchestrator/opsx-plan.py"],
             "known_change_files": [f"openspec/changes/{self.cid}/tasks.md"],
             "summary": "implemented first round",
@@ -448,7 +496,7 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
             [
                 {
                     "stage": "implement",
-                    "lines": "\x1b[0mnoise\n$ command\n{\"status\":\"implemented\",\"change\":\"add-example\",\"round\":1,\"progress_made\":false,\"completed_tasks\":[],\"remaining_tasks\":[],\"task_counts\":{\"complete\":2,\"total\":2},\"files_touched\":[],\"known_change_files\":[],\"summary\":\"implementation complete\"}\n",
+                    "lines": "\x1b[0mnoise\n$ command\n{\"status\":\"implemented\",\"change\":\"add-example\",\"round\":1,\"progress_made\":false,\"completed_tasks\":[\"1.1\",\"1.2\"],\"remaining_tasks\":[],\"task_counts\":{\"complete\":2,\"total\":2},\"files_touched\":[],\"known_change_files\":[],\"summary\":\"implementation complete\"}\n",
                 },
                 {
                     "stage": "review",
@@ -495,13 +543,14 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
                     "change": cid,
                     "round": round_num,
                     "progress_made": True,
-                    "completed_tasks": ["1.1"],
-                    "remaining_tasks": ["1.2"],
-                    "task_counts": {"complete": 1, "total": 2},
+                    "completed_tasks": ["1.1", "1.2"],
+                    "remaining_tasks": [],
+                    "task_counts": {"complete": 2, "total": 2},
                     "files_touched": ["orchestrator/opsx-plan.py"],
                     "known_change_files": [f"openspec/changes/{cid}/tasks.md"],
                     "summary": "implemented first round",
                 }
+                apply_completed_tasks(repo, cid, payload["completed_tasks"])
             elif stage == "review":
                 payload = {
                     "status": "reviewed",
@@ -554,13 +603,14 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
                     "change": cid,
                     "round": round_num,
                     "progress_made": True,
-                    "completed_tasks": ["1.1"],
-                    "remaining_tasks": ["1.2"],
-                    "task_counts": {"complete": 1, "total": 2},
+                    "completed_tasks": ["1.1", "1.2"],
+                    "remaining_tasks": [],
+                    "task_counts": {"complete": 2, "total": 2},
                     "files_touched": [],
                     "known_change_files": [f"openspec/changes/{cid}/tasks.md"],
                     "summary": "implemented first round",
                 }
+                apply_completed_tasks(repo, cid, payload["completed_tasks"])
             elif stage == "review":
                 payload = {
                     "status": "reviewed",
@@ -622,9 +672,9 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
                         "change": self.cid,
                         "round": 1,
                         "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
+                        "completed_tasks": ["1.1", "1.2"],
+                        "remaining_tasks": [],
+                        "task_counts": {"complete": 2, "total": 2},
                         "files_touched": ["orchestrator/opsx-plan.py"],
                         "known_change_files": [f"openspec/changes/{self.cid}/tasks.md"],
                         "summary": "implemented first round",
@@ -716,9 +766,9 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
                         "change": self.cid,
                         "round": 1,
                         "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
+                        "completed_tasks": ["1.1", "1.2"],
+                        "remaining_tasks": [],
+                        "task_counts": {"complete": 2, "total": 2},
                         "files_touched": ["orchestrator/opsx-plan.py"],
                         "known_change_files": [],
                         "summary": "implemented round 1",
@@ -803,9 +853,9 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
                         "change": self.cid,
                         "round": 1,
                         "progress_made": True,
-                        "completed_tasks": [],
-                        "remaining_tasks": ["1.1", "1.2"],
-                        "task_counts": {"complete": 0, "total": 2},
+                        "completed_tasks": ["1.1", "1.2"],
+                        "remaining_tasks": [],
+                        "task_counts": {"complete": 2, "total": 2},
                         "files_touched": [],
                         "known_change_files": [],
                         "summary": "implemented round 1",
@@ -845,9 +895,9 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
                         "change": self.cid,
                         "round": 1,
                         "progress_made": False,
-                        "completed_tasks": [],
-                        "remaining_tasks": ["1.1", "1.2"],
-                        "task_counts": {"complete": 0, "total": 2},
+                        "completed_tasks": ["1.1", "1.2"],
+                        "remaining_tasks": [],
+                        "task_counts": {"complete": 2, "total": 2},
                         "files_touched": [],
                         "known_change_files": [],
                         "summary": "no progress in round 1",
@@ -873,9 +923,9 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
                         "change": self.cid,
                         "round": 2,
                         "progress_made": False,
-                        "completed_tasks": [],
-                        "remaining_tasks": ["1.1", "1.2"],
-                        "task_counts": {"complete": 0, "total": 2},
+                        "completed_tasks": ["1.1", "1.2"],
+                        "remaining_tasks": [],
+                        "task_counts": {"complete": 2, "total": 2},
                         "files_touched": [],
                         "known_change_files": [],
                         "summary": "no progress in round 2",
@@ -892,7 +942,96 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
         self.assertEqual(record["last_result"], "no_progress")
         self.assertEqual(record["no_progress_streak"], 2)
 
-    def test_archive_success_without_repo_evidence_does_not_complete_change(self) -> None:
+    def test_implemented_with_unchecked_automatable_reenters_implement(self) -> None:
+        """status=implemented with an unchecked automatable task must not
+        advance to review: the controller re-enters implement with a
+        corrective prompt naming the remaining task."""
+        (self.repo / "openspec" / "changes" / self.cid / "tasks.md").write_text(
+            "## 1. Tasks\n\n- [ ] 1.1 Example task\n- [ ] 1.2 Second task\n",
+            encoding="utf-8",
+        )
+        calls, inputs = self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented round 1",
+                    },
+                },
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 2,
+                        "progress_made": True,
+                        "completed_tasks": ["1.2"],
+                        "remaining_tasks": [],
+                        "task_counts": {"complete": 2, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented round 2",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 2,
+                        "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "review passed",
+                        "fix_prompt": "",
+                        "next_phase": "archive",
+                    },
+                },
+                {
+                    "stage": "archive",
+                    "archive_repo": True,
+                    "result": {
+                        "status": "archived",
+                        "change": self.cid,
+                        "archive_path": "",
+                        "spec_sync_status": "no-delta",
+                        "commit": "",
+                        "summary": "archive succeeded",
+                    },
+                },
+            ]
+        )
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, self.opsx_plan.base.DONE)
+        self.assertEqual(
+            [stage for stage, _, _ in calls],
+            ["implement", "implement", "review", "archive"],
+        )
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
+        self.assertEqual(record["round"], 2)
+        # The retry implementer must receive the controller-generated
+        # corrective prompt naming the unchecked automatable task.
+        retry_input = inputs[1]
+        self.assertIn("LATEST_FIX_PROMPT:", retry_input)
+        self.assertIn("1.2 Second task", retry_input)
+
+    def test_implement_budget_exhaustion_fails_naming_task_ids(self) -> None:
+        """When implement keeps returning implemented with unchecked
+        automatable tasks until the round budget is exhausted, the change
+        fails with a reason naming the remaining task ids."""
+        self.cfg["max_rounds"] = 1
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
+        record["max_rounds"] = 1
         self.stage_runner(
             [
                 {
@@ -905,6 +1044,166 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
                         "completed_tasks": ["1.1"],
                         "remaining_tasks": ["1.2"],
                         "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented round 1",
+                    },
+                },
+            ]
+        )
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, "stop")
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
+        self.assertEqual(record["last_result"], "max_rounds_reached")
+        self.assertIn("implement retry budget exhausted", record["reason"])
+        self.assertIn("1.2", record["reason"])
+
+    def test_only_manual_tasks_remaining_advances_to_review(self) -> None:
+        """When every unchecked task is marked (manual), implemented advances
+        to review normally in the same round."""
+        (self.repo / "openspec" / "changes" / self.cid / "tasks.md").write_text(
+            "## 1. Tasks\n\n- [ ] 1.1 Example task\n"
+            "- [ ] 1.2 Plant fixtures and run live jobs (manual)\n",
+            encoding="utf-8",
+        )
+        calls, _ = self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1"],
+                        "remaining_tasks": ["1.2"],
+                        "task_counts": {"complete": 1, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented round 1",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 1,
+                        "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "review passed",
+                        "fix_prompt": "",
+                        "next_phase": "archive",
+                    },
+                },
+                {
+                    "stage": "archive",
+                    "archive_repo": True,
+                    "result": {
+                        "status": "archived",
+                        "change": self.cid,
+                        "archive_path": "",
+                        "spec_sync_status": "no-delta",
+                        "commit": "",
+                        "summary": "archive succeeded",
+                    },
+                },
+            ]
+        )
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, self.opsx_plan.base.DONE)
+        self.assertEqual(
+            [stage for stage, _, _ in calls],
+            ["implement", "review", "archive"],
+        )
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
+        # The pending manual task is recorded for the operator checklist.
+        self.assertEqual(
+            record["manual_tasks_pending"],
+            ["1.2 Plant fixtures and run live jobs (manual)"],
+        )
+        # The archive history entry carries the same checklist.
+        archive_entries = [e for e in record["history"] if e.get("phase") == "archive"]
+        self.assertTrue(archive_entries)
+        self.assertEqual(
+            archive_entries[-1].get("manual_tasks_pending"),
+            ["1.2 Plant fixtures and run live jobs (manual)"],
+        )
+
+    def test_archive_without_pending_manual_tasks_records_empty_checklist(self) -> None:
+        calls, _ = self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1", "1.2"],
+                        "remaining_tasks": [],
+                        "task_counts": {"complete": 2, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [],
+                        "summary": "implemented round 1",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 1,
+                        "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "review passed",
+                        "fix_prompt": "",
+                        "next_phase": "archive",
+                    },
+                },
+                {
+                    "stage": "archive",
+                    "archive_repo": True,
+                    "result": {
+                        "status": "archived",
+                        "change": self.cid,
+                        "archive_path": "",
+                        "spec_sync_status": "no-delta",
+                        "commit": "",
+                        "summary": "archive succeeded",
+                    },
+                },
+            ]
+        )
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+
+        self.assertEqual(result, self.opsx_plan.base.DONE)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
+        self.assertEqual(record["manual_tasks_pending"], [])
+        self.assertEqual(
+            [stage for stage, _, _ in calls],
+            ["implement", "review", "archive"],
+        )
+
+    def test_archive_success_without_repo_evidence_does_not_complete_change(self) -> None:
+        self.stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1", "1.2"],
+                        "remaining_tasks": [],
+                        "task_counts": {"complete": 2, "total": 2},
                         "files_touched": [],
                         "known_change_files": [],
                         "summary": "implemented round 1",
@@ -956,9 +1255,9 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
                         "change": self.cid,
                         "round": 1,
                         "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
+                        "completed_tasks": ["1.1", "1.2"],
+                        "remaining_tasks": [],
+                        "task_counts": {"complete": 2, "total": 2},
                         "files_touched": [],
                         "known_change_files": [],
                         "summary": "implemented round 1",
@@ -1023,9 +1322,9 @@ class DirectOpenCodeExecutionTests(unittest.TestCase):
                         "change": self.cid,
                         "round": 1,
                         "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
+                        "completed_tasks": ["1.1", "1.2"],
+                        "remaining_tasks": [],
+                        "task_counts": {"complete": 2, "total": 2},
                         "files_touched": ["orchestrator/opsx-plan.py"],
                         "known_change_files": [],
                         "summary": "round 1 done",
@@ -1360,6 +1659,10 @@ class SingleChangeRunnerTests(unittest.TestCase):
                 body = json.dumps(payload["result"]) + "\n"
             else:
                 body = lines
+            if stage == "implement":
+                parsed = extract_result_json(body)
+                if parsed.get("status") == "implemented":
+                    apply_completed_tasks(repo, cid, parsed.get("completed_tasks"))
             log_path.write_text(body, encoding="utf-8")
             return payload.get("outcome", "exited"), log_path
 
@@ -1380,9 +1683,9 @@ class SingleChangeRunnerTests(unittest.TestCase):
                         "change": self.cid,
                         "round": 1,
                         "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
+                        "completed_tasks": ["1.1", "1.2"],
+                        "remaining_tasks": [],
+                        "task_counts": {"complete": 2, "total": 2},
                         "files_touched": [],
                         "known_change_files": [],
                         "summary": "implemented round 1",
@@ -1442,9 +1745,9 @@ class SingleChangeRunnerTests(unittest.TestCase):
                         "change": self.cid,
                         "round": 1,
                         "progress_made": True,
-                        "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"],
-                        "task_counts": {"complete": 1, "total": 2},
+                        "completed_tasks": ["1.1", "1.2"],
+                        "remaining_tasks": [],
+                        "task_counts": {"complete": 2, "total": 2},
                         "files_touched": [],
                         "known_change_files": [],
                         "summary": "implemented round 1",
@@ -1532,9 +1835,9 @@ class SingleChangeRunnerTests(unittest.TestCase):
                         "change": self.cid,
                         "round": 1,
                         "progress_made": True,
-                        "completed_tasks": ["1.1"],
+                        "completed_tasks": ["1.1", "1.2"],
                         "remaining_tasks": [],
-                        "task_counts": {"complete": 1, "total": 2},
+                        "task_counts": {"complete": 2, "total": 2},
                         "files_touched": [],
                         "known_change_files": [],
                         "summary": "implemented",
@@ -1614,6 +1917,10 @@ class SingleChangeRunnerTests(unittest.TestCase):
                 body = json.dumps(payload["result"]) + "\n"
             else:
                 body = lines
+            if stage == "implement":
+                parsed = extract_result_json(body)
+                if parsed.get("status") == "implemented":
+                    apply_completed_tasks(repo, cid, parsed.get("completed_tasks"))
             log_path.write_text(body, encoding="utf-8")
             return payload.get("outcome", "exited"), log_path
 
@@ -1644,8 +1951,8 @@ class SingleChangeRunnerTests(unittest.TestCase):
                     "stage": "implement",
                     "result": {
                         "status": "implemented", "change": self.cid, "round": 1,
-                        "progress_made": True, "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"], "task_counts": {"complete": 1, "total": 2},
+                        "progress_made": True, "completed_tasks": ["1.1", "1.2"],
+                        "remaining_tasks": [], "task_counts": {"complete": 2, "total": 2},
                         "files_touched": [], "known_change_files": [],
                         "summary": "r1",
                     },
@@ -1745,8 +2052,8 @@ class SingleChangeRunnerTests(unittest.TestCase):
                     "stage": "implement",
                     "result": {
                         "status": "implemented", "change": self.cid, "round": 1,
-                        "progress_made": True, "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"], "task_counts": {"complete": 1, "total": 2},
+                        "progress_made": True, "completed_tasks": ["1.1", "1.2"],
+                        "remaining_tasks": [], "task_counts": {"complete": 2, "total": 2},
                         "files_touched": [], "known_change_files": [],
                         "summary": "r1",
                     },
@@ -1829,8 +2136,8 @@ class SingleChangeRunnerTests(unittest.TestCase):
                     "stage": "implement",
                     "result": {
                         "status": "implemented", "change": self.cid, "round": 1,
-                        "progress_made": True, "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"], "task_counts": {"complete": 1, "total": 2},
+                        "progress_made": True, "completed_tasks": ["1.1", "1.2"],
+                        "remaining_tasks": [], "task_counts": {"complete": 2, "total": 2},
                         "files_touched": [], "known_change_files": [],
                         "summary": "r1",
                     },
@@ -1928,9 +2235,8 @@ class SingleChangeRunnerTests(unittest.TestCase):
                     "stage": "implement",
                     "result": {
                         "status": "implemented", "change": self.cid, "round": 1,
-                        "progress_made": False, "completed_tasks": [],
-                        "remaining_tasks": ["1.1", "1.2"],
-                        "task_counts": {"complete": 0, "total": 2},
+                        "progress_made": False, "completed_tasks": ["1.1", "1.2"],
+                        "remaining_tasks": [], "task_counts": {"complete": 2, "total": 2},
                         "files_touched": [], "known_change_files": [],
                         "summary": "no progress",
                     },
@@ -1993,8 +2299,8 @@ class SingleChangeRunnerTests(unittest.TestCase):
                     "stage": "implement",
                     "result": {
                         "status": "implemented", "change": self.cid, "round": 1,
-                        "progress_made": True, "completed_tasks": ["1.1"],
-                        "remaining_tasks": ["1.2"], "task_counts": {"complete": 1, "total": 2},
+                        "progress_made": True, "completed_tasks": ["1.1", "1.2"],
+                        "remaining_tasks": [], "task_counts": {"complete": 2, "total": 2},
                         "files_touched": [], "known_change_files": [],
                         "summary": "r1",
                     },
@@ -2087,11 +2393,12 @@ class SingleChangeRunnerTests(unittest.TestCase):
             if stage == "implement":
                 body = json.dumps({
                     "status": "implemented", "change": cid, "round": round_num,
-                    "progress_made": True, "completed_tasks": ["1.1"],
-                    "remaining_tasks": [], "task_counts": {"complete": 1, "total": 1},
+                    "progress_made": True, "completed_tasks": ["1.1", "1.2"],
+                    "remaining_tasks": [], "task_counts": {"complete": 2, "total": 2},
                     "files_touched": [], "known_change_files": [],
                     "summary": f"impl r{round_num}",
                 }) + "\n"
+                apply_completed_tasks(repo, cid, ["1.1", "1.2"])
             elif stage == "review":
                 review_counts.setdefault(cid, 0)
                 review_counts[cid] += 1
@@ -4248,6 +4555,7 @@ class SpendBudgetTests(unittest.TestCase):
                     "known_change_files": [],
                     "summary": "implemented",
                 }
+                apply_completed_tasks(repo, cid, payload["completed_tasks"])
             elif stage == "review":
                 payload = {
                     "status": "reviewed",
@@ -4712,6 +5020,25 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
         self.assertIn("\u2192 opsx-plan approve gated-b", output)
         self.assertNotIn("\u2192 opsx-plan approve no-gate", output)
 
+    def test_status_lists_manual_follow_up_for_done_change(self) -> None:
+        plan = self._plan_with_gated_changes()
+        self._activate_plan(str(plan.relative_to(self.repo)))
+        cfg = self.opsx_plan.planref.load_plan(plan)
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
+        record = self.opsx_plan.state_mod.rec(state, "gated-a")
+        record["status"] = self.opsx_plan.base.DONE
+        record["phase"] = "done"
+        record["manual_tasks_pending"] = ["4.2 Plant fixtures (manual)"]
+        self.opsx_plan.state_mod.save_state(self.repo, "test-plan", state)
+
+        import io as _io
+        buf = _io.StringIO()
+        with mock.patch("sys.stdout", buf):
+            self.opsx_plan.cmd_status_inner(cfg, state, header="test", plan_arg=None)
+        output = buf.getvalue()
+        self.assertIn("manual follow-up (operator checklist):", output)
+        self.assertIn("- 4.2 Plant fixtures (manual)", output)
+
     def test_status_shows_reset_guidance_for_failed_changes(self) -> None:
         plan = self._plan_with_gated_changes()
         self._activate_plan(str(plan.relative_to(self.repo)))
@@ -5012,13 +5339,14 @@ class RunEventNotificationTests(unittest.TestCase):
                     "change": cid,
                     "round": 1,
                     "progress_made": True,
-                    "completed_tasks": ["1.1"],
-                    "remaining_tasks": ["1.2"],
-                    "task_counts": {"complete": 1, "total": 2},
+                    "completed_tasks": ["1.1", "1.2"],
+                    "remaining_tasks": [],
+                    "task_counts": {"complete": 2, "total": 2},
                     "files_touched": [],
                     "known_change_files": [],
                     "summary": "implemented",
                 }
+                apply_completed_tasks(repo, cid, payload["completed_tasks"])
             elif stage == "review":
                 payload = {
                     "status": "reviewed",
@@ -5181,13 +5509,14 @@ class RunEventNotificationTests(unittest.TestCase):
                     "change": cid,
                     "round": 1,
                     "progress_made": True,
-                    "completed_tasks": ["1.1"],
+                    "completed_tasks": ["1.1", "1.2"],
                     "remaining_tasks": [],
-                    "task_counts": {"complete": 1, "total": 2},
+                    "task_counts": {"complete": 2, "total": 2},
                     "files_touched": [],
                     "known_change_files": [],
                     "summary": "implemented",
                 }
+                apply_completed_tasks(repo, cid, payload["completed_tasks"])
             elif stage == "review":
                 payload = {
                     "status": "reviewed",
@@ -5273,13 +5602,14 @@ class RunEventNotificationTests(unittest.TestCase):
                     "change": cid,
                     "round": 1,
                     "progress_made": True,
-                    "completed_tasks": ["1.1"],
-                    "remaining_tasks": ["1.2"],
-                    "task_counts": {"complete": 1, "total": 2},
+                    "completed_tasks": ["1.1", "1.2"],
+                    "remaining_tasks": [],
+                    "task_counts": {"complete": 2, "total": 2},
                     "files_touched": [],
                     "known_change_files": [],
                     "summary": "implemented",
                 }
+                apply_completed_tasks(repo, cid, payload["completed_tasks"])
             elif stage == "review":
                 payload = {
                     "status": "reviewed",
@@ -5325,13 +5655,14 @@ class RunEventNotificationTests(unittest.TestCase):
                     "change": cid,
                     "round": 1,
                     "progress_made": True,
-                    "completed_tasks": ["1.1"],
-                    "remaining_tasks": ["1.2"],
-                    "task_counts": {"complete": 1, "total": 2},
+                    "completed_tasks": ["1.1", "1.2"],
+                    "remaining_tasks": [],
+                    "task_counts": {"complete": 2, "total": 2},
                     "files_touched": [],
                     "known_change_files": [],
                     "summary": "implemented",
                 }
+                apply_completed_tasks(repo, cid, payload["completed_tasks"])
             elif stage == "review":
                 payload = {
                     "status": "reviewed",

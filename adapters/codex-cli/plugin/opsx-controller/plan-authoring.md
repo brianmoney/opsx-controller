@@ -85,6 +85,26 @@ After the last phase:
   does not invent these gates; list them here so the operator knows where to
   apply them.
 
+## Manual Tasks in tasks.md
+
+A task line whose text ends with the marker `(manual)` (case-insensitive,
+trailing whitespace tolerated) is an **operator-only manual task**. The
+controller, implementer, reviewer, and archiver all classify tasks with this
+same marker, so an unchecked `(manual)` task never blocks an unattended run:
+implement may leave it unchecked, review does not flag it, and archive still
+succeeds — recording it as an operator checklist to complete after the change
+is archived.
+
+For a change that will run unattended under `opsx-plan`, keep side-effecting
+live-runtime verification out of `tasks.md` entirely. Express operator
+follow-up as prose in the proposal or design, or cover it with automated
+tests. If a manual step must stay a task, mark the task line `(manual)`.
+An unchecked automatable task fails the run before archive — the controller
+re-enters implement, and if the task stays unchecked the run fails naming it.
+An unmarked manual task in an unattended run is therefore an authoring
+defect: it traps the run in a failure loop that only the `(manual)` marker
+(or moving the step out of `tasks.md`) resolves.
+
 ## Machine-Read Compile Convention
 
 These eleven rules are interpreted by `opsx-plan compile`. Follow them

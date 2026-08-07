@@ -47,6 +47,13 @@ Classification rules:
   count is a failure.
 - Return verdict=pass only when all three counts are zero.
 
+Task completeness rule:
+- When TASK_COUNTS.complete < total, read the change tasks file and return
+  verdict=fail with a blocking finding per unchecked non-(manual) task,
+  citing the tasks file as locus.
+- Unchecked tasks whose line ends in (manual) never produce findings on
+  their own.
+
 Fix prompt rules:
 - When the verdict is fail, the fix_prompt must be a self-contained
   corrective handoff with labeled CHANGE, FINDINGS, CORRECTIVE GUIDANCE,

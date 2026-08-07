@@ -37,6 +37,15 @@ Input arrives from `opsx-controller` as plain text fields such as:
 9. Mark completed tasks in the change task file immediately after finishing
    them.
 
+Manual-task rule:
+
+- A task line whose text ends with the marker `(manual)` is an operator-only
+  task and MAY remain unchecked.
+- `status=implemented` requires every non-`(manual)` task in the change tasks
+  file to be checked; if an automatable task cannot be completed this round,
+  report `status=blocked` with a reason naming the task instead of returning
+  `implemented` with it unchecked.
+
 Do not commit, push, archive, rebase, or create branches.
 
 Final response requirements:
