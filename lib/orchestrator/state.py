@@ -79,6 +79,7 @@ def new_change_record() -> dict:
         "latest_fix_prompt": "",
         "last_result": "",
         "task_counts": {"complete": 0, "total": 0},
+        "manual_tasks_pending": [],
         "tracked_change_files": [],
         "context_cache": default_context_cache(),
         "last_review": default_last_review(),
@@ -162,17 +163,70 @@ def set_status(state: dict, cid: str, status: str, reason: str = "") -> None:
     r["updated_at"] = base.utcnow()
 
 
-def change_task_counts(repo: Path, cid: str) -> dict:
-    counts = {"complete": 0, "total": 0}
-    tasks = groundtruth.change_dir(repo, cid) / "tasks.md"
+def _change_tasks_path(repo: Path, cid: str) -> Path:
+    """Locate the change's tasks.md wherever the change currently lives.
+
+    Prefers the active change directory (``openspec/changes/<cid>/``); once a
+    change has been archived, falls back to the archive directory under
+    ``openspec/changes/archive/``.
+    """
+    direct = groundtruth.change_dir(repo, cid) / "tasks.md"
+    if direct.is_file():
+        return direct
+    archived = groundtruth.find_archive_dir(repo, cid)
+    if archived is not None and (archived / "tasks.md").is_file():
+        return archived / "tasks.md"
+    return direct
+
+
+def change_tasks(repo: Path, cid: str) -> list[dict]:
+    """Parse the change's tasks file into per-task records.
+
+    Each record has ``id`` (the task text after the checkbox), ``done``
+    (bool), and ``manual`` (bool, ``True`` when the line ends in the
+    ``(manual)`` marker).
+    """
+    tasks = _change_tasks_path(repo, cid)
+    records: list[dict] = []
     if not tasks.is_file():
-        return counts
+        return records
     for line in tasks.read_text(encoding="utf-8").splitlines():
         match = base.TASK_RE.match(line)
         if not match:
             continue
+        records.append(
+            {
+                "id": line[match.end():].rstrip(),
+                "done": match.group("done").lower() == "x",
+                "manual": base.classify_task_line(line) == "manual",
+            }
+        )
+    return records
+
+
+def remaining_automatable_tasks(repo: Path, cid: str) -> list[str]:
+    """Ids of unchecked automatable tasks in the change's tasks file."""
+    return [
+        task["id"]
+        for task in change_tasks(repo, cid)
+        if not task["done"] and not task["manual"]
+    ]
+
+
+def pending_manual_tasks(repo: Path, cid: str) -> list[str]:
+    """Ids of unchecked manual tasks in the change's tasks file."""
+    return [
+        task["id"]
+        for task in change_tasks(repo, cid)
+        if not task["done"] and task["manual"]
+    ]
+
+
+def change_task_counts(repo: Path, cid: str) -> dict:
+    counts = {"complete": 0, "total": 0}
+    for task in change_tasks(repo, cid):
         counts["total"] += 1
-        if match.group("done").lower() == "x":
+        if task["done"]:
             counts["complete"] += 1
     return counts
 

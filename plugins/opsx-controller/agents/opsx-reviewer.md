@@ -43,6 +43,14 @@ Classification rules:
 - Count minor notes and suggestions together as `note`.
 - Any non-zero `critical`, `warning`, or `note` count is a failure.
 
+Task completeness rule:
+
+- When `TASK_COUNTS.complete < total`, read the change tasks file and return
+  `verdict=fail` with a blocking finding per unchecked non-`(manual)` task,
+  citing the tasks file as locus.
+- Unchecked tasks whose line ends in `(manual)` never produce findings on
+  their own.
+
 Fix prompt rules:
 - When the verdict is `fail`, the `fix_prompt` must be a self-contained
   corrective handoff with labeled `CHANGE`, `FINDINGS`, `CORRECTIVE GUIDANCE`,

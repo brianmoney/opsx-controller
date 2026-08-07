@@ -57,6 +57,7 @@ class ChangeMetrics:
     max_rounds_exceeded: bool = False
     archive_failed: bool = False
     fast_check_failed: bool = False
+    manual_tasks_pending: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -676,6 +677,12 @@ def _change_aggregation(
         if has_round1_implement and not implement_round1_success:
             fast_check_failed = True
 
+        # Operator manual-task checklist recorded at archive time
+        manual_pending = ch_state.get("manual_tasks_pending", [])
+        if not isinstance(manual_pending, list):
+            manual_pending = []
+        manual_tasks_pending = [str(t) for t in manual_pending]
+
         results.append(
             ChangeMetrics(
                 change_id=cid,
@@ -691,6 +698,7 @@ def _change_aggregation(
                 max_rounds_exceeded=max_rounds_exceeded,
                 archive_failed=archive_failed,
                 fast_check_failed=fast_check_failed,
+                manual_tasks_pending=manual_tasks_pending,
             )
         )
 

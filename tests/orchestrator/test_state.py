@@ -236,5 +236,95 @@ class EscalationStateMigrationTests(unittest.TestCase):
         self.assertEqual(esc["model"], "deepseek/v4-ultra")
 
 
+class TaskClassificationTests(unittest.TestCase):
+    """Manual/automatable task classification and completeness helpers."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _write_tasks(self, cid: str, text: str) -> None:
+        cdir = self.repo / "openspec" / "changes" / cid
+        cdir.mkdir(parents=True)
+        (cdir / "tasks.md").write_text(text, encoding="utf-8")
+
+    def test_classify_task_line_marker_case_and_whitespace(self) -> None:
+        self.assertEqual(base_mod.classify_task_line("- [ ] 1.1 do it (manual)"), "manual")
+        self.assertEqual(base_mod.classify_task_line("- [ ] 1.1 do it (MANUAL)  "), "manual")
+        self.assertEqual(base_mod.classify_task_line("- [x] 1.1 do it (manual)"), "manual")
+        self.assertEqual(base_mod.classify_task_line("- [ ] 1.2 add a test"), "automatable")
+        self.assertEqual(base_mod.classify_task_line("- [ ] 1.3 write (manual) coverage"), "automatable")
+
+    def test_change_tasks_classifies_marked_and_unmarked_lines(self) -> None:
+        self._write_tasks(
+            "add-thing",
+            "## 1\n\n"
+            "- [ ] 1.1 Plant a malformed artifact and run the live jobs (manual)\n"
+            "- [ ] 1.2 verify in prod (MANUAL)  \n"
+            "- [ ] 1.3 Add a regression test\n",
+        )
+        tasks = state_mod.change_tasks(self.repo, "add-thing")
+        self.assertEqual(
+            [t["id"] for t in tasks],
+            [
+                "1.1 Plant a malformed artifact and run the live jobs (manual)",
+                "1.2 verify in prod (MANUAL)",
+                "1.3 Add a regression test",
+            ],
+        )
+        self.assertEqual(
+            [t["manual"] for t in tasks],
+            [True, True, False],
+        )
+        self.assertEqual([t["done"] for t in tasks], [False, False, False])
+
+    def test_remaining_automatable_excludes_manual_and_checked(self) -> None:
+        self._write_tasks(
+            "add-thing",
+            "## 1\n\n"
+            "- [x] 1.1 Add a regression test\n"
+            "- [ ] 1.2 Manual follow-up (manual)\n"
+            "- [ ] 1.3 Finish the wiring\n",
+        )
+        self.assertEqual(
+            state_mod.remaining_automatable_tasks(self.repo, "add-thing"),
+            ["1.3 Finish the wiring"],
+        )
+        self.assertEqual(
+            state_mod.pending_manual_tasks(self.repo, "add-thing"),
+            ["1.2 Manual follow-up (manual)"],
+        )
+
+    def test_remaining_automatable_all_manual_unchecked(self) -> None:
+        self._write_tasks(
+            "add-thing",
+            "## 1\n\n"
+            "- [x] 1.1 Add a regression test\n"
+            "- [ ] 1.2 Plant fixtures (manual)\n",
+        )
+        self.assertEqual(state_mod.remaining_automatable_tasks(self.repo, "add-thing"), [])
+        self.assertEqual(state_mod.pending_manual_tasks(self.repo, "add-thing"), ["1.2 Plant fixtures (manual)"])
+
+    def test_change_task_counts_totals_all_tasks(self) -> None:
+        self._write_tasks(
+            "add-thing",
+            "## 1\n\n"
+            "- [x] 1.1 Add a regression test\n"
+            "- [ ] 1.2 Manual follow-up (manual)\n",
+        )
+        self.assertEqual(
+            state_mod.change_task_counts(self.repo, "add-thing"),
+            {"complete": 1, "total": 2},
+        )
+
+    def test_helpers_return_empty_when_tasks_missing(self) -> None:
+        self.assertEqual(state_mod.change_tasks(self.repo, "missing"), [])
+        self.assertEqual(state_mod.remaining_automatable_tasks(self.repo, "missing"), [])
+        self.assertEqual(state_mod.pending_manual_tasks(self.repo, "missing"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

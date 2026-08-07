@@ -167,6 +167,22 @@ def _print_change_table(cm_list: list) -> None:
         print(fmt.format(*row))
 
 
+def _print_manual_follow_up(cm_list: list) -> None:
+    """Print the operator manual-task checklist for archived changes."""
+    entries = [
+        (c.change_id, c.manual_tasks_pending)
+        for c in cm_list
+        if getattr(c, "manual_tasks_pending", None)
+    ]
+    if not entries:
+        return
+    print("\n=== Manual Follow-Up (operator checklist) ===")
+    for cid, tasks in entries:
+        print(f"  {cid}:")
+        for task in tasks:
+            print(f"    - {task}")
+
+
 def _print_stage_aggregates(sa, stage_filter: str | None = None) -> None:
     """Print stage aggregates section."""
     print("\n=== Stage Aggregates ===")
@@ -479,6 +495,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         _print_plan_summary(result.plan_metrics, plan_name, selected_run_id,
                             filters)
         _print_change_table(result.change_metrics)
+        _print_manual_follow_up(result.change_metrics)
         _print_stage_aggregates(result.stage_aggregates, args.stage)
         _print_model_leaderboard(result.model_leaderboard)
 

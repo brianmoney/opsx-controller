@@ -102,3 +102,28 @@ installation status.
 - **THEN** the plan-authoring surface reports that the shared guidance is
   unavailable instead of reproducing a second convention or claiming it was
   read
+
+### Requirement: The reference documents the manual task marker
+
+The plan-authoring reference SHALL document the `(manual)` task marker
+convention and SHALL direct authors of changes intended for unattended
+`opsx-plan` runs to either keep side-effecting live-runtime verification
+out of `tasks.md` (expressing it as operator follow-up in the proposal or
+design, or covering it with automated tests) or mark the corresponding task
+lines with `(manual)`. The reference SHALL state that an unchecked
+automatable task fails the run before archive, so an unmarked manual task
+in an unattended run is an authoring defect.
+
+#### Scenario: Author plans live-runtime verification for an unattended change
+
+- **WHEN** an author writes a tasks file for a change that will run
+  unattended and one task requires planting fixtures in a live runtime
+- **THEN** the reference directs the author to mark that task `(manual)` or
+  move it out of the tasks file
+
+#### Scenario: Author leaves a side-effecting task unmarked
+
+- **WHEN** an unattended-run change has an unmarked task that an operator
+  must perform by hand
+- **THEN** the reference identifies this as an authoring defect that fails
+  the run before archive

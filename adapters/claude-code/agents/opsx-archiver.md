@@ -25,7 +25,9 @@ Required workflow:
    `tracked_change_files` list as the default implementation file set for
    explicit archive staging.
 5. Run `openspec status --change "<change>" --json`.
-6. Read the change tasks file and fail closed if any `- [ ]` tasks remain.
+6. Read the change tasks file and fail closed if any unchecked `- [ ]` task
+   remains whose line does not end in `(manual)`. An unchecked task marked
+   `(manual)` does not block archive.
 7. Run `openspec validate <change> --strict`.
 8. Run `git status --short --untracked-files=all`,
    `git diff --cached --name-only`, and `git log --oneline -1`.

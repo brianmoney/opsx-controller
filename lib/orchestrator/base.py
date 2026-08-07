@@ -18,6 +18,20 @@ SKIPPED = "skipped"
 
 ARCHIVE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-")
 TASK_RE = re.compile(r"^- \[(?P<done>[ xX])\]\s+")
+# A task line whose text ends with "(manual)" (case-insensitive, trailing
+# whitespace tolerated) is an operator-only manual task. Every consumer
+# classifies tasks with this same marker so implement, review, and archive
+# gates treat a task identically.
+MANUAL_TASK_RE = re.compile(r"\(manual\)\s*$", re.IGNORECASE)
+
+
+def classify_task_line(line: str) -> str:
+    """Classify a raw tasks-file line as ``manual`` or ``automatable``.
+
+    Callers must only pass lines already matched by ``TASK_RE``; the marker
+    is detected on the raw line so wrapped task text still classifies.
+    """
+    return "manual" if MANUAL_TASK_RE.search(line) else "automatable"
 
 ADAPTER_CLIENTS = {
     "opencode": "opencode",

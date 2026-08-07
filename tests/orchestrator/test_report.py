@@ -258,6 +258,60 @@ class ReportCommandTests(unittest.TestCase):
         self.assertIn("=== Model Leaderboard ===", stdout)
         self.assertIn("openai:gpt-4o", stdout)
 
+    def test_report_surfaces_pending_manual_tasks_checklist(self) -> None:
+        plan_name = "manual-plan"
+        cid = "ch-manual"
+        plan_path = self._write_plan_toml(plan_name, [cid])
+
+        records = [
+            self._build_record(
+                stage="implement", change_id=cid, plan_name=plan_name,
+                duration_ms=120000, input_tokens=50000, output_tokens=10000,
+                estimated_cost=0.25, cost_status="estimated",
+            ),
+            self._build_record(
+                stage="review", change_id=cid, plan_name=plan_name,
+                duration_ms=30000, input_tokens=20000, output_tokens=5000,
+                estimated_cost=0.10, cost_status="estimated",
+                verdict="pass",
+            ),
+            self._build_record(
+                stage="archive", change_id=cid, plan_name=plan_name,
+                duration_ms=10000, input_tokens=8000, output_tokens=2000,
+                estimated_cost=0.04, cost_status="estimated",
+            ),
+        ]
+        self._write_telemetry(plan_name, records)
+        self._write_state(plan_name, {
+            "plan": plan_name, "approvals": [],
+            "changes": {
+                cid: {
+                    "status": "done", "round": 1, "phase": "done",
+                    "manual_tasks_pending": [
+                        "4.2 Plant fixtures and run the live jobs (manual)",
+                    ],
+                },
+            },
+        })
+
+        rc, stdout, _ = self._run_report(
+            plan_path=plan_path, plan_name=plan_name, json=True,
+        )
+        self.assertEqual(rc, 0)
+        data = json.loads(stdout)
+        cm = [c for c in data["change_metrics"] if c["change_id"] == cid][0]
+        self.assertEqual(
+            cm["manual_tasks_pending"],
+            ["4.2 Plant fixtures and run the live jobs (manual)"],
+        )
+
+        rc, stdout, _ = self._run_report(
+            plan_path=plan_path, plan_name=plan_name,
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("=== Manual Follow-Up (operator checklist) ===", stdout)
+        self.assertIn("4.2 Plant fixtures and run the live jobs (manual)", stdout)
+
     # -- 7.2 table output for multi-change plan (mixed cost statuses)
 
     def test_table_output_multi_change_mixed_costs(self) -> None:
