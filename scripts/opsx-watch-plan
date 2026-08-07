@@ -422,22 +422,45 @@ cleanup_follower() {
 
 trap 'cleanup_follower' EXIT
 
-# Resolve the active plan's change ids once at startup.  When an active
-# plan is available, only logs belonging to its changes are considered.
-# Without an active plan, all logs are followed (legacy / test behaviour).
-ACTIVE_PLAN_IDS=""
-active_toml=$(resolve_active_plan_toml "$REPO" 2>/dev/null || true)
-if [[ -n "$active_toml" ]]; then
-  ACTIVE_PLAN_IDS=$(extract_plan_change_ids "$active_toml" 2>/dev/null || true)
-fi
+# Resolve the change ids the follower should scope to: the active plan's
+# changes unioned with the derived single-change manifests that ``run-one``
+# writes under .opsx-plan/plans/run-*.toml.  Scoping to the active plan
+# alone would hide a live ``run-one`` execution whenever the active-plan
+# pointer still references a different plan (the common case: running one
+# change directly while a prior plan stays active).  When neither an active
+# plan nor a derived manifest exists, all logs are followed (legacy / test
+# behaviour).  Refreshed every loop so a manifest written after the watcher
+# starts is picked up within one poll interval.
+resolve_allowed_ids() {
+  local allowed=""
 
-# Track filenames we've already switched away from.  Once the
-# orchestrator moves on from a stage log it never returns, and
-# appending to an abandoned log must not trigger a switch back.
+  local active_toml
+  active_toml=$(resolve_active_plan_toml "$REPO" 2>/dev/null || true)
+  if [[ -n "$active_toml" ]]; then
+    allowed=$(extract_plan_change_ids "$active_toml" 2>/dev/null || true)
+  fi
+
+  local manifest
+  for manifest in "$REPO/.opsx-plan/plans/"run-*.toml; do
+    [[ -e "$manifest" ]] || continue
+    local manifest_ids
+    manifest_ids=$(extract_plan_change_ids "$manifest" 2>/dev/null || true)
+    for id in $manifest_ids; do
+      if [[ " $allowed " != *" $id "* ]]; then
+        allowed="$allowed $id"
+      fi
+    done
+  done
+
+  printf '%s' "$allowed"
+}
+
+ACTIVE_PLAN_IDS=""
 EXHAUSTED_FILENAMES=""
 
 current=""
 while true; do
+  ACTIVE_PLAN_IDS=$(resolve_allowed_ids)
   candidate=$(newest_log "$ACTIVE_PLAN_IDS")
   if [[ -n "$candidate" && "$candidate" != "$current" ]]; then
     # Switch to a newer log: stop the current tail and start fresh.
