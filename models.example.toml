@@ -23,6 +23,12 @@
 # (reviewer: xhigh, all others: high). Re-run the adapter install script
 # after changing a variant.
 #
+# `controller_variant` is also honored by `opsx-plan compile`: OpenCode
+# compilation appends `opencode run --variant <variant>` when the controller
+# role resolves a variant, and omits the flag entirely when it does not.
+# Claude Code compilation ignores the controller variant (the Claude CLI has
+# no reasoning-variant flag) — documented behavior, not an error.
+#
 # Identifier syntax is adapter-specific:
 #   - opencode requires "provider/model" (e.g. "deepseek/deepseek-v4-pro")
 #   - claude-code requires a bare Anthropic alias (e.g. "claude-sonnet-5")

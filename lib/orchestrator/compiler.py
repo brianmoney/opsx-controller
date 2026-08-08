@@ -63,8 +63,13 @@ def resolve_compile_output(repo: Path, output: str, force: bool) -> Path:
     return p
 
 
-def check_controller_model(repo: Path | None = None, adapter: str = "opencode") -> str:
-    """Return the controller model resolved for *adapter*.
+def check_controller_model(repo: Path | None = None,
+                           adapter: str = "opencode") -> tuple[str, str | None]:
+    """Return the controller ``(model, variant)`` resolved for *adapter*.
+
+    ``variant`` is the optional controller reasoning-effort label
+    (``None`` when no ``controller_variant`` source is set — the compile
+    invocation then omits the flag entirely).
 
     Raises ``PlanError`` when the ``controller`` role cannot be resolved
     for *adapter*, or when the resolved identifier violates the adapter's
@@ -102,7 +107,8 @@ def check_controller_model(repo: Path | None = None, adapter: str = "opencode") 
             f"configuration file."
         )
 
-    return model
+    variant = resolved["controller"].variant
+    return model, variant
 
 
 def discover_template_pairs(repo: Path) -> list[tuple[Path, Path | None]]:
@@ -349,8 +355,15 @@ def build_compile_prompt(source_content: str, source_path: Path,
 
 
 def _build_compile_argv(adapter: str, model: str, prompt: str,
-                        prompt_file: Path | None = None) -> list[str]:
+                        prompt_file: Path | None = None,
+                        variant: str | None = None) -> list[str]:
     """Build the compile client argv for *adapter*.
+
+    For OpenCode, a resolved *variant* is appended as ``--variant
+    <variant>`` immediately after ``--model <model>``; when *variant* is
+    ``None`` the flag is omitted entirely so the client's built-in default
+    applies. Claude Code has no reasoning-variant flag, so *variant* is
+    always ignored for it.
 
     Raises ``PlanError`` when the adapter is unsupported for compilation.
     """
@@ -366,11 +379,15 @@ def _build_compile_argv(adapter: str, model: str, prompt: str,
         )
     executable = entry["executable"]
     if adapter == "opencode" and prompt_file is not None:
-        return [
+        argv = [
             executable, "run", "--model", model,
             "Follow the complete compile instructions in the attached file. Output only TOML.",
             "--file", str(prompt_file),
         ]
+        if variant:
+            model_index = argv.index("--model")
+            argv[model_index + 2:model_index + 2] = ["--variant", variant]
+        return argv
 
     # Use a template-style argv construction so we compose the full command
     # from the registry without relying on a shared argv template format.
@@ -383,12 +400,20 @@ def _build_compile_argv(adapter: str, model: str, prompt: str,
                 .replace("{model}", model)
                 .replace("{prompt}", prompt)
         )
+    if adapter == "opencode" and variant:
+        model_index = argv.index("--model")
+        argv[model_index + 2:model_index + 2] = ["--variant", variant]
     return argv
 
 
 def run_compile_client(repo: Path, adapter: str, model: str,
-                        prompt: str) -> tuple[str, str]:
+                       prompt: str,
+                       variant: str | None = None) -> tuple[str, str]:
     """Invoke the selected compile client non-interactively.
+
+    *variant* is the optional controller reasoning variant. OpenCode
+    appends ``--variant <variant>`` to its invocation when set; Claude
+    Code ignores it.
 
     Returns ``(stdout, stderr)`` as a tuple.  Raises ``PlanError`` on
     spawn failure, timeout, or unsupported adapter.
@@ -405,7 +430,7 @@ def run_compile_client(repo: Path, adapter: str, model: str,
             handle.write(prompt)
             prompt_file = Path(handle.name)
 
-    argv = _build_compile_argv(adapter, model, prompt, prompt_file)
+    argv = _build_compile_argv(adapter, model, prompt, prompt_file, variant)
     try:
         proc = subprocess.run(
             argv,

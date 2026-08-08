@@ -1059,6 +1059,12 @@ Compile a markdown plan into a runnable TOML manifest. Requires a
 an existing output unless `--force` is passed. When `-o` is omitted,
 defaults to `openspec/plans/<source-stem>.toml`.
 
+OpenCode compilation appends `opencode run --variant <variant>` when the
+controller role resolves a reasoning variant (`controller_variant` key or
+`OPSX_CONTROLLER_VARIANT`); when no variant resolves the flag is omitted
+entirely. Claude Code compilation ignores the controller variant, since the
+Claude CLI has no reasoning-variant flag.
+
 ### `opsx-plan models`
 
 ```
