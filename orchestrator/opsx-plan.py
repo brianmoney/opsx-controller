@@ -494,6 +494,14 @@ def apply_model_env(cfg: dict) -> None:
     else:
         os.environ.pop(ROLE_ENV[escalation_role], None)
 
+    # Reasoning variants are optional per role. Export the resolved variant
+    # (if any) for every role; an unresolved variant is set to an empty
+    # string so ``--variant "$OPSX_<ROLE>_VARIANT"`` in a stage invoke drops
+    # the flag instead of aborting on an unset variable.
+    for role in ALL_ROLES:
+        entry = models.get(role)
+        os.environ[ROLE_VARIANT_ENV[role]] = entry.variant if entry and entry.variant else ""
+
 # ---------------------------------------------------------------------------
 # Active plan pointer
 # ---------------------------------------------------------------------------
@@ -1114,7 +1122,10 @@ def _expand_invoke_token(token: str) -> tuple[str | None, str]:
     """Expand ``$VAR``/``${VAR}`` references in *token*.
 
     Returns ``(expanded, "")`` on success. When a referenced variable is
-    unset, returns ``(None, var_name)`` naming the first such variable.
+    unset, returns ``(None, var_name)`` naming the first such variable. When
+    a referenced variable is set to an empty string (or the token contains
+    no variable at all and expands to empty), returns ``("", "")`` so the
+    caller can drop the token and any dangling flag that precedes it.
     """
     if "$" not in token:
         return token, ""
@@ -1124,9 +1135,10 @@ def _expand_invoke_token(token: str) -> tuple[str | None, str]:
         # Reference survived expansion: the variable is entirely unset.
         return None, unresolved.group(1) or unresolved.group(2)
     if not expanded:
-        # Fully expanded but empty: the variable was set to an empty string.
-        original = _ENV_VAR_RE.search(token)
-        return None, (original.group(1) or original.group(2)) if original else token
+        # Fully expanded to empty: the referenced variable was set to an
+        # empty string (e.g. an optional reasoning variant). Expand to
+        # empty and let the caller omit the flag.
+        return "", ""
     return expanded, ""
 
 
@@ -1153,7 +1165,20 @@ def invoke_direct_stage(
             return "env_error", log_path
         expanded_tokens.append(value)
 
-    cmd = expanded_tokens + [input_block]
+    # Drop tokens that expanded to empty (a set-but-empty variable, e.g. an
+    # optional reasoning variant) along with a preceding flag token that
+    # would otherwise dangle as ``--variant ""``. Required model variables
+    # are never empty because apply_model_env fails closed on unresolved
+    # roles.
+    cmd: list[str] = []
+    for token in expanded_tokens:
+        if not token:
+            if cmd and cmd[-1].startswith("-") and "=" not in cmd[-1]:
+                cmd.pop()
+            continue
+        cmd.append(token)
+
+    cmd = cmd + [input_block]
     log_path = next_stage_log_path(repo, cid, stage, round_num)
     timeout_s = cfg["changes"][cid]["timeout_minutes"] * 60
     base.log(

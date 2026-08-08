@@ -3114,10 +3114,14 @@ class InvokeDirectStageEnvExpansionTests(unittest.TestCase):
     def test_apply_model_env_populates_variable_invoke_expands(self) -> None:
         """7.5: after apply_model_env, invoke_direct_stage expands
         $OPSX_IMPLEMENTER_MODEL to the adapter-specific resolved value."""
-        # apply_model_env writes all four OPSX_*_MODEL vars into the real
-        # process environment, so all four must be saved and restored.
+        # apply_model_env writes all four OPSX_*_MODEL vars (and the
+        # OPSX_*_VARIANT vars) into the real process environment, so all must
+        # be saved and restored.
         saved_vars = {
-            var: os.environ.get(var) for var in self.opsx_plan.ROLE_ENV.values()
+            var: os.environ.get(var) for var in (
+                *self.opsx_plan.ROLE_ENV.values(),
+                *self.opsx_plan.ROLE_VARIANT_ENV.values(),
+            )
         }
         try:
             cfg = {
@@ -3153,6 +3157,123 @@ class InvokeDirectStageEnvExpansionTests(unittest.TestCase):
                     os.environ[var] = value
                 else:
                     os.environ.pop(var, None)
+
+    def _model_env_config(self, *, variants: dict[str, str | None]) -> dict:
+        """A minimal cfg whose models resolve the four required roles, with
+        the given per-role variant overrides."""
+        base_models = {
+            role: ResolvedModel(role=role, model=f"model-{role}", source="test")
+            for role in self.opsx_plan.ROLES
+        }
+        for role, variant in variants.items():
+            base_models[role] = ResolvedModel(
+                role=role, model=f"model-{role}", source="test", variant=variant
+            )
+        return {
+            "adapter": "opencode",
+            "models": base_models,
+            "changes": {"c1": {"timeout_minutes": 1}},
+        }
+
+    def test_apply_model_env_exports_resolved_and_empty_variants(self) -> None:
+        """apply_model_env exports each role's resolved variant and an empty
+        string for roles without one (so a default invoke drops the flag)."""
+        saved_vars = {
+            var: os.environ.get(var) for var in (
+                *self.opsx_plan.ROLE_ENV.values(),
+                *self.opsx_plan.ROLE_VARIANT_ENV.values(),
+            )
+        }
+        try:
+            cfg = self._model_env_config(
+                variants={"implementer": "max", "reviewer": "high"}
+            )
+            self.opsx_plan.apply_model_env(cfg)
+            self.assertEqual(os.environ["OPSX_IMPLEMENTER_VARIANT"], "max")
+            self.assertEqual(os.environ["OPSX_REVIEWER_VARIANT"], "high")
+            self.assertEqual(os.environ["OPSX_CONTROLLER_VARIANT"], "")
+            self.assertEqual(os.environ["OPSX_ARCHIVER_VARIANT"], "")
+        finally:
+            for var, value in saved_vars.items():
+                if value is not None:
+                    os.environ[var] = value
+                else:
+                    os.environ.pop(var, None)
+
+    def test_opencode_variant_reaches_subprocess_when_resolved(self) -> None:
+        """A resolved implementer variant is dispatched as ``--variant``
+        right after the model (mirrors the compile passthrough)."""
+        argv_dump = self.repo / "argv.json"
+        script = (
+            "import sys, json, pathlib; "
+            f"pathlib.Path({str(argv_dump)!r}).write_text(json.dumps(sys.argv))"
+        )
+        saved_vars = {
+            var: os.environ.get(var) for var in (
+                *self.opsx_plan.ROLE_ENV.values(),
+                *self.opsx_plan.ROLE_VARIANT_ENV.values(),
+            )
+        }
+        try:
+            cfg = self._model_env_config(variants={"implementer": "max"})
+            cfg["implement_invoke"] = (
+                f"python3 -c {shlex.quote(script)} "
+                '--model "$OPSX_IMPLEMENTER_MODEL" '
+                '--variant "$OPSX_IMPLEMENTER_VARIANT"'
+            )
+            self.opsx_plan.apply_model_env(cfg)
+            outcome, _log_path = self.opsx_plan.invoke_direct_stage(
+                self.repo, cfg, "c1", "implement", 1, "INPUT_BLOCK"
+            )
+        finally:
+            for var, value in saved_vars.items():
+                if value is not None:
+                    os.environ[var] = value
+                else:
+                    os.environ.pop(var, None)
+
+        self.assertEqual(outcome, "exited")
+        argv = json.loads(argv_dump.read_text(encoding="utf-8"))
+        self.assertIn("--variant", argv)
+        self.assertEqual(argv[argv.index("--model") + 1], "model-implementer")
+        self.assertEqual(argv[argv.index("--variant") + 1], "max")
+
+    def test_opencode_variant_flag_omitted_when_unresolved(self) -> None:
+        """With no variant resolved, the default invoke's ``--variant`` flag
+        is dropped so the client default applies and the run proceeds."""
+        argv_dump = self.repo / "argv.json"
+        script = (
+            "import sys, json, pathlib; "
+            f"pathlib.Path({str(argv_dump)!r}).write_text(json.dumps(sys.argv))"
+        )
+        saved_vars = {
+            var: os.environ.get(var) for var in (
+                *self.opsx_plan.ROLE_ENV.values(),
+                *self.opsx_plan.ROLE_VARIANT_ENV.values(),
+            )
+        }
+        try:
+            cfg = self._model_env_config(variants={})
+            cfg["implement_invoke"] = (
+                f"python3 -c {shlex.quote(script)} "
+                '--model "$OPSX_IMPLEMENTER_MODEL" '
+                '--variant "$OPSX_IMPLEMENTER_VARIANT"'
+            )
+            self.opsx_plan.apply_model_env(cfg)
+            outcome, _log_path = self.opsx_plan.invoke_direct_stage(
+                self.repo, cfg, "c1", "implement", 1, "INPUT_BLOCK"
+            )
+        finally:
+            for var, value in saved_vars.items():
+                if value is not None:
+                    os.environ[var] = value
+                else:
+                    os.environ.pop(var, None)
+
+        self.assertEqual(outcome, "exited")
+        argv = json.loads(argv_dump.read_text(encoding="utf-8"))
+        self.assertNotIn("--variant", argv)
+        self.assertEqual(argv[argv.index("--model") + 1], "model-implementer")
 
 
 class OpenCodeAgentModeTests(unittest.TestCase):

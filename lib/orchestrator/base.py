@@ -53,13 +53,16 @@ ADAPTER_DEFAULTS = {
     "opencode": {
         "state_file": ".opencode/opsx-controller/{change}.json",
         "implement_invoke": (
-            'opencode run --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL"'
+            'opencode run --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL" '
+            '--variant "$OPSX_IMPLEMENTER_VARIANT"'
         ),
         "review_invoke": (
-            'opencode run --agent opsx-reviewer --model "$OPSX_REVIEWER_MODEL"'
+            'opencode run --agent opsx-reviewer --model "$OPSX_REVIEWER_MODEL" '
+            '--variant "$OPSX_REVIEWER_VARIANT"'
         ),
         "archive_invoke": (
-            'opencode run --agent opsx-archiver --model "$OPSX_ARCHIVER_MODEL"'
+            'opencode run --agent opsx-archiver --model "$OPSX_ARCHIVER_MODEL" '
+            '--variant "$OPSX_ARCHIVER_VARIANT"'
         ),
     },
     "claude-code": {

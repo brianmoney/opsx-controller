@@ -6,9 +6,9 @@
 name = "sample-implementation-plan"
 adapter = "opencode"
 state_file = ".opencode/opsx-controller/{change}.json"
-implement_invoke = 'opencode run --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL"'
-review_invoke = 'opencode run --agent opsx-reviewer --model "$OPSX_REVIEWER_MODEL"'
-archive_invoke = 'opencode run --agent opsx-archiver --model "$OPSX_ARCHIVER_MODEL"'
+implement_invoke = 'opencode run --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL" --variant "$OPSX_IMPLEMENTER_VARIANT"'
+review_invoke = 'opencode run --agent opsx-reviewer --model "$OPSX_REVIEWER_MODEL" --variant "$OPSX_REVIEWER_VARIANT"'
+archive_invoke = 'opencode run --agent opsx-archiver --model "$OPSX_ARCHIVER_MODEL" --variant "$OPSX_ARCHIVER_VARIANT"'
 notify_cmd = ""
 plan_doc = "openspec/plans/sample-plan.md"
 create_invoke = 'opencode run "/opsx-propose Please review @{plan_doc} and create the OpenSpec change {change}."'

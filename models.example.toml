@@ -23,6 +23,12 @@
 # (reviewer: xhigh, all others: high). Re-run the adapter install script
 # after changing a variant.
 #
+# Resolved variants are also passed through to direct plan dispatch
+# (`opsx-plan run`): the OpenCode stage invokes append
+# `--variant "$OPSX_<ROLE>_VARIANT"` and the orchestrator exports that
+# variable per role, dropping the flag entirely when a role has no variant
+# configured so the client's built-in default applies.
+#
 # `controller_variant` is also honored by `opsx-plan compile`: OpenCode
 # compilation appends `opencode run --variant <variant>` when the controller
 # role resolves a variant, and omits the flag entirely when it does not.

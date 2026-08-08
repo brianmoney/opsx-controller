@@ -285,9 +285,16 @@ Defaults (override with `implement_invoke` / `review_invoke` /
 
 | adapter | invocation | state file |
 |---|---|---|
-| `opencode` | `opencode run --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL"`, and similarly for reviewer/archiver | `.opsx-plan/<plan>.state.json` |
+| `opencode` | `opencode run --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL" --variant "$OPSX_IMPLEMENTER_VARIANT"`, and similarly for reviewer/archiver | `.opsx-plan/<plan>.state.json` |
 | `claude-code` | `claude -p --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL" --permission-mode bypassPermissions --output-format json`, and similarly for reviewer/archiver | `.opsx-plan/<plan>.state.json` |
 | `codex-cli` | Direct dispatch not available by default — `codex-cli` has no default stage invokes and a codex-cli plan missing explicit `implement_invoke` / `review_invoke` / `archive_invoke` keys fails at load time with a `PlanError` naming all three required keys. An operator can opt into direct dispatch by hand-writing all three invokes in `[plan]`. | `.opsx-plan/<plan>.state.json` |
+
+The OpenCode invokes reference an `OPSX_*_VARIANT` variable alongside the
+model. The orchestrator exports it per role from the resolved
+`<role>_variant` configuration; when a role has no variant configured the
+variable is exported empty and `opsx-plan` drops the `--variant` flag before
+spawning, so the client's built-in default applies. Claude Code has no
+reasoning-variant flag, so its invokes never reference a variant.
 
 Verify your client's headless syntax and permission configuration before an
 unattended run — for example, Claude Code's `-p` mode needs tool permissions
