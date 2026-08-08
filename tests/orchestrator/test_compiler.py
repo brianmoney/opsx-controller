@@ -1031,6 +1031,33 @@ class CompileTests(unittest.TestCase):
         self.assertNotIn(prompt, observed["argv"])
         self.assertFalse(observed["path"].exists())
 
+    def test_run_compile_client_prompt_file_lives_inside_workspace(self) -> None:
+        """The opencode prompt attachment must be inside the repo so the
+        sandbox can read it; /tmp paths are auto-rejected as
+        external_directory."""
+        prompt = "compile this plan"
+        observed: dict[str, object] = {}
+        result = mock.Mock(returncode=0, stdout="[plan]\n", stderr="")
+
+        def fake_run(argv, **kwargs):
+            prompt_file = Path(argv[argv.index("--file") + 1])
+            observed["path"] = prompt_file
+            return result
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            compiler_mod.run_compile_client(
+                self.repo, "opencode", "test-provider/test-model", prompt
+            )
+
+        prompt_file = observed["path"]
+        self.assertIsInstance(prompt_file, Path)
+        self.assertTrue(str(prompt_file).startswith(str(self.repo.resolve())))
+        self.assertEqual(
+            prompt_file.parent,
+            (self.repo / ".opsx-plan" / "compile").resolve(),
+        )
+        self.assertFalse(prompt_file.exists())
+
     def test_run_compile_client_opencode_passes_variant_in_argv(self) -> None:
         """A resolved controller variant reaches the opencode client argv."""
         prompt = "compile this plan"

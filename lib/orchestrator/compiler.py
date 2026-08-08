@@ -406,6 +406,27 @@ def _build_compile_argv(adapter: str, model: str, prompt: str,
     return argv
 
 
+def _repo_compile_prompt_dir(repo: Path) -> Path:
+    """Return the workspace-local directory for compile prompt files.
+
+    OpenCode resolves ``--file`` attachments through its permission system,
+    which auto-rejects reads of files outside the working tree
+    (``external_directory`` — e.g. the system ``/tmp``).  The compile prompt
+    file must therefore live inside the repository so the sandbox can read it
+    without prompting.  It is stored under ``.opsx-plan/compile/``; the
+    ``.opsx-plan/`` root is self-ignored by git, so a leftover prompt file
+    never pollutes the working tree.
+    """
+    dot_dir = repo / ".opsx-plan"
+    dot_dir.mkdir(parents=True, exist_ok=True)
+    gi = dot_dir / ".gitignore"
+    if not gi.exists():
+        gi.write_text("*\n", encoding="utf-8")
+    prompt_dir = dot_dir / "compile"
+    prompt_dir.mkdir(parents=True, exist_ok=True)
+    return prompt_dir
+
+
 def run_compile_client(repo: Path, adapter: str, model: str,
                        prompt: str,
                        variant: str | None = None) -> tuple[str, str]:
@@ -420,12 +441,16 @@ def run_compile_client(repo: Path, adapter: str, model: str,
     """
     executable = COMPILE_CLIENTS[adapter]["executable"]
     prompt_file: Path | None = None
+    prompt_dir: Path | None = None
     if adapter == "opencode":
         # OpenCode receives attached files as prompt parts. Keeping the full
         # prompt out of argv avoids the OS argument-size limit for large plans.
+        # The file is written inside the workspace (not /tmp) because opencode
+        # auto-rejects external_directory reads of the attachment.
+        prompt_dir = _repo_compile_prompt_dir(repo)
         with tempfile.NamedTemporaryFile(
             mode="w", encoding="utf-8", prefix="opsx-compile-", suffix=".md",
-            delete=False,
+            dir=str(prompt_dir), delete=False,
         ) as handle:
             handle.write(prompt)
             prompt_file = Path(handle.name)
@@ -452,6 +477,11 @@ def run_compile_client(repo: Path, adapter: str, model: str,
     finally:
         if prompt_file is not None:
             prompt_file.unlink(missing_ok=True)
+            assert prompt_dir is not None
+            try:
+                prompt_dir.rmdir()
+            except OSError:
+                pass
     if proc.returncode != 0:
         raise base.PlanError(
             f"{executable} exited with code {proc.returncode}\n"
