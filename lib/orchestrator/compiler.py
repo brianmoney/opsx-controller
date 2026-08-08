@@ -520,10 +520,10 @@ def _strip_claude_envelope(output: str) -> str:
 def extract_toml(output: str, adapter: str = "opencode") -> str:
     """Extract a TOML payload from raw model output.
 
-    Accepts a single clean fenced ``toml` block or a bare TOML
-    payload.  Raises ``PlanError`` for ambiguous output: multiple
-    fenced blocks, extra prose or non-whitespace content surrounding a
-    fenced block, or no TOML content at all.
+    Accepts a single fenced ``toml`` block — possibly surrounded by
+    short model preamble / trailing prose, which is logged and ignored —
+    or a bare TOML payload.  Raises ``PlanError`` for ambiguous output:
+    multiple fenced blocks, or no TOML content at all.
 
     *adapter* is used in error messages and may trigger client-specific
     envelope handling.
@@ -547,9 +547,10 @@ def extract_toml(output: str, adapter: str = "opencode") -> str:
         before = stripped[:match.start()].strip()
         after = stripped[match.end():].strip()
         if before or after:
-            raise base.PlanError(
-                "ambiguous model output: extra content found around "
-                "the fenced TOML payload; expected only the TOML block"
+            base.log(
+                f"  ignoring {len(before.splitlines())} leading and "
+                f"{len(after.splitlines())} trailing prose line(s) around "
+                "the fenced TOML payload"
             )
         return match.group(1).strip()
 

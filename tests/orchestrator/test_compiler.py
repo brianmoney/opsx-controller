@@ -618,17 +618,19 @@ class CompileTests(unittest.TestCase):
             compiler_mod.extract_toml(output)
         self.assertIn("multiple fenced", str(ctx.exception))
 
-    def test_extract_toml_rejects_prose_before_fenced_block(self) -> None:
+    def test_extract_toml_ignores_prose_before_fenced_block(self) -> None:
         output = "Here is the compiled plan:\n\n```toml\n[plan]\nname = \"x\"\n```\n"
-        with self.assertRaises(base_mod.PlanError) as ctx:
-            compiler_mod.extract_toml(output)
-        self.assertIn("extra content found around", str(ctx.exception))
+        result = compiler_mod.extract_toml(output)
+        self.assertIn('[plan]', result)
+        self.assertNotIn('Here is the compiled plan', result)
+        self.assertNotIn('```', result)
 
-    def test_extract_toml_rejects_prose_after_fenced_block(self) -> None:
+    def test_extract_toml_ignores_prose_after_fenced_block(self) -> None:
         output = "```toml\n[plan]\nname = \"x\"\n```\n\nLet me know if you need changes."
-        with self.assertRaises(base_mod.PlanError) as ctx:
-            compiler_mod.extract_toml(output)
-        self.assertIn("extra content found around", str(ctx.exception))
+        result = compiler_mod.extract_toml(output)
+        self.assertIn('[plan]', result)
+        self.assertNotIn('Let me know if you need changes', result)
+        self.assertNotIn('```', result)
 
     def test_extract_toml_accepts_clean_fenced_block_with_surrounding_whitespace(self) -> None:
         output = "\n\n```toml\n[plan]\nname = \"x\"\n```\n\n"
