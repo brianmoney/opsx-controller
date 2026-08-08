@@ -69,6 +69,13 @@ The compile command refuses to overwrite an existing output file unless
 `--force` is passed. It fails before client invocation if the controller
 model is unconfigured for the selected adapter.
 
+OpenCode compilation runs `opencode run --model <model>` and appends
+`--variant <variant>` when the `controller` role resolves a reasoning
+variant (`controller_variant` key or `OPSX_CONTROLLER_VARIANT`); with no
+variant resolved the flag is omitted so the client's built-in default
+applies. Claude Code compilation ignores the controller variant — the
+Claude CLI has no reasoning-variant flag, so it is never passed through.
+
 Two things the compiler cannot do, by design: detect a dependency the doc
 forgot to state, and place judgment gates such as phase exit reviews — add
 those `pause_before = true` entries yourself. Always review the DAG

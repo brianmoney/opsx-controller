@@ -166,8 +166,9 @@ class CompileTests(unittest.TestCase):
 
     def test_check_controller_model_succeeds_when_set(self) -> None:
         self._set_model()
-        model = compiler_mod.check_controller_model()
+        model, variant = compiler_mod.check_controller_model()
         self.assertEqual(model, "test-provider/test-model")
+        self.assertIsNone(variant)
 
     # -- prompt construction --
 
@@ -284,7 +285,7 @@ class CompileTests(unittest.TestCase):
             "[[changes]]\nid = \"c1\"\nphase = 1\n"
         )
 
-        def fake_run(repo, adapter, model, prompt):
+        def fake_run(repo, adapter, model, prompt, variant=None):
             return valid_toml, ""
 
         original = compiler_mod.run_compile_client
@@ -312,7 +313,7 @@ class CompileTests(unittest.TestCase):
             '```\n'
         )
 
-        def fake_run(repo, adapter, model, prompt):
+        def fake_run(repo, adapter, model, prompt, variant=None):
             return fenced_toml, ""
 
         original = compiler_mod.run_compile_client
@@ -329,13 +330,80 @@ class CompileTests(unittest.TestCase):
         finally:
             compiler_mod.run_compile_client = original
 
+    def test_cmd_compile_passes_resolved_variant_to_client(self) -> None:
+        """A resolved OPSX_CONTROLLER_VARIANT flows from model resolution
+        through cmd_compile to the opencode compile client."""
+        self._set_model()
+        original_variant = os.environ.get("OPSX_CONTROLLER_VARIANT")
+        os.environ["OPSX_CONTROLLER_VARIANT"] = "max"
+        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
+
+        valid_toml = (
+            '[plan]\nname = "test"\nadapter = "opencode"\n\n'
+            "[[changes]]\nid = \"c1\"\nphase = 1\n"
+        )
+
+        observed: dict[str, object] = {}
+
+        def fake_run(repo, adapter, model, prompt, variant=None):
+            observed["variant"] = variant
+            return valid_toml, ""
+
+        original = compiler_mod.run_compile_client
+        try:
+            compiler_mod.run_compile_client = fake_run
+            out = self.repo / "out.toml"
+            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
+                                      output=str(out), force=False, adapter="opencode")
+            rc = self.opsx_plan.cmd_compile(args)
+            self.assertEqual(rc, 0)
+            self.assertEqual(observed["variant"], "max")
+        finally:
+            compiler_mod.run_compile_client = original
+            if original_variant is not None:
+                os.environ["OPSX_CONTROLLER_VARIANT"] = original_variant
+            else:
+                os.environ.pop("OPSX_CONTROLLER_VARIANT", None)
+
+    def test_cmd_compile_omits_variant_when_unresolved(self) -> None:
+        """No variant reaches the client when OPSX_CONTROLLER_VARIANT and the
+        controller_variant keys are all unset."""
+        self._set_model()
+        original_variant = os.environ.pop("OPSX_CONTROLLER_VARIANT", None)
+        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
+
+        valid_toml = (
+            '[plan]\nname = "test"\nadapter = "opencode"\n\n'
+            "[[changes]]\nid = \"c1\"\nphase = 1\n"
+        )
+
+        observed: dict[str, object] = {}
+
+        def fake_run(repo, adapter, model, prompt, variant=None):
+            observed["variant"] = variant
+            return valid_toml, ""
+
+        original = compiler_mod.run_compile_client
+        try:
+            compiler_mod.run_compile_client = fake_run
+            out = self.repo / "out.toml"
+            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
+                                      output=str(out), force=False, adapter="opencode")
+            rc = self.opsx_plan.cmd_compile(args)
+            self.assertEqual(rc, 0)
+            self.assertIsNone(observed["variant"])
+        finally:
+            compiler_mod.run_compile_client = original
+            if original_variant is not None:
+                os.environ["OPSX_CONTROLLER_VARIANT"] = original_variant
+
     # -- invalid TOML rejection --
 
     def test_cmd_compile_rejects_invalid_toml(self) -> None:
         self._set_model()
         source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
 
-        def fake_run(repo, adapter, model, prompt):
+        def fake_run(repo, adapter, model, prompt, variant=None):
             return "not valid toml {{{", ""
 
         original = compiler_mod.run_compile_client
@@ -354,7 +422,7 @@ class CompileTests(unittest.TestCase):
         self._set_model()
         source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
 
-        def fake_run(repo, adapter, model, prompt):
+        def fake_run(repo, adapter, model, prompt, variant=None):
             return "   ", ""
 
         original = compiler_mod.run_compile_client
@@ -375,7 +443,7 @@ class CompileTests(unittest.TestCase):
 
         no_changes_toml = '[plan]\nname = "test"\n'
 
-        def fake_run(repo, adapter, model, prompt):
+        def fake_run(repo, adapter, model, prompt, variant=None):
             return no_changes_toml, ""
 
         original = compiler_mod.run_compile_client
@@ -400,7 +468,7 @@ class CompileTests(unittest.TestCase):
             "depends_on = [\"nonexistent\"]\n"
         )
 
-        def fake_run(repo, adapter, model, prompt):
+        def fake_run(repo, adapter, model, prompt, variant=None):
             return unknown_dep_toml, ""
 
         original = compiler_mod.run_compile_client
@@ -425,7 +493,7 @@ class CompileTests(unittest.TestCase):
             "[[changes]]\nid = \"c1\"\nphase = 2\n"
         )
 
-        def fake_run(repo, adapter, model, prompt):
+        def fake_run(repo, adapter, model, prompt, variant=None):
             return dup_id_toml, ""
 
         original = compiler_mod.run_compile_client
@@ -448,7 +516,7 @@ class CompileTests(unittest.TestCase):
         out = self.repo / "out.toml"
         out.write_text("original content", encoding="utf-8")
 
-        def fake_run(repo, adapter, model, prompt):
+        def fake_run(repo, adapter, model, prompt, variant=None):
             return "bad toml {{{", ""
 
         original = compiler_mod.run_compile_client
@@ -476,7 +544,7 @@ class CompileTests(unittest.TestCase):
 
         original = compiler_mod.run_compile_client
         try:
-            compiler_mod.run_compile_client = lambda repo, adapter, model, prompt: (
+            compiler_mod.run_compile_client = lambda repo, adapter, model, prompt, variant=None: (
                 malformed_toml, ""
             )
             args = argparse.Namespace(
@@ -505,7 +573,7 @@ class CompileTests(unittest.TestCase):
 
         original = compiler_mod.run_compile_client
         try:
-            compiler_mod.run_compile_client = lambda repo, adapter, model, prompt: (
+            compiler_mod.run_compile_client = lambda repo, adapter, model, prompt, variant=None: (
                 malformed_toml, ""
             )
             args = argparse.Namespace(
@@ -598,7 +666,7 @@ class CompileTests(unittest.TestCase):
             "[[changes]]\nid = \"c1\"\nphase = 1\n"
         )
 
-        def fake_run(repo, adapter, model, prompt):
+        def fake_run(repo, adapter, model, prompt, variant=None):
             return valid_toml, ""
 
         original = compiler_mod.run_compile_client
@@ -718,7 +786,7 @@ class CompileTests(unittest.TestCase):
         os.environ["OPSX_CONTROLLER_MODEL"] = "claude-sonnet-5"
         source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
 
-        def fake_run(repo, adapter, model, prompt):
+        def fake_run(repo, adapter, model, prompt, variant=None):
             self.assertEqual(adapter, "claude-code")
             self.assertIn("adapter defaults (claude-code)", prompt.lower())
             return (
@@ -752,7 +820,7 @@ class CompileTests(unittest.TestCase):
 
         invoked = False
 
-        def fake_run(repo, adapter, model, prompt):
+        def fake_run(repo, adapter, model, prompt, variant=None):
             nonlocal invoked
             invoked = True
             return wrong_toml, ""
@@ -814,6 +882,51 @@ class CompileTests(unittest.TestCase):
             compiler_mod._build_compile_argv("codex-cli", "m", "prompt")
         self.assertIn("not supported", str(ctx.exception))
 
+    def test_build_argv_opencode_includes_variant_after_model(self) -> None:
+        """A resolved variant is appended as --variant <variant> right after
+        --model <model> for the opencode file-prompt invocation."""
+        prompt_file = self.repo / "compile-prompt.md"
+        argv = compiler_mod._build_compile_argv(
+            "opencode", "m1", "prompt text", prompt_file, "high"
+        )
+        self.assertIn("--variant", argv)
+        self.assertIn("high", argv)
+        self.assertLess(
+            argv.index("--model") + 1, argv.index("--variant")
+        )
+        self.assertLess(
+            argv.index("--variant") + 1, argv.index("--file")
+        )
+
+    def test_build_argv_opencode_template_path_includes_variant(self) -> None:
+        """The non-file template path also carries --variant when resolved."""
+        argv = compiler_mod._build_compile_argv(
+            "opencode", "m1", "compile this", None, "max"
+        )
+        self.assertIn("--variant", argv)
+        self.assertIn("max", argv)
+        self.assertLess(
+            argv.index("--model"), argv.index("--variant")
+        )
+
+    def test_build_argv_opencode_omits_variant_when_unresolved(self) -> None:
+        """No --variant flag when no variant is resolved; the client default
+        applies."""
+        prompt_file = self.repo / "compile-prompt.md"
+        argv = compiler_mod._build_compile_argv(
+            "opencode", "m1", "prompt text", prompt_file, None
+        )
+        self.assertNotIn("--variant", argv)
+
+    def test_build_argv_claude_never_includes_variant(self) -> None:
+        """Claude Code has no reasoning-variant flag, so a resolved variant
+        must not appear in its argv."""
+        argv = compiler_mod._build_compile_argv(
+            "claude-code", "m2", "compile this", None, "high"
+        )
+        self.assertNotIn("--variant", argv)
+        self.assertIn("compile this", argv)
+
     # -- controller model syntax validation (reject before spawn) -----------
 
     def test_check_controller_model_rejects_provider_prefix_for_claude(self) -> None:
@@ -845,17 +958,39 @@ class CompileTests(unittest.TestCase):
     def test_check_controller_model_accepts_valid_opencode_model(self) -> None:
         """A valid provider/model identifier is accepted for opencode."""
         self._set_model()  # sets OPSX_CONTROLLER_MODEL = "test-provider/test-model"
-        model = compiler_mod.check_controller_model(adapter="opencode")
+        model, variant = compiler_mod.check_controller_model(adapter="opencode")
         self.assertEqual(model, "test-provider/test-model")
+        self.assertIsNone(variant)
 
     def test_check_controller_model_accepts_valid_claude_model(self) -> None:
         """A non-prefixed model identifier is accepted for claude-code."""
         os.environ["OPSX_CONTROLLER_MODEL"] = "claude-sonnet-5"
         try:
-            model = compiler_mod.check_controller_model(adapter="claude-code")
+            model, variant = compiler_mod.check_controller_model(adapter="claude-code")
             self.assertEqual(model, "claude-sonnet-5")
+            self.assertIsNone(variant)
         finally:
             os.environ.pop("OPSX_CONTROLLER_MODEL", None)
+
+    def test_check_controller_model_returns_resolved_variant(self) -> None:
+        """The resolved controller variant is returned alongside the model."""
+        original_model = os.environ.get("OPSX_CONTROLLER_MODEL")
+        original_variant = os.environ.get("OPSX_CONTROLLER_VARIANT")
+        os.environ["OPSX_CONTROLLER_MODEL"] = "test-provider/test-model"
+        os.environ["OPSX_CONTROLLER_VARIANT"] = "high"
+        try:
+            model, variant = compiler_mod.check_controller_model(adapter="opencode")
+            self.assertEqual(model, "test-provider/test-model")
+            self.assertEqual(variant, "high")
+        finally:
+            for env_name, original in (
+                ("OPSX_CONTROLLER_MODEL", original_model),
+                ("OPSX_CONTROLLER_VARIANT", original_variant),
+            ):
+                if original is not None:
+                    os.environ[env_name] = original
+                else:
+                    os.environ.pop(env_name, None)
 
     # -- compile client timeout ----------------------------------------------
 
@@ -895,6 +1030,66 @@ class CompileTests(unittest.TestCase):
         ), observed["argv"].index("--file"))
         self.assertNotIn(prompt, observed["argv"])
         self.assertFalse(observed["path"].exists())
+
+    def test_run_compile_client_opencode_passes_variant_in_argv(self) -> None:
+        """A resolved controller variant reaches the opencode client argv."""
+        prompt = "compile this plan"
+        observed: dict[str, object] = {}
+        result = mock.Mock(returncode=0, stdout="[plan]\n", stderr="")
+
+        def fake_run(argv, **kwargs):
+            observed["argv"] = argv
+            return result
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            compiler_mod.run_compile_client(
+                self.repo, "opencode", "test-provider/test-model", prompt, "max"
+            )
+
+        argv = observed["argv"]
+        self.assertIn("--variant", argv)
+        self.assertIn("max", argv)
+        self.assertLess(
+            argv.index("--model"), argv.index("--variant")
+        )
+        self.assertLess(
+            argv.index("--variant"), argv.index("--file")
+        )
+
+    def test_run_compile_client_opencode_omits_variant_when_none(self) -> None:
+        """No --variant flag in the opencode argv when nothing resolved."""
+        prompt = "compile this plan"
+        observed: dict[str, object] = {}
+        result = mock.Mock(returncode=0, stdout="[plan]\n", stderr="")
+
+        def fake_run(argv, **kwargs):
+            observed["argv"] = argv
+            return result
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            compiler_mod.run_compile_client(
+                self.repo, "opencode", "test-provider/test-model", prompt, None
+            )
+
+        self.assertNotIn("--variant", observed["argv"])
+
+    def test_run_compile_client_claude_never_passes_variant(self) -> None:
+        """Claude Code argv carries no variant even when one is resolved."""
+        prompt = "compile this plan"
+        observed: dict[str, object] = {}
+        result = mock.Mock(returncode=0, stdout="[plan]\n", stderr="")
+
+        def fake_run(argv, **kwargs):
+            observed["argv"] = argv
+            return result
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            compiler_mod.run_compile_client(
+                self.repo, "claude-code", "claude-sonnet-5", prompt, "high"
+            )
+
+        self.assertNotIn("--variant", observed["argv"])
+        self.assertNotIn("high", observed["argv"])
 
     # -- _strip_claude_envelope / extract_toml tests --
 
@@ -1018,7 +1213,7 @@ class CompileTests(unittest.TestCase):
             "[[changes]]\nid = \"c1\"\nphase = 1\n"
         )
 
-        def fake_run(repo, adapter, model, prompt):
+        def fake_run(repo, adapter, model, prompt, variant=None):
             return raw_toml, ""
 
         original = compiler_mod.run_compile_client
@@ -1056,7 +1251,7 @@ class CompileTests(unittest.TestCase):
             '```\n'
         )
 
-        def fake_run(repo, adapter, model, prompt):
+        def fake_run(repo, adapter, model, prompt, variant=None):
             return fenced_toml, ""
 
         original = compiler_mod.run_compile_client
@@ -1087,7 +1282,7 @@ class CompileTests(unittest.TestCase):
             "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n",
         )
 
-        def fake_run(repo, adapter, model, prompt):
+        def fake_run(repo, adapter, model, prompt, variant=None):
             return "I cannot compile this plan because it lacks change entries.", ""
 
         original = compiler_mod.run_compile_client
@@ -1123,7 +1318,7 @@ class CompileTests(unittest.TestCase):
             "[[changes]]\nid = \"c1\"\nphase = 1\n"
         )
 
-        def fake_run(repo, adapter, model, prompt):
+        def fake_run(repo, adapter, model, prompt, variant=None):
             return valid_toml, ""
 
         original = compiler_mod.run_compile_client

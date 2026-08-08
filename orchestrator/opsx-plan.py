@@ -2808,18 +2808,20 @@ def cmd_compile(args: argparse.Namespace) -> int:
         output_path.parent.mkdir(parents=True, exist_ok=True)
     else:
         output_path = compiler.resolve_compile_output(repo, args.output, args.force)
-    model = compiler.check_controller_model(repo, adapter=adapter)
+    model, controller_variant = compiler.check_controller_model(repo, adapter=adapter)
 
     client_name = entry["executable"]
+    variant_note = f", variant: {controller_variant}" if controller_variant else ""
     base.log(f"compile: {source_path} -> {output_path}  "
-        f"(adapter: {adapter}, client: {client_name}, model: {model})")
+        f"(adapter: {adapter}, client: {client_name}, model: {model}{variant_note})")
 
     source_content = source_path.read_text(encoding="utf-8")
     prompt = compiler.build_compile_prompt(source_content, source_path, repo, adapter=adapter)
     base.log(f"  prompt size: {len(prompt)} chars")
 
     base.log(f"  invoking {client_name} ...")
-    stdout, stderr = compiler.run_compile_client(repo, adapter, model, prompt)
+    stdout, stderr = compiler.run_compile_client(repo, adapter, model, prompt,
+                                                 controller_variant)
     if stderr.strip():
         base.log(f"  {client_name} stderr: {stderr.strip()[:500]}")
 
