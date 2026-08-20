@@ -3883,7 +3883,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
         )
         original = self.opsx_plan.compiler.run_compile_client
         try:
-            self.opsx_plan.compiler.run_compile_client = lambda repo, adapter, model, prompt, variant=None: (valid_toml, "")
+            self.opsx_plan.compiler.run_compile_client = lambda repo, adapter, model, prompt, variant=None, timeout_minutes=10.0: (valid_toml, "")
             args = argparse.Namespace(repo=str(self.repo), source="plan.md",
                                       output=str(out), force=False)
             rc = self.opsx_plan.cmd_compile(args)

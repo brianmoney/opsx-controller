@@ -40,8 +40,15 @@ claude-code` to compile through Claude Code instead.
 
 The compiler builds a self-contained prompt that includes the source
 markdown, adapter-aware TOML schema (derived from the plan loader),
-dependency-resolution rules, adapter defaults, and repository template
-plan pairs from `openspec/plans/` when available.
+dependency-resolution rules, adapter defaults, and compile instructions.
+The prompt is bounded by an explicit budget (~128,000 characters):
+optional examples are included only while they fit the remaining budget,
+in fixed priority order — the canonical sample plan pair first, then at
+most one repository template pair (the smallest active `openspec/plans/`
+pair that fits). Pairs under `openspec/plans/archived/` are excluded
+unconditionally, and any example omitted for budget reasons is logged
+with a note, so the prompt never grows without bound no matter how large
+the plan archive becomes.
 
 The generated TOML is validated locally before writing: it must parse as
 valid TOML, pass the existing `load_plan()` path (unique ids, known deps,
@@ -63,11 +70,24 @@ opsx-plan compile --adapter claude-code docs/my-plan.md
 
 # Overwrite an existing manifest
 opsx-plan compile docs/my-plan.md -o plan.toml --force
+
+# Raise the compile client timeout to 20 minutes
+opsx-plan compile --timeout-minutes 20 docs/my-plan.md
 ```
 
 The compile command refuses to overwrite an existing output file unless
 `--force` is passed. It fails before client invocation if the controller
 model is unconfigured for the selected adapter.
+
+The compile prompt is delivered per adapter: OpenCode receives it as a
+workspace-local `--file` attachment, while Claude Code reads it from
+standard input (`claude -p --model <model>`) so prompt size is never
+limited by the operating-system argument-list limit. A pre-spawn guard
+rejects any invocation whose argv would carry an oversized inline prompt
+with a clear error naming the adapter, instead of surfacing an opaque OS
+error. Compile client invocations time out after 10 minutes by default;
+`--timeout-minutes <minutes>` overrides the limit, and timeout
+diagnostics name the flag.
 
 OpenCode compilation runs `opencode run --model <model>` and appends
 `--variant <variant>` when the `controller` role resolves a reasoning
