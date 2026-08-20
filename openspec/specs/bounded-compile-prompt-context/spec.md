@@ -1,10 +1,11 @@
-## Purpose
+# bounded-compile-prompt-context Specification
 
+## Purpose
 Keep the `opsx-plan compile` prompt bounded and its delivery safe in
 repositories of any age, so compilation stays reliable no matter how large
 the plan archive grows.
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Compile prompt respects an explicit size budget
 

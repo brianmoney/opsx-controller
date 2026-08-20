@@ -285,7 +285,7 @@ class CompileTests(unittest.TestCase):
             "[[changes]]\nid = \"c1\"\nphase = 1\n"
         )
 
-        def fake_run(repo, adapter, model, prompt, variant=None):
+        def fake_run(repo, adapter, model, prompt, variant=None, timeout_minutes=10.0):
             return valid_toml, ""
 
         original = compiler_mod.run_compile_client
@@ -313,7 +313,7 @@ class CompileTests(unittest.TestCase):
             '```\n'
         )
 
-        def fake_run(repo, adapter, model, prompt, variant=None):
+        def fake_run(repo, adapter, model, prompt, variant=None, timeout_minutes=10.0):
             return fenced_toml, ""
 
         original = compiler_mod.run_compile_client
@@ -345,7 +345,7 @@ class CompileTests(unittest.TestCase):
 
         observed: dict[str, object] = {}
 
-        def fake_run(repo, adapter, model, prompt, variant=None):
+        def fake_run(repo, adapter, model, prompt, variant=None, timeout_minutes=10.0):
             observed["variant"] = variant
             return valid_toml, ""
 
@@ -379,7 +379,7 @@ class CompileTests(unittest.TestCase):
 
         observed: dict[str, object] = {}
 
-        def fake_run(repo, adapter, model, prompt, variant=None):
+        def fake_run(repo, adapter, model, prompt, variant=None, timeout_minutes=10.0):
             observed["variant"] = variant
             return valid_toml, ""
 
@@ -403,7 +403,7 @@ class CompileTests(unittest.TestCase):
         self._set_model()
         source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
 
-        def fake_run(repo, adapter, model, prompt, variant=None):
+        def fake_run(repo, adapter, model, prompt, variant=None, timeout_minutes=10.0):
             return "not valid toml {{{", ""
 
         original = compiler_mod.run_compile_client
@@ -422,7 +422,7 @@ class CompileTests(unittest.TestCase):
         self._set_model()
         source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
 
-        def fake_run(repo, adapter, model, prompt, variant=None):
+        def fake_run(repo, adapter, model, prompt, variant=None, timeout_minutes=10.0):
             return "   ", ""
 
         original = compiler_mod.run_compile_client
@@ -443,7 +443,7 @@ class CompileTests(unittest.TestCase):
 
         no_changes_toml = '[plan]\nname = "test"\n'
 
-        def fake_run(repo, adapter, model, prompt, variant=None):
+        def fake_run(repo, adapter, model, prompt, variant=None, timeout_minutes=10.0):
             return no_changes_toml, ""
 
         original = compiler_mod.run_compile_client
@@ -468,7 +468,7 @@ class CompileTests(unittest.TestCase):
             "depends_on = [\"nonexistent\"]\n"
         )
 
-        def fake_run(repo, adapter, model, prompt, variant=None):
+        def fake_run(repo, adapter, model, prompt, variant=None, timeout_minutes=10.0):
             return unknown_dep_toml, ""
 
         original = compiler_mod.run_compile_client
@@ -493,7 +493,7 @@ class CompileTests(unittest.TestCase):
             "[[changes]]\nid = \"c1\"\nphase = 2\n"
         )
 
-        def fake_run(repo, adapter, model, prompt, variant=None):
+        def fake_run(repo, adapter, model, prompt, variant=None, timeout_minutes=10.0):
             return dup_id_toml, ""
 
         original = compiler_mod.run_compile_client
@@ -516,7 +516,7 @@ class CompileTests(unittest.TestCase):
         out = self.repo / "out.toml"
         out.write_text("original content", encoding="utf-8")
 
-        def fake_run(repo, adapter, model, prompt, variant=None):
+        def fake_run(repo, adapter, model, prompt, variant=None, timeout_minutes=10.0):
             return "bad toml {{{", ""
 
         original = compiler_mod.run_compile_client
@@ -544,7 +544,7 @@ class CompileTests(unittest.TestCase):
 
         original = compiler_mod.run_compile_client
         try:
-            compiler_mod.run_compile_client = lambda repo, adapter, model, prompt, variant=None: (
+            compiler_mod.run_compile_client = lambda repo, adapter, model, prompt, variant=None, timeout_minutes=10.0: (
                 malformed_toml, ""
             )
             args = argparse.Namespace(
@@ -573,7 +573,7 @@ class CompileTests(unittest.TestCase):
 
         original = compiler_mod.run_compile_client
         try:
-            compiler_mod.run_compile_client = lambda repo, adapter, model, prompt, variant=None: (
+            compiler_mod.run_compile_client = lambda repo, adapter, model, prompt, variant=None, timeout_minutes=10.0: (
                 malformed_toml, ""
             )
             args = argparse.Namespace(
@@ -668,7 +668,7 @@ class CompileTests(unittest.TestCase):
             "[[changes]]\nid = \"c1\"\nphase = 1\n"
         )
 
-        def fake_run(repo, adapter, model, prompt, variant=None):
+        def fake_run(repo, adapter, model, prompt, variant=None, timeout_minutes=10.0):
             return valid_toml, ""
 
         original = compiler_mod.run_compile_client
@@ -788,7 +788,7 @@ class CompileTests(unittest.TestCase):
         os.environ["OPSX_CONTROLLER_MODEL"] = "claude-sonnet-5"
         source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
 
-        def fake_run(repo, adapter, model, prompt, variant=None):
+        def fake_run(repo, adapter, model, prompt, variant=None, timeout_minutes=10.0):
             self.assertEqual(adapter, "claude-code")
             self.assertIn("adapter defaults (claude-code)", prompt.lower())
             return (
@@ -822,7 +822,7 @@ class CompileTests(unittest.TestCase):
 
         invoked = False
 
-        def fake_run(repo, adapter, model, prompt, variant=None):
+        def fake_run(repo, adapter, model, prompt, variant=None, timeout_minutes=10.0):
             nonlocal invoked
             invoked = True
             return wrong_toml, ""
@@ -871,13 +871,13 @@ class CompileTests(unittest.TestCase):
         self.assertNotIn("prompt text", argv)
 
     def test_build_argv_for_claude_code(self) -> None:
+        """The claude-code argv template no longer carries {prompt}: the
+        prompt is delivered via stdin, so argv stays small."""
         argv = compiler_mod._build_compile_argv(
             "claude-code", "m2", "compile this"
         )
-        self.assertIn("claude", argv[0])
-        self.assertIn("-p", argv)
-        self.assertIn("m2", argv)
-        self.assertIn("compile this", argv)
+        self.assertEqual(argv, ["claude", "-p", "--model", "m2"])
+        self.assertNotIn("compile this", argv)
 
     def test_build_argv_rejects_unsupported_codex(self) -> None:
         with self.assertRaises(base_mod.PlanError) as ctx:
@@ -922,12 +922,14 @@ class CompileTests(unittest.TestCase):
 
     def test_build_argv_claude_never_includes_variant(self) -> None:
         """Claude Code has no reasoning-variant flag, so a resolved variant
-        must not appear in its argv."""
+        must not appear in its argv; the prompt is not carried in argv
+        either (it travels on stdin)."""
         argv = compiler_mod._build_compile_argv(
             "claude-code", "m2", "compile this", None, "high"
         )
+        self.assertEqual(argv, ["claude", "-p", "--model", "m2"])
         self.assertNotIn("--variant", argv)
-        self.assertIn("compile this", argv)
+        self.assertNotIn("compile this", argv)
 
     # -- controller model syntax validation (reject before spawn) -----------
 
@@ -998,15 +1000,93 @@ class CompileTests(unittest.TestCase):
 
     def test_run_compile_client_raises_on_timeout(self) -> None:
         """A compile client invocation that exceeds the timeout is reported
-        as a PlanError."""
+        as a PlanError naming the --timeout-minutes option."""
         def fake_run(args, **kwargs):
             raise subprocess.TimeoutExpired(args, kwargs.get("timeout", 60))
 
         with mock.patch("subprocess.run", side_effect=fake_run):
             with self.assertRaises(base_mod.PlanError) as ctx:
                 compiler_mod.run_compile_client(self.repo, "claude-code",
-                                                   "m", "prompt")
+                                                   "m", "prompt",
+                                                   timeout_minutes=2.5)
             self.assertIn("timed out", str(ctx.exception).lower())
+            self.assertIn("--timeout-minutes", str(ctx.exception))
+
+    def test_run_compile_client_uses_configured_timeout(self) -> None:
+        """3.1 — timeout_minutes is converted to seconds for the client
+        subprocess."""
+        observed: dict[str, object] = {}
+        result = mock.Mock(returncode=0, stdout='[plan]\nname = "p"\n', stderr="")
+
+        def fake_run(argv, **kwargs):
+            observed["timeout"] = kwargs.get("timeout")
+            return result
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            compiler_mod.run_compile_client(
+                self.repo, "claude-code", "m", "prompt", timeout_minutes=3.0
+            )
+        self.assertEqual(observed["timeout"], 180.0)
+
+    def test_cmd_compile_passes_timeout_minutes_to_client(self) -> None:
+        """3.2 — --timeout-minutes flows from the CLI namespace into the
+        compile client invocation."""
+        self._set_model()
+        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
+
+        valid_toml = (
+            '[plan]\nname = "test"\nadapter = "opencode"\n\n'
+            "[[changes]]\nid = \"c1\"\nphase = 1\n"
+        )
+
+        observed: dict[str, object] = {}
+
+        def fake_run(repo, adapter, model, prompt, variant=None, timeout_minutes=10.0):
+            observed["timeout_minutes"] = timeout_minutes
+            return valid_toml, ""
+
+        original = compiler_mod.run_compile_client
+        try:
+            compiler_mod.run_compile_client = fake_run
+            out = self.repo / "out.toml"
+            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
+                                      output=str(out), force=False,
+                                      adapter="opencode", timeout_minutes=2.5)
+            rc = self.opsx_plan.cmd_compile(args)
+            self.assertEqual(rc, 0)
+            self.assertEqual(observed["timeout_minutes"], 2.5)
+        finally:
+            compiler_mod.run_compile_client = original
+
+    def test_cmd_compile_defaults_timeout_to_10_minutes(self) -> None:
+        """3.2 — cmd_compile passes the 10.0-minute default when the
+        --timeout-minutes flag is absent."""
+        self._set_model()
+        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
+
+        valid_toml = (
+            '[plan]\nname = "test"\nadapter = "opencode"\n\n'
+            "[[changes]]\nid = \"c1\"\nphase = 1\n"
+        )
+
+        observed: dict[str, object] = {}
+
+        def fake_run(repo, adapter, model, prompt, variant=None, timeout_minutes=10.0):
+            observed["timeout_minutes"] = timeout_minutes
+            return valid_toml, ""
+
+        original = compiler_mod.run_compile_client
+        try:
+            compiler_mod.run_compile_client = fake_run
+            out = self.repo / "out.toml"
+            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
+                                      output=str(out), force=False,
+                                      adapter="opencode")
+            rc = self.opsx_plan.cmd_compile(args)
+            self.assertEqual(rc, 0)
+            self.assertEqual(observed["timeout_minutes"], 10.0)
+        finally:
+            compiler_mod.run_compile_client = original
 
     def test_run_compile_client_opencode_attaches_and_removes_prompt_file(self) -> None:
         prompt = "large compile prompt"
@@ -1242,7 +1322,7 @@ class CompileTests(unittest.TestCase):
             "[[changes]]\nid = \"c1\"\nphase = 1\n"
         )
 
-        def fake_run(repo, adapter, model, prompt, variant=None):
+        def fake_run(repo, adapter, model, prompt, variant=None, timeout_minutes=10.0):
             return raw_toml, ""
 
         original = compiler_mod.run_compile_client
@@ -1280,7 +1360,7 @@ class CompileTests(unittest.TestCase):
             '```\n'
         )
 
-        def fake_run(repo, adapter, model, prompt, variant=None):
+        def fake_run(repo, adapter, model, prompt, variant=None, timeout_minutes=10.0):
             return fenced_toml, ""
 
         original = compiler_mod.run_compile_client
@@ -1311,7 +1391,7 @@ class CompileTests(unittest.TestCase):
             "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n",
         )
 
-        def fake_run(repo, adapter, model, prompt, variant=None):
+        def fake_run(repo, adapter, model, prompt, variant=None, timeout_minutes=10.0):
             return "I cannot compile this plan because it lacks change entries.", ""
 
         original = compiler_mod.run_compile_client
@@ -1347,7 +1427,7 @@ class CompileTests(unittest.TestCase):
             "[[changes]]\nid = \"c1\"\nphase = 1\n"
         )
 
-        def fake_run(repo, adapter, model, prompt, variant=None):
+        def fake_run(repo, adapter, model, prompt, variant=None, timeout_minutes=10.0):
             return valid_toml, ""
 
         original = compiler_mod.run_compile_client
@@ -1399,8 +1479,9 @@ class CompileOptionalOutputTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def test_discover_template_pairs_includes_archived(self):
-        """7.9"""
+    def test_discover_template_pairs_excludes_archived(self):
+        """4.2 — discover_template_pairs returns only top-level active
+        openspec/plans pairs; archived pairs are excluded entirely."""
         plans_dir = self.repo / "openspec" / "plans"
         plans_dir.mkdir(parents=True)
         archived_dir = plans_dir / "archived"
@@ -1412,12 +1493,9 @@ class CompileOptionalOutputTests(unittest.TestCase):
         (archived_dir / "done.toml").write_text("", encoding="utf-8")
 
         pairs = compiler_mod.discover_template_pairs(self.repo)
-        self.assertEqual(len(pairs), 2)
-        # The active pair must come first
+        self.assertEqual(len(pairs), 1)
         first_md = pairs[0][0]
         self.assertIn("active.md", str(first_md))
-        second_md = pairs[1][0]
-        self.assertIn("done.md", str(second_md))
 
 
 class SamplePlanTests(unittest.TestCase):
@@ -1815,5 +1893,244 @@ class SamplePlanTests(unittest.TestCase):
             restored, original,
             "re-running the installer must restore the original sample content",
         )
+
+
+class CompilePromptBoundTests(unittest.TestCase):
+    """1.x/4.x — bounded compile prompt, archived exclusion, budget
+    priority, Claude stdin transport, and the pre-spawn argv guard."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        git(self.repo, "init")
+        git(
+            self.repo,
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "user.name=Test User",
+            "commit",
+            "-m",
+            "init",
+            "--allow-empty",
+        )
+        from lib.models import resolver as _resolver
+        self._models_patch = mock.patch.object(
+            _resolver, "USER_CONFIG_PATH", Path(self.tmp.name) / "unused-home" / "models.toml"
+        )
+        self._models_patch.start()
+        self.addCleanup(self._models_patch.stop)
+        self._original_controller_model = os.environ.get("OPSX_CONTROLLER_MODEL")
+        self.addCleanup(self._restore_controller_model)
+
+    def _restore_controller_model(self) -> None:
+        if self._original_controller_model is not None:
+            os.environ["OPSX_CONTROLLER_MODEL"] = self._original_controller_model
+        else:
+            os.environ.pop("OPSX_CONTROLLER_MODEL", None)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _write_plan_md(self, rel_path: str, content: str) -> Path:
+        p = self.repo / rel_path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    def _set_model(self) -> None:
+        import os as _os
+        _os.environ["OPSX_CONTROLLER_MODEL"] = "test-provider/test-model"
+
+    def _make_archived_pairs(self, name: str, size: int) -> None:
+        plans_dir = self.repo / "openspec" / "plans"
+        archived_dir = plans_dir / "archived"
+        archived_dir.mkdir(parents=True, exist_ok=True)
+        blob = "x" * size
+        (archived_dir / f"{name}.md").write_text(blob, encoding="utf-8")
+        (archived_dir / f"{name}.toml").write_text(blob, encoding="utf-8")
+
+    # -- 4.1: budget reproduction test --
+
+    def test_prompt_stays_bounded_with_large_archive(self) -> None:
+        """4.1 — enough large archived pairs to exceed the old unbounded
+        prompt; the built prompt stays within the budget (plus the fixed
+        sections) and contains no archived content."""
+        self._make_archived_pairs("archived-a", 200_000)
+        self._make_archived_pairs("archived-b", 200_000)
+
+        prompt = compiler_mod.build_compile_prompt(
+            "# Small source\n", Path("/tmp/fake.md"), self.repo, adapter="opencode",
+        )
+        self.assertLessEqual(len(prompt), compiler_mod.COMPILE_PROMPT_BUDGET_CHARS)
+        self.assertNotIn("x" * 200_000, prompt)
+        self.assertNotIn("archived", prompt)
+
+    # -- 4.2: archived exclusion --
+
+    def test_archived_pairs_never_appear_in_prompt_with_budget_remaining(self) -> None:
+        """4.2 — archived pair content never appears in the prompt even
+        when the budget has ample room for it."""
+        self._make_archived_pairs("done", 50)
+        plans_dir = self.repo / "openspec" / "plans"
+        plans_dir.mkdir(parents=True, exist_ok=True)
+        (plans_dir / "active.md").write_text("# active\n", encoding="utf-8")
+        (plans_dir / "active.toml").write_text("", encoding="utf-8")
+
+        prompt = compiler_mod.build_compile_prompt(
+            "# Source\n", Path("docs/test.md"), self.repo, adapter="opencode",
+        )
+        self.assertNotIn("x" * 50, prompt)
+        self.assertNotIn("archived", prompt)
+        self.assertIn("active", prompt)
+
+    # -- 4.3: budget priority --
+
+    def test_budget_priority_keeps_fixed_sections_drops_examples(self) -> None:
+        """4.3 — when the source plan alone exceeds the budget, the fixed
+        sections (source markdown, schema guidance, compile instructions)
+        remain present and optional examples are dropped."""
+        self._make_archived_pairs("archived-a", 200_000)
+        plans_dir = self.repo / "openspec" / "plans"
+        plans_dir.mkdir(parents=True, exist_ok=True)
+        (plans_dir / "active.md").write_text("# active\n", encoding="utf-8")
+        (plans_dir / "active.toml").write_text("", encoding="utf-8")
+
+        source = "# Oversized source plan\n\n" + ("s" * 130_000)
+        prompt = compiler_mod.build_compile_prompt(
+            source, Path("/tmp/fake.md"), self.repo, adapter="opencode",
+        )
+        self.assertIn("# Oversized source plan", prompt)
+        self.assertIn("[plan]", prompt)              # schema guidance
+        self.assertIn("[[changes]]", prompt)         # schema guidance
+        self.assertIn("Compile instructions", prompt)
+        self.assertIn("s" * 130_000, prompt)         # full source still present
+        self.assertNotIn("Sample plan (canonical)", prompt)
+        self.assertNotIn("Repository template plans", prompt)
+
+    def test_select_repo_template_pair_picks_smallest_fitting(self) -> None:
+        """1.3 — the smallest active pair whose combined size fits is
+        selected; None when no active pair fits."""
+        plans_dir = self.repo / "openspec" / "plans"
+        plans_dir.mkdir(parents=True)
+        (plans_dir / "big.md").write_text("z" * 5_000, encoding="utf-8")
+        (plans_dir / "big.toml").write_text("", encoding="utf-8")
+        (plans_dir / "small.md").write_text("# small\n", encoding="utf-8")
+        (plans_dir / "small.toml").write_text("", encoding="utf-8")
+
+        pair = compiler_mod._select_repo_template_pair(self.repo, 10_000)
+        self.assertIsNotNone(pair)
+        self.assertIn("small.md", str(pair[0]))
+
+        pair = compiler_mod._select_repo_template_pair(self.repo, 10)
+        self.assertIsNone(pair)
+
+    def test_at_most_one_repo_template_pair_in_prompt(self) -> None:
+        """Spec — the prompt includes at most one repository template pair
+        even when several active pairs would fit."""
+        plans_dir = self.repo / "openspec" / "plans"
+        plans_dir.mkdir(parents=True)
+        for name in ("alpha", "beta", "gamma"):
+            (plans_dir / f"{name}.md").write_text(f"# {name}\n", encoding="utf-8")
+            (plans_dir / f"{name}.toml").write_text("", encoding="utf-8")
+
+        prompt = compiler_mod.build_compile_prompt(
+            "# Source\n", Path("docs/test.md"), self.repo, adapter="opencode",
+        )
+        self.assertEqual(prompt.count("### Template:"), 1)
+
+    # -- 4.4: Claude stdin transport --
+
+    def test_run_compile_client_claude_delivers_prompt_via_stdin(self) -> None:
+        """4.4 — claude-code passes the prompt through stdin (input=prompt);
+        no argv element contains the prompt and argv stays small."""
+        prompt = "compile this oversized plan " + ("x" * 200_000)
+        observed: dict[str, object] = {}
+        result = mock.Mock(returncode=0, stdout='[plan]\nname = "p"\n', stderr="")
+
+        def fake_run(argv, **kwargs):
+            observed["argv"] = argv
+            observed["input"] = kwargs.get("input")
+            return result
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            compiler_mod.run_compile_client(
+                self.repo, "claude-code", "claude-sonnet-5", prompt
+            )
+
+        self.assertEqual(observed["input"], prompt)
+        self.assertEqual(
+            observed["argv"], ["claude", "-p", "--model", "claude-sonnet-5"]
+        )
+        self.assertTrue(
+            all(prompt not in element for element in observed["argv"])
+        )
+        self.assertLess(sum(len(e) for e in observed["argv"]), 1000)
+
+    # -- 4.5: pre-spawn argv guard --
+
+    def test_run_compile_client_rejects_oversized_inline_argv_before_spawn(self) -> None:
+        """4.5 — an argv element over MAX_INLINE_ARG_CHARS raises a
+        PlanError naming the adapter; subprocess.run is never called."""
+        oversized = "x" * (compiler_mod.MAX_INLINE_ARG_CHARS + 1)
+        with mock.patch.object(
+            compiler_mod, "_build_compile_argv",
+            return_value=["opencode", "run", "--model", "m", oversized],
+        ):
+            with mock.patch("subprocess.run") as m_run:
+                with self.assertRaises(base_mod.PlanError) as ctx:
+                    compiler_mod.run_compile_client(
+                        self.repo, "opencode", "m", "prompt"
+                    )
+        m_run.assert_not_called()
+        self.assertIn("too large for argv delivery", str(ctx.exception))
+        self.assertIn("opencode", str(ctx.exception))
+
+    # -- 4.7: end-to-end compile in the large-archive synthetic repo --
+
+    def test_cmd_compile_large_archive_repo_validates_and_writes(self) -> None:
+        """4.7 — end-to-end in the large-archive synthetic repo:
+        cmd_compile builds a bounded prompt with no archived content, and
+        the generated manifest passes load_plan() validation and is
+        written."""
+        self._set_model()
+        self._write_plan_md(
+            "plan.md",
+            "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n",
+        )
+        self._make_archived_pairs("archived-a", 200_000)
+        self._make_archived_pairs("archived-b", 200_000)
+
+        valid_toml = (
+            '[plan]\nname = "test"\nadapter = "opencode"\n\n'
+            "[[changes]]\nid = \"c1\"\nphase = 1\n"
+        )
+
+        observed: dict[str, object] = {}
+
+        def fake_run(repo, adapter, model, prompt, variant=None, timeout_minutes=10.0):
+            observed["prompt_size"] = len(prompt)
+            observed["prompt"] = prompt
+            return valid_toml, ""
+
+        original = compiler_mod.run_compile_client
+        try:
+            compiler_mod.run_compile_client = fake_run
+            out = self.repo / "out.toml"
+            args = argparse.Namespace(repo=str(self.repo), source="plan.md",
+                                      output=str(out), force=False,
+                                      adapter="opencode")
+            rc = self.opsx_plan.cmd_compile(args)
+            self.assertEqual(rc, 0)
+            self.assertLessEqual(
+                observed["prompt_size"], compiler_mod.COMPILE_PROMPT_BUDGET_CHARS
+            )
+            self.assertNotIn("x" * 200_000, observed["prompt"])
+            self.assertTrue(out.is_file())
+            cfg = self.opsx_plan.planref.load_plan(out)
+            self.assertEqual(cfg["changes"]["c1"]["phase"], 1)
+        finally:
+            compiler_mod.run_compile_client = original
 
 

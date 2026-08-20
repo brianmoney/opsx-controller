@@ -2802,9 +2802,10 @@ def cmd_run_one(args: argparse.Namespace) -> int:
 
 
 def cmd_compile(args: argparse.Namespace) -> int:
-    """opsx-plan compile <source.md> [-o <output.toml>] [--force] [--adapter <adapter>]"""
+    """opsx-plan compile <source.md> [-o <output.toml>] [--force] [--adapter <adapter>] [--timeout-minutes <minutes>]"""
     repo = Path(args.repo).resolve()
     adapter = getattr(args, "adapter", "opencode") or "opencode"
+    timeout_minutes = getattr(args, "timeout_minutes", 10.0) or 10.0
 
     # Reject unsupported adapters before model resolution.
     entry = compiler.COMPILE_CLIENTS.get(adapter)
@@ -2846,7 +2847,8 @@ def cmd_compile(args: argparse.Namespace) -> int:
 
     base.log(f"  invoking {client_name} ...")
     stdout, stderr = compiler.run_compile_client(repo, adapter, model, prompt,
-                                                 controller_variant)
+                                                 controller_variant,
+                                                 timeout_minutes=timeout_minutes)
     if stderr.strip():
         base.log(f"  {client_name} stderr: {stderr.strip()[:500]}")
 
@@ -3440,6 +3442,10 @@ def main() -> int:
         "--adapter", default="opencode",
         choices=list(compiler.COMPILE_CLIENTS),
         help="adapter to compile against (default: opencode)",
+    )
+    p_compile.add_argument(
+        "--timeout-minutes", type=float, default=10.0,
+        help="compile client timeout in minutes (default: 10.0)",
     )
     p_compile.set_defaults(fn=cmd_compile)
 

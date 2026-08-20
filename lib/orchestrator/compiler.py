@@ -14,18 +14,39 @@ from pathlib import Path
 
 from lib.orchestrator import base
 
+# Character budget for the assembled compile prompt.
+#
+# The compile prompt is built in fixed priority order: the source plan
+# markdown, schema guidance, and compile instructions are always included
+# whole; the canonical sample pair and at most one active repository
+# template pair are included only while they fit within this budget.  The
+# value (~128k) is roughly a 4x reduction from the ~559k prompt observed
+# in a mature repository while leaving ample room for a large source plan
+# plus the fixed sections.  A constant, not a config knob: a single value
+# keeps behavior predictable across repositories.
+COMPILE_PROMPT_BUDGET_CHARS = 128_000
+
+# Maximum acceptable length for a single compile-client argv element.
+#
+# Any argv element longer than this fails before spawn with a named
+# ``PlanError`` instead of surfacing an opaque OS "Argument list too long"
+# error.  The threshold is far below ``ARG_MAX``; it only guards against
+# future regressions to an inline-argv prompt transport (today OpenCode
+# uses a workspace-local file and Claude Code uses stdin).
+MAX_INLINE_ARG_CHARS = 100_000
+
 COMPILE_CLIENTS: dict[str, dict] = {
     "opencode": {
         "executable": "opencode",
         "supported": True,
+        "prompt_transport": "file",
         "argv_template": ["{executable}", "run", "--model", "{model}", "{prompt}"],
     },
     "claude-code": {
         "executable": "claude",
         "supported": True,
-        "argv_template": [
-            "{executable}", "-p", "--model", "{model}", "{prompt}",
-        ],
+        "prompt_transport": "stdin",
+        "argv_template": ["{executable}", "-p", "--model", "{model}"],
     },
     "codex-cli": {
         "executable": "codex",
@@ -114,8 +135,10 @@ def check_controller_model(repo: Path | None = None,
 def discover_template_pairs(repo: Path) -> list[tuple[Path, Path | None]]:
     """Find repository template plan pairs (md + matching toml).
 
-    Lists top-level ``openspec/plans/`` pairs first and
-    ``openspec/plans/archived/`` pairs second, without recursing further.
+    Lists only top-level ``openspec/plans/`` pairs, without recursing.
+    Pairs under ``openspec/plans/archived/`` are excluded unconditionally:
+    archived plans are historical records, not conventions to imitate, and
+    they are what historically inflated the compile prompt without bound.
     Returns a list of ``(md_path, toml_path_or_None)`` tuples.
     """
     plans_dir = repo / "openspec" / "plans"
@@ -124,12 +147,71 @@ def discover_template_pairs(repo: Path) -> list[tuple[Path, Path | None]]:
         for md_path in sorted(plans_dir.glob("*.md")):
             toml_path = md_path.with_suffix(".toml")
             pairs.append((md_path, toml_path if toml_path.is_file() else None))
-    archived_dir = repo / "openspec" / "plans" / "archived"
-    if archived_dir.is_dir():
-        for md_path in sorted(archived_dir.glob("*.md")):
-            toml_path = md_path.with_suffix(".toml")
-            pairs.append((md_path, toml_path if toml_path.is_file() else None))
     return pairs
+
+
+def _render_repo_pair(repo: Path, md: Path,
+                      toml: Path | None) -> str:
+    """Render one repository template pair (md + optional toml) as text.
+
+    The rendered text is exactly what ``build_compile_prompt`` appends for
+    the pair, so budget selection can rely on its length.
+    """
+    parts = ["## Repository template plans\n"]
+    rel = md.relative_to(repo)
+    parts.append(f"### Template: `{rel}`\n")
+    try:
+        parts.append(md.read_text(encoding="utf-8"))
+    except OSError:
+        pass
+    if toml is not None:
+        rel_toml = toml.relative_to(repo)
+        parts.append(f"### Template manifest: `{rel_toml}`\n")
+        try:
+            parts.append(toml.read_text(encoding="utf-8"))
+        except OSError:
+            pass
+    return "\n".join(parts)
+
+
+def _render_sample_pair(sample_md: Path, sample_toml: Path) -> str:
+    """Render the canonical sample pair (md + toml) as text.
+
+    The rendered text is exactly what ``build_compile_prompt`` appends for
+    the pair, so budget selection can rely on its length.
+    """
+    parts = ["## Sample plan (canonical)\n"]
+    try:
+        parts.append(sample_md.read_text(encoding="utf-8"))
+    except OSError:
+        pass
+    parts.append("### Sample manifest (canonical)\n")
+    try:
+        parts.append(sample_toml.read_text(encoding="utf-8"))
+    except OSError:
+        pass
+    return "\n".join(parts)
+
+
+def _select_repo_template_pair(repo: Path,
+                               available_chars: int) -> tuple[Path, Path | None] | None:
+    """Select the smallest active repository template pair that fits.
+
+    Returns the smallest ``(md, toml)`` pair from top-level
+    ``openspec/plans/`` whose combined rendered size is
+    <= *available_chars*, or ``None`` when no active pair fits.  Archived
+    pairs are never considered (see ``discover_template_pairs``).
+    """
+    best: tuple[Path, Path | None] | None = None
+    best_size: int | None = None
+    for md, toml in discover_template_pairs(repo):
+        size = len(_render_repo_pair(repo, md, toml))
+        if size > available_chars:
+            continue
+        if best_size is None or size < best_size:
+            best = (md, toml)
+            best_size = size
+    return best
 
 
 def resolve_sample_plan_pair() -> tuple[Path, Path | None] | None:
@@ -272,56 +354,35 @@ def build_compile_prompt(source_content: str, source_path: Path,
                          repo: Path, adapter: str = "opencode") -> str:
     """Build the complete compile prompt for the selected adapter.
 
-    Includes: source markdown, manifest schema guidance (adapter-aware),
-    template plan pairs from the repository, and model instructions.
+    The prompt is assembled under ``COMPILE_PROMPT_BUDGET_CHARS`` in fixed
+    priority order: the source plan markdown, adapter-aware schema
+    guidance, and compile instructions are always included whole — when
+    the source plan alone exceeds the budget a warning is logged and the
+    source is still included, because it is the input, not an example.
+    Optional examples follow while they fit the remaining budget: first
+    the canonical sample plan pair, then at most one repository template
+    pair (the smallest active ``openspec/plans/`` pair that fits, selected
+    by ``_select_repo_template_pair``).  An optional example omitted for
+    budget reasons is logged with a note.
     """
     try:
         rel_source = str(source_path.resolve().relative_to(repo.resolve()))
     except ValueError:
         rel_source = str(source_path)
 
-    parts: list[str] = []
+    budget = COMPILE_PROMPT_BUDGET_CHARS
 
-    parts.append("## Source plan markdown\n")
-    parts.append(source_content)
+    source_part = f"## Source plan markdown\n{source_content}"
+    guidance_part = build_schema_guidance(adapter)
 
-    parts.append(build_schema_guidance(adapter))
+    if len(source_content) > budget:
+        base.log(
+            f"  warning: source plan markdown alone ({len(source_content)} "
+            f"chars) exceeds the compile prompt budget ({budget} chars); "
+            "it is included whole regardless, and optional examples are omitted"
+        )
 
-    # Canonical sample plans (installed or from repo checkout) always appear
-    # ahead of repository pairs.
-    sample_pair = resolve_sample_plan_pair()
-    if sample_pair is not None:
-        sample_md, sample_toml = sample_pair
-        parts.append("## Sample plan (canonical)\n")
-        try:
-            parts.append(sample_md.read_text(encoding="utf-8"))
-        except OSError:
-            pass
-        parts.append(f"### Sample manifest (canonical)\n")
-        try:
-            parts.append(sample_toml.read_text(encoding="utf-8"))
-        except OSError:
-            pass
-
-    template_pairs = discover_template_pairs(repo)
-    if template_pairs:
-        parts.append("## Repository template plans\n")
-        for md, toml in template_pairs:
-            rel = md.relative_to(repo)
-            parts.append(f"### Template: `{rel}`\n")
-            try:
-                parts.append(md.read_text(encoding="utf-8"))
-            except OSError:
-                pass
-            if toml is not None:
-                rel_toml = toml.relative_to(repo)
-                parts.append(f"### Template manifest: `{rel_toml}`\n")
-                try:
-                    parts.append(toml.read_text(encoding="utf-8"))
-                except OSError:
-                    pass
-
-    parts.append(
+    instructions_part = (
         "## Compile instructions\n"
         "\n"
         "Convert the source plan markdown above into a valid opsx-plan TOML "
@@ -350,6 +411,38 @@ def build_compile_prompt(source_content: str, source_path: Path,
         "must reference another change in the manifest.\n"
         "9. **The DAG must have no cycles.**\n"
     )
+
+    # 1. Fixed sections — always included whole.
+    parts: list[str] = [source_part, guidance_part, instructions_part]
+    # Two "\n" join separators between the three fixed parts, plus one more
+    # per optional part appended below.
+    fixed_size = len(source_part) + len(guidance_part) + len(instructions_part) + 2
+    available = max(budget - fixed_size, 0)
+
+    # 2. Canonical sample pair — included only while it fits the budget.
+    sample_pair = resolve_sample_plan_pair()
+    if sample_pair is not None:
+        sample_text = _render_sample_pair(*sample_pair)
+        if available >= len(sample_text) + 1:
+            parts.append(sample_text)
+            available -= len(sample_text) + 1
+        else:
+            base.log(
+                f"  note: omitting canonical sample plan pair: it does not "
+                f"fit within the remaining compile prompt budget "
+                f"({len(sample_text) + 1} chars needed, {available} available)"
+            )
+
+    # 3. One repository template pair — the smallest active pair that fits.
+    repo_pair = _select_repo_template_pair(repo, available)
+    if repo_pair is not None:
+        parts.append(_render_repo_pair(repo, *repo_pair))
+    elif discover_template_pairs(repo):
+        base.log(
+            "  note: omitting repository template plans: no active "
+            "openspec/plans pair fits within the remaining compile prompt "
+            f"budget ({available} chars available)"
+        )
 
     return "\n".join(parts)
 
@@ -429,20 +522,36 @@ def _repo_compile_prompt_dir(repo: Path) -> Path:
 
 def run_compile_client(repo: Path, adapter: str, model: str,
                        prompt: str,
-                       variant: str | None = None) -> tuple[str, str]:
+                       variant: str | None = None,
+                       timeout_minutes: float = 10.0) -> tuple[str, str]:
     """Invoke the selected compile client non-interactively.
 
     *variant* is the optional controller reasoning variant. OpenCode
     appends ``--variant <variant>`` to its invocation when set; Claude
     Code ignores it.
 
+    The prompt is delivered according to the adapter's
+    ``prompt_transport``: ``"file"`` writes it to a workspace-local file
+    attached via ``--file`` (OpenCode, unchanged), ``"stdin"`` pipes it
+    through the client's standard input (Claude Code) so prompt size is
+    never limited by the OS argument-list limit.  After argv construction
+    a pre-spawn guard rejects any single argv element over
+    ``MAX_INLINE_ARG_CHARS`` with an adapter-naming ``PlanError`` instead
+    of an opaque OS error.
+
+    *timeout_minutes* bounds the client invocation (default 10.0 minutes,
+    preserving the historical 600-second timeout); a timeout failure names
+    the ``--timeout-minutes`` option in its diagnostic.
+
     Returns ``(stdout, stderr)`` as a tuple.  Raises ``PlanError`` on
     spawn failure, timeout, or unsupported adapter.
     """
-    executable = COMPILE_CLIENTS[adapter]["executable"]
+    entry = COMPILE_CLIENTS[adapter]
+    executable = entry["executable"]
+    transport = entry.get("prompt_transport", "file")
     prompt_file: Path | None = None
     prompt_dir: Path | None = None
-    if adapter == "opencode":
+    if transport == "file":
         # OpenCode receives attached files as prompt parts. Keeping the full
         # prompt out of argv avoids the OS argument-size limit for large plans.
         # The file is written inside the workspace (not /tmp) because opencode
@@ -457,13 +566,27 @@ def run_compile_client(repo: Path, adapter: str, model: str,
 
     argv = _build_compile_argv(adapter, model, prompt, prompt_file, variant)
     try:
-        proc = subprocess.run(
-            argv,
-            cwd=repo,
-            capture_output=True,
-            text=True,
-            timeout=600,  # 10 minute timeout for model invocation
-        )
+        # Pre-spawn guard: no single argv element may carry an oversized
+        # inline prompt (would surface as an opaque OS "Argument list too
+        # long" error after spawn).
+        for element in argv:
+            if len(element) > MAX_INLINE_ARG_CHARS:
+                raise base.PlanError(
+                    f"compile prompt is too large for argv delivery to the "
+                    f"{adapter} adapter client ({executable}): an argv "
+                    f"element is {len(element)} chars, over the "
+                    f"{MAX_INLINE_ARG_CHARS} char inline-argument limit"
+                )
+        timeout_s = timeout_minutes * 60
+        run_kwargs = {
+            "cwd": repo,
+            "capture_output": True,
+            "text": True,
+            "timeout": timeout_s,
+        }
+        if transport == "stdin":
+            run_kwargs["input"] = prompt
+        proc = subprocess.run(argv, **run_kwargs)
     except FileNotFoundError:
         raise base.PlanError(
             f"could not spawn {executable}; is it installed and on PATH?"
@@ -472,7 +595,8 @@ def run_compile_client(repo: Path, adapter: str, model: str,
         raise base.PlanError(f"could not spawn {executable}: {exc}") from exc
     except subprocess.TimeoutExpired:
         raise base.PlanError(
-            f"{executable} compile invocation timed out after 600s"
+            f"{executable} compile invocation timed out after "
+            f"{timeout_s:g}s (--timeout-minutes {timeout_minutes:g})"
         )
     finally:
         if prompt_file is not None:
