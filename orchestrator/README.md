@@ -36,7 +36,9 @@ and durable bookkeeping.
 `compile` converts a markdown implementation plan into a runnable TOML
 manifest by invoking your selected compile adapter client with its
 configured controller model. OpenCode is the default; use `--adapter
-claude-code` to compile through Claude Code instead.
+claude-code` to compile through Claude Code instead. The `codex-cli` and
+`dsh` adapters are recognized as `--adapter` selections but rejected before
+model resolution — compilation through them is out of scope for this release.
 
 The compiler builds a self-contained prompt that includes the source
 markdown, adapter-aware TOML schema (derived from the plan loader),
@@ -308,6 +310,17 @@ Defaults (override with `implement_invoke` / `review_invoke` /
 | `opencode` | `opencode run --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL" --variant "$OPSX_IMPLEMENTER_VARIANT"`, and similarly for reviewer/archiver | `.opsx-plan/<plan>.state.json` |
 | `claude-code` | `claude -p --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL" --permission-mode bypassPermissions --output-format json`, and similarly for reviewer/archiver | `.opsx-plan/<plan>.state.json` |
 | `codex-cli` | Direct dispatch not available by default — `codex-cli` has no default stage invokes and a codex-cli plan missing explicit `implement_invoke` / `review_invoke` / `archive_invoke` keys fails at load time with a `PlanError` naming all three required keys. An operator can opt into direct dispatch by hand-writing all three invokes in `[plan]`. | `.opsx-plan/<plan>.state.json` |
+| `dsh` | `opsx-dsh-worker --role implementer` (and similarly `--role reviewer` / `--role archiver`) — a shim composes the installed role instructions with the worker input into one headless dsh prompt | plan bookkeeping `.opsx-plan/<plan>.state.json`; per-change state `.opsx-controller/<change>.json` |
+
+The `dsh` invokes resolve their model at exec time inside the shim: the
+orchestrator exports `OPSX_*_MODEL` per role, the shim maps the provider
+(`deepseek` → `deepseek-official`, plus the `OPSX_DSH_PROVIDER_MAP` overlay)
+and writes a flat `--patch` override. With no configured model the shim emits
+no `--patch` and dsh's shipped default applies. For the dsh adapter the
+per-change v3 state file the worker reads via `STATE_FILE` lives at
+`.opsx-controller/<change>.json`; the `.opsx-plan/` files remain plan-level
+bookkeeping only. On resume the controller validates that file and stops with
+a diagnostic when it is malformed or belongs to a different change.
 
 The OpenCode invokes reference an `OPSX_*_VARIANT` variable alongside the
 model. The orchestrator exports it per role from the resolved

@@ -193,7 +193,7 @@ The plan manifest is a TOML file with a `[plan]` table and one or more
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `name` | string | filename stem | Plan display name |
-| `adapter` | string | `"opencode"` | Client adapter: `opencode`, `claude-code`, or `codex-cli` |
+| `adapter` | string | `"opencode"` | Client adapter: `opencode`, `claude-code`, `codex-cli`, or `dsh` |
 | `timeout_minutes` | float | `90` | Per-change stage timeout |
 | `max_rounds` | int | `5` | Implement-review loop ceiling |
 | `no_progress_limit` | int | `2` | Consecutive no-progress rounds before failing |
@@ -329,7 +329,8 @@ catch this whole class of drift at `doctor` time rather than after a run.
 `opsx-plan compile` converts a markdown implementation plan into a runnable
 TOML manifest. It invokes the selected compile client (default `opencode`,
 also supports `--adapter claude-code`) with the `controller` role resolved
-for that adapter. The `codex-cli` adapter is not supported for compilation.
+for that adapter. The `codex-cli` and `dsh` adapters are not supported for
+compilation.
 
 ```bash
 # Required: a controller model resolved for the opencode adapter

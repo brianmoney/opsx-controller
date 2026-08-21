@@ -39,6 +39,7 @@
 #   - opencode requires "provider/model" (e.g. "deepseek/deepseek-v4-pro")
 #   - claude-code requires a bare Anthropic alias (e.g. "claude-sonnet-5")
 #   - codex-cli requires a bare OpenAI id (e.g. "gpt-5.4")
+#   - dsh requires "provider/model" (e.g. "deepseek/deepseek-v4-pro")
 # `opsx-plan doctor` and `opsx-plan models show` flag identifiers that don't
 # match the target adapter's syntax.
 
@@ -68,3 +69,9 @@ implementer = "gpt-5.4"
 # implementer_escalation = "gpt-5.4-pro"  # optional
 reviewer = "gpt-5.4"
 archiver = "gpt-5.4"
+
+[adapters.dsh]
+implementer = "deepseek/deepseek-v4-pro"
+# implementer_escalation = "deepseek/deepseek-v4-ultra"  # optional
+reviewer = "deepseek/deepseek-v4-pro"
+archiver = "deepseek/deepseek-v4-pro"

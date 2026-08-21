@@ -2772,6 +2772,299 @@ class ClaudeCodeAdapterDefaultsTests(unittest.TestCase):
         self.assertTrue(self.opsx_plan.planref.is_direct_mode(cfg))
 
 
+class DshAdapterDefaultsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _write_plan(self, name: str, body: str) -> Path:
+        p = self.repo / name
+        p.write_text(body, encoding="utf-8")
+        return p
+
+    def test_dsh_plan_resolves_all_three_defaults_and_takes_direct_path(self) -> None:
+        plan = self._write_plan(
+            "plan.toml",
+            '[plan]\nname = "test"\nadapter = "dsh"\n\n'
+            '[[changes]]\nid = "c1"\n',
+        )
+        cfg = self.opsx_plan.planref.load_plan(plan)
+
+        for stage, role in (
+            ("implement", "implementer"),
+            ("review", "reviewer"),
+            ("archive", "archiver"),
+        ):
+            invoke = cfg[f"{stage}_invoke"]
+            self.assertEqual(invoke, f"opsx-dsh-worker --role {role}")
+
+        self.assertEqual(cfg["state_file"], ".opsx-controller/{change}.json")
+        self.assertTrue(
+            self.opsx_plan.planref.is_direct_mode(cfg),
+            "dsh plan with no invoke overrides must resolve to the direct path",
+        )
+
+    def test_single_overridden_stage_invoke_is_honored_others_fall_back(self) -> None:
+        defaults = self.opsx_plan.base.ADAPTER_DEFAULTS["dsh"]
+        plan = self._write_plan(
+            "plan.toml",
+            '[plan]\nname = "test"\nadapter = "dsh"\n'
+            'review_invoke = "opsx-dsh-worker --role custom-review"\n\n'
+            '[[changes]]\nid = "c1"\n',
+        )
+        cfg = self.opsx_plan.planref.load_plan(plan)
+
+        self.assertEqual(cfg["review_invoke"], "opsx-dsh-worker --role custom-review")
+        self.assertEqual(cfg["implement_invoke"], defaults["implement_invoke"])
+        self.assertEqual(cfg["archive_invoke"], defaults["archive_invoke"])
+        self.assertTrue(self.opsx_plan.planref.is_direct_mode(cfg))
+
+
+class DshDirectStateTests(unittest.TestCase):
+    """Regression tests for the dsh adapter's authoritative per-change state.
+
+    The dsh spec requires durable v3 state at ``.opsx-controller/<change>.json``
+    and that the worker input's ``STATE_FILE`` points there. The ``.opsx-plan/``
+    files stay plan-level bookkeeping; a malformed or wrong-change per-change
+    state file stops the controller with an actionable diagnostic.
+    """
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        git(self.repo, "init")
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        (self.repo / ".gitignore").write_text(
+            "openspec/changes/archive/\n", encoding="utf-8"
+        )
+        git(self.repo, "add", "tracked.txt", ".gitignore")
+        git(
+            self.repo,
+            "-c", "user.email=test@example.invalid",
+            "-c", "user.name=Test User",
+            "commit", "-m", "init",
+        )
+        self.cid = "add-dsh-state"
+        self.plan_name = "dsh-plan"
+        self.cfg = {
+            "name": self.plan_name,
+            "adapter": "dsh",
+            "implement_invoke": "opsx-dsh-worker --role implementer",
+            "review_invoke": "opsx-dsh-worker --role reviewer",
+            "archive_invoke": "opsx-dsh-worker --role archiver",
+            "state_file": ".opsx-controller/{change}.json",
+            "timeout_minutes": 1,
+            "max_rounds": 2,
+            "no_progress_limit": 2,
+            "fast_checks": [],
+            "check_timeout_minutes": 1,
+            "require_clean_tracked": False,
+            "review_created": False,
+            "changes": {
+                self.cid: {
+                    "id": self.cid,
+                    "depends_on": [],
+                    "enabled": True,
+                    "pause_before": False,
+                    "timeout_minutes": 1,
+                    "create_invoke": "",
+                    "create_max_attempts": 1,
+                }
+            },
+            "order": [self.cid],
+            "created_check": "",
+            "plan_doc": "",
+            "create_timeout_minutes": 1,
+        }
+        self.state = {"plan": self.plan_name, "approvals": [], "changes": {}}
+        self.write_authored_change(self.cid)
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
+        record["max_rounds"] = self.cfg["max_rounds"]
+        record["tracked_change_files"] = self.opsx_plan.state_mod.change_context_paths(
+            self.repo, self.cid
+        )
+        self._saved_invoke = self.opsx_plan.invoke_direct_stage
+        self._saved_checks = self.opsx_plan.groundtruth.run_fast_checks
+
+    def tearDown(self) -> None:
+        self.opsx_plan.invoke_direct_stage = self._saved_invoke
+        self.opsx_plan.groundtruth.run_fast_checks = self._saved_checks
+        self.tmp.cleanup()
+
+    def write_authored_change(self, cid: str) -> None:
+        cdir = self.repo / "openspec" / "changes" / cid
+        cdir.mkdir(parents=True)
+        (cdir / "proposal.md").write_text("## Why\n", encoding="utf-8")
+        (cdir / "tasks.md").write_text(
+            "## 1. Tasks\n\n- [ ] 1.1 Example task\n- [ ] 1.2 Example task\n",
+            encoding="utf-8",
+        )
+
+    def _dsh_state_path(self) -> Path:
+        return self.repo / ".opsx-controller" / f"{self.cid}.json"
+
+    def _stage_runner(self, payloads: list[dict]) -> list[str]:
+        """Mock invoke_direct_stage; return the worker input blocks."""
+        input_blocks: list[str] = []
+
+        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+            self.assertTrue(payloads, f"unexpected stage call: {stage}")
+            payload = payloads.pop(0)
+            self.assertEqual(stage, payload["stage"])
+            input_blocks.append(input_block)
+            if stage == "archive" and payload.get("archive_repo"):
+                src = repo / "openspec" / "changes" / cid
+                dst = repo / "openspec" / "changes" / "archive" / f"2026-08-21-{cid}"
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                src.rename(dst)
+                payload = {
+                    **payload,
+                    "result": {
+                        **payload["result"],
+                        "archive_path": str(dst.relative_to(repo)),
+                        "commit": "",
+                    },
+                }
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            if stage == "implement":
+                parsed = payload["result"]
+                if parsed.get("status") == "implemented":
+                    tasks_path = repo / "openspec" / "changes" / cid / "tasks.md"
+                    if tasks_path.is_file():
+                        content = tasks_path.read_text(encoding="utf-8")
+                        for tid in parsed.get("completed_tasks") or []:
+                            content = re.sub(
+                                rf"- \[ \] {re.escape(str(tid))}",
+                                "- [x] " + str(tid),
+                                content,
+                                count=1,
+                            )
+                        tasks_path.write_text(content, encoding="utf-8")
+            log_path.write_text(json.dumps(payload["result"]) + "\n", encoding="utf-8")
+            return payload.get("outcome", "exited"), log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+        return input_blocks
+
+    def test_dsh_state_written_to_opsx_controller_and_passed_as_state_file(self) -> None:
+        inputs = self._stage_runner(
+            [
+                {
+                    "stage": "implement",
+                    "result": {
+                        "status": "implemented",
+                        "change": self.cid,
+                        "round": 1,
+                        "progress_made": True,
+                        "completed_tasks": ["1.1", "1.2"],
+                        "remaining_tasks": [],
+                        "task_counts": {"complete": 2, "total": 2},
+                        "files_touched": [],
+                        "known_change_files": [
+                            f"openspec/changes/{self.cid}/tasks.md",
+                        ],
+                        "summary": "implemented",
+                    },
+                },
+                {
+                    "stage": "review",
+                    "result": {
+                        "status": "reviewed",
+                        "change": self.cid,
+                        "round": 1,
+                        "verdict": "pass",
+                        "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                        "summary": "review passed",
+                        "fix_prompt": "",
+                        "next_phase": "archive",
+                    },
+                },
+                {
+                    "stage": "archive",
+                    "archive_repo": True,
+                    "result": {
+                        "status": "archived",
+                        "change": self.cid,
+                        "archive_path": "",
+                        "spec_sync_status": "no-delta",
+                        "commit": "",
+                        "summary": "archive succeeded",
+                    },
+                },
+            ]
+        )
+
+        result = self.opsx_plan.run_direct_change(self.repo, self.cfg, self.state, self.cid)
+        self.assertEqual(result, self.opsx_plan.base.DONE)
+
+        # Every dispatch's STATE_FILE must point at the authoritative path.
+        for block in inputs:
+            self.assertIn(f"STATE_FILE: {self._dsh_state_path()}", block)
+        self.assertNotIn(
+            f"STATE_FILE: {self.repo / '.opsx-plan' / 'workers'}",
+            "\n".join(inputs),
+        )
+
+        # The durable v3 state file exists at .opsx-controller/<change>.json.
+        state_path = self._dsh_state_path()
+        self.assertTrue(state_path.is_file(), f"expected state at {state_path}")
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["version"], 3)
+        self.assertEqual(payload["change"], self.cid)
+        self.assertEqual(payload["phase"], "done")
+
+        # The .opsx-plan worker-snapshot path is NOT used for dsh.
+        worker_snapshot = self.opsx_plan.worker_state_path(
+            self.repo, self.plan_name, self.cid
+        )
+        self.assertFalse(
+            worker_snapshot.is_file(),
+            "dsh must not write a .opsx-plan/workers snapshot",
+        )
+
+    def test_dsh_malformed_state_file_fails_closed(self) -> None:
+        state_path = self._dsh_state_path()
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text("{not valid json\n", encoding="utf-8")
+
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
+            self.opsx_plan.validate_dsh_state_files(self.repo, self.cfg, self.state)
+        message = str(ctx.exception)
+        self.assertIn(str(state_path), message)
+        self.assertIn("not valid JSON", message)
+        self.assertIn("Fix or remove", message)
+
+    def test_dsh_wrong_change_state_file_rejected(self) -> None:
+        state_path = self._dsh_state_path()
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(
+            json.dumps({"version": 3, "change": "some-other-change"}),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(self.opsx_plan.base.PlanError) as ctx:
+            self.opsx_plan.validate_dsh_state_files(self.repo, self.cfg, self.state)
+        message = str(ctx.exception)
+        self.assertIn(str(state_path), message)
+        self.assertIn(self.cid, message)
+        self.assertIn("some-other-change", message)
+        self.assertIn("remove or replace", message)
+
+    def test_dsh_validation_skips_non_dsh_adapters(self) -> None:
+        self.cfg["adapter"] = "opencode"
+        state_path = self._dsh_state_path()
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text("broken\n", encoding="utf-8")
+        # No exception: the per-change validation is dsh-specific.
+        self.opsx_plan.validate_dsh_state_files(self.repo, self.cfg, self.state)
+
+
 class ModelResolutionWiringTests(unittest.TestCase):
     """7.4, 7.7: load_plan populates cfg["models"] per adapter, and the
     incomplete-direct-dispatch guard ensures incomplete configs fail closed
@@ -3380,15 +3673,17 @@ class ArchiverDeletionStagingTests(unittest.TestCase):
         "adapters/opencode/agents/opsx-archiver.md",
         "adapters/codex-cli/agents/opsx-archiver.toml",
         "adapters/codex-cli/plugin/agents/opsx-archiver.toml",
+        "adapters/dsh/agents/opsx-archiver.md",
         "plugins/opsx-controller/agents/opsx-archiver.md",
     )
-    # These four name the change directory in their scope-determination step
+    # These five name the change directory in their scope-determination step
     # with the shared "(the deletion left by the move)" marker; the
     # claude-code definition names it inline in its staging step instead.
     SCOPE_STEP_ENUMERATES_CHANGE_DIR_FILES = (
         "adapters/opencode/agents/opsx-archiver.md",
         "adapters/codex-cli/agents/opsx-archiver.toml",
         "adapters/codex-cli/plugin/agents/opsx-archiver.toml",
+        "adapters/dsh/agents/opsx-archiver.md",
         "plugins/opsx-controller/agents/opsx-archiver.md",
     )
 
@@ -3411,6 +3706,10 @@ class ArchiverDeletionStagingTests(unittest.TestCase):
         ),
         "adapters/codex-cli/plugin/agents/opsx-archiver.toml": (
             "and the change-directory deletion staged in step 12."
+        ),
+        "adapters/dsh/agents/opsx-archiver.md": (
+            "Leave the change-directory deletion from step 12 staged; "
+            "do not unstage it."
         ),
         "plugins/opsx-controller/agents/opsx-archiver.md": (
             "Stage only the rest of the explicit archive set."

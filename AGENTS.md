@@ -7,9 +7,10 @@ and any coding assistant working in this repository.
 
 `opsx-controller` is a portable OpenSpec controller workflow: a client-neutral
 core contract (`core/`) plus client-specific adapters (`adapters/opencode/`,
-`adapters/claude-code/`, `adapters/codex-cli/`) and the plan orchestrator
-(`orchestrator/opsx-plan.py`). Start from `core/controller-contract.md`,
-`core/state-schema.md`, and `core/phase-protocol.md`.
+`adapters/claude-code/`, `adapters/codex-cli/`, `adapters/dsh/`) and the plan
+orchestrator (`orchestrator/opsx-plan.py`). Start from
+`core/controller-contract.md`, `core/state-schema.md`, and
+`core/phase-protocol.md`.
 
 For implementation plans that feed `opsx-plan compile`, the single
 client-neutral reference is `core/plan-authoring.md`. Plan-authoring agents
@@ -47,6 +48,7 @@ installer(s) to deploy it:**
 bash adapters/opencode/install.sh --global --verify
 bash adapters/claude-code/install.sh --global --verify   # if Claude Code adapter changed
 bash adapters/codex-cli/install.sh --global --verify      # if Codex CLI adapter changed
+bash adapters/dsh/install.sh --global --verify            # if dsh adapter changed
 ```
 
 Any global installer now deploys the shared `opsx-plan` and `opsx-run`

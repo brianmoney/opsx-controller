@@ -781,6 +781,20 @@ class CompileTests(unittest.TestCase):
         m_run.assert_not_called()
         self.assertNotEqual(rc, 0)
 
+    def test_cmd_compile_dsh_rejected_before_spawn(self) -> None:
+        """dsh compile exits non-zero before model resolution or client
+        spawn (compile is recognized but unsupported, codex-style)."""
+        self._set_model()
+        source = self._write_plan_md("plan.md", "# Plan\n\n## Phase 1\n\n### Change: `c1`\n\n**Depends on:** None.\n")
+        out = self.repo / "out.toml"
+        args = argparse.Namespace(repo=str(self.repo), source="plan.md",
+                                  output=str(out), force=False, adapter="dsh")
+        # Must not call subprocess.run at all — reject in cmd_compile itself.
+        with mock.patch("subprocess.run") as m_run:
+            rc = self.opsx_plan.cmd_compile(args)
+        m_run.assert_not_called()
+        self.assertNotEqual(rc, 0)
+
     def test_cmd_compile_claude_adapter_propagates_to_prompt(self) -> None:
         """Claude adapter appears in the compile prompt."""
         # _set_model() provides a provider-prefixed model valid for opencode
@@ -883,6 +897,12 @@ class CompileTests(unittest.TestCase):
         with self.assertRaises(base_mod.PlanError) as ctx:
             compiler_mod._build_compile_argv("codex-cli", "m", "prompt")
         self.assertIn("not supported", str(ctx.exception))
+
+    def test_build_argv_rejects_unsupported_dsh(self) -> None:
+        with self.assertRaises(base_mod.PlanError) as ctx:
+            compiler_mod._build_compile_argv("dsh", "m", "prompt")
+        self.assertIn("not supported", str(ctx.exception))
+        self.assertIn("dsh", str(ctx.exception))
 
     def test_build_argv_opencode_includes_variant_after_model(self) -> None:
         """A resolved variant is appended as --variant <variant> right after

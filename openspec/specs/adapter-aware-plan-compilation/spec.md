@@ -104,14 +104,20 @@ that option in its diagnostic.
 
 ### Requirement: Unsupported compile adapters fail before invocation
 
-The compiler SHALL recognize `codex-cli` as an adapter selection but SHALL
-reject it before model resolution or client spawn with an error that states
-Codex CLI compilation is unsupported in the current release.
+The compiler SHALL recognize `codex-cli` and `dsh` as adapter selections but
+SHALL reject them before model resolution or client spawn with an error that
+states compilation with the selected adapter is unsupported in the current
+release.
 
 #### Scenario: Codex compile is rejected explicitly
 
 - **WHEN** an operator runs `opsx-plan compile --adapter codex-cli plan.md -o plan.toml`
 - **THEN** no Codex process is spawned and the command reports that Codex compilation is out of scope
+
+#### Scenario: dsh compile is rejected explicitly
+
+- **WHEN** an operator runs `opsx-plan compile --adapter dsh plan.md -o plan.toml`
+- **THEN** no dsh process is spawned and the command reports that dsh compilation is out of scope
 
 ### Requirement: TOML extraction remains fail closed per client
 

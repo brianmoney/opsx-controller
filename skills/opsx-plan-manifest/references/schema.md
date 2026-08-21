@@ -37,7 +37,7 @@ All optional; defaults shown.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `name` | string | filename stem | Plan display name; also names the state file |
-| `adapter` | string | `"opencode"` | `opencode`, `claude-code`, or `codex-cli` |
+| `adapter` | string | `"opencode"` | `opencode`, `claude-code`, `codex-cli`, or `dsh` |
 | `timeout_minutes` | float | `90` | Per-change stage timeout |
 | `max_rounds` | int | `5` | Implement–review loop ceiling |
 | `no_progress_limit` | int | `2` | Consecutive no-progress rounds before failing |
@@ -100,6 +100,7 @@ legacy single-command fallback.
 | `opencode` | `.opencode/opsx-controller/{change}.json` |
 | `claude-code` | `.claude/opsx-controller/{change}.json` |
 | `codex-cli` | `.opsx-controller/{change}.json` |
+| `dsh` | `.opsx-controller/{change}.json` |
 
 Both `opencode` and `claude-code` define `implement_invoke` / `review_invoke`
 / `archive_invoke`, so a plan using either adapter takes the direct
@@ -115,6 +116,15 @@ implement-review-archive path with no manifest changes:
 three stage invokes fails at load time with a `PlanError` naming all three
 required keys — there is no fallback execution path. An operator can opt
 `codex-cli` into direct dispatch by hand-writing all three invokes in `[plan]`.
+
+`dsh` defines stage invokes that dispatch the installed shim
+(`opsx-dsh-worker --role implementer`, `--role reviewer`, `--role archiver`),
+so a `dsh` plan takes the direct path with no manifest changes. The shim
+composes the installed role instructions with the worker input into one
+headless dsh prompt; the model is resolved per role at exec time via
+`OPSX_*_MODEL` and a generated `--patch` override, so the dsh invokes carry no
+model variable tokens.
+
 The `$OPSX_*_MODEL` references in both sets of defaults are resolved once per
 adapter when the plan loads, from `~/.config/opsx-controller/models.toml` —
 see `docs/opsx-plan-operator-workflow.md`'s Model Configuration section.

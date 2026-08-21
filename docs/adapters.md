@@ -9,37 +9,38 @@ model, so the core controller semantics stay identical.
 - [OpenCode adapter](#opencode-adapter)
 - [Claude Code adapter](#claude-code-adapter)
 - [Codex CLI adapter](#codex-cli-adapter)
+- [dsh adapter](#dsh-adapter)
 - [Packaging: Claude plugin, Codex plugin, Vercel skill](#packaging)
 - [Deprecation notes](#deprecation-notes)
 
 ## Choosing an adapter
 
-All three adapters drive the same loop. They differ in what gets installed and
+All four adapters drive the same loop. They differ in what gets installed and
 in the plan compilation and authoring capabilities that vary by adapter:
 
-| | OpenCode | Claude Code | Codex CLI |
-|---|---|---|---|
-| implement / review / archive loop (plan-level) | yes | yes | opt-in (hand-written stage invokes) |
-| `opsx-plan` + `opsx-run` on `PATH` | installed to `~/.local/bin` | installed to `~/.local/bin` | installed to `~/.local/bin` |
-| single-change `opsx-run` | yes | no (OpenCode-pinned) | no (OpenCode-pinned) |
-| `opsx-plan compile` (markdown plan → TOML) | yes (OpenCode controller model) | yes (Claude Code controller model) | needs OpenCode or Claude Code |
-| plan authoring skill (`/opsx-plan`) | yes | yes | — |
+| | OpenCode | Claude Code | Codex CLI | dsh |
+|---|---|---|---|---|
+| implement / review / archive loop (plan-level) | yes | yes | opt-in (hand-written stage invokes) | yes |
+| `opsx-plan` + `opsx-run` on `PATH` | installed to `~/.local/bin` | installed to `~/.local/bin` | installed to `~/.local/bin` | installed to `~/.local/bin` |
+| single-change `opsx-run` | yes | no (OpenCode-pinned) | no (OpenCode-pinned) | no (OpenCode-pinned) |
+| `opsx-plan compile` (markdown plan → TOML) | yes (OpenCode controller model) | yes (Claude Code controller model) | needs OpenCode or Claude Code | needs OpenCode or Claude Code |
+| plan authoring skill (`/opsx-plan`) | yes | yes | — | — |
 
-All three adapters install `opsx-plan` and `opsx-run` to `~/.local/bin/`
-via the shared installer helper. The Codex CLI adapter does not support
-plan compilation (`opsx-plan compile`) or single-change `opsx-run`, but its
-global installer still deploys the orchestrator executables — use
+All four adapters install `opsx-plan` and `opsx-run` to `~/.local/bin/`
+via the shared installer helper. The Codex CLI and dsh adapters do not support
+plan compilation (`opsx-plan compile`) or single-change `opsx-run`, but their
+global installers still deploy the orchestrator executables — use
 `opsx-plan` from `PATH` as you would with any other adapter.
 Single-change `opsx-run` is OpenCode-pinned: `run-one` has no `--adapter` flag
-and always uses the OpenCode adapter. Claude Code and Codex CLI operators run
-single changes via a hand-written plan manifest with `adapter = "claude-code"`
+and always uses the OpenCode adapter. Claude Code, Codex CLI, and dsh operators
+run single changes via a hand-written plan manifest with `adapter = "claude-code"`
 and `opsx-plan run` instead.
 
 `opsx-plan compile` supports OpenCode (the default) and Claude Code (via
 `--adapter claude-code`). Each requires a `controller` model resolved for
 the corresponding adapter — the compiler rejects invalid model syntax
 before writing any output. Plan compilation is not supported through the
-Codex CLI adapter; use `--adapter opencode` or `--adapter claude-code`
+Codex CLI or dsh adapters; use `--adapter opencode` or `--adapter claude-code`
 instead. A markdown plan authored under any adapter can be compiled as
 long as an appropriate `controller` model is resolved.
 
@@ -213,6 +214,115 @@ protects the `.codex/` directory from agent writes.
 To advertise the controller path in the host repo's instructions, merge
 `adapters/codex-cli/templates/project/AGENTS.snippet.md` into its `AGENTS.md`.
 
+## dsh adapter
+
+The DeepSeek Harness (`dsh`, https://github.com/deepseek-ai/deepseek-harness)
+adapter drives the same implement/review/archive loop with a headless dsh
+profile. dsh has no `--agent` flag, so role specialization is carried by an
+installed shim instead of client-side agent registration.
+
+What it contains:
+
+- `adapters/dsh/bin/opsx-dsh-worker`: the worker shim — the single
+  translation point between the orchestrator's invoke contract and the dsh
+  CLI
+- `adapters/dsh/agents/opsx-implementer.md`: implementation phase role
+  instructions
+- `adapters/dsh/agents/opsx-reviewer.md`: strict review phase role
+  instructions
+- `adapters/dsh/agents/opsx-archiver.md`: non-interactive archive phase role
+  instructions
+- `adapters/dsh/support/opsx-controller-state-README.md`: state contract
+- `adapters/dsh/templates/project/AGENTS.snippet.md`: host-project setup
+  snippet
+- `adapters/dsh/install.sh`: dsh installer
+
+Shim contract:
+
+- Dispatch is `opsx-dsh-worker --role implementer|reviewer|archiver <input>`
+  with the controller's worker input block as the final positional argument.
+- The shim composes the role instruction file with the input block into one
+  prompt and execs `dsh --profile headless [--patch <model-patch>] <prompt>`,
+  replacing its own process image so the controller's timeout and
+  process-group signal handling apply directly to dsh.
+- Role instructions resolve project-first from `.opsx-controller/dsh/agents/`
+  relative to the working directory, then global from
+  `~/.config/opsx-controller/dsh/agents/`.
+
+Binary resolution (in this order):
+
+1. `DSH_BINARY` — an executable path or a name resolved on `PATH`
+2. `dsh` on `PATH`
+3. Pinned npx fallback `npx --yes @deepseek-ai/dsh@0.1.0-rc.7`
+
+When none resolves, the shim fails closed naming all three sources. The pin is
+a single constant with a re-validation note; dsh is developer preview with
+explicit breaking-change warnings, and the shim is the one place a CLI change
+touches.
+
+Model override via generated patch:
+
+- `OPSX_<ROLE>_MODEL` is split into provider/model, the provider is mapped
+  through the built-in `deepseek` → `deepseek-official` map overlaid by the
+  `OPSX_DSH_PROVIDER_MAP` JSON environment variable, and a flat
+  entry-override YAML patch (`agent-default-model`) is written under
+  `$DSH_HOME/patches/` and passed via `--patch`.
+- No `OPSX_<ROLE>_MODEL` → no `--patch` → dsh's shipped default model
+  applies. Secrets are never written into patches or prompts.
+
+Controlled runtime environment:
+
+- `DSH_HOME` resolves as ambient `DSH_HOME` → `OPSX_DSH_HOME` → a default
+  under the user's state directory.
+- `DSH_PERMISSION_MODE=workspace-write`, `DSH_TOOLS_MODE=code`, and
+  `DSH_TELEMETRY_DISABLED=1` are defaulted without overriding operator-set
+  values.
+- A stable startup `AGENTS.md` is written into `DSH_HOME` only when absent.
+  dsh reads the project `AGENTS.md` from the working directory natively.
+
+Requirements:
+
+- Node.js with TypeScript type-stripping
+  (`process.features.typescript`); DFSG distro Node builds boot dsh but every
+  tool call fails. The installer warns when the check is falsy.
+- either a `dsh` binary or `npx` on `PATH` (the pinned npx fallback dispatches
+  dsh without a real binary)
+- OpenSpec CLI available in the shell
+- a host project that already uses OpenSpec
+- repo guidance in the host project's `AGENTS.md`
+
+Install:
+
+```bash
+bash adapters/dsh/install.sh --global
+bash adapters/dsh/install.sh --project /path/to/project
+```
+
+Add `--verify` to either form to check the deployment after installing.
+
+Project install behavior:
+
+- copies role instructions and support files into
+  `<project>/.opsx-controller/dsh/`
+- project-installed role files shadow the global ones (the shim resolves the
+  project directory first)
+
+State path: durable per-change state files live at
+`.opsx-controller/<change-id>.json` (project root) because dsh has no
+protected project config directory. That file is the authoritative per-change
+state the controller writes and the dsh worker reads via `STATE_FILE`; on
+resume the controller validates it and stops with a diagnostic when it is
+malformed or belongs to a different change. Plan-level bookkeeping stays under
+`.opsx-plan/<plan>.state.json` as an internal mechanism, separate from the
+per-change file.
+
+Usage from the host project root: run the plan loop with `opsx-plan run` on a
+manifest with `adapter = "dsh"`; there are no slash commands, and
+`opsx-plan compile` and single-change `opsx-run` are not supported (use
+`--adapter opencode` or `--adapter claude-code` to compile). To advertise the
+controller path in the host repo's instructions, merge
+`adapters/dsh/templates/project/AGENTS.snippet.md` into its `AGENTS.md`.
+
 ## Packaging
 
 ### Claude Code plugin
@@ -275,8 +385,8 @@ invokes were introduced; the nested-controller path is no longer available.
 Use `opsx-run <change-id>` (equivalently `opsx-plan run-one <change-id>`) for
 single-change execution: it is OpenCode-pinned (`run-one` has no `--adapter`
 flag) and drives the implement/review/archive loop with the same retry,
-no-progress, and archive-verification gates. Claude Code and Codex CLI users
-run single changes via a plan manifest with `adapter = "claude-code"` and
+no-progress, and archive-verification gates. Claude Code, Codex CLI, and dsh
+users run single changes via a plan manifest with `adapter = "claude-code"` and
 `opsx-plan run`.
 
 ## Adding another adapter

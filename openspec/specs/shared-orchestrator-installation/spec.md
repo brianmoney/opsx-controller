@@ -26,8 +26,8 @@ Each global adapter installer SHALL additionally deploy the client-neutral
 plan-authoring reference to `~/.local/lib/opsx-controller/plan-authoring.md`.
 
 The installed executable paths, runtime layout, sample paths, and reference
-path SHALL be identical regardless of whether OpenCode, Claude Code, or Codex
-CLI performed the installation.
+path SHALL be identical regardless of whether OpenCode, Claude Code, Codex
+CLI, or dsh performed the installation.
 
 #### Scenario: Claude global install provides the executables
 
@@ -38,6 +38,12 @@ CLI performed the installation.
 #### Scenario: Codex global install provides the executables
 
 - **WHEN** an operator runs `bash adapters/codex-cli/install.sh --global`
+- **THEN** `~/.local/bin/opsx-plan`, `~/.local/bin/opsx-run`,
+  `~/.local/bin/opsx-watch-plan`, and their runtime libraries are installed
+
+#### Scenario: dsh global install provides the executables
+
+- **WHEN** an operator runs `bash adapters/dsh/install.sh --global`
 - **THEN** `~/.local/bin/opsx-plan`, `~/.local/bin/opsx-run`,
   `~/.local/bin/opsx-watch-plan`, and their runtime libraries are installed
 

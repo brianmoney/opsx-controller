@@ -18,6 +18,7 @@ Current adapters:
 - `adapters/opencode/`: OpenCode commands, agents, installer, and templates
 - `adapters/claude-code/`: Claude Code skill, agents, installer, and templates
 - `adapters/codex-cli/`: Codex CLI skill, agents, installer, and plugin bundle
+- `adapters/dsh/`: dsh worker shim, role instruction files, installer, and templates
 - `plugins/opsx-controller/`: Claude Code plugin package for namespaced distribution
 - `skills/opsx-controller/`: Vercel `npx skill` package for discovery and guided use
 

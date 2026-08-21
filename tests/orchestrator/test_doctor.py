@@ -686,6 +686,41 @@ class DirectWorkerAgentDoctorCheckTests(unittest.TestCase):
         self.assertIn("adapters/claude-code/install.sh", remediation)
 
 
+class DshAdapterDoctorTests(unittest.TestCase):
+    """dsh adapter registry: the doctor installer mapping and the
+    dsh-or-npx executable check (the pinned npx fallback means dsh itself
+    need not be installed)."""
+
+    def test_dsh_installer_mapping_registered(self) -> None:
+        self.assertEqual(
+            doctor_mod._ADAPTER_INSTALLERS["dsh"],
+            "adapters/dsh/install.sh",
+        )
+
+    def test_dsh_executable_check_passes_with_dsh_on_path(self) -> None:
+        with mock.patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}"):
+            passed, label, remediation = doctor_mod._check_adapter_client_on_path("dsh")
+        self.assertTrue(passed, f"expected pass: {remediation}")
+        self.assertIn("dsh", label)
+
+    def test_dsh_executable_check_passes_with_only_npx_on_path(self) -> None:
+        def fake_which(name):
+            if name == "dsh":
+                return None
+            return f"/usr/bin/{name}"
+
+        with mock.patch("shutil.which", side_effect=fake_which):
+            passed, label, remediation = doctor_mod._check_adapter_client_on_path("dsh")
+        self.assertTrue(passed, f"npx on PATH must satisfy the dsh check: {remediation}")
+
+    def test_dsh_executable_check_fails_when_neither_dsh_nor_npx(self) -> None:
+        with mock.patch("shutil.which", return_value=None):
+            passed, label, remediation = doctor_mod._check_adapter_client_on_path("dsh")
+        self.assertFalse(passed)
+        self.assertIn("dsh", label)
+        self.assertIn("npx", remediation)
+
+
 class DoctorProbeCoverageTests(unittest.TestCase):
     """Assert that every _check_* probe defined in doctor.py is invoked by
     both ``run_doctor_checks`` and ``run_preflight_warnings`` in the

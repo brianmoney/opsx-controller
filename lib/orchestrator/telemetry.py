@@ -365,6 +365,38 @@ def _parse_invocation_model_value(model_value):
     return result
 
 
+_STAGE_ROLE = {
+    "implement": "implementer",
+    "review": "reviewer",
+    "archive": "archiver",
+}
+
+
+def _resolved_role_model(cfg: dict, stage: str) -> dict:
+    """Resolve the configured model identity for a dsh stage role.
+
+    dsh stage invokes carry no ``--model``/``--agent`` flag, so telemetry
+    falls back to the role model already resolved from ``[adapters.dsh]`` /
+    ``OPSX_*_MODEL`` and stored in ``cfg["models"]``. Returns the normalized
+    ``{provider, model_id, model_alias}`` dict, empty for non-dsh adapters or
+    an unresolved role.
+    """
+    result = {
+        "provider": None,
+        "model_id": None,
+        "model_alias": None,
+    }
+    if cfg.get("adapter") != "dsh":
+        return result
+    role = _STAGE_ROLE.get(stage)
+    if role is None:
+        return result
+    entry = (cfg.get("models") or {}).get(role)
+    if entry is None or not getattr(entry, "model", None):
+        return result
+    return _parse_invocation_model_value(entry.model)
+
+
 _ADAPTER_AGENT_DIR_PARTS = {
     "opencode": (".config", "opencode", "agents"),
     "claude-code": (".claude", "agents"),
@@ -935,6 +967,14 @@ def _record_stage_telemetry(
             for key in ("provider", "model_id", "model_alias"):
                 if model[key] is None and invocation_model[key] is not None:
                     model[key] = invocation_model[key]
+            if model["provider"] is None and model["model_id"] is None:
+                # dsh carries no --model/--agent in the invoke; attribute
+                # from the resolved role model instead of leaving the stage
+                # unattributed.
+                role_model = _resolved_role_model(cfg, stage)
+                for key in ("provider", "model_id", "model_alias"):
+                    if model[key] is None and role_model[key] is not None:
+                        model[key] = role_model[key]
         record["usage"].update(usage)
         record["model"].update(model)
     except Exception:

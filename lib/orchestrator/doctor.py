@@ -84,9 +84,22 @@ def _check_openspec_on_path() -> tuple[bool, str, str]:
 
 
 def _check_adapter_client_on_path(adapter: str) -> tuple[bool, str, str]:
-    """Check that the configured adapter client executable is on PATH."""
+    """Check that the configured adapter client executable is on PATH.
+
+    The dsh adapter accepts either ``dsh`` or ``npx``: the pinned npx
+    fallback means a real ``dsh`` binary need not be installed for dispatch.
+    """
     client = base.ADAPTER_CLIENTS.get(adapter, adapter)
     label = f"{client} on PATH"
+    if adapter == "dsh":
+        if shutil.which("dsh") or shutil.which("npx"):
+            return (True, label, "")
+        return (
+            False,
+            label,
+            "Install dsh or npx (the pinned npx fallback dispatches dsh "
+            "via npx --yes @deepseek-ai/dsh@0.1.0-rc.7)",
+        )
     if shutil.which(client):
         return (True, label, "")
     return (False, label, f"Install {client} or add it to PATH")
@@ -171,6 +184,7 @@ _DIRECT_STAGE_AGENT_NAMES = ("opsx-implementer", "opsx-reviewer", "opsx-archiver
 _ADAPTER_INSTALLERS = {
     "opencode": "adapters/opencode/install.sh",
     "claude-code": "adapters/claude-code/install.sh",
+    "dsh": "adapters/dsh/install.sh",
 }
 
 
