@@ -2716,6 +2716,112 @@ class DirectStageUsageExtractionTests(unittest.TestCase):
         self._assert_usage_unavailable(usage)
 
 
+class DshTelemetryModelAttributionTests(unittest.TestCase):
+    """dsh stage invokes carry no ``--model``/``--agent`` flag, so telemetry
+    must attribute the resolved role model from ``cfg["models"]``."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        self.repo.mkdir(parents=True, exist_ok=True)
+        self.cid = "add-dsh-telemetry"
+        self.plan_name = "dsh-telemetry-plan"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _cfg(self) -> dict:
+        models = {
+            "implementer": ResolvedModel(
+                role="implementer", model="deepseek/deepseek-chat", source="test"
+            ),
+            "reviewer": ResolvedModel(
+                role="reviewer", model="deepseek/deepseek-reasoner", source="test"
+            ),
+            "archiver": ResolvedModel(
+                role="archiver", model="deepseek/deepseek-v4", source="test"
+            ),
+        }
+        return {
+            "name": self.plan_name,
+            "adapter": "dsh",
+            "implement_invoke": "opsx-dsh-worker --role implementer",
+            "review_invoke": "opsx-dsh-worker --role reviewer",
+            "archive_invoke": "opsx-dsh-worker --role archiver",
+            "models": models,
+            "changes": {
+                self.cid: {"timeout_minutes": 1},
+            },
+        }
+
+    def test_resolved_role_model_parses_dsh_role_model(self) -> None:
+        model = telemetry_mod._resolved_role_model(self._cfg(), "implement")
+        self.assertEqual(model["provider"], "deepseek")
+        self.assertEqual(model["model_id"], "deepseek-chat")
+        self.assertIsNone(model["model_alias"])
+
+    def test_resolved_role_model_ignores_non_dsh_adapter(self) -> None:
+        cfg = self._cfg()
+        cfg["adapter"] = "opencode"
+        model = telemetry_mod._resolved_role_model(cfg, "implement")
+        self.assertIsNone(model["provider"])
+        self.assertIsNone(model["model_id"])
+
+    def test_record_stage_telemetry_attributes_dsh_role_model(self) -> None:
+        cfg = self._cfg()
+        state = {"plan": self.plan_name, "approvals": [], "changes": {}}
+        payload = {"status": "implemented", "change": self.cid}
+        log_path = self.repo / ".opsx-plan" / "logs" / f"{self.cid}.implement.r1.1.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text('{"status": "implemented"}\n', encoding="utf-8")
+
+        telemetry_mod._record_stage_telemetry(
+            self.repo, cfg, state, self.cid, "implement", 1,
+            "2026-08-21T10:00:00", "2026-08-21T10:00:01", 1000,
+            "completed", None, payload, log_path,
+        )
+
+        jsonl = (
+            self.repo / ".opsx-plan" / "telemetry" / f"{self.plan_name}.jsonl"
+        )
+        self.assertTrue(jsonl.is_file(), f"expected telemetry at {jsonl}")
+        records = [
+            json.loads(line)
+            for line in jsonl.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["model"]["provider"], "deepseek")
+        self.assertEqual(records[0]["model"]["model_id"], "deepseek-chat")
+
+    def test_record_stage_telemetry_unresolved_dsh_model_stays_null(self) -> None:
+        cfg = self._cfg()
+        cfg["models"] = {}
+        state = {"plan": self.plan_name, "approvals": [], "changes": {}}
+        payload = {"status": "implemented", "change": self.cid}
+        log_path = self.repo / ".opsx-plan" / "logs" / f"{self.cid}.implement.r1.1.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text('{"status": "implemented"}\n', encoding="utf-8")
+
+        telemetry_mod._record_stage_telemetry(
+            self.repo, cfg, state, self.cid, "implement", 1,
+            "2026-08-21T10:00:00", "2026-08-21T10:00:01", 1000,
+            "completed", None, payload, log_path,
+        )
+
+        jsonl = (
+            self.repo / ".opsx-plan" / "telemetry" / f"{self.plan_name}.jsonl"
+        )
+        records = [
+            json.loads(line)
+            for line in jsonl.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(len(records), 1)
+        self.assertIsNone(records[0]["model"]["provider"])
+        self.assertIsNone(records[0]["model"]["model_id"])
+
+
 class ClaudeResultEnvelopeUsagePrecedenceTests(unittest.TestCase):
     """Tests for the claude_result_json usage/model source and its precedence."""
 

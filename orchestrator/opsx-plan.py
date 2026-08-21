@@ -560,6 +560,24 @@ def worker_state_path(repo: Path, plan_name: str, cid: str) -> Path:
     return repo / ".opsx-plan" / "workers" / plan_name / f"{cid}.json"
 
 
+def per_change_state_path(repo: Path, cfg: dict, cid: str) -> Path:
+    """Resolve the authoritative per-change v3 state file path for *cfg*.
+
+    The ``dsh`` adapter persists its durable per-change controller state to
+    the manifest ``state_file`` template (``.opsx-controller/<change>.json``)
+    at the project root — the file the worker reads back via ``STATE_FILE``.
+    Every other adapter keeps an internal worker-compatibility snapshot under
+    ``.opsx-plan/workers/<plan>/<change>.json``. The plan-level bookkeeping
+    file (``.opsx-plan/<plan>.state.json``) is a separate internal mechanism
+    for every adapter and is never presented as the per-change state file.
+    """
+    if cfg.get("adapter") == "dsh":
+        template = cfg.get("state_file") or ""
+        if template:
+            return repo / template.format(change=cid)
+    return worker_state_path(repo, cfg["name"], cid)
+
+
 def save_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -594,7 +612,7 @@ def save_worker_state(repo: Path, cfg: dict, state: dict, cid: str) -> None:
         "history": r["history"],
         "telemetry": r["telemetry"],
     }
-    save_json(worker_state_path(repo, cfg["name"], cid), payload)
+    save_json(per_change_state_path(repo, cfg, cid), payload)
 
 
 def persist_direct_state(repo: Path, cfg: dict, state: dict, cid: str) -> None:
@@ -605,6 +623,44 @@ def persist_direct_state(repo: Path, cfg: dict, state: dict, cid: str) -> None:
 def sync_direct_worker_state(repo: Path, cfg: dict, state: dict) -> None:
     for cid in cfg["order"]:
         save_worker_state(repo, cfg, state, cid)
+
+
+def validate_dsh_state_files(repo: Path, cfg: dict, state: dict) -> None:
+    """Fail closed when a dsh per-change state file is unusable on resume.
+
+    The dsh worker resumes from ``STATE_FILE`` — the authoritative
+    ``.opsx-controller/<change>.json``. A malformed JSON file, or one written
+    for a different change, would poison the resumed run, so the controller
+    stops with an actionable diagnostic before it regenerates the file.
+    Plan-level bookkeeping (``.opsx-plan/<plan>.state.json``) is untouched;
+    done changes are skipped because their per-change file is regenerated
+    bookkeeping, not a resume source.
+    """
+    if cfg.get("adapter") != "dsh":
+        return
+    for cid in cfg["order"]:
+        if not cfg["changes"][cid]["enabled"]:
+            continue
+        if state_mod.rec(state, cid)["phase"] == "done":
+            continue
+        path = per_change_state_path(repo, cfg, cid)
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise base.PlanError(
+                f"dsh per-change state file is not valid JSON: {path}\n"
+                f"Fix or remove the broken state file before resuming. "
+                f"(parse error: {exc})"
+            ) from exc
+        if not isinstance(payload, dict) or payload.get("change") != cid:
+            found = payload.get("change") if isinstance(payload, dict) else "<not an object>"
+            raise base.PlanError(
+                f"dsh per-change state file {path} belongs to a different "
+                f"change (expected {cid!r}, found {found!r}); "
+                "remove or replace it before resuming"
+            )
 
 
 def single_line(value: str) -> str:
@@ -643,7 +699,7 @@ def build_worker_input(repo: Path, cfg: dict, state: dict, cid: str, stage: str 
     lines = [
         f"CHANGE: {cid}",
         f"ROUND: {r['round']}",
-        f"STATE_FILE: {worker_state_path(repo, cfg['name'], cid)}",
+        f"STATE_FILE: {per_change_state_path(repo, cfg, cid)}",
         f"LATEST_FIX_PROMPT: {single_line(r['latest_fix_prompt'])}",
         f"TASK_COUNTS: {r['task_counts']['complete']}/{r['task_counts']['total']}",
         f"CONTEXT_CACHE_STATUS: {cache['status']}",
@@ -2238,6 +2294,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     state = state_mod.load_state(repo, cfg["name"])
     signal.signal(signal.SIGINT, handle_sigint)
 
+    validate_dsh_state_files(repo, cfg, state)
     reconcile(repo, cfg, state)
     state_mod.save_state(repo, cfg["name"], state)
     sync_direct_worker_state(repo, cfg, state)
@@ -2465,6 +2522,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     plan_src = planref.resolve_plan(repo, args.plan)
     cfg = planref.load_plan(planref._resolve_plan_path(repo, plan_src), repo=repo)
     state = state_mod.load_state(repo, cfg["name"])
+    validate_dsh_state_files(repo, cfg, state)
     reconcile(repo, cfg, state)
     state_mod.save_state(repo, cfg["name"], state)
     sync_direct_worker_state(repo, cfg, state)
@@ -2757,6 +2815,7 @@ def cmd_run_one(args: argparse.Namespace) -> int:
     )
     write_single_change_manifest(repo, change_id, cfg)
 
+    validate_dsh_state_files(repo, cfg, state)
     reconcile(repo, cfg, state)
     state_mod.save_state(repo, cfg["name"], state)
     sync_direct_worker_state(repo, cfg, state)

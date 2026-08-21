@@ -219,6 +219,9 @@ generated tool-correctly per client by the core profile (OpenSpec 1.7.0+):
 - **OpenCode:** `/opsx-propose`, `/opsx-apply`, `/opsx-archive`
 - **Claude Code:** `/opsx:propose`, `/opsx:apply`, `/opsx:archive`
 - **Codex CLI:** `$openspec-propose`, `$openspec-apply`, `$openspec-archive`
+- **dsh:** none — dsh has no slash commands or agent-selection flag; the
+  upstream per-change operations run via the OpenSpec CLI directly, or through
+  the plan loop.
 
 These operate on a single OpenSpec change — proposing requirements, applying
 implementation, archiving completed work.
@@ -230,7 +233,7 @@ opsx-controller provides plan-level orchestration commands:
 - **`opsx-plan`** — compile, run, report on multi-change plans. The CLI
   entrypoint, installed to `~/.local/bin/opsx-plan`.
 - **`opsx-run`** — manual single-change controller loop (OpenCode and Claude
-  Code only; not supported on Codex CLI).
+  Code only; not supported on Codex CLI or dsh).
 - **`opsx-watch-plan`** — live stage-log follower.
 
 ### Rule

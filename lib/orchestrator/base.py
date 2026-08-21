@@ -37,6 +37,7 @@ ADAPTER_CLIENTS = {
     "opencode": "opencode",
     "claude-code": "claude",
     "codex-cli": "codex",
+    "dsh": "dsh",
 }
 
 # Populated by the entrypoint's `_ensure_runtime_modules()` immediately after
@@ -82,6 +83,12 @@ ADAPTER_DEFAULTS = {
     },
     "codex-cli": {
         "state_file": ".opsx-controller/{change}.json",
+    },
+    "dsh": {
+        "state_file": ".opsx-controller/{change}.json",
+        "implement_invoke": "opsx-dsh-worker --role implementer",
+        "review_invoke": "opsx-dsh-worker --role reviewer",
+        "archive_invoke": "opsx-dsh-worker --role archiver",
     },
 }
 

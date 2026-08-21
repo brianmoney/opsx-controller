@@ -30,6 +30,7 @@ _SCRIPT = _REPO / "orchestrator" / "opsx-plan.py"
 _OPENCODE_INSTALLER = _REPO / "adapters" / "opencode" / "install.sh"
 _CLAUDE_INSTALLER = _REPO / "adapters" / "claude-code" / "install.sh"
 _CODEX_INSTALLER = _REPO / "adapters" / "codex-cli" / "install.sh"
+_DSH_INSTALLER = _REPO / "adapters" / "dsh" / "install.sh"
 
 
 def _model_env() -> dict[str, str]:
@@ -362,6 +363,158 @@ class AdapterInstallerTests(unittest.TestCase):
                          f"Codex CLI verify must succeed with reference deployed: {proc.stderr}")
         self.assertIn("plan-authoring reference deployed and matches source", proc.stdout)
 
+    # -- dsh adapter cases ------------------------------------------------
+
+    def test_dsh_global_install_deploys_runtime(self) -> None:
+        _run_installer(_DSH_INSTALLER, Path(self.home.name), self.env)
+        self._assert_executables_installed()
+        self._assert_runtime_libraries_installed()
+
+    def test_dsh_global_install_deploys_shim_and_role_files(self) -> None:
+        """The dsh global installer must deploy the worker shim to
+        ~/.local/bin and the three role instruction files plus support files
+        to the global dsh controller support directory."""
+        _run_installer(_DSH_INSTALLER, Path(self.home.name), self.env)
+
+        shim = self._bin_dir() / "opsx-dsh-worker"
+        self.assertTrue(shim.is_file(), f"dsh worker shim missing at {shim}")
+        self.assertTrue(os.access(str(shim), os.X_OK))
+
+        support = Path(self.home.name) / ".config" / "opsx-controller" / "dsh"
+        agents = support / "agents"
+        for role in ("implementer", "reviewer", "archiver"):
+            self.assertTrue(
+                (agents / f"opsx-{role}.md").is_file(),
+                f"role instruction file opsx-{role}.md missing from {agents}",
+            )
+        self.assertTrue((support / "README.md").is_file())
+        self.assertTrue((support / "plan-authoring.md").is_file())
+
+    def test_dsh_global_install_deploys_plan_authoring_reference(self) -> None:
+        _run_installer(_DSH_INSTALLER, Path(self.home.name), self.env)
+        self._assert_plan_authoring_reference_in_shared_lib()
+        self._assert_dsh_support_has_reference()
+
+    def _assert_dsh_support_has_reference(self) -> None:
+        ref = (
+            Path(self.home.name) / ".config" / "opsx-controller" / "dsh"
+            / "plan-authoring.md"
+        )
+        self.assertTrue(ref.is_file(),
+                        f"dsh plan-authoring reference missing at {ref}")
+        source = _REPO / "core" / "plan-authoring.md"
+        self.assertEqual(
+            hashlib.sha256(source.read_bytes()).digest(),
+            hashlib.sha256(ref.read_bytes()).digest(),
+        )
+
+    def test_dsh_global_output_mentions_reference(self) -> None:
+        proc = subprocess.run(
+            ["bash", str(_DSH_INSTALLER), "--global"],
+            cwd=_REPO,
+            env={**os.environ, **self.env},
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        output = proc.stdout + proc.stderr
+        self.assertIn("plan-authoring reference", output,
+                      "dsh installer output must mention the plan-authoring reference")
+
+    def test_dsh_verify_succeeds_with_reference(self) -> None:
+        _run_installer(_DSH_INSTALLER, Path(self.home.name), self.env)
+        proc = _run_installer_verify(_DSH_INSTALLER, Path(self.home.name), self.env)
+        self.assertEqual(proc.returncode, 0,
+                         f"dsh verify must succeed with reference deployed: {proc.stderr}")
+        self.assertIn("plan-authoring reference deployed and matches source", proc.stdout)
+
+    def test_dsh_global_output_mentions_shim(self) -> None:
+        proc = subprocess.run(
+            ["bash", str(_DSH_INSTALLER), "--global"],
+            cwd=_REPO,
+            env={**os.environ, **self.env},
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertIn("opsx-dsh-worker", proc.stdout + proc.stderr)
+
+    def test_dsh_installer_warns_on_node_without_typescript_type_stripping(self) -> None:
+        """A host whose node reports process.features.typescript falsy must be
+        warned (not failed) by the dsh installer."""
+        fake_node_dir = Path(self.home.name) / "fakenode"
+        fake_node_dir.mkdir(parents=True)
+        node_shim = fake_node_dir / "node"
+        node_shim.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "-e" ]; then\n'
+            "  exit 1\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        os.chmod(node_shim, 0o755)
+
+        env = {
+            **self.env,
+            "PATH": str(fake_node_dir) + ":" + os.environ.get("PATH", ""),
+        }
+        proc = subprocess.run(
+            ["bash", str(_DSH_INSTALLER), "--global"],
+            cwd=_REPO,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        output = proc.stdout + proc.stderr
+        self.assertIn("Warning", output)
+        self.assertIn("process.features.typescript", output)
+        self.assertIn("type-stripping", output)
+
+    def test_dsh_installer_stays_quiet_when_node_type_stripping_present(self) -> None:
+        """A host whose node reports process.features.typescript truthy must
+        not receive the type-stripping warning."""
+        fake_node_dir = Path(self.home.name) / "fakenode"
+        fake_node_dir.mkdir(parents=True)
+        node_shim = fake_node_dir / "node"
+        node_shim.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "-e" ]; then\n'
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        os.chmod(node_shim, 0o755)
+
+        env = {
+            **self.env,
+            "PATH": str(fake_node_dir) + ":" + os.environ.get("PATH", ""),
+        }
+        proc = subprocess.run(
+            ["bash", str(_DSH_INSTALLER), "--global"],
+            cwd=_REPO,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        output = proc.stdout + proc.stderr
+        self.assertNotIn("process.features.typescript", output)
+
+    def test_dsh_install_usage_error_without_mode(self) -> None:
+        """No mode must print a usage message and exit non-zero."""
+        proc = subprocess.run(
+            ["bash", str(_DSH_INSTALLER)],
+            cwd=_REPO,
+            env={**os.environ, **self.env},
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("Usage:", proc.stdout + proc.stderr)
+
     def test_repeat_install_replaces_stale_reference_opencode(self) -> None:
         """A modified reference must be replaced by the source on repeat install."""
         home = Path(self.home.name)
@@ -402,6 +555,22 @@ class AdapterInstallerTests(unittest.TestCase):
         (support_dir / "plan-authoring.md").write_text("stale content\n", encoding="utf-8")
 
         _run_installer(_CODEX_INSTALLER, home, self.env)
+
+        installed = support_dir / "plan-authoring.md"
+        source = _REPO / "core" / "plan-authoring.md"
+        self.assertEqual(
+            hashlib.sha256(source.read_bytes()).digest(),
+            hashlib.sha256(installed.read_bytes()).digest(),
+            "repeat install must replace stale plan-authoring reference",
+        )
+
+    def test_repeat_install_replaces_stale_reference_dsh(self) -> None:
+        home = Path(self.home.name)
+        support_dir = home / ".config" / "opsx-controller" / "dsh"
+        support_dir.mkdir(parents=True)
+        (support_dir / "plan-authoring.md").write_text("stale content\n", encoding="utf-8")
+
+        _run_installer(_DSH_INSTALLER, home, self.env)
 
         installed = support_dir / "plan-authoring.md"
         source = _REPO / "core" / "plan-authoring.md"
@@ -454,6 +623,16 @@ class AdapterInstallerTests(unittest.TestCase):
         proc = _run_installer_verify(_CODEX_INSTALLER, home, self.env)
         self.assertEqual(proc.returncode, 0,
                          f"Codex CLI verify must succeed after reinstall: {proc.stderr}")
+        self.assertIn("plan-authoring reference deployed and matches source", proc.stdout)
+
+    def test_verify_reports_stale_reference_divergence_dsh(self) -> None:
+        home = Path(self.home.name)
+        _run_installer(_DSH_INSTALLER, home, self.env)
+        support_dir = home / ".config" / "opsx-controller" / "dsh"
+        (support_dir / "plan-authoring.md").write_text("post-install corruption\n", encoding="utf-8")
+        proc = _run_installer_verify(_DSH_INSTALLER, home, self.env)
+        self.assertEqual(proc.returncode, 0,
+                         f"dsh verify must succeed after reinstall: {proc.stderr}")
         self.assertIn("plan-authoring reference deployed and matches source", proc.stdout)
 
     def test_opencode_install_removes_stale_legacy_commands(self) -> None:
@@ -677,6 +856,86 @@ class ProjectInstallerTests(unittest.TestCase):
         self.assertIn("plan-authoring reference", proc.stdout,
                       "Codex CLI project install output must mention the reference")
 
+    def test_dsh_project_deploys_reference_and_role_files(self) -> None:
+        proc = _run_installer_project(
+            _DSH_INSTALLER, Path(self.project.name), Path(self.home.name),
+            self.env,
+        )
+        support = (
+            Path(self.project.name) / ".opsx-controller" / "dsh"
+        )
+        ref = support / "plan-authoring.md"
+        self._assert_project_reference(ref)
+        self.assertIn("plan-authoring reference", proc.stdout,
+                      "dsh project install output must mention the reference")
+        agents = support / "agents"
+        for role in ("implementer", "reviewer", "archiver"):
+            self.assertTrue(
+                (agents / f"opsx-{role}.md").is_file(),
+                f"project role instruction file opsx-{role}.md missing from {agents}",
+            )
+
+    def test_dsh_project_install_shadows_global_role_files(self) -> None:
+        """A project install must make the installed shim resolve the
+        project-installed role files first when run from the project dir."""
+        _run_installer(_DSH_INSTALLER, Path(self.home.name), self.env)
+        _run_installer_project(
+            _DSH_INSTALLER, Path(self.project.name), Path(self.home.name),
+            self.env,
+        )
+
+        shim = Path(self.home.name) / ".local" / "bin" / "opsx-dsh-worker"
+        self.assertTrue(shim.is_file(), f"dsh worker shim missing at {shim}")
+
+        project_role = (
+            Path(self.project.name) / ".opsx-controller" / "dsh" / "agents"
+            / "opsx-implementer.md"
+        )
+        global_role = (
+            Path(self.home.name) / ".config" / "opsx-controller" / "dsh" / "agents"
+            / "opsx-implementer.md"
+        )
+        self.assertTrue(project_role.is_file(), "project role file missing")
+        self.assertTrue(global_role.is_file(), "global role file missing")
+
+        # Make the global copy stale so the two copies are distinguishable:
+        # the shim must compose from the project copy, not the stale global.
+        stale_marker = "STALE-GLOBAL-IMPLEMENTER-MARKER"
+        global_role.write_text(
+            f"stale global instructions {stale_marker}\n", encoding="utf-8"
+        )
+        project_content = project_role.read_text(encoding="utf-8")
+
+        capture = Path(self.project.name) / "dsh-argv-capture.txt"
+        fake = Path(self.project.name) / "fake-dsh"
+        fake.write_text(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"" + str(capture) + "\"\n",
+            encoding="utf-8",
+        )
+        os.chmod(fake, 0o755)
+
+        proc = subprocess.run(
+            [str(shim), "--role", "implementer", "CHANGE: add-example\nROUND: 1\n"],
+            cwd=Path(self.project.name),
+            env={
+                **os.environ,
+                **self.env,
+                "PATH": "/usr/bin:/bin:/usr/local/bin:" + os.environ.get("PATH", ""),
+                "DSH_BINARY": str(fake),
+            },
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, f"shim failed: {proc.stderr}")
+        self.assertTrue(capture.is_file(), "fake dsh never captured argv")
+        captured = capture.read_text(encoding="utf-8")
+        self.assertNotIn(
+            stale_marker,
+            captured,
+            "shim must resolve the project-installed role file first",
+        )
+        self.assertIn(project_content.strip(), captured)
+
     def test_codex_plugin_includes_reference(self) -> None:
         """Codex --plugin output must contain plan-authoring.md."""
         subprocess.run(
@@ -800,6 +1059,13 @@ class StaleInstallDetectionTests(unittest.TestCase):
         )
         self.assertTrue(ok, f"stale check failed after codex install: {msg}")
 
+    def test_stale_detection_after_dsh_install(self) -> None:
+        self._install_via(_DSH_INSTALLER)
+        ok, label, msg = self._call_stale_check(
+            self._load_opsx_plan(), self.home.name
+        )
+        self.assertTrue(ok, f"stale check failed after dsh install: {msg}")
+
     def test_detects_content_mismatch_after_opencode_install(self) -> None:
         """Modify the installed copy after OpenCode install and assert mismatch is detected."""
         self._install_via(_OPENCODE_INSTALLER)
@@ -834,6 +1100,18 @@ class StaleInstallDetectionTests(unittest.TestCase):
             self._load_opsx_plan(), self.home.name
         )
         self.assertFalse(ok, "stale check should detect content mismatch after codex install")
+        self.assertIn("stale", msg.lower())
+
+    def test_detects_content_mismatch_after_dsh_install(self) -> None:
+        """Modify the installed copy after dsh install and assert mismatch is detected."""
+        self._install_via(_DSH_INSTALLER)
+        installed = Path(self.home.name) / ".local" / "bin" / "opsx-plan"
+        # Corrupt the installed copy
+        installed.write_bytes(b"corrupted content")
+        ok, label, msg = self._call_stale_check(
+            self._load_opsx_plan(), self.home.name
+        )
+        self.assertFalse(ok, "stale check should detect content mismatch after dsh install")
         self.assertIn("stale", msg.lower())
 
     def _installed_orchestrator_pkg(self) -> Path:

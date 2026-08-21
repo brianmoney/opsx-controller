@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""opsx-dsh-worker: the dsh adapter's single translation point.
+
+The orchestrator's direct-stage dispatch runs `opsx-dsh-worker --role
+<stage> <input>` with the worker input block as the final positional
+argument. This shim composes the installed role instruction file with that
+input block into one prompt and execs dsh, replacing its own process image
+so the controller's timeout / process-group signal handling applies directly
+to the dsh process.
+
+The shim is deliberately the only place that knows dsh's CLI. Binary
+resolution, the model-to-patch mapping, the controlled runtime environment,
+and prompt composition all live here; the orchestrator only gained registry
+entries.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+
+# Pinned npx fallback. dsh is developer preview with explicit
+# breaking-change warnings; the pin is the insulation. Before moving this
+# pin, re-validate the CLI, `--profile headless` shape, and the flat
+# entry-override `--patch` contract against the pinned release.
+PINNED_DSH_PACKAGE = "@deepseek-ai/dsh@0.1.0-rc.7"
+
+# Built-in provider map applied to the model provider before writing a patch.
+# dsh upstream hosts the deepseek provider under this id; operators can
+# override or extend the map with OPSX_DSH_PROVIDER_MAP (JSON object).
+BUILTIN_PROVIDER_MAP = {"deepseek": "deepseek-official"}
+
+# Control-environment defaults. An operator-set value is never overridden.
+DEFAULT_PERMISSION_MODE = "workspace-write"
+DEFAULT_TOOLS_MODE = "code"
+DEFAULT_TELEMETRY_DISABLED = "1"
+
+# Default DSH_HOME when neither DSH_HOME nor OPSX_DSH_HOME is set.
+DEFAULT_DSH_HOME_REL = ".local/state/opsx-controller/dsh"
+
+# Stable startup AGENTS.md written into DSH_HOME only when absent. dsh reads
+# AGENTS.md from cwd/DSH_HOME natively; role specialization travels in the
+# composed prompt, not in per-role startup files (upstream merge behavior is
+# preview-unstable).
+STARTUP_AGENTS_MD = """\
+# opsx-controller dsh runtime
+
+This AGENTS.md is the stable startup file written by the opsx-controller
+dsh shim into DSH_HOME. dsh loads it alongside any project AGENTS.md found
+in the working directory. The role instructions for the active phase are
+carried in the invocation prompt by `opsx-dsh-worker`; do not add per-role
+startup variants here.
+"""
+
+ROLES = ("implementer", "reviewer", "archiver")
+
+SUPPORT_DIR_GLOBAL = Path("~/.config/opsx-controller/dsh").expanduser()
+SUPPORT_DIR_PROJECT_REL = Path(".opsx-controller/dsh")
+
+
+class DshWorkerError(Exception):
+    """Fail-closed diagnostic from the shim."""
+
+
+def role_env_var(role: str) -> str:
+    """Return the OPSX_*_MODEL environment variable for *role*."""
+    return f"OPSX_{role.upper()}_MODEL"
+
+
+def resolve_binary() -> list[str]:
+    """Resolve the dsh command argv prefix in fixed order.
+
+    ``$DSH_BINARY`` (a path or a name resolved on PATH) wins, then a ``dsh``
+    on PATH, then the pinned npx fallback. Returns the executable plus any
+    leading argv (e.g. ``["npx", "--yes", PINNED_DSH_PACKAGE]``). Fails
+    closed naming all three sources when none resolves.
+    """
+    explicit = os.environ.get("DSH_BINARY", "").strip()
+    if explicit:
+        if os.path.dirname(explicit):
+            if not os.path.isfile(explicit) or not os.access(explicit, os.X_OK):
+                raise DshWorkerError(
+                    f"DSH_BINARY names a non-executable path: {explicit}"
+                )
+            return [explicit]
+        resolved = shutil.which(explicit)
+        if resolved is None:
+            raise DshWorkerError(
+                f"DSH_BINARY names a command not found on PATH: {explicit}"
+            )
+        return [resolved]
+
+    on_path = shutil.which("dsh")
+    if on_path is not None:
+        return [on_path]
+
+    npx = shutil.which("npx")
+    if npx is not None:
+        return [npx, "--yes", PINNED_DSH_PACKAGE]
+
+    raise DshWorkerError(
+        "no dsh executable resolved: checked DSH_BINARY, dsh on PATH, "
+        f"and the pinned npx fallback ({PINNED_DSH_PACKAGE}); "
+        "install dsh or npx, or set DSH_BINARY"
+    )
+
+
+def resolve_role_instruction(role: str) -> Path:
+    """Locate the role instruction file project-first, global-second.
+
+    The project controller support directory is resolved relative to the
+    spawn cwd (always the repository root for direct dispatch). Fails closed
+    naming the missing role file when neither location has it.
+    """
+    rel = Path("agents") / f"opsx-{role}.md"
+    project_candidates = [
+        Path.cwd() / SUPPORT_DIR_PROJECT_REL / rel,
+        SUPPORT_DIR_GLOBAL / rel,
+    ]
+    for candidate in project_candidates:
+        if candidate.is_file():
+            return candidate
+    raise DshWorkerError(
+        f"role instruction file for '{role}' not found; checked "
+        f"{project_candidates[0]} and {project_candidates[1]}; "
+        "run `bash adapters/dsh/install.sh --global` or "
+        "`bash adapters/dsh/install.sh --project <repo>`"
+    )
+
+
+def resolve_dsh_home() -> Path:
+    """Resolve DSH_HOME with precedence: ambient DSH_HOME, OPSX_DSH_HOME,
+    then a default under the user's state directory."""
+    value = os.environ.get("DSH_HOME", "").strip()
+    if not value:
+        value = os.environ.get("OPSX_DSH_HOME", "").strip()
+    if not value:
+        value = str(Path.home() / DEFAULT_DSH_HOME_REL)
+    return Path(value).expanduser()
+
+
+def mapped_provider(provider: str) -> str:
+    """Map *provider* through the built-in map plus the JSON overlay.
+
+    The OPSX_DSH_PROVIDER_MAP environment variable, when set, must be a JSON
+    object mapping provider ids; its entries override the built-in map.
+    """
+    provider_map = dict(BUILTIN_PROVIDER_MAP)
+    overlay_raw = os.environ.get("OPSX_DSH_PROVIDER_MAP", "").strip()
+    if overlay_raw:
+        try:
+            overlay = json.loads(overlay_raw)
+        except json.JSONDecodeError as exc:
+            raise DshWorkerError(
+                f"OPSX_DSH_PROVIDER_MAP is not valid JSON: {exc}"
+            ) from exc
+        if not isinstance(overlay, dict):
+            raise DshWorkerError(
+                "OPSX_DSH_PROVIDER_MAP must be a JSON object of provider "
+                "id to provider id"
+            )
+        provider_map.update({str(k): str(v) for k, v in overlay.items()})
+    return provider_map.get(provider, provider)
+
+
+def write_model_patch(dsh_home: Path, role: str) -> Path | None:
+    """Write a flat entry-override YAML patch for OPSX_<ROLE>_MODEL.
+
+    Returns the patch path, or ``None`` when no model is configured (dsh's
+    shipped default then applies and no ``--patch`` is emitted). Never
+    writes secrets: the patch carries only the mapped provider and model id.
+    """
+    model_value = os.environ.get(role_env_var(role), "").strip()
+    if not model_value:
+        return None
+
+    if "/" in model_value:
+        provider, model = model_value.split("/", 1)
+        provider = provider.strip()
+        model = model.strip()
+    else:
+        provider = ""
+        model = model_value.strip()
+    if not model:
+        raise DshWorkerError(
+            f"{role_env_var(role)} is not a valid provider/model value: "
+            f"{model_value!r}"
+        )
+
+    provider = mapped_provider(provider) if provider else provider
+
+    patches_dir = dsh_home / "patches"
+    patches_dir.mkdir(parents=True, exist_ok=True)
+    patch_path = patches_dir / f"opsx-{role}-model-{os.getpid()}.yml"
+    # Flat entry-override shape validated against upstream dsh in the
+    # knowledge-forge integration; richer patch formats re-expose upstream
+    # patch finickiness.
+    if provider:
+        patch_path.write_text(
+            f"agent-default-model:\n  {provider}: {model}\n",
+            encoding="utf-8",
+        )
+    else:
+        patch_path.write_text(
+            f"agent-default-model: {model}\n",
+            encoding="utf-8",
+        )
+    return patch_path
+
+
+def ensure_startup_agents(dsh_home: Path) -> None:
+    """Write the stable startup AGENTS.md into DSH_HOME only when absent."""
+    dsh_home.mkdir(parents=True, exist_ok=True)
+    agents_path = dsh_home / "AGENTS.md"
+    if not agents_path.is_file():
+        agents_path.write_text(STARTUP_AGENTS_MD, encoding="utf-8")
+
+
+def controlled_env(dsh_home: Path) -> dict[str, str]:
+    """Build the exec environment: operator values preserved, defaults
+    applied only for unset variables."""
+    env = os.environ.copy()
+    env["DSH_HOME"] = str(dsh_home)
+    env.setdefault("DSH_PERMISSION_MODE", DEFAULT_PERMISSION_MODE)
+    env.setdefault("DSH_TOOLS_MODE", DEFAULT_TOOLS_MODE)
+    env.setdefault("DSH_TELEMETRY_DISABLED", DEFAULT_TELEMETRY_DISABLED)
+    return env
+
+
+def compose_prompt(role: str, input_block: str) -> str:
+    """Compose the role instructions plus the worker input block into the
+    single positional prompt dsh receives."""
+    instruction_path = resolve_role_instruction(role)
+    instruction = instruction_path.read_text(encoding="utf-8")
+    return f"{instruction}\n\n## Worker input block\n\n{input_block}\n"
+
+
+def build_argv(prompt: str, patch_path: Path | None) -> list[str]:
+    """Build the full dsh argv: ``dsh --profile headless [--patch …] <prompt>``.
+
+    Kept separate from ``main`` so tests exercise argv construction without
+    ever execing.
+    """
+    argv = resolve_binary() + ["--profile", "headless"]
+    if patch_path is not None:
+        argv += ["--patch", str(patch_path)]
+    argv.append(prompt)
+    return argv
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="opsx-dsh-worker",
+        description="Translate an opsx-controller stage invocation into a "
+        "headless dsh run.",
+    )
+    parser.add_argument(
+        "--role",
+        required=True,
+        choices=ROLES,
+        help="controller phase role (implementer, reviewer, or archiver)",
+    )
+    parser.add_argument(
+        "input_block",
+        help="the controller worker input block, as the final positional "
+        "argument",
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        dsh_home = resolve_dsh_home()
+        ensure_startup_agents(dsh_home)
+        patch_path = write_model_patch(dsh_home, args.role)
+        prompt = compose_prompt(args.role, args.input_block)
+        dsh_argv = build_argv(prompt, patch_path)
+        env = controlled_env(dsh_home)
+    except DshWorkerError as exc:
+        print(f"opsx-dsh-worker: {exc}", file=sys.stderr)
+        return 1
+
+    # Exec replaces this process; the controller's timeout and signal
+    # handling then apply directly to dsh.
+    os.execvpe(dsh_argv[0], dsh_argv, env)
+    # Unreachable unless execvpe fails.
+    print(
+        f"opsx-dsh-worker: exec failed for {dsh_argv[0]}",
+        file=sys.stderr,
+    )
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

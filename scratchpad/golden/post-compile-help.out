@@ -1,5 +1,6 @@
 usage: opsx-plan compile [-h] [-o OUTPUT] [--force]
-                         [--adapter {opencode,claude-code,codex-cli}]
+                         [--adapter {opencode,claude-code,codex-cli,dsh}]
+                         [--timeout-minutes TIMEOUT_MINUTES]
                          source
 
 positional arguments:
@@ -7,9 +8,10 @@ positional arguments:
 
 options:
   -h, --help            show this help message and exit
-  -o OUTPUT, --output OUTPUT
-                        output TOML path (default: openspec/plans/<source-
+  -o, --output OUTPUT   output TOML path (default: openspec/plans/<source-
                         stem>.toml)
   --force               overwrite existing output
-  --adapter {opencode,claude-code,codex-cli}
+  --adapter {opencode,claude-code,codex-cli,dsh}
                         adapter to compile against (default: opencode)
+  --timeout-minutes TIMEOUT_MINUTES
+                        compile client timeout in minutes (default: 10.0)

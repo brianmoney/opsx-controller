@@ -130,12 +130,12 @@ Requires Python 3.11+ (the orchestrator uses `tomllib`), git, the
 coding client. There is nothing to pip install — the orchestrator is
 stdlib-only.
 
-> **OpenCode and Claude Code can compile plans; all three adapters install the
+> **OpenCode and Claude Code can compile plans; all four adapters install the
 > orchestrator to `~/.local/bin/`.**  `opsx-plan compile` supports `--adapter
 > opencode` (the default) and `--adapter claude-code`.  Every adapter's global
 > installer deploys `opsx-plan` and `opsx-run` to `~/.local/bin/` via a shared
 > installer helper.  `opsx-run` is supported on OpenCode and Claude Code only;
-> Codex CLI has no default stage invokes and cannot drive
+> Codex CLI and dsh have no default stage invokes and cannot drive
 > single-change `opsx-run` without a hand-written plan manifest.
 > See [docs/adapters.md](docs/adapters.md#choosing-an-adapter).
 
@@ -155,7 +155,7 @@ resolves.
 **2. Install the adapter for your coding client.**
 
 ```bash
-bash adapters/opencode/install.sh --global      # or claude-code, or codex-cli
+bash adapters/opencode/install.sh --global      # or claude-code, codex-cli, or dsh
 ```
 
 Use `--project /path/to/repo` instead of `--global` to install into a single
@@ -199,7 +199,7 @@ already-authored change, skip the plan manifest entirely with
 |---|---|
 | [Operator Workflow](docs/opsx-plan-operator-workflow.md) | The full operator loop: activation, `doctor`, budgets, manual gates, logs, notifications, branch/PR delivery |
 | [Plan-Authoring Reference](core/plan-authoring.md) | How to write compilable markdown implementation plans for `opsx-plan compile` |
-| [Adapter Reference](docs/adapters.md) | Per-client install and packaging for OpenCode, Claude Code, and Codex CLI |
+| [Adapter Reference](docs/adapters.md) | Per-client install and packaging for OpenCode, Claude Code, Codex CLI, and dsh |
 | [Orchestrator Reference](orchestrator/README.md) | Manifest schema, execution model, retry policy, adapter invocation |
 | [Model Efficiency Workflow](core/model-efficiency-workflow.md) | Benchmarking model choices with telemetry, reports, and dashboards |
 | [Controller Contract](core/controller-contract.md) | Lifecycle, phase order, stop conditions |
@@ -212,7 +212,7 @@ already-authored change, skip the plan manifest entirely with
 - `orchestrator/`: `opsx-plan` deterministic plan-level orchestrator
 - `docs/`: operator workflow, adapter reference, and benchmarking guides
 - `adapters/`: per-client commands, agents, installers, and templates for
-  `opencode`, `claude-code`, and `codex-cli`
+  `opencode`, `claude-code`, `codex-cli`, and `dsh`
 - `plugins/opsx-controller/`: Claude Code plugin package for `--plugin-dir` and
   marketplace packaging
 - `skills/`: Vercel `npx skill` packages — `opsx-controller` (discovery and

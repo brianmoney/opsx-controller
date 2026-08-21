@@ -52,6 +52,10 @@ COMPILE_CLIENTS: dict[str, dict] = {
         "executable": "codex",
         "supported": False,
     },
+    "dsh": {
+        "executable": "dsh",
+        "supported": False,
+    },
 }
 
 
