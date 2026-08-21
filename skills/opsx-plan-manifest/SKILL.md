@@ -49,8 +49,10 @@ draft and run every step below against it.
 ### 1. Read the schema from source, not from examples
 
 The authoritative key list is `load_plan()` in
-`<controller>/orchestrator/opsx-plan.py`. The same file has
-`build_schema_guidance()`, which emits the key tables as markdown.
+`<controller>/lib/orchestrator/planref.py` (before the runtime split it was
+`orchestrator/opsx-plan.py`). `build_schema_guidance()` — which emits the key
+tables as markdown and is what `compile` feeds to the model — lives in
+`<controller>/lib/orchestrator/compiler.py`.
 
 This matters because the loader reads an explicit allowlist and **silently drops
 every other key**. Example manifests and previously compiled plans in the wild

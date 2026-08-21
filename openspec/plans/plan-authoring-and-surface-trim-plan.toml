@@ -2,7 +2,6 @@
 name = "plan-authoring-and-surface-trim"
 adapter = "opencode"
 timeout_minutes = 90
-max_attempts = 2
 max_rounds = 5
 no_progress_limit = 2
 require_clean_tracked = true

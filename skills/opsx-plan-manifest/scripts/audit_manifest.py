@@ -59,7 +59,11 @@ DECORATIVE_CHANGE_KEYS = {
 
 
 def find_controller(explicit: str | None) -> Path:
-    """Locate orchestrator/opsx-plan.py, which is the schema's source of truth."""
+    """Locate the opsx-controller checkout, which is the schema's source of truth.
+
+    Returns the checkout root. ``--controller`` accepts either the checkout
+    directory or the ``orchestrator/opsx-plan.py`` entrypoint directly.
+    """
     candidates = []
     if explicit:
         candidates.append(Path(explicit))
@@ -67,14 +71,16 @@ def find_controller(explicit: str | None) -> Path:
     if env:
         candidates.append(Path(env))
     candidates.append(Path.home() / "opsx-controller")
+    candidates.append(Path.cwd())
 
     for base in candidates:
         base = base.expanduser()
-        direct = base if base.name == "opsx-plan.py" else base / "orchestrator" / "opsx-plan.py"
-        if direct.is_file():
-            return direct
+        if base.name == "opsx-plan.py":
+            base = base.parent.parent
+        if (base / "orchestrator" / "opsx-plan.py").is_file():
+            return base
     raise SystemExit(
-        "error: could not find orchestrator/opsx-plan.py. Pass --controller "
+        "error: could not find the opsx-controller checkout. Pass --controller "
         "or set KF_OPSX_CONTROLLER."
     )
 
@@ -94,18 +100,33 @@ def _function_source(source: str, name: str) -> str:
     return rest[: end.start()] if end else rest
 
 
-def known_keys(controller_py: Path) -> tuple[set[str], set[str], set[str]]:
+def known_keys(controller: Path) -> tuple[set[str], set[str], set[str], Path]:
     """Extract the key allowlists the loader actually reads.
 
     Derived from source rather than hardcoded so this tracks whatever controller
     version is installed instead of drifting from it.
+
+    The loader lives in ``lib/orchestrator/planref.py`` since the runtime
+    split; fall back to ``orchestrator/opsx-plan.py`` for older checkouts.
     """
-    source = controller_py.read_text(encoding="utf-8")
+    loader_py = None
+    for rel in ("lib/orchestrator/planref.py", "orchestrator/opsx-plan.py"):
+        cand = controller / rel
+        if cand.is_file():
+            loader_py = cand
+            break
+    if loader_py is None:
+        raise SystemExit(
+            f"error: could not locate the plan loader under {controller} "
+            "(expected lib/orchestrator/planref.py or orchestrator/opsx-plan.py)"
+        )
+
+    source = loader_py.read_text(encoding="utf-8")
     load_plan = _function_source(source, "load_plan")
     git_delivery = _function_source(source, "_parse_git_delivery_config")
 
     if not load_plan:
-        raise SystemExit(f"error: could not locate load_plan() in {controller_py}")
+        raise SystemExit(f"error: could not locate load_plan() in {loader_py}")
 
     plan_keys = set(re.findall(r'plan\.get\(\s*["\'](\w+)["\']', load_plan))
     change_keys = set(re.findall(r'c\.get\(\s*["\'](\w+)["\']', load_plan))
@@ -113,7 +134,7 @@ def known_keys(controller_py: Path) -> tuple[set[str], set[str], set[str]]:
 
     # `git_delivery` is consumed as a nested table, not a scalar plan key.
     plan_keys.add("git_delivery")
-    return plan_keys, change_keys, delivery_keys
+    return plan_keys, change_keys, delivery_keys, loader_py
 
 
 def classify_change(repo: Path, cid: str) -> str:
@@ -149,8 +170,8 @@ def main() -> int:
         print(f"error: {manifest_path} is not valid TOML: {exc}", file=sys.stderr)
         return 2
 
-    controller_py = find_controller(args.controller)
-    plan_keys, change_keys, delivery_keys = known_keys(controller_py)
+    controller_root = find_controller(args.controller)
+    plan_keys, change_keys, delivery_keys, loader_py = known_keys(controller_root)
 
     findings: list[str] = []
     decorative: list[str] = []
@@ -222,7 +243,7 @@ def main() -> int:
         return 1
 
     print(f"audit: clean -- {label}")
-    print(f"  schema source: {controller_py}")
+    print(f"  schema source: {loader_py}")
     print(f"  {len(changes)} change(s), all reconciled against openspec/")
     print_decorative()
     return 0

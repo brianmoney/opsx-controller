@@ -17,16 +17,17 @@ controller looks newer, re-derive rather than trusting this file — see
 
 ## Re-deriving from source
 
-Two places in `<controller>/orchestrator/opsx-plan.py` are authoritative:
+Two places in `<controller>/` are authoritative:
 
-- `load_plan()` — builds the config with one explicit `.get()` per key it
-  reads. Anything not looked up here is ignored.
-- `build_schema_guidance()` — emits the key tables as markdown, and is what
-  `compile` feeds to the model.
+- `lib/orchestrator/planref.py` → `load_plan()` — builds the config with one
+  explicit `.get()` per key it reads. Anything not looked up here is ignored.
+  (Before the runtime split it lived in `orchestrator/opsx-plan.py`.)
+- `lib/orchestrator/compiler.py` → `build_schema_guidance()` — emits the key
+  tables as markdown, and is what `compile` feeds to the model.
 
 ```bash
 # The keys the loader actually reads
-sed -n '/^def load_plan/,/^def /p' $KF_OPSX_CONTROLLER/orchestrator/opsx-plan.py \
+sed -n '/^def load_plan/,/^def /p' $KF_OPSX_CONTROLLER/lib/orchestrator/planref.py \
   | grep -oE '(plan|c)\.get\(\s*"[a-z_]+"'
 ```
 
