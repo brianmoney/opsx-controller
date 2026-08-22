@@ -619,6 +619,21 @@ counts and model identity came from, in deterministic precedence order:
 A record with no usable source anywhere in the chain reports usage as
 unavailable rather than guessing.
 
+Each telemetry record's `model.attribution` field says whether its model
+identity was observed at runtime or only configured:
+
+- `"observed"` — extracted from worker output, a result envelope, stage log
+  metadata, an `--model`/`--agent` in the worker invocation, or the OpenCode
+  sidecar.
+- `"configured"` — supplied only by the dsh configuration fallback: dsh
+  invokes carry no model flag, so the resolved role model is attributed as
+  configured rather than pretending it was observed.
+- `null` — no model identity was available anywhere in the chain.
+
+The dsh adapter exposes no usage through headless output, so dsh telemetry
+records have unavailable usage and unresolved cost until a session-usage
+integration lands; do not treat their cost columns as measured spend.
+
 ### Dashboard
 
 ```bash

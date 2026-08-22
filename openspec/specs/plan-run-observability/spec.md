@@ -92,16 +92,27 @@ Telemetry records SHALL include a `model` object with the following fields:
 - `provider` (string or null): The API provider name (e.g. `"openai"`, `"anthropic"`, `"google"`). SHALL be `null` when the provider cannot be determined.
 - `model_id` (string or null): The canonical model identifier used in API calls (e.g. `"gpt-4o"`). SHALL be `null` when the model cannot be determined.
 - `model_alias` (string or null): The operator-configured alias for this model, if the agent configuration uses an alias instead of a raw model id. SHALL be `null` when no alias is configured or when the actual model is unknown.
+- `attribution` (string or null): SHALL be `"observed"` when identity is extracted from worker output, a result envelope, stage log metadata, or another runtime source; SHALL be `"configured"` when identity is supplied only by adapter configuration fallback; SHALL be `null` when no model identity is available.
 
-All three fields SHALL be `null` when model identity cannot be extracted from the worker invocation or output.
+Model identity extraction SHALL preserve the existing source precedence. A
+configured fallback MUST NOT be represented as observed runtime identity.
+
+All identity fields except `attribution` SHALL be `null` when model identity
+cannot be extracted from the worker invocation, output, or adapter
+configuration. `attribution` SHALL also be `null` in that case.
 
 #### Scenario: Model identity extracted from worker output
 - **WHEN** the worker output or configuration reveals the provider and model
-- **THEN** the telemetry record populates `model.provider` and `model.model_id`
+- **THEN** the telemetry record populates `model.provider` and `model.model_id` and sets `model.attribution` to `"observed"`
+
+#### Scenario: Model identity supplied by dsh configuration fallback
+
+- **WHEN** a dsh stage exposes no runtime model identity and telemetry falls back to the resolved role model from configuration
+- **THEN** the telemetry record populates the configured provider and model and sets `model.attribution` to `"configured"`
 
 #### Scenario: Model identity unavailable
 - **WHEN** the worker invocation provides no model identity information
-- **THEN** `model.provider`, `model.model_id`, and `model_alias` are all `null`
+- **THEN** `model.provider`, `model.model_id`, `model.model_alias`, and `model.attribution` are all `null`
 
 ### Requirement: Telemetry records capture parsed worker result summary
 

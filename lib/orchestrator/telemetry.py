@@ -70,6 +70,7 @@ def build_telemetry_record(
             "provider": None,
             "model_id": None,
             "model_alias": None,
+            "attribution": None,
         },
         "result": {
             "log_path": log_path,
@@ -778,6 +779,7 @@ def extract_usage_and_model(
         "provider": None,
         "model_id": None,
         "model_alias": None,
+        "attribution": None,
     }
 
     worker_usage_found = False
@@ -800,6 +802,8 @@ def extract_usage_and_model(
             if wm[key] is not None:
                 model[key] = wm[key]
                 worker_model_found = True
+        if worker_model_found:
+            model["attribution"] = "observed"
 
     # 2. Claude Code result envelope ---------------------------------------
     envelope_usage_found = False
@@ -822,6 +826,8 @@ def extract_usage_and_model(
                 if env_model[key] is not None:
                     model[key] = env_model[key]
                     envelope_model_found = True
+            if envelope_model_found:
+                model["attribution"] = "observed"
 
     # 3. Log fallback ------------------------------------------------------
     log_usage_found = False
@@ -839,9 +845,12 @@ def extract_usage_and_model(
 
         if not worker_model_found and not envelope_model_found:
             log_model = _scan_log_for_model(log_path)
+            log_model_found = any(v is not None for v in log_model.values())
             for key in ("provider", "model_id", "model_alias"):
                 if model[key] is None and log_model[key] is not None:
                     model[key] = log_model[key]
+            if log_model_found:
+                model["attribution"] = "observed"
 
     # 4. OpenCode plugin sidecar fallback ----------------------------------
     # Always consult the sidecar for model identity when no higher source
@@ -867,9 +876,13 @@ def extract_usage_and_model(
 
         # Sidecar model identity supplements only when no higher source
         if not worker_model_found and not envelope_model_found:
+            sidecar_model_found = False
             for key in ("provider", "model_id", "model_alias"):
                 if model[key] is None and sidecar_model[key] is not None:
                     model[key] = sidecar_model[key]
+                    sidecar_model_found = True
+            if sidecar_model_found:
+                model["attribution"] = "observed"
 
     return usage, model
 
@@ -964,17 +977,26 @@ def _record_stage_telemetry(
         if model["provider"] is None and model["model_id"] is None:
             expanded_invoke = _best_effort_expand_invoke(cfg[f"{stage}_invoke"])
             invocation_model = _extract_invocation_model(expanded_invoke, cfg["adapter"], repo)
+            invocation_filled = False
             for key in ("provider", "model_id", "model_alias"):
                 if model[key] is None and invocation_model[key] is not None:
                     model[key] = invocation_model[key]
+                    invocation_filled = True
+            if invocation_filled and model["attribution"] is None:
+                model["attribution"] = "observed"
             if model["provider"] is None and model["model_id"] is None:
                 # dsh carries no --model/--agent in the invoke; attribute
                 # from the resolved role model instead of leaving the stage
-                # unattributed.
+                # unattributed. This is configuration fallback, never
+                # observed runtime identity.
                 role_model = _resolved_role_model(cfg, stage)
+                role_filled = False
                 for key in ("provider", "model_id", "model_alias"):
                     if model[key] is None and role_model[key] is not None:
                         model[key] = role_model[key]
+                        role_filled = True
+                if role_filled and model["attribution"] is None:
+                    model["attribution"] = "configured"
         record["usage"].update(usage)
         record["model"].update(model)
     except Exception:

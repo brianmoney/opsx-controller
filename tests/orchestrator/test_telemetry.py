@@ -2013,6 +2013,7 @@ class DirectStageUsageExtractionTests(unittest.TestCase):
         self.assertEqual(model["provider"], "openai")
         self.assertEqual(model["model_id"], "gpt-5.5")
         self.assertEqual(model["model_alias"], "primary")
+        self.assertEqual(model["attribution"], "observed")
 
     def test_worker_json_model_top_level_alternate_keys(self) -> None:
         payload = {
@@ -2050,6 +2051,7 @@ class DirectStageUsageExtractionTests(unittest.TestCase):
         _, model = telemetry_mod.extract_usage_and_model(payload, log_path)
         self.assertEqual(model["provider"], "openai")
         self.assertEqual(model["model_id"], "gpt-5.5")
+        self.assertEqual(model["attribution"], "observed")
 
     # -- 4.6 Worker JSON takes precedence over log -------------------------
 
@@ -2716,6 +2718,84 @@ class DirectStageUsageExtractionTests(unittest.TestCase):
         self._assert_usage_unavailable(usage)
 
 
+class TelemetryModelAttributionTests(unittest.TestCase):
+    """model.attribution distinguishes runtime-observed identity from the
+    configured dsh fallback, and stays null when no identity is available."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.log_dir = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _write_log(self, *lines: str) -> Path:
+        p = self.log_dir / f"attrib-{hash(lines)}.log"
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return p
+
+    def test_worker_json_observed_attribution(self) -> None:
+        payload = {"status": "implemented", "change": "ex",
+                   "model": {"provider": "openai", "model_id": "gpt-5.5"}}
+        _, model = telemetry_mod.extract_usage_and_model(payload, None)
+        self.assertEqual(model["attribution"], "observed")
+
+    def test_log_metadata_observed_attribution(self) -> None:
+        log_path = self._write_log('{"provider": "openai", "model_id": "gpt-5.5"}')
+        _, model = telemetry_mod.extract_usage_and_model(
+            {"status": "implemented", "change": "ex"}, log_path
+        )
+        self.assertEqual(model["attribution"], "observed")
+
+    def test_sidecar_observed_attribution(self) -> None:
+        sidecar_path = self._write_sidecar_attrib(
+            {"provider": "openai", "model_id": "gpt-4o"}
+        )
+        _, model = telemetry_mod.extract_usage_and_model(
+            {"status": "implemented", "change": "ex"}, None,
+            sidecar_path=sidecar_path,
+            plan_name="test-plan", run_id="run-001", change_id="ex",
+            stage="implement", round_num=1, is_normal_completion=True,
+        )
+        self.assertEqual(model["attribution"], "observed")
+
+    def test_unavailable_identity_has_null_attribution(self) -> None:
+        _, model = telemetry_mod.extract_usage_and_model(
+            {"status": "implemented", "change": "ex"}, None
+        )
+        self.assertIsNone(model["provider"])
+        self.assertIsNone(model["model_id"])
+        self.assertIsNone(model["attribution"])
+
+    def test_worker_observed_beats_configured_fallback(self) -> None:
+        """Observed identity from any source is never relabeled configured
+        by a later fallback in _record_stage_telemetry."""
+        payload = {
+            "status": "implemented", "change": "ex",
+            "model": {"provider": "openai", "model_id": "gpt-5.5"},
+        }
+        _, model = telemetry_mod.extract_usage_and_model(payload, None)
+        self.assertEqual(model["attribution"], "observed")
+
+    def _write_sidecar_attrib(self, model: dict) -> Path:
+        sidecar = self.log_dir / f"attrib-sidecar-{hash(str(model))}.jsonl"
+        sidecar.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "event_type": "final",
+                    "emitted_at": "2026-07-01T10:00:05Z",
+                    "model": model,
+                    "plan_name": "test-plan", "run_id": "run-001",
+                    "change_id": "ex", "stage": "implement", "round": 1,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return sidecar
+
+
 class DshTelemetryModelAttributionTests(unittest.TestCase):
     """dsh stage invokes carry no ``--model``/``--agent`` flag, so telemetry
     must attribute the resolved role model from ``cfg["models"]``."""
@@ -2793,6 +2873,7 @@ class DshTelemetryModelAttributionTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["model"]["provider"], "deepseek")
         self.assertEqual(records[0]["model"]["model_id"], "deepseek-chat")
+        self.assertEqual(records[0]["model"]["attribution"], "configured")
 
     def test_record_stage_telemetry_unresolved_dsh_model_stays_null(self) -> None:
         cfg = self._cfg()
@@ -2820,6 +2901,68 @@ class DshTelemetryModelAttributionTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertIsNone(records[0]["model"]["provider"])
         self.assertIsNone(records[0]["model"]["model_id"])
+        self.assertIsNone(records[0]["model"]["attribution"])
+
+    def test_record_stage_telemetry_observed_when_worker_output_has_model(self) -> None:
+        """A dsh stage whose worker output reveals model identity is
+        attributed observed, never configured."""
+        cfg = self._cfg()
+        state = {"plan": self.plan_name, "approvals": [], "changes": {}}
+        payload = {
+            "status": "implemented", "change": self.cid,
+            "model": {"provider": "deepseek", "model_id": "deepseek-chat"},
+        }
+        log_path = self.repo / ".opsx-plan" / "logs" / f"{self.cid}.implement.r1.1.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text('{"status": "implemented"}\n', encoding="utf-8")
+
+        telemetry_mod._record_stage_telemetry(
+            self.repo, cfg, state, self.cid, "implement", 1,
+            "2026-08-21T10:00:00", "2026-08-21T10:00:01", 1000,
+            "completed", None, payload, log_path,
+        )
+
+        jsonl = (
+            self.repo / ".opsx-plan" / "telemetry" / f"{self.plan_name}.jsonl"
+        )
+        records = [
+            json.loads(line)
+            for line in jsonl.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(records[0]["model"]["provider"], "deepseek")
+        self.assertEqual(records[0]["model"]["model_id"], "deepseek-chat")
+        self.assertEqual(records[0]["model"]["attribution"], "observed")
+
+    def test_record_stage_telemetry_invocation_model_is_observed(self) -> None:
+        """An explicit --model in the worker invocation is attribution
+        observed; only the resolved dsh role model is configured."""
+        cfg = self._cfg()
+        cfg["adapter"] = "opencode"
+        cfg["implement_invoke"] = 'opencode run --model "acme/acme-model"'
+        state = {"plan": self.plan_name, "approvals": [], "changes": {}}
+        payload = {"status": "implemented", "change": self.cid}
+        log_path = self.repo / ".opsx-plan" / "logs" / f"{self.cid}.implement.r1.1.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text('{"status": "implemented"}\n', encoding="utf-8")
+
+        telemetry_mod._record_stage_telemetry(
+            self.repo, cfg, state, self.cid, "implement", 1,
+            "2026-08-21T10:00:00", "2026-08-21T10:00:01", 1000,
+            "completed", None, payload, log_path,
+        )
+
+        jsonl = (
+            self.repo / ".opsx-plan" / "telemetry" / f"{self.plan_name}.jsonl"
+        )
+        records = [
+            json.loads(line)
+            for line in jsonl.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(records[0]["model"]["provider"], "acme")
+        self.assertEqual(records[0]["model"]["model_id"], "acme-model")
+        self.assertEqual(records[0]["model"]["attribution"], "observed")
 
 
 class ClaudeResultEnvelopeUsagePrecedenceTests(unittest.TestCase):
