@@ -417,7 +417,7 @@ The `doctor` command SHALL check that every model role resolves for the target a
 
 The `doctor` command SHALL check that each resolved model identifier is valid for the target adapter's identifier syntax, and SHALL fail when a resolved identifier is provider-prefixed for the `claude-code` adapter or lacks a `provider/` prefix for the `opencode` adapter.
 
-The `doctor` command SHALL check that `openspec` and the configured adapter client executable are available on `PATH`.
+The `doctor` command SHALL check that the configured adapter client executable is available on `PATH`, and that the `openspec` CLI is available either repo-locally (`<repo>/node_modules/.bin/openspec`) or, failing that, on `PATH`. `openspec` resolution SHALL prefer the repo-local install over the global one.
 
 The `doctor` command SHALL check that the tracked worktree contains no tracked `__pycache__` directories or tracked `.pyc` files.
 
@@ -450,8 +450,18 @@ The `doctor` command SHALL check that the tracked tree is clean.
 
 #### Scenario: Doctor detects missing CLI dependencies
 
-- **WHEN** `openspec` or the configured adapter client is not available on `PATH`
-- **THEN** `opsx-plan doctor` reports the missing executable name and exits non-zero
+- **WHEN** `openspec` is unavailable both repo-locally and on `PATH`, or the configured adapter client is not available on `PATH`
+- **THEN** `opsx-plan doctor` reports the missing executable name, tells the operator to initialize OpenSpec (e.g. `npx openspec@latest init`), and exits non-zero
+
+#### Scenario: Doctor prefers a repo-local openspec install
+
+- **WHEN** the repository has `node_modules/.bin/openspec` and `openspec` is also on `PATH`
+- **THEN** `opsx-plan doctor` resolves the repo-local binary for the `openspec` check
+
+#### Scenario: Doctor accepts a repo-local openspec when global is absent
+
+- **WHEN** the repository has `node_modules/.bin/openspec` and no `openspec` is on `PATH`
+- **THEN** `opsx-plan doctor` reports the `openspec` check as passing
 
 #### Scenario: Doctor detects tracked bytecode artifacts
 

@@ -238,9 +238,9 @@ def sweep_stale_patches(dsh_home: Path) -> None:
         return
     cutoff = time.time() - STALE_PATCH_AGE_SECONDS
     for candidate in candidates:
-        if not candidate.is_file() or not _is_shim_owned_patch(candidate.name):
-            continue
         try:
+            if not candidate.is_file() or not _is_shim_owned_patch(candidate.name):
+                continue
             if candidate.stat().st_mtime < cutoff:
                 candidate.unlink()
         except OSError:

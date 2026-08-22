@@ -129,8 +129,9 @@ class BinaryResolutionTests(ShimTestCase):
 
 class RoleInstructionTests(ShimTestCase):
     def test_missing_role_file_fails_closed_naming_it(self) -> None:
+        missing_global = Path(self.tmp.name) / "missing-global"
         with mock.patch.object(Path, "cwd", return_value=Path(self.tmp.name)), \
-             mock.patch.object(self.shim, "SUPPORT_DIR_GLOBAL", Path(self.tmp.name) / "no-global"):
+             mock.patch.object(self.shim, "SUPPORT_DIR_GLOBAL", missing_global):
             with self.assertRaises(self.shim.DshWorkerError) as ctx:
                 self.shim.resolve_role_instruction("reviewer")
         self.assertIn("reviewer", str(ctx.exception))
@@ -580,8 +581,9 @@ class MainExecTests(ShimTestCase):
         self.assertEqual(exec_env["DSH_PERMISSION_MODE"], "workspace-write")
 
     def test_main_returns_nonzero_and_diagnostic_on_missing_role_file(self) -> None:
+        missing_global = Path(self.tmp.name) / "missing-global"
         with mock.patch.object(Path, "cwd", return_value=Path(self.tmp.name)), \
-             mock.patch.object(self.shim, "SUPPORT_DIR_GLOBAL", Path(self.tmp.name) / "no-global"), \
+             mock.patch.object(self.shim, "SUPPORT_DIR_GLOBAL", missing_global), \
              mock.patch("os.execvpe") as m_exec, \
              mock.patch("sys.stderr", new_callable=io.StringIO) as err:
             rc = self.shim.main(["--role", "archiver", "CHANGE: x\n"])

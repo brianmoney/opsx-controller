@@ -161,7 +161,7 @@ opsx-plan doctor --adapter claude-code
 | Installed orchestrator matches repo copy | SHA-256 comparison of `~/.local/bin/opsx-plan` against `orchestrator/opsx-plan.py` |
 | Model roles resolve for the target adapter | All four roles (`controller`, `implementer`, `reviewer`, `archiver`) resolve for the resolved plan's adapter via `models.toml`/ambient environment; reports each resolved model with its source. When no plan is active, `--adapter` selects the adapter to resolve against (defaults to `opencode`). |
 | Resolved model identifiers match adapter syntax | Flags a provider-prefixed identifier under `claude-code` or a bare identifier under `opencode`, before it fails at dispatch |
-| `openspec` on PATH | OpenSpec CLI is installed and reachable |
+| `openspec` available (repo or global) | OpenSpec CLI resolves repo-locally first (`<repo>/node_modules/.bin/openspec`), falling back to a global install on `PATH` |
 | OpenSpec initialized in repo | The repo has a durable `openspec/config.yaml` (written by `openspec init`) **and** `openspec list --json` resolves a healthy root from the repo directory. Direct-dispatch workers read their per-project phase prompts from files `openspec init` writes, so an uninitialized repo ships workers that fail mid-run; the check fails closed with the exact `openspec init` command and the installed CLI version. |
 | Adapter client on PATH | e.g. `opencode`, `claude`, or `codex`. When `--adapter` is set without a plan, validates the specified adapter's client. |
 | No tracked bytecode | No `__pycache__/` or `.pyc` files tracked in git |
@@ -936,7 +936,7 @@ opsx-plan doctor
 #       reviewer     github-copilot/gpt-5.4      [user-global config (~/.config/opsx-controller/models.toml)]
 #       archiver     github-copilot/gpt-5.4      [user-global config (~/.config/opsx-controller/models.toml)]
 #   ✓ Resolved model identifiers match adapter syntax
-#   ✓ openspec on PATH
+#   ✓ openspec available (repo or global)
 #   ✓ opencode on PATH
 #   ✓ No tracked __pycache__ or .pyc files
 #   ✗ Tracked tree is clean
