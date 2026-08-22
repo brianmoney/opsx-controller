@@ -281,10 +281,10 @@ Model override via generated patch:
 Reasoning variants:
 
 - `OPSX_<ROLE>_VARIANT` (set by the orchestrator from the resolved
-  `<role>_variant`) passes `off`, `low`, `high`, and `max` through
-  unchanged; `none` and `disabled` alias to `off`, and `xhigh` aliases to
-  `max`. An unknown non-empty label prints a role/value diagnostic and is
-  dropped so dsh's default effort applies.
+  `<role>_variant`) uses canonical `low`, `medium`, `high`, and `max` labels;
+  dsh maps them to `off`, `low`, `high`, and `max` respectively. An unknown
+  non-empty label prints a role/value diagnostic and is dropped so dsh's
+  default effort applies.
 - dsh accepts the effort only through the `agent-default-model` settings
   section of `$DSH_HOME/settings.yaml` (not the patch config), so the shim
   merges the resolved variant into exactly that key, preserving every other

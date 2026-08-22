@@ -317,9 +317,11 @@ orchestrator exports `OPSX_*_MODEL` and `OPSX_*_VARIANT` per role, the shim
 maps the provider (`deepseek` → `deepseek-official`, plus the
 `OPSX_DSH_PROVIDER_MAP` overlay), writes a top-level-array `--patch` override
 (`agent-default-model` with a `config:` of provider and model; shape validated
-against dsh `0.1.1-rc.2`), and merges the resolved reasoning variant into the
-`agent-default-model.reasoningEffort` settings key of `$DSH_HOME/settings.yaml`
-so dsh honors it. With no configured model the shim emits no `--patch` and
+against dsh `0.1.1-rc.2`), and maps the canonical reasoning variant to dsh's
+effort vocabulary (`low` → `off`, `medium` → `low`, `high` → `high`, `max` →
+`max`) in the `agent-default-model.reasoningEffort` settings key of
+`$DSH_HOME/settings.yaml` so dsh honors it. With no configured model the shim
+emits no `--patch` and
 dsh's shipped default applies; a provider-less model value fails closed. For
 the dsh adapter the per-change v3 state file the worker reads via `STATE_FILE`
 lives at `.opsx-controller/<change>.json`; the `.opsx-plan/` files remain
