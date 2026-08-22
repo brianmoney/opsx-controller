@@ -39,15 +39,15 @@ PINNED_DSH_PACKAGE = "@deepseek-ai/dsh@0.1.0-rc.7"
 # whenever PINNED_DSH_PACKAGE moves.
 BUILTIN_PROVIDER_MAP = {"deepseek": "deepseek-official"}
 
-# Reasoning-effort values the DeepSeek provider accepts unchanged (validated
-# against dsh 0.1.1-rc.2's dsh-llm-deepseek). Conservative aliases reduce to
-# them; an unknown non-empty label warns and is omitted so dsh's default
-# effort applies.
-SUPPORTED_VARIANTS = ("off", "low", "high", "max")
-VARIANT_ALIASES = {
-    "none": "off",
-    "disabled": "off",
-    "xhigh": "max",
+# Canonical controller effort labels are translated to the dsh values
+# accepted by dsh 0.1.1-rc.2's dsh-llm-deepseek. An unknown non-empty label
+# warns and is omitted so dsh's default effort applies.
+CANONICAL_VARIANTS = ("low", "medium", "high", "max")
+DSH_VARIANT_MAP = {
+    "low": "off",
+    "medium": "low",
+    "high": "high",
+    "max": "max",
 }
 
 # How long a generated shim-owned patch may linger before the sweep deletes
@@ -100,22 +100,22 @@ def role_variant_env_var(role: str) -> str:
 def resolve_variant(role: str) -> str:
     """Resolve the role's reasoning-effort variant for dsh.
 
-    Returns the validated dsh effort value, or ``""`` when the role has no
-    variant (dsh's default effort then applies). Supported values pass
-    through unchanged; conservative aliases are mapped; an unknown non-empty
-    label prints a role/value diagnostic and is dropped rather than silently
-    claimed as an effort dsh would not honor.
+    Returns the dsh effort value, or ``""`` when the role has no canonical
+    variant (dsh's default effort then applies). Canonical controller labels
+    are translated through the dsh map; an unknown non-empty label prints a
+    role/value diagnostic and is dropped rather than silently claimed as an
+    effort dsh would not honor.
     """
     raw = os.environ.get(role_variant_env_var(role), "").strip()
     if not raw:
         return ""
-    value = VARIANT_ALIASES.get(raw, raw)
-    if value in SUPPORTED_VARIANTS:
+    value = DSH_VARIANT_MAP.get(raw)
+    if value is not None:
         return value
     print(
         f"opsx-dsh-worker: {role_variant_env_var(role)}={raw!r} is not a "
         f"supported dsh reasoning effort; ignoring it so dsh's default "
-        f"applies (supported: {', '.join(SUPPORTED_VARIANTS)})",
+        f"applies (supported: {', '.join(CANONICAL_VARIANTS)})",
         file=sys.stderr,
     )
     return ""

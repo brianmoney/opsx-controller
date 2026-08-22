@@ -110,11 +110,11 @@ other secret values into patch files or prompts.
 ### Requirement: Reasoning variants
 
 When `OPSX_<ROLE>_VARIANT` is set for the dispatched role, the shim SHALL
-resolve it to a dsh reasoning effort: the supported values `off`, `low`,
-`high`, and `max` pass through unchanged, the conservative aliases `none` and
-`disabled` map to `off`, and `xhigh` maps to `max`. An unknown non-empty label
-SHALL print a role/value diagnostic and be omitted so dsh's default effort
-applies. An empty or unset variant SHALL be omitted.
+resolve the canonical controller effort to a dsh reasoning effort: `low` maps
+to `off`, `medium` maps to `low`, `high` maps to `high`, and `max` maps to
+`max`. An unknown non-empty label SHALL print a role/value diagnostic and be
+omitted so dsh's default effort applies. An empty or unset variant SHALL be
+omitted.
 
 Because the validated dsh release accepts the effort only through the
 `agent-default-model` settings section of `$DSH_HOME/settings.yaml`, the shim
@@ -128,10 +128,15 @@ does not leak.
 - **WHEN** the implementer role dispatches with `OPSX_IMPLEMENTER_VARIANT=high`
 - **THEN** the shim sets `agent-default-model.reasoningEffort: high` in `$DSH_HOME/settings.yaml` and preserves unrelated settings
 
-#### Scenario: Alias reduces to a supported effort
+#### Scenario: Canonical medium maps to dsh low
 
-- **WHEN** the reviewer role dispatches with `OPSX_REVIEWER_VARIANT=xhigh`
-- **THEN** the shim sets `agent-default-model.reasoningEffort: max`
+- **WHEN** the reviewer role dispatches with `OPSX_REVIEWER_VARIANT=medium`
+- **THEN** the shim sets `agent-default-model.reasoningEffort: low`
+
+#### Scenario: Canonical low maps to dsh off
+
+- **WHEN** the implementer role dispatches with `OPSX_IMPLEMENTER_VARIANT=low`
+- **THEN** the shim sets `agent-default-model.reasoningEffort: off`
 
 #### Scenario: Unknown variant is dropped
 

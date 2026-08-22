@@ -252,16 +252,16 @@ class VariantResolutionTests(ShimTestCase):
             os.environ, {f"OPSX_{role.upper()}_VARIANT": value}, clear=False
         )
 
-    def test_supported_values_pass_through(self) -> None:
-        for value in ("off", "low", "high", "max"):
+    def test_canonical_values_map_to_dsh_efforts(self) -> None:
+        cases = {
+            "low": "off",
+            "medium": "low",
+            "high": "high",
+            "max": "max",
+        }
+        for value, expected in cases.items():
             with self._variant_env("implementer", value):
-                self.assertEqual(self.shim.resolve_variant("implementer"), value)
-
-    def test_aliases_map_to_supported_efforts(self) -> None:
-        cases = {"none": "off", "disabled": "off", "xhigh": "max"}
-        for raw, expected in cases.items():
-            with self._variant_env("reviewer", raw):
-                self.assertEqual(self.shim.resolve_variant("reviewer"), expected)
+                self.assertEqual(self.shim.resolve_variant("implementer"), expected)
 
     def test_empty_variant_returns_empty(self) -> None:
         with self._variant_env("implementer", ""):
@@ -362,7 +362,7 @@ class VariantSettingsTests(ShimTestCase):
             encoding="utf-8",
         )
         with mock.patch.dict(
-            os.environ, {"OPSX_IMPLEMENTER_VARIANT": "off"}, clear=False
+            os.environ, {"OPSX_IMPLEMENTER_VARIANT": "low"}, clear=False
         ):
             self.shim.apply_variant_settings(Path(self.tmp.name) / "state", "implementer")
         content = settings.read_text(encoding="utf-8")
