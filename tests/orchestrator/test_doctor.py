@@ -5,6 +5,7 @@ import ast
 import importlib.util
 import inspect
 import io
+import json
 import os
 import subprocess
 import tempfile
@@ -354,6 +355,78 @@ class DoctorPreflightTests(unittest.TestCase):
 
         self.assertTrue(passed, f"unexpected failure: {remediation}")
 
+    def test_check_openspec_initialized_fails_when_config_missing(self) -> None:
+        """A repo without openspec/config.yaml must fail the check with an
+        openspec init hint."""
+        with mock.patch("shutil.which", return_value="/usr/bin/openspec"), \
+             mock.patch.object(doctor_mod, "_installed_openspec_version", return_value="1.9.0"):
+            passed, label, remediation = doctor_mod._check_openspec_initialized(self.repo)
+
+        self.assertFalse(passed)
+        self.assertIn("openspec init", remediation)
+        self.assertIn("1.9.0", remediation)
+
+    def test_check_openspec_initialized_passes_when_healthy_root(self) -> None:
+        """A repo with openspec/config.yaml and a resolvable root passes."""
+        (self.repo / "openspec" / "config.yaml").parent.mkdir(parents=True)
+        (self.repo / "openspec" / "config.yaml").write_text("schema: spec-driven\n", encoding="utf-8")
+        payload = json.dumps({
+            "changes": [],
+            "root": {"path": str(self.repo), "source": "nearest"},
+            "status": [],
+        })
+        with mock.patch("shutil.which", return_value="/usr/bin/openspec"), \
+             mock.patch.object(doctor_mod, "_installed_openspec_version", return_value="1.9.0"), \
+             mock.patch.object(doctor_mod.subprocess, "run",
+                               return_value=mock.Mock(returncode=0, stdout=payload, stderr="")):
+            passed, label, remediation = doctor_mod._check_openspec_initialized(self.repo)
+
+        self.assertTrue(passed, f"unexpected failure: {remediation}")
+
+    def test_check_openspec_initialized_fails_when_root_unresolvable(self) -> None:
+        """Even with config present, an unresolvable root must fail."""
+        (self.repo / "openspec" / "config.yaml").parent.mkdir(parents=True)
+        (self.repo / "openspec" / "config.yaml").write_text("schema: spec-driven\n", encoding="utf-8")
+        payload = json.dumps({
+            "changes": [],
+            "root": None,
+            "status": [{"severity": "error", "code": "no_openspec_root",
+                        "message": "No OpenSpec root found from the current directory.",
+                        "target": "openspec.root",
+                        "fix": "Run openspec init to create a root here."}],
+        })
+        with mock.patch("shutil.which", return_value="/usr/bin/openspec"), \
+             mock.patch.object(doctor_mod, "_installed_openspec_version", return_value="1.9.0"), \
+             mock.patch.object(doctor_mod.subprocess, "run",
+                               return_value=mock.Mock(returncode=0, stdout=payload, stderr="")):
+            passed, label, remediation = doctor_mod._check_openspec_initialized(self.repo)
+
+        self.assertFalse(passed)
+        self.assertIn("openspec init", remediation)
+        self.assertIn("No OpenSpec root", remediation)
+
+    def test_check_openspec_initialized_fails_when_openspec_missing(self) -> None:
+        """When openspec is not on PATH the check must fail with a hint."""
+        with mock.patch("shutil.which", return_value=None):
+            passed, label, remediation = doctor_mod._check_openspec_initialized(self.repo)
+
+        self.assertFalse(passed)
+        self.assertIn("openspec init", remediation)
+
+    def test_installed_openspec_version_parses(self) -> None:
+        """The version parser extracts X.Y.Z from --version output."""
+        res = mock.Mock(returncode=0, stdout="1.9.0\n", stderr="")
+        with mock.patch("shutil.which", return_value="/usr/bin/openspec"), \
+             mock.patch.object(doctor_mod.subprocess, "run", return_value=res):
+            self.assertEqual(doctor_mod._installed_openspec_version(), "1.9.0")
+
+    def test_installed_openspec_version_none_on_failure(self) -> None:
+        """A non-zero --version probe yields None."""
+        res = mock.Mock(returncode=1, stdout="", stderr="boom")
+        with mock.patch("shutil.which", return_value="/usr/bin/openspec"), \
+             mock.patch.object(doctor_mod.subprocess, "run", return_value=res):
+            self.assertIsNone(doctor_mod._installed_openspec_version())
+
     def test_check_adapter_client_on_path_fails_when_client_missing(self) -> None:
         """When the adapter client executable is not on PATH, the check must
         fail with an install hint."""
@@ -509,6 +582,75 @@ class DoctorPreflightTests(unittest.TestCase):
             )
             rc = self.opsx_plan.cmd_run(args)
         self.assertTrue(preflight_called, "run_preflight_warnings was not called")
+
+    def test_cmd_run_blocks_on_uninitialized_openspec(self) -> None:
+        """An uninitialized OpenSpec repo must fail the run before dispatch."""
+        plan_path = self._write_plan_toml(name="openspec-gate-plan")
+        plan_src = str(plan_path.relative_to(self.repo))
+
+        # No openspec/config.yaml exists in the temp repo.
+        with mock.patch.object(
+            self.opsx_plan.doctor, "_check_openspec_initialized",
+            return_value=(False, "OpenSpec initialized in repo", "openspec init hint"),
+        ):
+            args = argparse.Namespace(
+                repo=str(self.repo),
+                plan=plan_src,
+                dry_run=False,
+                only=None,
+                max_changes=0,
+                budget_minutes=0,
+                budget_usd=0,
+                create_only=False,
+                no_branch=False,
+                no_pr=False,
+                skip_warning=False,
+                skip_suggestion=False,
+                skip_openspec=False,
+            )
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                rc = self.opsx_plan.cmd_run(args)
+        self.assertEqual(rc, 2)
+        self.assertIn("openspec init", stderr.getvalue())
+
+    def test_cmd_run_skips_gate_with_skip_openspec(self) -> None:
+        """--skip-openspec bypasses the fail-closed gate."""
+        plan_path = self._write_plan_toml(name="openspec-skip-plan")
+        plan_src = str(plan_path.relative_to(self.repo))
+
+        gate_called: list[bool] = []
+
+        def fake_gate(repo):
+            gate_called.append(True)
+            return (False, "OpenSpec initialized in repo", "openspec init hint")
+
+        def fake_preflight(repo, plan_src_, adapter, cfg=None):
+            return None
+
+        with mock.patch.object(
+            self.opsx_plan.doctor, "_check_openspec_initialized", side_effect=fake_gate
+        ), mock.patch.object(
+            self.opsx_plan, "run_preflight_warnings", side_effect=fake_preflight
+        ):
+            args = argparse.Namespace(
+                repo=str(self.repo),
+                plan=plan_src,
+                dry_run=False,
+                only=None,
+                max_changes=0,
+                budget_minutes=0,
+                budget_usd=0,
+                create_only=False,
+                no_branch=False,
+                no_pr=False,
+                skip_warning=False,
+                skip_suggestion=False,
+                skip_openspec=True,
+            )
+            rc = self.opsx_plan.cmd_run(args)
+        self.assertFalse(gate_called, "gate should be skipped with --skip-openspec")
+        self.assertIsNotNone(rc)
 
     # -- doctor --adapter tests --
 
