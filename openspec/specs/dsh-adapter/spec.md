@@ -75,9 +75,13 @@ before the pin is moved.
 When `OPSX_<ROLE>_MODEL` is set for the dispatched role, the shim SHALL split
 the value into provider and model, map the provider through the built-in
 mapping (`deepseek` → `deepseek-official`) overlaid by the
-`OPSX_DSH_PROVIDER_MAP` JSON environment variable when set, and write a flat
-entry-override patch file containing an `agent-default-model` entry under
-`$DSH_HOME/patches/`. The shim SHALL pass that file via `--patch`.
+`OPSX_DSH_PROVIDER_MAP` JSON environment variable when set, and write a
+top-level-array loader patch under `$DSH_HOME/patches/` that overrides the
+`agent-default-model` plugin with a `config` map carrying the mapped provider
+and model. The shim SHALL pass that file via `--patch`. The patch shape SHALL
+be validated against the pinned dsh release; a provider-less
+`OPSX_<ROLE>_MODEL` SHALL fail closed with a diagnostic because the validated
+release requires a provider in the plugin config.
 
 When `OPSX_<ROLE>_MODEL` is unset the shim SHALL pass no `--patch` and dsh's
 shipped default model applies. The shim SHALL NOT write API keys, tokens, or
@@ -86,7 +90,12 @@ other secret values into patch files or prompts.
 #### Scenario: Configured model produces a patch
 
 - **WHEN** the reviewer role dispatches with `OPSX_REVIEWER_MODEL=deepseek/deepseek-chat`
-- **THEN** dsh is launched with `--patch` pointing at a flat YAML file overriding `agent-default-model` for the mapped provider and model
+- **THEN** dsh is launched with `--patch` pointing at a top-level-array YAML file whose `agent-default-model` entry carries `config` with the mapped provider and model
+
+#### Scenario: Provider-less model fails closed
+
+- **WHEN** a role dispatches with `OPSX_<ROLE>_MODEL` carrying no provider prefix
+- **THEN** the shim exits non-zero with a diagnostic naming the role variable and the provider requirement, and does not launch dsh
 
 #### Scenario: No configured model uses the dsh default
 
@@ -97,6 +106,55 @@ other secret values into patch files or prompts.
 
 - **WHEN** `OPSX_DSH_PROVIDER_MAP` maps `deepseek` to a custom provider id and the model is `deepseek/deepseek-chat`
 - **THEN** the generated patch names the custom provider id
+
+### Requirement: Reasoning variants
+
+When `OPSX_<ROLE>_VARIANT` is set for the dispatched role, the shim SHALL
+resolve it to a dsh reasoning effort: the supported values `off`, `low`,
+`high`, and `max` pass through unchanged, the conservative aliases `none` and
+`disabled` map to `off`, and `xhigh` maps to `max`. An unknown non-empty label
+SHALL print a role/value diagnostic and be omitted so dsh's default effort
+applies. An empty or unset variant SHALL be omitted.
+
+Because the validated dsh release accepts the effort only through the
+`agent-default-model` settings section of `$DSH_HOME/settings.yaml`, the shim
+SHALL merge the resolved variant into exactly the `reasoningEffort` key of that
+section, preserving every other key and section byte-for-byte, and SHALL
+remove that key when the resolved variant is empty so a prior stage's effort
+does not leak.
+
+#### Scenario: Supported variant passes through
+
+- **WHEN** the implementer role dispatches with `OPSX_IMPLEMENTER_VARIANT=high`
+- **THEN** the shim sets `agent-default-model.reasoningEffort: high` in `$DSH_HOME/settings.yaml` and preserves unrelated settings
+
+#### Scenario: Alias reduces to a supported effort
+
+- **WHEN** the reviewer role dispatches with `OPSX_REVIEWER_VARIANT=xhigh`
+- **THEN** the shim sets `agent-default-model.reasoningEffort: max`
+
+#### Scenario: Unknown variant is dropped
+
+- **WHEN** a role dispatches with an unsupported `OPSX_<ROLE>_VARIANT` label
+- **THEN** the shim prints a role/value diagnostic and leaves dsh's default effort in place
+
+### Requirement: Generated patch accumulation is bounded
+
+Before writing a new model patch the shim SHALL unlink shim-owned patch files
+under `$DSH_HOME/patches/` matching its `opsx-*-model-*.yml` convention whose
+modification time is older than one hour. The sweep SHALL be best effort: fresh
+shim-owned files and operator-owned files remain intact, and individual
+filesystem failures are ignored.
+
+#### Scenario: Stale shim patch is reclaimed
+
+- **WHEN** a shim-owned patch older than one hour exists and a new model patch is written
+- **THEN** the stale file is removed and a fresh patch for the current role remains
+
+#### Scenario: Fresh and foreign files are preserved
+
+- **WHEN** the patches directory contains fresh shim-owned patches and unrelated operator files
+- **THEN** only stale shim-owned patches are removed
 
 ### Requirement: Controlled dsh runtime environment
 

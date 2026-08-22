@@ -21,18 +21,39 @@ import json
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 # Pinned npx fallback. dsh is developer preview with explicit
-# breaking-change warnings; the pin is the insulation. Before moving this
-# pin, re-validate the CLI, `--profile headless` shape, and the flat
-# entry-override `--patch` contract against the pinned release.
+# breaking-change warnings; the pin is the insulation. The top-level array
+# patch shape and the `reasoningEffort` settings path below were validated
+# against installed dsh 0.1.1-rc.2 on 2026-08-22 (see the change design
+# notes). Before moving this pin, re-validate the CLI, `--profile headless`
+# shape, and the `--patch` overlay contract against the pinned release.
 PINNED_DSH_PACKAGE = "@deepseek-ai/dsh@0.1.0-rc.7"
 
 # Built-in provider map applied to the model provider before writing a patch.
 # dsh upstream hosts the deepseek provider under this id; operators can
-# override or extend the map with OPSX_DSH_PROVIDER_MAP (JSON object).
+# override or extend the map with OPSX_DSH_PROVIDER_MAP (JSON object). The
+# map is dsh-version-sensitive: re-validate it against the pinned release
+# whenever PINNED_DSH_PACKAGE moves.
 BUILTIN_PROVIDER_MAP = {"deepseek": "deepseek-official"}
+
+# Reasoning-effort values the DeepSeek provider accepts unchanged (validated
+# against dsh 0.1.1-rc.2's dsh-llm-deepseek). Conservative aliases reduce to
+# them; an unknown non-empty label warns and is omitted so dsh's default
+# effort applies.
+SUPPORTED_VARIANTS = ("off", "low", "high", "max")
+VARIANT_ALIASES = {
+    "none": "off",
+    "disabled": "off",
+    "xhigh": "max",
+}
+
+# How long a generated shim-owned patch may linger before the sweep deletes
+# it. Abandoned files from an interrupted run are reclaimed after this age;
+# fresh and operator-owned files are never touched.
+STALE_PATCH_AGE_SECONDS = 3600
 
 # Control-environment defaults. An operator-set value is never overridden.
 DEFAULT_PERMISSION_MODE = "workspace-write"
@@ -69,6 +90,35 @@ class DshWorkerError(Exception):
 def role_env_var(role: str) -> str:
     """Return the OPSX_*_MODEL environment variable for *role*."""
     return f"OPSX_{role.upper()}_MODEL"
+
+
+def role_variant_env_var(role: str) -> str:
+    """Return the OPSX_*_VARIANT environment variable for *role*."""
+    return f"OPSX_{role.upper()}_VARIANT"
+
+
+def resolve_variant(role: str) -> str:
+    """Resolve the role's reasoning-effort variant for dsh.
+
+    Returns the validated dsh effort value, or ``""`` when the role has no
+    variant (dsh's default effort then applies). Supported values pass
+    through unchanged; conservative aliases are mapped; an unknown non-empty
+    label prints a role/value diagnostic and is dropped rather than silently
+    claimed as an effort dsh would not honor.
+    """
+    raw = os.environ.get(role_variant_env_var(role), "").strip()
+    if not raw:
+        return ""
+    value = VARIANT_ALIASES.get(raw, raw)
+    if value in SUPPORTED_VARIANTS:
+        return value
+    print(
+        f"opsx-dsh-worker: {role_variant_env_var(role)}={raw!r} is not a "
+        f"supported dsh reasoning effort; ignoring it so dsh's default "
+        f"applies (supported: {', '.join(SUPPORTED_VARIANTS)})",
+        file=sys.stderr,
+    )
+    return ""
 
 
 def resolve_binary() -> list[str]:
@@ -167,12 +217,46 @@ def mapped_provider(provider: str) -> str:
     return provider_map.get(provider, provider)
 
 
+def _is_shim_owned_patch(name: str) -> bool:
+    """True when *name* matches the shim's generated patch convention."""
+    return name.startswith("opsx-") and "-model-" in name and name.endswith(".yml")
+
+
+def sweep_stale_patches(dsh_home: Path) -> None:
+    """Best-effort unlink of shim-owned model patches older than one hour.
+
+    Only files matching the shim's ``opsx-*-model-*.yml`` convention with a
+    modification time older than ``STALE_PATCH_AGE_SECONDS`` are removed.
+    Fresh patches and operator-owned files are preserved. Individual
+    filesystem failures are ignored so a locked or missing file never blocks
+    dispatch.
+    """
+    patches_dir = dsh_home / "patches"
+    try:
+        candidates = list(patches_dir.iterdir())
+    except OSError:
+        return
+    cutoff = time.time() - STALE_PATCH_AGE_SECONDS
+    for candidate in candidates:
+        if not candidate.is_file() or not _is_shim_owned_patch(candidate.name):
+            continue
+        try:
+            if candidate.stat().st_mtime < cutoff:
+                candidate.unlink()
+        except OSError:
+            continue
+
+
 def write_model_patch(dsh_home: Path, role: str) -> Path | None:
-    """Write a flat entry-override YAML patch for OPSX_<ROLE>_MODEL.
+    """Write a top-level-array YAML patch for OPSX_<ROLE>_MODEL.
 
     Returns the patch path, or ``None`` when no model is configured (dsh's
-    shipped default then applies and no ``--patch`` is emitted). Never
-    writes secrets: the patch carries only the mapped provider and model id.
+    shipped default then applies and no ``--patch`` is emitted). The emitted
+    shape is the loader patch-list entry validated against dsh 0.1.1-rc.2:
+    an ``agent-default-model`` entry carrying a ``config`` map of the mapped
+    provider and model id. The plugin's Config schema requires ``provider``,
+    so a provider-less ``OPSX_<ROLE>_MODEL`` value fails closed. Never writes
+    secrets: the patch carries only the mapped provider and model id.
     """
     model_value = os.environ.get(role_env_var(role), "").strip()
     if not model_value:
@@ -195,21 +279,153 @@ def write_model_patch(dsh_home: Path, role: str) -> Path | None:
 
     patches_dir = dsh_home / "patches"
     patches_dir.mkdir(parents=True, exist_ok=True)
+    # Reclaim shim-owned patches abandoned by interrupted runs before leaving
+    # a new file behind.
+    sweep_stale_patches(dsh_home)
     patch_path = patches_dir / f"opsx-{role}-model-{os.getpid()}.yml"
-    # Flat entry-override shape validated against upstream dsh in the
-    # knowledge-forge integration; richer patch formats re-expose upstream
-    # patch finickiness.
-    if provider:
-        patch_path.write_text(
-            f"agent-default-model:\n  {provider}: {model}\n",
-            encoding="utf-8",
+    # Top-level-array overlay shape validated against upstream dsh 0.1.1-rc.2;
+    # the plugin rejects flat maps and a provider-less config.
+    if not provider:
+        raise DshWorkerError(
+            f"{role_env_var(role)}={model_value!r} has no provider prefix; "
+            f"the validated dsh patch contract requires a provider, so use "
+            f"the provider/model form (e.g. deepseek/{model_value})"
         )
-    else:
-        patch_path.write_text(
-            f"agent-default-model: {model}\n",
-            encoding="utf-8",
-        )
+    patch_path.write_text(
+        "- id: agent-default-model\n"
+        "  config:\n"
+        f"    provider: {provider}\n"
+        f"    model: {model}\n",
+        encoding="utf-8",
+    )
     return patch_path
+
+
+SETTINGS_VARIANT_NAMESPACE = "agent-default-model"
+SETTINGS_VARIANT_KEY = "reasoningEffort"
+
+
+def _settings_section_lines(lines: list[str]) -> tuple[str, int, int]:
+    """Return the ``agent-default-model`` section block for editing.
+
+    Returns ``(indent, start, end)`` where *indent* is the whitespace prefix
+    used by the section's member lines (two spaces by convention), *start* is
+    the index of the ``agent-default-model:`` top-level key line, and *end* is
+    the index just past the last content line of the section. ``start`` is
+    ``-1`` when the section is absent and ``-2`` when it exists but is written
+    inline (flow style), which this block editor cannot merge into safely.
+    Works on the documented settings format: top-level ``key:`` sections with
+    indented scalar members.
+    """
+    start = -1
+    for i, line in enumerate(lines):
+        stripped = line.rstrip("\n\r")
+        if not stripped or stripped.startswith(("#", " ", "\t")):
+            continue
+        if not stripped.startswith(f"{SETTINGS_VARIANT_NAMESPACE}:"):
+            continue
+        tail = stripped[len(SETTINGS_VARIANT_NAMESPACE) + 1 :]
+        if not tail.strip() or tail.lstrip().startswith("#"):
+            start = i
+        elif tail.lstrip().startswith("{"):
+            start = -2
+        break
+    if start < 0:
+        return "  ", start, start
+
+    indent = "  "
+    for line in lines[start + 1 :]:
+        stripped = line.lstrip()
+        if stripped and not stripped.startswith("#"):
+            indent = line[: len(line) - len(stripped)]
+            break
+    end = start + 1
+    while end < len(lines):
+        line = lines[end]
+        if line.strip() and not line.startswith((" ", "\t")):
+            break
+        end += 1
+    return indent, start, end
+
+
+def apply_variant_settings(dsh_home: Path, role: str) -> None:
+    """Merge the role's resolved variant into dsh's settings mechanism.
+
+    dsh accepts ``reasoningEffort`` only through the ``agent-default-model``
+    settings section of ``$DSH_HOME/settings.yaml`` (the patch config surface
+    drops it). This writes exactly that key, preserving every other key and
+    section byte-for-byte. A supported variant sets the key; an empty or
+    unknown variant removes it so dsh's default effort applies and a previous
+    stage's variant cannot leak. Best effort: an unreadable or unparseable
+    settings document prints a diagnostic and leaves the variant unapplied
+    rather than failing the dispatch.
+    """
+    variant = resolve_variant(role)
+    settings_path = dsh_home / "settings.yaml"
+    try:
+        if settings_path.is_file():
+            raw = settings_path.read_text(encoding="utf-8")
+        else:
+            raw = ""
+    except OSError as exc:
+        print(
+            f"opsx-dsh-worker: could not read {settings_path}: {exc}; "
+            f"leaving dsh's default reasoning effort in place",
+            file=sys.stderr,
+        )
+        return
+
+    lines = raw.splitlines(keepends=True)
+    indent, start, end = _settings_section_lines(lines)
+    if start == -2:
+        print(
+            f"opsx-dsh-worker: {settings_path} stores agent-default-model "
+            f"inline, which the shim does not merge into; leaving dsh's "
+            f"default reasoning effort in place",
+            file=sys.stderr,
+        )
+        return
+
+    existing_index = -1
+    for i in range(start + 1, end):
+        stripped = lines[i].lstrip()
+        if stripped.startswith(f"{SETTINGS_VARIANT_KEY}:") or stripped.startswith(
+            f"{SETTINGS_VARIANT_KEY} "
+        ):
+            existing_index = i
+            break
+
+    if variant:
+        key_line = f"{indent}{SETTINGS_VARIANT_KEY}: {variant}\n"
+        if existing_index != -1:
+            if lines[existing_index] == key_line:
+                return
+            lines[existing_index] = key_line
+        elif start >= 0:
+            lines.insert(start + 1, key_line)
+        else:
+            if lines and not lines[-1].endswith("\n"):
+                lines.append("\n")
+            if lines and lines[-1].strip():
+                lines.append("\n")
+            lines.append(f"{SETTINGS_VARIANT_NAMESPACE}:\n{key_line}")
+    else:
+        if existing_index == -1:
+            return
+        section_only_had_key = start >= 0 and (end - start - 1) == 1
+        del lines[existing_index]
+        if section_only_had_key:
+            del lines[start]
+
+    try:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text("".join(lines), encoding="utf-8")
+    except OSError as exc:
+        print(
+            f"opsx-dsh-worker: could not write {settings_path}: {exc}; "
+            f"dsh may run with a previous reasoning effort",
+            file=sys.stderr,
+        )
 
 
 def ensure_startup_agents(dsh_home: Path) -> None:
@@ -275,6 +491,9 @@ def main(argv: list[str] | None = None) -> int:
         dsh_home = resolve_dsh_home()
         ensure_startup_agents(dsh_home)
         patch_path = write_model_patch(dsh_home, args.role)
+        # dsh accepts the reasoning variant only through the settings layer;
+        # merge it (best effort) before exec so it applies to this stage.
+        apply_variant_settings(dsh_home, args.role)
         prompt = compose_prompt(args.role, args.input_block)
         dsh_argv = build_argv(prompt, patch_path)
         env = controlled_env(dsh_home)

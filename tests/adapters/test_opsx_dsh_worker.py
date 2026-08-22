@@ -12,6 +12,7 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -128,7 +129,8 @@ class BinaryResolutionTests(ShimTestCase):
 
 class RoleInstructionTests(ShimTestCase):
     def test_missing_role_file_fails_closed_naming_it(self) -> None:
-        with mock.patch.object(Path, "cwd", return_value=Path(self.tmp.name)):
+        with mock.patch.object(Path, "cwd", return_value=Path(self.tmp.name)), \
+             mock.patch.object(self.shim, "SUPPORT_DIR_GLOBAL", Path(self.tmp.name) / "no-global"):
             with self.assertRaises(self.shim.DshWorkerError) as ctx:
                 self.shim.resolve_role_instruction("reviewer")
         self.assertIn("reviewer", str(ctx.exception))
@@ -191,8 +193,10 @@ class ModelPatchTests(ShimTestCase):
             patch_path = self.shim.write_model_patch(Path(self.tmp.name), "reviewer")
         self.assertIsNotNone(patch_path)
         content = Path(patch_path).read_text(encoding="utf-8")
-        self.assertIn("agent-default-model:", content)
-        self.assertIn("deepseek-official: deepseek-chat", content)
+        self.assertIn("- id: agent-default-model", content)
+        self.assertIn("config:", content)
+        self.assertIn("provider: deepseek-official", content)
+        self.assertIn("model: deepseek-chat", content)
         self.assertTrue(str(patch_path).startswith(str(Path(self.tmp.name) / "patches")))
 
     def test_provider_overlay_takes_precedence(self) -> None:
@@ -203,14 +207,15 @@ class ModelPatchTests(ShimTestCase):
         ):
             patch_path = self.shim.write_model_patch(Path(self.tmp.name), "reviewer")
         content = Path(patch_path).read_text(encoding="utf-8")
-        self.assertIn("custom-provider: deepseek-chat", content)
+        self.assertIn("provider: custom-provider", content)
         self.assertNotIn("deepseek-official", content)
 
     def test_unmapped_provider_passes_through(self) -> None:
         with self._patch_env(OPSX_IMPLEMENTER_MODEL="acme/acme-model"):
             patch_path = self.shim.write_model_patch(Path(self.tmp.name), "implementer")
         content = Path(patch_path).read_text(encoding="utf-8")
-        self.assertIn("acme: acme-model", content)
+        self.assertIn("provider: acme", content)
+        self.assertIn("model: acme-model", content)
 
     def test_no_model_env_returns_no_patch(self) -> None:
         with self._patch_env():  # OPSX_*_MODEL absent
@@ -225,10 +230,228 @@ class ModelPatchTests(ShimTestCase):
         ):
             patch_path = self.shim.write_model_patch(Path(self.tmp.name), "implementer")
         content = Path(patch_path).read_text(encoding="utf-8")
-        self.assertIn("agent-default-model:", content)
-        self.assertIn("deepseek-official: deepseek-v4-pro", content)
+        self.assertIn("- id: agent-default-model", content)
+        self.assertIn("provider: deepseek-official", content)
+        self.assertIn("model: deepseek-v4-pro", content)
         self.assertNotIn("SOME_API_KEY", content)
         self.assertNotIn("sk-keep-out-of-patch", content)
+
+    def test_provider_less_model_fails_closed(self) -> None:
+        with self._patch_env(OPSX_REVIEWER_MODEL="deepseek-chat"):
+            with self.assertRaises(self.shim.DshWorkerError) as ctx:
+                self.shim.write_model_patch(Path(self.tmp.name), "reviewer")
+        message = str(ctx.exception)
+        self.assertIn("OPSX_REVIEWER_MODEL", message)
+        self.assertIn("provider", message)
+
+
+class VariantResolutionTests(ShimTestCase):
+    def _variant_env(self, role: str, value: str) -> mock._patch:
+        return mock.patch.dict(
+            os.environ, {f"OPSX_{role.upper()}_VARIANT": value}, clear=False
+        )
+
+    def test_supported_values_pass_through(self) -> None:
+        for value in ("off", "low", "high", "max"):
+            with self._variant_env("implementer", value):
+                self.assertEqual(self.shim.resolve_variant("implementer"), value)
+
+    def test_aliases_map_to_supported_efforts(self) -> None:
+        cases = {"none": "off", "disabled": "off", "xhigh": "max"}
+        for raw, expected in cases.items():
+            with self._variant_env("reviewer", raw):
+                self.assertEqual(self.shim.resolve_variant("reviewer"), expected)
+
+    def test_empty_variant_returns_empty(self) -> None:
+        with self._variant_env("implementer", ""):
+            self.assertEqual(self.shim.resolve_variant("implementer"), "")
+
+    def test_missing_variant_env_returns_empty(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            self.assertEqual(self.shim.resolve_variant("archiver"), "")
+
+    def test_unknown_label_warns_and_is_dropped(self) -> None:
+        with self._variant_env("implementer", "turbo"), \
+             mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            value = self.shim.resolve_variant("implementer")
+        self.assertEqual(value, "")
+        output = err.getvalue()
+        self.assertIn("OPSX_IMPLEMENTER_VARIANT", output)
+        self.assertIn("turbo", output)
+
+    def test_unknown_label_omitted_from_settings(self) -> None:
+        dsh_home = Path(self.tmp.name) / "state"
+        with self._variant_env("implementer", "bogus"), \
+             mock.patch("sys.stderr", new_callable=io.StringIO):
+            self.shim.apply_variant_settings(dsh_home, "implementer")
+        settings_path = dsh_home / "settings.yaml"
+        self.assertFalse(settings_path.is_file(), "unknown variant must not write settings")
+
+
+class VariantSettingsTests(ShimTestCase):
+    def _settings_path(self) -> Path:
+        return Path(self.tmp.name) / "state" / "settings.yaml"
+
+    def test_supported_variant_writes_reasoning_effort(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"OPSX_IMPLEMENTER_VARIANT": "high"}, clear=False
+        ):
+            self.shim.apply_variant_settings(Path(self.tmp.name) / "state", "implementer")
+        content = self._settings_path().read_text(encoding="utf-8")
+        self.assertIn("agent-default-model:\n", content)
+        self.assertIn("  reasoningEffort: high\n", content)
+
+    def test_existing_operator_section_preserved(self) -> None:
+        settings = self._settings_path()
+        settings.parent.mkdir(parents=True)
+        settings.write_text(
+            "ui-onboarding:\n  welcomeNoticeVersion: 2026-08-13.1\n"
+            "agent-default-model:\n  provider: openai-codex\n  model: gpt-5.6-luna\n",
+            encoding="utf-8",
+        )
+        with mock.patch.dict(
+            os.environ, {"OPSX_IMPLEMENTER_VARIANT": "max"}, clear=False
+        ):
+            self.shim.apply_variant_settings(Path(self.tmp.name) / "state", "implementer")
+        content = settings.read_text(encoding="utf-8")
+        self.assertIn("ui-onboarding:\n  welcomeNoticeVersion: 2026-08-13.1\n", content)
+        self.assertIn("agent-default-model:\n", content)
+        self.assertIn("  provider: openai-codex\n", content)
+        self.assertIn("  model: gpt-5.6-luna\n", content)
+        self.assertIn("  reasoningEffort: max\n", content)
+
+    def test_no_variant_removes_key_and_preserves_rest(self) -> None:
+        settings = self._settings_path()
+        settings.parent.mkdir(parents=True)
+        settings.write_text(
+            "agent-default-model:\n  provider: deepseek-official\n"
+            "  model: deepseek-chat\n  reasoningEffort: low\n"
+            "llm-deepseek:\n  apiKeyEnv: DEEPSEEK_API_KEY\n",
+            encoding="utf-8",
+        )
+        with mock.patch.dict(
+            os.environ, {"OPSX_IMPLEMENTER_VARIANT": ""}, clear=False
+        ):
+            self.shim.apply_variant_settings(Path(self.tmp.name) / "state", "implementer")
+        content = settings.read_text(encoding="utf-8")
+        self.assertNotIn("reasoningEffort", content)
+        self.assertIn("provider: deepseek-official", content)
+        self.assertIn("model: deepseek-chat", content)
+        self.assertIn("llm-deepseek:\n  apiKeyEnv: DEEPSEEK_API_KEY\n", content)
+
+    def test_no_variant_removes_empty_section_header(self) -> None:
+        settings = self._settings_path()
+        settings.parent.mkdir(parents=True)
+        settings.write_text(
+            "agent-default-model:\n  reasoningEffort: low\n",
+            encoding="utf-8",
+        )
+        with mock.patch.dict(
+            os.environ, {"OPSX_IMPLEMENTER_VARIANT": ""}, clear=False
+        ):
+            self.shim.apply_variant_settings(Path(self.tmp.name) / "state", "implementer")
+        content = settings.read_text(encoding="utf-8")
+        self.assertEqual(content, "")
+
+    def test_update_in_place_when_key_present(self) -> None:
+        settings = self._settings_path()
+        settings.parent.mkdir(parents=True)
+        settings.write_text(
+            "agent-default-model:\n  reasoningEffort: low\n",
+            encoding="utf-8",
+        )
+        with mock.patch.dict(
+            os.environ, {"OPSX_IMPLEMENTER_VARIANT": "off"}, clear=False
+        ):
+            self.shim.apply_variant_settings(Path(self.tmp.name) / "state", "implementer")
+        content = settings.read_text(encoding="utf-8")
+        self.assertEqual(content, "agent-default-model:\n  reasoningEffort: off\n")
+
+    def test_inline_section_left_untouched(self) -> None:
+        settings = self._settings_path()
+        settings.parent.mkdir(parents=True)
+        settings.write_text(
+            "agent-default-model: {provider: deepseek-official, model: deepseek-chat}\n",
+            encoding="utf-8",
+        )
+        with mock.patch.dict(
+            os.environ, {"OPSX_IMPLEMENTER_VARIANT": "low"}, clear=False
+        ), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.shim.apply_variant_settings(Path(self.tmp.name) / "state", "implementer")
+        self.assertEqual(
+            settings.read_text(encoding="utf-8"),
+            "agent-default-model: {provider: deepseek-official, model: deepseek-chat}\n",
+        )
+        self.assertIn("inline", err.getvalue())
+
+    def test_unwritable_settings_does_not_raise(self) -> None:
+        dsh_home = Path(self.tmp.name) / "state"
+        with mock.patch.dict(
+            os.environ, {"OPSX_IMPLEMENTER_VARIANT": "high"}, clear=False
+        ), mock.patch.object(Path, "write_text", side_effect=OSError("permission denied")), \
+             mock.patch("sys.stderr", new_callable=io.StringIO):
+            # Must not raise; the shim reports and continues to dispatch.
+            self.shim.apply_variant_settings(dsh_home, "implementer")
+
+
+class StalePatchSweepTests(ShimTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.patches = self.home / "patches"
+        self.patches.mkdir(parents=True)
+
+    def _touch(self, name: str, age_seconds: int) -> Path:
+        p = self.patches / name
+        p.write_text("stale\n", encoding="utf-8")
+        ts = time.time() - age_seconds
+        os.utime(p, (ts, ts))
+        return p
+
+    def test_stale_shim_patch_removed(self) -> None:
+        self._touch("opsx-implementer-model-123.yml", age_seconds=7200)
+        self.shim.sweep_stale_patches(self.home)
+        self.assertEqual(list(self.patches.iterdir()), [])
+
+    def test_fresh_shim_patch_preserved(self) -> None:
+        self._touch("opsx-implementer-model-123.yml", age_seconds=60)
+        self.shim.sweep_stale_patches(self.home)
+        self.assertEqual([p.name for p in self.patches.iterdir()],
+                         ["opsx-implementer-model-123.yml"])
+
+    def test_foreign_and_operator_files_preserved(self) -> None:
+        stale_shim = self._touch("opsx-reviewer-model-9.yml", age_seconds=7200)
+        self._touch("operator-patch.yml", age_seconds=7200)
+        self._touch("agent-default-model.yml", age_seconds=7200)
+        self._touch("opsx-notes.txt", age_seconds=7200)
+        self.shim.sweep_stale_patches(self.home)
+        self.assertEqual(
+            sorted(p.name for p in self.patches.iterdir()),
+            ["agent-default-model.yml", "operator-patch.yml", "opsx-notes.txt"],
+        )
+        self.assertFalse(stale_shim.exists())
+
+    def test_sweep_tolerates_filesystem_errors(self) -> None:
+        self._touch("opsx-implementer-model-123.yml", age_seconds=7200)
+        with mock.patch.object(Path, "stat", side_effect=OSError("stale handle")), \
+             mock.patch.object(Path, "unlink", side_effect=OSError("locked")):
+            self.shim.sweep_stale_patches(self.home)  # must not raise
+        self.assertEqual([p.name for p in self.patches.iterdir()],
+                         ["opsx-implementer-model-123.yml"])
+
+    def test_sweep_missing_directory_is_noop(self) -> None:
+        self.shim.sweep_stale_patches(self.home / "absent")  # must not raise
+
+    def test_sweep_runs_before_new_patch_is_written(self) -> None:
+        stale = self._touch("opsx-archiver-model-7.yml", age_seconds=7200)
+        with mock.patch.dict(
+            os.environ, {"OPSX_ARCHIVER_MODEL": "deepseek/deepseek-chat"}, clear=False
+        ):
+            new_patch = self.shim.write_model_patch(self.home, "archiver")
+        self.assertFalse(stale.exists())
+        self.assertIsNotNone(new_patch)
+        self.assertEqual(
+            sorted(p.name for p in self.patches.iterdir()), [new_patch.name]
+        )
 
 
 class EnvironmentTests(ShimTestCase):
@@ -358,6 +581,7 @@ class MainExecTests(ShimTestCase):
 
     def test_main_returns_nonzero_and_diagnostic_on_missing_role_file(self) -> None:
         with mock.patch.object(Path, "cwd", return_value=Path(self.tmp.name)), \
+             mock.patch.object(self.shim, "SUPPORT_DIR_GLOBAL", Path(self.tmp.name) / "no-global"), \
              mock.patch("os.execvpe") as m_exec, \
              mock.patch("sys.stderr", new_callable=io.StringIO) as err:
             rc = self.shim.main(["--role", "archiver", "CHANGE: x\n"])

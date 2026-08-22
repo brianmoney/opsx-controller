@@ -264,11 +264,32 @@ Model override via generated patch:
 
 - `OPSX_<ROLE>_MODEL` is split into provider/model, the provider is mapped
   through the built-in `deepseek` → `deepseek-official` map overlaid by the
-  `OPSX_DSH_PROVIDER_MAP` JSON environment variable, and a flat
-  entry-override YAML patch (`agent-default-model`) is written under
-  `$DSH_HOME/patches/` and passed via `--patch`.
+  `OPSX_DSH_PROVIDER_MAP` JSON environment variable, and a top-level-array
+  loader patch (`- id: agent-default-model` with a `config:` map of the
+  mapped provider and model) is written under `$DSH_HOME/patches/` and
+  passed via `--patch`. A provider-less `OPSX_<ROLE>_MODEL` fails closed —
+  the validated dsh release requires a provider in the patch config.
+- The patch shape was validated against dsh `0.1.1-rc.2`; keep the
+  `PINNED_DSH_PACKAGE` and `BUILTIN_PROVIDER_MAP` constants in
+  `opsx-dsh-worker` in sync with any release you move the pin to.
 - No `OPSX_<ROLE>_MODEL` → no `--patch` → dsh's shipped default model
   applies. Secrets are never written into patches or prompts.
+- Before writing a new patch the shim sweeps stale `opsx-*-model-*.yml`
+  files older than one hour from `$DSH_HOME/patches/`; fresh patches and
+  operator-owned files are left untouched.
+
+Reasoning variants:
+
+- `OPSX_<ROLE>_VARIANT` (set by the orchestrator from the resolved
+  `<role>_variant`) passes `off`, `low`, `high`, and `max` through
+  unchanged; `none` and `disabled` alias to `off`, and `xhigh` aliases to
+  `max`. An unknown non-empty label prints a role/value diagnostic and is
+  dropped so dsh's default effort applies.
+- dsh accepts the effort only through the `agent-default-model` settings
+  section of `$DSH_HOME/settings.yaml` (not the patch config), so the shim
+  merges the resolved variant into exactly that key, preserving every other
+  setting. A stage with no variant removes the key so a previous stage's
+  effort cannot leak.
 
 Controlled runtime environment:
 
