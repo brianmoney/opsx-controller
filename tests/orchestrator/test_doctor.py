@@ -341,19 +341,43 @@ class DoctorPreflightTests(unittest.TestCase):
         self.assertIn("not found", remediation.lower())
 
     def test_check_openspec_on_path_fails_when_openspec_missing(self) -> None:
-        """When openspec is not on PATH, the check must fail with an install hint."""
+        """When openspec is not resolvable repo-locally or on PATH, the check
+        must fail with an initialize-OpenSpec hint."""
         with mock.patch("shutil.which", return_value=None):
-            passed, label, remediation = doctor_mod._check_openspec_on_path()
+            passed, label, remediation = doctor_mod._check_openspec_on_path(self.repo)
 
         self.assertFalse(passed)
-        self.assertIn("Install openspec", remediation)
+        self.assertIn("npx openspec@latest init", remediation)
 
     def test_check_openspec_on_path_passes_when_found(self) -> None:
         """When openspec is on PATH, the check must pass."""
         with mock.patch("shutil.which", return_value="/usr/bin/openspec"):
-            passed, label, remediation = doctor_mod._check_openspec_on_path()
+            passed, label, remediation = doctor_mod._check_openspec_on_path(self.repo)
 
         self.assertTrue(passed, f"unexpected failure: {remediation}")
+
+    def test_check_openspec_on_path_passes_with_repo_local_openspec(self) -> None:
+        """A repo-local node_modules/.bin/openspec passes even when no global
+        openspec is on PATH."""
+        bin_dir = self.repo / "node_modules" / ".bin"
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "openspec").write_text("#!/bin/sh\n", encoding="utf-8")
+        with mock.patch("shutil.which", return_value=None):
+            passed, label, remediation = doctor_mod._check_openspec_on_path(self.repo)
+
+        self.assertTrue(passed, f"unexpected failure: {remediation}")
+
+    def test_resolve_openspec_binary_prefers_repo_local_over_path(self) -> None:
+        """A repo-local OpenSpec binary wins when a global one also exists."""
+        bin_dir = self.repo / "node_modules" / ".bin"
+        bin_dir.mkdir(parents=True)
+        local = bin_dir / "openspec"
+        local.write_text("#!/bin/sh\n", encoding="utf-8")
+
+        with mock.patch("shutil.which", return_value="/usr/bin/openspec"):
+            resolved = doctor_mod._resolve_openspec_binary(self.repo)
+
+        self.assertEqual(resolved, str(local))
 
     def test_check_openspec_initialized_fails_when_config_missing(self) -> None:
         """A repo without openspec/config.yaml must fail the check with an
@@ -418,14 +442,14 @@ class DoctorPreflightTests(unittest.TestCase):
         res = mock.Mock(returncode=0, stdout="1.9.0\n", stderr="")
         with mock.patch("shutil.which", return_value="/usr/bin/openspec"), \
              mock.patch.object(doctor_mod.subprocess, "run", return_value=res):
-            self.assertEqual(doctor_mod._installed_openspec_version(), "1.9.0")
+            self.assertEqual(doctor_mod._installed_openspec_version(self.repo), "1.9.0")
 
     def test_installed_openspec_version_none_on_failure(self) -> None:
         """A non-zero --version probe yields None."""
         res = mock.Mock(returncode=1, stdout="", stderr="boom")
         with mock.patch("shutil.which", return_value="/usr/bin/openspec"), \
              mock.patch.object(doctor_mod.subprocess, "run", return_value=res):
-            self.assertIsNone(doctor_mod._installed_openspec_version())
+            self.assertIsNone(doctor_mod._installed_openspec_version(self.repo))
 
     def test_check_adapter_client_on_path_fails_when_client_missing(self) -> None:
         """When the adapter client executable is not on PATH, the check must

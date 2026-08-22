@@ -78,25 +78,47 @@ def _print_model_resolution_detail(repo: Path, adapter: str) -> None:
         print(f"      {role:<12} {value}  [{entry.source}]")
 
 
-def _check_openspec_on_path() -> tuple[bool, str, str]:
-    """Check that openspec is on PATH."""
-    label = "openspec on PATH"
-    if shutil.which("openspec"):
+_OPENSPEC_BIN_NAMES = ("openspec", "openspec.cmd", "openspec.exe")
+
+_OPENSPEC_INIT_REMEDIATION = (
+    "OpenSpec CLI not found repo-locally or on PATH. Run `npx openspec@latest init`, "
+    "or install globally (`npm install -g @fission-ai/openspec`) and run `openspec init`."
+)
+
+
+def _resolve_openspec_binary(repo: Path) -> str | None:
+    """Resolve the openspec CLI, preferring a repo-local install.
+
+    Returns ``<repo>/node_modules/.bin/openspec`` when present, else any
+    ``openspec`` found on PATH, else ``None``.
+    """
+    bin_dir = repo / "node_modules" / ".bin"
+    for name in _OPENSPEC_BIN_NAMES:
+        candidate = bin_dir / name
+        if candidate.is_file():
+            return str(candidate)
+    return shutil.which("openspec")
+
+
+def _check_openspec_on_path(repo: Path) -> tuple[bool, str, str]:
+    """Check that openspec resolves repo-locally or on PATH."""
+    label = "openspec available (repo or global)"
+    if _resolve_openspec_binary(repo):
         return (True, label, "")
-    return (False, label, "Install openspec (e.g. npm install -g @openspec/cli)")
+    return (False, label, _OPENSPEC_INIT_REMEDIATION)
 
 
 _OPENSPEC_VERSION_RE = re.compile(r"^(\d+\.\d+\.\d+)")
 
 
-def _installed_openspec_version() -> str | None:
+def _installed_openspec_version(repo: Path) -> str | None:
     """Return the installed openspec CLI version (``X.Y.Z``) or None.
 
-    The version comes from ``openspec --version``. ``openspec`` on PATH
+    The version comes from ``openspec --version``. ``openspec`` resolving
     without a version, or a non-zero/empty probe, yields None — the caller
     reports the failure with an install hint.
     """
-    binary = shutil.which("openspec")
+    binary = _resolve_openspec_binary(repo)
     if not binary:
         return None
     try:
@@ -132,10 +154,10 @@ def _check_openspec_initialized(repo: Path) -> tuple[bool, str, str]:
     check does not itself enforce a minimum version.
     """
     label = "OpenSpec initialized in repo"
-    binary = shutil.which("openspec")
+    binary = _resolve_openspec_binary(repo)
     if not binary:
-        return (False, label, "openspec not on PATH; install it and run `openspec init`")
-    version = _installed_openspec_version() or "(unknown)"
+        return (False, label, _OPENSPEC_INIT_REMEDIATION)
+    version = _installed_openspec_version(repo) or "(unknown)"
     if not any((repo / marker).is_file() for marker in _OPENSPEC_INIT_MARKERS):
         return (
             False,
