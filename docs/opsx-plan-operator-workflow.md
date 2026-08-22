@@ -162,6 +162,7 @@ opsx-plan doctor --adapter claude-code
 | Model roles resolve for the target adapter | All four roles (`controller`, `implementer`, `reviewer`, `archiver`) resolve for the resolved plan's adapter via `models.toml`/ambient environment; reports each resolved model with its source. When no plan is active, `--adapter` selects the adapter to resolve against (defaults to `opencode`). |
 | Resolved model identifiers match adapter syntax | Flags a provider-prefixed identifier under `claude-code` or a bare identifier under `opencode`, before it fails at dispatch |
 | `openspec` on PATH | OpenSpec CLI is installed and reachable |
+| OpenSpec initialized in repo | The repo has a durable `openspec/config.yaml` (written by `openspec init`) **and** `openspec list --json` resolves a healthy root from the repo directory. Direct-dispatch workers read their per-project phase prompts from files `openspec init` writes, so an uninitialized repo ships workers that fail mid-run; the check fails closed with the exact `openspec init` command and the installed CLI version. |
 | Adapter client on PATH | e.g. `opencode`, `claude`, or `codex`. When `--adapter` is set without a plan, validates the specified adapter's client. |
 | No tracked bytecode | No `__pycache__/` or `.pyc` files tracked in git |
 | Tracked tree is clean | No uncommitted modifications to tracked files |
@@ -177,9 +178,21 @@ The `doctor` command itself does not gate `run` — it is a diagnostic that
 reports findings without blocking anything. The same checks re-run as warnings
 before each `run` (visible as ⚠ lines) without changing the run outcome.
 However, `opsx-plan run` has its **own independent fail-closed guards** (e.g.,
-`require_clean_tracked`, PR delivery preflight) that will refuse to dispatch
-stages regardless of doctor results. Fix doctor failures before an unattended
-run; treat them as actionable, not informational.
+`require_clean_tracked`, PR delivery preflight, and the OpenSpec-initialization
+gate) that will refuse to dispatch stages regardless of doctor results. Fix
+doctor failures before an unattended run; treat them as actionable, not
+informational.
+
+#### OpenSpec-initialization gate on `run`
+
+`run` fails closed — before any dispatch — when the repo is not initialized
+(no `openspec/config.yaml` or `openspec list --json` cannot resolve a root),
+printing the exact `openspec init` command to run. Direct-dispatch workers read
+their per-project phase prompts from files that `openspec init` writes, so an
+uninitialized repo would otherwise dispatch workers that fail mid-run for a
+missing prompt file. Pass `--skip-openspec` only when you deliberately want to
+proceed without the check (dispatch may then fail once workers cannot find
+their prompt files). `--dry-run` never triggers the gate.
 
 ---
 

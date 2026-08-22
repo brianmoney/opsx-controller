@@ -7,7 +7,10 @@ along with the install-staleness probes (design decision D6).
 
 from __future__ import annotations
 
+import json
+import re
 import shutil
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -81,6 +84,91 @@ def _check_openspec_on_path() -> tuple[bool, str, str]:
     if shutil.which("openspec"):
         return (True, label, "")
     return (False, label, "Install openspec (e.g. npm install -g @openspec/cli)")
+
+
+_OPENSPEC_VERSION_RE = re.compile(r"^(\d+\.\d+\.\d+)")
+
+
+def _installed_openspec_version() -> str | None:
+    """Return the installed openspec CLI version (``X.Y.Z``) or None.
+
+    The version comes from ``openspec --version``. ``openspec`` on PATH
+    without a version, or a non-zero/empty probe, yields None — the caller
+    reports the failure with an install hint.
+    """
+    binary = shutil.which("openspec")
+    if not binary:
+        return None
+    try:
+        res = subprocess.run(
+            [binary, "--version"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    m = _OPENSPEC_VERSION_RE.match((res.stdout or res.stderr).strip())
+    return m.group(1) if m else None
+
+
+_OPENSPEC_INIT_MARKERS = ("openspec/config.yaml", "openspec/config.yml")
+
+
+def _check_openspec_initialized(repo: Path) -> tuple[bool, str, str]:
+    """Check that OpenSpec is initialized in *repo* (a durable ``openspec/
+    config.yaml`` exists) and that the installed CLI can resolve a root from
+    that directory.
+
+    ``openspec init`` is a per-project setup step: it writes the project's
+    ``openspec/config.yaml`` (and the per-tool prompt files the direct-dispatch
+    workers read). A repo that never ran ``openspec init`` (or that dropped its
+    config) ships workers that fail mid-run because their prompt files are
+    missing. This probe fails closed so the operator is told exactly what to
+    run *before* any dispatch.
+
+    The installed version is surfaced alongside the remediation so an operator
+    can confirm the CLI they have matches the controller's expectations; the
+    check does not itself enforce a minimum version.
+    """
+    label = "OpenSpec initialized in repo"
+    binary = shutil.which("openspec")
+    if not binary:
+        return (False, label, "openspec not on PATH; install it and run `openspec init`")
+    version = _installed_openspec_version() or "(unknown)"
+    if not any((repo / marker).is_file() for marker in _OPENSPEC_INIT_MARKERS):
+        return (
+            False,
+            label,
+            f"No openspec/config.yaml (openspec CLI {version}); the repo is not "
+            f"initialized. Run `openspec init` from the repo root first, then "
+            f"rerun opsx-plan.",
+        )
+    try:
+        res = subprocess.run(
+            [binary, "list", "--json"],
+            cwd=repo, capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return (False, label, f"openspec list could not run: {exc}")
+    try:
+        payload = json.loads(res.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return (False, label, "openspec list --json returned non-JSON output")
+    if not payload or payload.get("root") is None:
+        diag = ""
+        status = payload.get("status", []) if isinstance(payload, dict) else []
+        for entry in status:
+            if isinstance(entry, dict) and entry.get("message"):
+                diag = f": {entry['message']}"
+                break
+        return (
+            False,
+            label,
+            f"openspec could not resolve an OpenSpec root in the repo{diag}. "
+            f"Run `openspec init` from the repo root, then rerun opsx-plan.",
+        )
+    return (True, label, "")
 
 
 def _check_adapter_client_on_path(adapter: str) -> tuple[bool, str, str]:

@@ -2011,6 +2011,7 @@ def run_doctor_checks(repo: Path, plan_src: str | None,
     checks.append(doctor._check_model_resolution(repo, adapter))
     checks.append(doctor._check_model_identifier_syntax(repo, adapter))
     checks.append(doctor._check_openspec_on_path())
+    checks.append(doctor._check_openspec_initialized(repo))
     checks.append(doctor._check_adapter_client_on_path(adapter))
     checks.append(doctor._check_tracked_bytecode(repo))
     checks.append(doctor._check_tracked_tree_clean(repo))
@@ -2044,6 +2045,7 @@ def run_preflight_warnings(repo: Path, plan_src: str | None,
     checks.append(doctor._check_model_resolution(repo, adapter))
     checks.append(doctor._check_model_identifier_syntax(repo, adapter))
     checks.append(doctor._check_openspec_on_path())
+    checks.append(doctor._check_openspec_initialized(repo))
     checks.append(doctor._check_adapter_client_on_path(adapter))
     checks.append(doctor._check_tracked_bytecode(repo))
     checks.append(doctor._check_tracked_tree_clean(repo))
@@ -2316,6 +2318,22 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     # Run preflight checks as warnings only — never change run outcome.
     run_preflight_warnings(repo, plan_src, cfg["adapter"], cfg)
+
+    # --- OpenSpec initialization gate ---
+    # Direct-dispatch workers read their phase prompts from per-project files
+    # that `openspec init` writes. An uninitialized repo would dispatch workers
+    # that fail mid-run for a missing prompt file. Fail closed before any
+    # dispatch with the exact command to run.
+    if not args.dry_run and not getattr(args, "skip_openspec", False):
+        init_ok, _, init_err = doctor._check_openspec_initialized(repo)
+        if not init_ok:
+            print(f"error: {init_err}", file=sys.stderr)
+            print(
+                "error: run `openspec init` from the repo root and rerun opsx-plan; "
+                "or pass --skip-openspec to proceed without the check",
+                file=sys.stderr,
+            )
+            return 2
 
     # --- git delivery: ensure delivery branch before any stage dispatch ---
     if not args.dry_run:
@@ -3450,6 +3468,10 @@ def main() -> int:
     p_run.add_argument("--skip-suggestion", action="store_true",
                        help="treat review suggestions as non-blocking; "
                             "critical and warning findings still prevent archive")
+    p_run.add_argument("--skip-openspec", action="store_true",
+                       help="skip the fail-closed OpenSpec-initialization gate "
+                            "(the repo has no openspec/config.yaml; dispatch may "
+                            "fail when workers cannot find their prompt files)")
     p_run.set_defaults(fn=cmd_run)
 
     p_status = sub.add_parser("status", help="reconcile and show plan status")

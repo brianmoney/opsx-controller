@@ -4212,7 +4212,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
             args = argparse.Namespace(
                 repo=str(self.repo), plan=str(plan),
                 dry_run=False, budget_minutes=0, max_changes=0,
-                only=[], create_only=False,
+                only=[], create_only=False, skip_openspec=True,
             )
             rc = self.opsx_plan.cmd_run(args)
             # cmd_run returns 0 on success
@@ -4253,7 +4253,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
             args = argparse.Namespace(
                 repo=str(self.repo), plan=str(plan),
                 dry_run=False, budget_minutes=0, max_changes=0,
-                only=[], create_only=False,
+                only=[], create_only=False, skip_openspec=True,
             )
             self.assertEqual(self.opsx_plan.cmd_run(args), 0)
         finally:
@@ -4274,7 +4274,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
         args = argparse.Namespace(
             repo=str(self.repo), plan=str(p),
             dry_run=False, budget_minutes=0, max_changes=0,
-            only=[], create_only=False,
+            only=[], create_only=False, skip_openspec=True,
         )
 
         # Ensure no pointer exists before the call
@@ -4540,7 +4540,7 @@ class ActivePlanResolutionTests(unittest.TestCase):
             args = argparse.Namespace(
                 repo=str(self.repo), plan=None,
                 dry_run=False, budget_minutes=0, max_changes=0,
-                only=[], create_only=False,
+                only=[], create_only=False, skip_openspec=True,
             )
             rc = self.opsx_plan.cmd_run(args)
             self.assertEqual(rc, 0)
@@ -6202,7 +6202,7 @@ class RunEventNotificationTests(unittest.TestCase):
                 repo=str(self.repo), plan=str(plan_rel),
                 dry_run=False, max_changes=None, budget_minutes=None,
                 budget_usd=None, create_only=False, only=None,
-                no_branch=False, no_pr=False,
+                no_branch=False, no_pr=False, skip_openspec=True,
             )
             rc = self.opsx_plan.cmd_run(args)
 
@@ -6288,7 +6288,7 @@ class RunEventNotificationTests(unittest.TestCase):
                 repo=str(self.repo), plan=str(plan_rel),
                 dry_run=False, max_changes=None, budget_minutes=None,
                 budget_usd=None, create_only=False, only=None,
-                no_branch=False, no_pr=False,
+                no_branch=False, no_pr=False, skip_openspec=True,
             )
             rc = self.opsx_plan.cmd_run(args)
 
@@ -6391,7 +6391,7 @@ class RunEventNotificationTests(unittest.TestCase):
                 repo=str(self.repo), plan=str(plan_rel),
                 dry_run=False, max_changes=None, budget_minutes=None,
                 budget_usd=None, create_only=False, only=None,
-                no_branch=False, no_pr=False,
+                no_branch=False, no_pr=False, skip_openspec=True,
             )
             rc = self.opsx_plan.cmd_run(args)
 
@@ -6467,7 +6467,7 @@ class RunEventNotificationTests(unittest.TestCase):
                 repo=str(self.repo), plan=str(plan_rel),
                 dry_run=False, max_changes=None, budget_minutes=None,
                 budget_usd=None, create_only=False, only=None,
-                no_branch=False, no_pr=False,
+                no_branch=False, no_pr=False, skip_openspec=True,
             )
             rc = self.opsx_plan.cmd_run(args)
 
@@ -6555,7 +6555,7 @@ class RunEventNotificationTests(unittest.TestCase):
                 repo=str(self.repo), plan=str(plan_rel),
                 dry_run=False, max_changes=None, budget_minutes=None,
                 budget_usd=None, create_only=False, only=None,
-                no_branch=False, no_pr=False,
+                no_branch=False, no_pr=False, skip_openspec=True,
             )
             rc = self.opsx_plan.cmd_run(args)
 
@@ -6645,7 +6645,7 @@ class RunEventNotificationTests(unittest.TestCase):
                 repo=str(self.repo), plan=str(plan_rel),
                 dry_run=False, max_changes=None, budget_minutes=None,
                 budget_usd=None, create_only=False, only=None,
-                no_branch=False, no_pr=False,
+                no_branch=False, no_pr=False, skip_openspec=True,
             )
             rc = self.opsx_plan.cmd_run(args)
 
