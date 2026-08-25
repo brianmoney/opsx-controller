@@ -293,8 +293,13 @@ Before dispatching a stage, `opsx-plan` expands `$VAR`/`${VAR}` references in
 each argument of the resolved invoke string — this is how `OPSX_*_MODEL`
 selects the per-stage model for both `claude-code` and `opencode` direct
 stage invokes (both now pass an explicit `--model "$OPSX_*_MODEL"` argument).
-If a referenced variable is unset, the stage fails immediately with a
-message naming the variable — no client subprocess is started. The
+This also applies to the templated `create_invoke` authoring command: the
+`{change}`, `{plan_doc}`, and `{controller_model}` placeholders are formatted
+first, then each resulting argument is expanded exactly like a direct stage
+invoke, so a create command such as
+`opencode run --model "$OPSX_CONTROLLER_MODEL" ...` receives the resolved
+model value. If a referenced variable is unset, the stage fails immediately
+with a message naming the variable — no client subprocess is started. The
 `exec[stage]` log line always shows the already-expanded command (with the
 worker input block elided).
 

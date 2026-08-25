@@ -3569,6 +3569,204 @@ class InvokeDirectStageEnvExpansionTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--model") + 1], "model-implementer")
 
 
+class CreateStageEnvExpansionTests(unittest.TestCase):
+    """create_invoke templating and environment-variable expansion (section
+    1 of the fix-create-invoke-env-expansion change)."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _cfg(self, invoke: str, plan_doc: str = "plan.md") -> dict:
+        return {
+            "plan_doc": plan_doc,
+            "changes": {"c1": {"timeout_minutes": 1}},
+        }
+
+    def _run_stage(self, invoke: str):
+        return self.opsx_plan.run_stage(
+            self.repo, self._cfg(invoke), "c1", "create", invoke, 1, 1
+        )
+
+    def test_create_invoke_expands_model_variable_in_log(self) -> None:
+        """2.1: `$OPSX_CONTROLLER_MODEL` in create_invoke resolves and the
+        resolved value appears in the exec/log command."""
+        saved = os.environ.get("OPSX_CONTROLLER_MODEL")
+        os.environ["OPSX_CONTROLLER_MODEL"] = "create-page-model"
+        try:
+            with mock.patch("sys.stdout", io.StringIO()) as stdout:
+                outcome, log_path = self._run_stage(
+                    'echo --model "$OPSX_CONTROLLER_MODEL"'
+                )
+        finally:
+            if saved is not None:
+                os.environ["OPSX_CONTROLLER_MODEL"] = saved
+            else:
+                os.environ.pop("OPSX_CONTROLLER_MODEL", None)
+
+        self.assertEqual(outcome, "exited")
+        content = log_path.read_text(encoding="utf-8")
+        self.assertIn("create-page-model", content)
+        self.assertNotIn("$OPSX_CONTROLLER_MODEL", content)
+        printed = stdout.getvalue()
+        exec_lines = [ln for ln in printed.splitlines() if "exec[create]" in ln]
+        self.assertEqual(len(exec_lines), 1)
+        self.assertIn("create-page-model", exec_lines[0])
+
+    def test_create_invoke_expands_braced_model_variable(self) -> None:
+        """2.2: `${OPSX_CONTROLLER_MODEL}` expands in create_invoke."""
+        argv_dump = self.repo / "argv.json"
+        script = (
+            "import sys, json, pathlib; "
+            f"pathlib.Path({str(argv_dump)!r}).write_text(json.dumps(sys.argv))"
+        )
+        saved = os.environ.get("OPSX_CONTROLLER_MODEL")
+        os.environ["OPSX_CONTROLLER_MODEL"] = "braced-model"
+        try:
+            outcome, _log_path = self._run_stage(
+                f"python3 -c {shlex.quote(script)} "
+                '--model "${OPSX_CONTROLLER_MODEL}"'
+            )
+        finally:
+            if saved is not None:
+                os.environ["OPSX_CONTROLLER_MODEL"] = saved
+            else:
+                os.environ.pop("OPSX_CONTROLLER_MODEL", None)
+
+        self.assertEqual(outcome, "exited")
+        argv = json.loads(argv_dump.read_text(encoding="utf-8"))
+        self.assertEqual(argv[argv.index("--model") + 1], "braced-model")
+        self.assertNotIn("$OPSX_CONTROLLER_MODEL", argv)
+
+    def test_create_invoke_unset_variable_returns_env_error(self) -> None:
+        """2.3: an unset create-stage variable yields env_error, names the
+        variable, and does not spawn the client."""
+        var = "OPSX_CREATE_MISSING_MODEL_VAR"
+        os.environ.pop(var, None)
+        spawned: list = []
+
+        def fake_run_logged_command(repo, cmd, log_path, timeout_s, stage, attempt, input_text=""):
+            spawned.append(cmd)
+            return "exited", log_path
+
+        with mock.patch.object(
+            self.opsx_plan, "run_logged_command", side_effect=fake_run_logged_command
+        ):
+            outcome, log_path = self._run_stage(f'echo --model "${var}"')
+
+        self.assertEqual(outcome, "env_error")
+        content = log_path.read_text(encoding="utf-8")
+        self.assertIn(var, content)
+        self.assertIn("unset environment variable", content)
+        self.assertEqual(spawned, [], "client must not be spawned on env_error")
+
+    def test_create_placeholder_substitution_still_reaches_command(self) -> None:
+        """2.4: create placeholders are still substituted and reach the
+        spawned create command."""
+        argv_dump = self.repo / "argv.json"
+        script = (
+            "import sys, json, pathlib; "
+            f"pathlib.Path({str(argv_dump)!r}).write_text(json.dumps(sys.argv))"
+        )
+        saved = os.environ.get("OPSX_CONTROLLER_MODEL")
+        os.environ["OPSX_CONTROLLER_MODEL"] = "placeholder-model"
+        try:
+            outcome, _log_path = self._run_stage(
+                f"python3 -c {shlex.quote(script)} "
+                "--change {change} --plan {plan_doc} --model {controller_model}"
+            )
+        finally:
+            if saved is not None:
+                os.environ["OPSX_CONTROLLER_MODEL"] = saved
+            else:
+                os.environ.pop("OPSX_CONTROLLER_MODEL", None)
+
+        self.assertEqual(outcome, "exited")
+        argv = json.loads(argv_dump.read_text(encoding="utf-8"))
+        # The {controller_model} placeholder carries the env-injected value.
+        self.assertEqual(argv[argv.index("--model") + 1], "placeholder-model")
+        self.assertEqual(argv[argv.index("--change") + 1], "c1")
+        self.assertEqual(argv[argv.index("--plan") + 1], "plan.md")
+
+
+class CreateStageTerminalEnvErrorRunLoopTests(unittest.TestCase):
+    """2.5: a create-stage env_error is terminal — the change fails and the
+    run does not fall through to change-verification retries."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        subprocess.run(
+            ["git", "init"], cwd=self.repo, check=True, capture_output=True, text=True
+        )
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=T",
+             "commit", "--allow-empty", "-m", "init"],
+            cwd=self.repo, check=True, capture_output=True, text=True,
+        )
+        self.plan_path = self.repo / "create-env-error.toml"
+        # The change is deliberately NOT authored, so the run hits create.
+        self.plan_path.write_text(
+            '[plan]\n'
+            'name = "create-env-error"\n'
+            'adapter = "opencode"\n'
+            'require_clean_tracked = false\n'
+            'create_timeout_minutes = 1\n'
+            '\n'
+            '[[changes]]\n'
+            'id = "needs-create"\n'
+            'create_invoke = "echo --model \\"$OPSX_MISSING_CREATE_VAR\\""\n',
+            encoding="utf-8",
+        )
+        self.plan_src = str(self.plan_path.relative_to(self.repo))
+        os.environ["OPSX_CONTROLLER_MODEL"] = "env-model"
+        self._saved_environ = dict(os.environ)
+
+    def tearDown(self) -> None:
+        # cmd_run calls apply_model_env, which mutates the whole process env
+        # (OPSX_*_MODEL and OPSX_*_VARIANT); restore everything so later test
+        # classes are not affected.
+        os.environ.clear()
+        os.environ.update(self._saved_environ)
+        self.tmp.cleanup()
+
+    def test_create_env_error_terminates_change_without_retrying(self) -> None:
+        os.environ.pop("OPSX_MISSING_CREATE_VAR", None)
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            plan=self.plan_src,
+            dry_run=False,
+            only=None,
+            max_changes=0,
+            budget_minutes=0,
+            budget_usd=0,
+            create_only=False,
+            no_branch=True,
+            no_pr=True,
+            skip_openspec=True,
+            skip_warning=False,
+            skip_suggestion=False,
+        )
+        rc = self.opsx_plan.cmd_run(args)
+        # The run completes (rc != 2): the env_error fails the change in the
+        # loop rather than aborting the process like spawn_error does.
+        self.assertNotEqual(rc, 2)
+
+        state = self.opsx_plan.state_mod.load_state(self.repo, "create-env-error")
+        rec = state["changes"]["needs-create"]
+        # The environment error must fail the change terminally.
+        self.assertEqual(rec["status"], self.opsx_plan.base.FAILED)
+        self.assertIn("OPSX_MISSING_CREATE_VAR", rec["reason"])
+        self.assertIn("environment error", rec["reason"])
+        # create_attempts is consumed but within budget — not a retry loop.
+        self.assertGreaterEqual(rec.get("create_attempts", 0), 1)
+
+
 class OpenCodeAgentModeTests(unittest.TestCase):
     AGENT_DIR = Path(__file__).resolve().parents[2] / "adapters" / "opencode" / "agents"
 
