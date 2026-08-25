@@ -2068,17 +2068,52 @@ def run_stage(
     timeout_minutes: float, attempt: int,
 ) -> tuple[str, Path]:
     """Run a templated stage command ('create'). Returns
-    (outcome, log_path) where outcome is 'exited', 'timeout', or
-    'spawn_error'. Output goes to a log file so it can be tailed live;
-    the exit code is informational only."""
+    (outcome, log_path) where outcome is 'env_error', 'exited',
+    'timeout', or 'spawn_error'. Output goes to a log file so it can be
+    tailed live; the exit code is informational only."""
     log_dir = repo / ".opsx-plan" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{cid}.{stage}{attempt}.log"
 
-    cmd = shlex.split(
-        invoke_tpl.format(change=cid, plan_doc=cfg["plan_doc"],
-                          controller_model=os.environ.get("OPSX_CONTROLLER_MODEL", ""))
+    # Substitute the three known create placeholders manually rather than via
+    # str.format(): a ``${VAR}`` create reference would otherwise be parsed as
+    # a format field and raise KeyError. Replacing by name leaves ``$VAR`` and
+    # ``${VAR}`` environment references intact for _expand_invoke_token below.
+    formatted = (
+        invoke_tpl.replace("{change}", cid)
+        .replace("{plan_doc}", cfg["plan_doc"])
+        .replace(
+            "{controller_model}",
+            os.environ.get("OPSX_CONTROLLER_MODEL", ""),
+        )
     )
+    tokens = shlex.split(formatted)
+    expanded_tokens: list[str] = []
+    for token in tokens:
+        value, missing_var = _expand_invoke_token(token)
+        if value is None:
+            message = (
+                f"stage invoke references unset environment variable "
+                f"'{missing_var}'"
+            )
+            log_path.write_text(
+                f"# {base.utcnow()} {stage}: {message}\n", encoding="utf-8"
+            )
+            base.log(f"  exec[{stage}]: aborted - {message}")
+            return "env_error", log_path
+        expanded_tokens.append(value)
+
+    # Drop tokens that expanded to empty (a set-but-empty variable, e.g. an
+    # optional reasoning variant) along with a preceding flag token that
+    # would otherwise dangle as ``--variant ""``. Mirrors invoke_direct_stage.
+    cmd: list[str] = []
+    for token in expanded_tokens:
+        if not token:
+            if cmd and cmd[-1].startswith("-") and "=" not in cmd[-1]:
+                cmd.pop()
+            continue
+        cmd.append(token)
+
     timeout_s = timeout_minutes * 60
     base.log(f"  exec[{stage}]: {' '.join(cmd)}  "
         f"(timeout {timeout_s/60:g}m, log {log_path})")
@@ -2454,6 +2489,18 @@ def cmd_run(args: argparse.Namespace) -> int:
                 cfg["create_timeout_minutes"], c_attempt,
             )
             r["last_log"] = str(log_path)
+
+            if outcome == "env_error":
+                # A deterministic environment configuration error (unset
+                # variable in create_invoke) must fail the change terminally,
+                # not fall through to change-verification retries.
+                why = log_path.read_text(encoding="utf-8").strip().lstrip("#").strip()
+                state_mod.set_status(
+                    state, cid, base.FAILED,
+                    f"create environment error: {why or change_cfg['create_invoke']}",
+                )
+                state_mod.save_state(repo, cfg["name"], state)
+                continue
 
             if outcome == "spawn_error":
                 state_mod.set_status(state, cid, base.FAILED,
