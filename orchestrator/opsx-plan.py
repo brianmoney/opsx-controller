@@ -2391,7 +2391,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 state["git_delivery"]["remote_name"] = remote_name
 
     if args.dry_run:
-        return cmd_status_inner(cfg, state, header="dry run: planned order")
+        return cmd_status_inner(cfg, state, header="dry run: planned order", repo=repo)
 
     budget_deadline = (
         time.monotonic() + args.budget_minutes * 60 if args.budget_minutes else None
@@ -2566,7 +2566,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 # before returning an error status.
                 state_mod.save_state(repo, cfg["name"], state)
                 print()
-                return cmd_status_inner(cfg, state, header="run finished (PR delivery failed)")
+                return cmd_status_inner(cfg, state, header="run finished (PR delivery failed)", repo=repo)
             gd_state = state.get("git_delivery", {})
             if gd_state.get("delivery_status") == "pr_opened":
                 plan_notified = notified.setdefault("_plan_", [])
@@ -2579,7 +2579,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             state_mod.save_state(repo, cfg["name"], state)
 
     print()
-    return cmd_status_inner(cfg, state, header="run finished")
+    return cmd_status_inner(cfg, state, header="run finished", repo=repo)
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -2612,7 +2612,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         None if args.plan is None or (active and args.plan == active)
         else plan_src
     )
-    return cmd_status_inner(cfg, state, header=header, plan_arg=plan_arg)
+    return cmd_status_inner(cfg, state, header=header, plan_arg=plan_arg, repo=repo)
 
 
 def display_order(cfg: dict) -> list[str]:
@@ -2628,9 +2628,39 @@ def display_order(cfg: dict) -> list[str]:
     return sorted(cfg["order"], key=key)
 
 
+def _print_model_banner(cfg: dict, repo: Path | None) -> None:
+    """Print the effective per-role model banner for the plan's adapter.
+
+    Resolves models through the same resolver the run uses, so the banner
+    reflects exactly what stages will invoke (repo-local > user-global >
+    [defaults] > env). Roles without a resolved model are shown as
+    '<unresolved>' rather than omitted, surfacing misconfiguration at
+    dry-run/status time instead of later.
+    """
+    adapter = cfg.get("adapter", "opencode")
+    try:
+        resolved = resolve_models(adapter, repo=repo)
+    except ModelConfigError as exc:
+        print(f"  models: <cannot resolve for adapter '{adapter}': {exc}>")
+        return
+    parts: list[str] = []
+    for role in ROLES:
+        entry = resolved.get(role)
+        model = (entry.model if entry else None) or "<unresolved>"
+        variant = entry.variant if entry and entry.variant else None
+        parts.append(f"{role}: {model}" + (f"@{variant}" if variant else ""))
+    suffix = ""
+    esc = resolved.get("implementer_escalation")
+    if esc and esc.model:
+        suffix = f"  (escalation: {esc.model})"
+    print(f"  models [{adapter}]: " + " | ".join(parts) + suffix)
+
+
 def cmd_status_inner(cfg: dict, state: dict, header: str,
-                     plan_arg: str | None = None) -> int:
+                     plan_arg: str | None = None,
+                     repo: Path | None = None) -> int:
     print(header)
+    _print_model_banner(cfg, repo)
     width = max(len(c) for c in cfg["order"])
     failed = 0
     for cid in display_order(cfg):
