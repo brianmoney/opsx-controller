@@ -9,6 +9,11 @@
 # comment-prefixed OPSX WORKER INPUT block in each direct-stage log
 # (including corrective handoffs) is visible as the stage begins.
 #
+# When the active stage is a dsh direct dispatch, also streams the live
+# session transcript dsh writes to <dsh_home>/sessions/<cwd-key>/<uuid>/
+# (steps, reasoning, tool calls/commands, results, tokens) alongside the
+# stage log.
+#
 # Renders stage-handoff and review-verdict banners as they occur.
 set -euo pipefail
 
@@ -259,7 +264,189 @@ render_verdict_banner() {
 }
 
 # -------------------------------------------------------------------
-# 5. Active-plan change-id resolution
+# 5. dsh session following
+# -------------------------------------------------------------------
+#
+# dsh writes the full transcript of a stage to a zstd-compressed JSONL
+# session file under <dsh_home>/sessions/<cwd-key>/<uuid>/session.jsonl.zstd
+# while the stage log only carries the worker-input header and the final
+# JSON result line.  When the active stage is a dsh direct dispatch
+# (its log names `opsx-dsh-worker`), this follower decompresses the newest
+# session for the repo and renders the interesting events as they stream.
+
+DSH_HOME="${DSH_HOME:-${OPSX_DSH_HOME:-$HOME/.local/state/opsx-controller/dsh}}"
+DSH_SESSION_FILE=""
+DSH_SESSION_LINES=0
+DSH_SESSION_MTIME=0
+DSH_SESSION_SIZE=0
+
+dsh_cwd_key() {
+  local abs
+  abs=$(cd "$REPO" && pwd 2>/dev/null) || return 1
+  abs="${abs#/}"
+  printf -- '--%s--' "${abs//\//-}"
+}
+
+newest_dsh_session() {
+  local key dir best="" best_t=0 f t
+  key=$(dsh_cwd_key 2>/dev/null) || return 1
+  dir="$DSH_HOME/sessions/$key"
+  [[ -d "$dir" ]] || return 1
+  for f in "$dir"/*/session.jsonl.zstd; do
+    [[ -f "$f" ]] || continue
+    t=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+    if (( t > best_t )); then
+      best="$f"
+      best_t=$t
+    fi
+  done
+  printf '%s' "$best"
+}
+
+# Render dsh session events (JSONL on stdin) as readable lines.
+render_dsh_events() {
+  local w width
+  w=$(banner_width)
+  width="${w:-80}"
+  local tmp
+  tmp=$(mktemp "${TMPDIR:-/tmp}/opsx-watch-render.XXXXXX")
+  cat > "$tmp" <<'PYEOF'
+import json, sys
+
+W = int(sys.argv[1])
+
+def clip(s, n):
+    s = " ".join(s.split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+def walk_text(node, out):
+    if isinstance(node, dict):
+        if node.get("type") == "text" and isinstance(node.get("text"), str):
+            out.append(node["text"])
+        for v in node.values():
+            walk_text(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            walk_text(v, out)
+
+def brief_args(args):
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except Exception:
+            return clip(args, 80)
+    if isinstance(args, dict):
+        for k in ("command", "file_path", "pattern", "name"):
+            if args.get(k):
+                return clip(str(args[k]), 160)
+        return clip(json.dumps(args), 80)
+    return clip(str(args), 80)
+
+for raw in sys.stdin:
+    raw = raw.rstrip("\n")
+    if not raw.strip():
+        continue
+    try:
+        e = json.loads(raw)
+    except Exception:
+        continue
+    t = e.get("type")
+    d = e.get("data") or {}
+
+    if t == "session":
+        print(f"[dsh] session {e.get('id','')} (cwd {e.get('cwd','')})")
+    elif t == "turn/start":
+        print(f"[dsh] ─ turn {d.get('turn')} start")
+    elif t == "turn/end":
+        r = (d.get("reason") or {}).get("kind", "")
+        print(f"[dsh] ─ turn {d.get('turn')} end ({r})")
+    elif t == "step/start":
+        print(f"[dsh]   step {d.get('step')} (turn {d.get('turn')})")
+    elif t == "step/end":
+        print(f"[dsh]   ✓ step {d.get('step')} done")
+    elif t == "assistant/message":
+        for b in (d.get("message") or {}).get("content") or []:
+            bt = b.get("type")
+            if bt == "reasoning" and b.get("text"):
+                print(f"[dsh]   · {clip(b['text'], 200)}")
+            elif bt == "tool-call":
+                print(f"[dsh]   → {b.get('name')}")
+            elif bt == "text" and b.get("text"):
+                print(f"[dsh]   ✎ {clip(b['text'], 200)}")
+    elif t == "tool/call":
+        print(f"[dsh]     → {d.get('name')} {brief_args(d.get('arguments'))}")
+    elif t == "tool/code-dispatch":
+        args = d.get("arguments") or {}
+        cmd = args.get("command") or args.get("file_path") or ""
+        print(f"[dsh]       ↳ {d.get('name')}: {clip(str(cmd), 160)}")
+    elif t == "tool/result":
+        out = []
+        walk_text(d.get("message") or {}, out)
+        if out:
+            print(f"[dsh]     ← {clip(' '.join(out), 160)}")
+    elif t == "assistant/chunk":
+        c = d.get("chunk") or {}
+        ct = c.get("type")
+        if ct == "usage":
+            u = c.get("usage") or {}
+            print(f"[dsh]     tokens in={u.get('inputTokens')} out={u.get('outputTokens')}")
+        elif ct == "finish":
+            r = (c.get("reason") or {}).get("kind", "")
+            print(f"[dsh]   ⏹ finish: {r}")
+PYEOF
+  python3 "$tmp" "$width" 2>/dev/null
+  rm -f "$tmp"
+}
+
+poll_dsh_session() {
+  local current="$1"
+  [[ -n "$current" ]] || return 0
+  grep -q 'opsx-dsh-worker' "$current" 2>/dev/null || return 0
+
+  local sess mtime size
+  sess=$(newest_dsh_session 2>/dev/null) || return 0
+  [[ -n "$sess" ]] || return 0
+
+  mtime=$(stat -c %Y "$sess" 2>/dev/null || echo 0)
+  size=$(stat -c %s "$sess" 2>/dev/null || echo 0)
+
+  if [[ "$sess" != "$DSH_SESSION_FILE" ]]; then
+    if [[ -n "$DSH_SESSION_FILE" ]]; then
+      printf '\n[dsh] → session switched: %s\n' "$(basename "$(dirname "$sess")")"
+    else
+      printf '\n[dsh] following session: %s\n' "$(basename "$(dirname "$sess")")"
+    fi
+    DSH_SESSION_FILE="$sess"
+    DSH_SESSION_LINES=0
+    DSH_SESSION_MTIME=$mtime
+    DSH_SESSION_SIZE=$size
+    # First poll of a session always renders everything present so far.
+    if (( size > 0 )); then
+      DSH_SESSION_MTIME=$(( mtime - 1 ))
+    fi
+  fi
+
+  if (( mtime < DSH_SESSION_MTIME )) || \
+     (( mtime == DSH_SESSION_MTIME && size == DSH_SESSION_SIZE )); then
+    return 0
+  fi
+  DSH_SESSION_MTIME=$mtime
+  DSH_SESSION_SIZE=$size
+
+  local tmp total
+  tmp=$(mktemp "${TMPDIR:-/tmp}/opsx-watch-dsh.XXXXXX")
+  if zstd -d -c "$sess" 2>/dev/null > "$tmp"; then
+    total=$(wc -l < "$tmp" 2>/dev/null || echo 0)
+    if (( total > DSH_SESSION_LINES )); then
+      sed -n "$((DSH_SESSION_LINES + 1)),\$p" "$tmp" 2>/dev/null | render_dsh_events
+      DSH_SESSION_LINES=$total
+    fi
+  fi
+  rm -f "$tmp"
+}
+
+# -------------------------------------------------------------------
+# 6. Active-plan change-id resolution
 # -------------------------------------------------------------------
 
 # Resolve the active plan TOML path from the repo.  Checks OPSX_PLAN env
@@ -493,5 +680,9 @@ while true; do
     } &
     reader_pid=$!
   fi
+
+  # When the active stage is a dsh dispatch, stream its session transcript.
+  poll_dsh_session "$current"
+
   sleep 2
 done
