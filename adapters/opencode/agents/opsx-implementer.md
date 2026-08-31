@@ -35,10 +35,14 @@ Input arrives from `opsx-controller` as plain text fields such as:
 Required workflow:
 1. Parse the input block.
 2. Read repo-root `AGENTS.md` if it exists; continue without it if missing. Never search parent or external directories for it.
-3. Read the installed global apply prompt from the first file that exists.
-   Expand `$HOME` before reading; never pass a literal `$HOME/...` path to the
-   Read tool. Do not use Glob for this step; try exact Read paths in order and
-   continue when a specific candidate does not exist. Preferred locations are:
+3. Read the apply prompt from the first file that exists, project-first then
+   global. The apply prompt may be supplied project-locally by openspec
+   (`<repo>/.opencode/commands/opsx-apply.md` or the `openspec-apply-change`
+   skill) or installed globally by the controller. Expand `$HOME` before
+   reading; never pass a literal `$HOME/...` path to the Read tool. Do not use
+   Glob for this step; try exact Read paths in order and continue when a
+   specific candidate does not exist. Preferred locations are:
+   - `<repo>/.opencode/commands/opsx-apply.md`
    - `<expanded-home>/.config/opencode/commands/opsx-apply.md`
    - `<expanded-home>/.config/opencode/command/opsx-apply.md`
 4. If `.venv/bin/activate` exists at the repo root, activate it before running
