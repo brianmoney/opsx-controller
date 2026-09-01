@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -31,6 +32,7 @@ _OPENCODE_INSTALLER = _REPO / "adapters" / "opencode" / "install.sh"
 _CLAUDE_INSTALLER = _REPO / "adapters" / "claude-code" / "install.sh"
 _CODEX_INSTALLER = _REPO / "adapters" / "codex-cli" / "install.sh"
 _DSH_INSTALLER = _REPO / "adapters" / "dsh" / "install.sh"
+_UNIVERSAL_INSTALLER = _REPO / "install.sh"
 
 
 def _model_env() -> dict[str, str]:
@@ -86,6 +88,25 @@ def _run_installer_verify(
     """
     return subprocess.run(
         ["bash", str(installer), "--global", "--verify"],
+        cwd=_REPO,
+        env={**os.environ, **env},
+        capture_output=True,
+        text=True,
+    )
+
+
+def _run_universal(
+    home: Path, env: dict[str, str], *args: str
+) -> subprocess.CompletedProcess:
+    """Run the repo-root universal installer against *home*.
+
+    *env* must include ``HOME`` (pointing at *home*) plus the
+    ``OPSX_*_MODEL`` overrides. Returns the ``CompletedProcess`` so callers
+    can inspect stdout/stderr and the return code (delegated adapter
+    failures and usage errors produce non-zero exits).
+    """
+    return subprocess.run(
+        ["bash", str(_UNIVERSAL_INSTALLER), *args],
         cwd=_REPO,
         env={**os.environ, **env},
         capture_output=True,
@@ -183,6 +204,26 @@ class SharedInstallerHelperTests(unittest.TestCase):
             hashlib.sha256(watcher_path.read_bytes()).digest(),
             hashlib.sha256(repo_copy.read_bytes()).digest(),
         )
+
+    def test_helper_deploys_canonical_sample_pair(self) -> None:
+        self._run_helper()
+        samples = self.lib_dir.parent / "samples"
+        for name in ("sample-plan.md", "sample-plan.toml"):
+            installed = samples / name
+            source = _REPO / "orchestrator" / "samples" / name
+            self.assertTrue(installed.is_file(), f"sample missing: {installed}")
+            self.assertEqual(source.read_bytes(), installed.read_bytes())
+
+    def test_repeated_install_refreshes_canonical_sample_pair(self) -> None:
+        self._run_helper()
+        samples = self.lib_dir.parent / "samples"
+        stale = samples / "sample-plan.md"
+        stale.write_text("stale sample\n", encoding="utf-8")
+
+        self._run_helper()
+
+        source = _REPO / "orchestrator" / "samples" / "sample-plan.md"
+        self.assertEqual(source.read_bytes(), stale.read_bytes())
 
 
 class AdapterInstallerTests(unittest.TestCase):
@@ -1204,9 +1245,9 @@ class WatcherBehaviorTests(unittest.TestCase):
                 break
         return output
 
-    def _start_watcher(self) -> subprocess.Popen:
+    def _start_watcher(self, watcher_script: Path | None = None) -> subprocess.Popen:
         return subprocess.Popen(
-            ["bash", str(self.watcher_script), str(self.repo)],
+            ["bash", str(watcher_script or self.watcher_script), str(self.repo)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -1251,6 +1292,36 @@ class WatcherBehaviorTests(unittest.TestCase):
             )
         finally:
             self._stop_watcher(proc)
+
+    def test_installed_watcher_follows_initial_log_and_switches_to_newer(self) -> None:
+        """The installed watcher must behave like the repository watcher."""
+        home = tempfile.TemporaryDirectory()
+        try:
+            subprocess.run(
+                ["bash", str(_REPO / "scripts" / "install-orchestrator.sh"), str(_REPO)],
+                cwd=_REPO,
+                env={**os.environ, "HOME": home.name},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            log1 = self.log_dir / "chg.implement.r1.1.log"
+            log1.write_text("installed round 1 output\n")
+            self.time.sleep(0.1)
+
+            installed_watcher = Path(home.name) / ".local" / "bin" / "opsx-watch-plan"
+            proc = self._start_watcher(installed_watcher)
+            try:
+                out1 = self._read_until(proc, "installed round 1 output", 10.0)
+                self.assertIn("installed round 1 output", out1)
+                log2 = self.log_dir / "chg.implement.r2.1.log"
+                log2.write_text("installed round 2 output QWERTY\n")
+                out2 = self._read_until(proc, "QWERTY", 10.0)
+                self.assertIn("QWERTY", out2)
+            finally:
+                self._stop_watcher(proc)
+        finally:
+            home.cleanup()
 
     def test_watcher_picks_later_log_on_same_second_mtime_tie(self) -> None:
         """When a review log and a later implement log share the same mtime
@@ -1875,6 +1946,458 @@ class CleanHomeReportDashboardTests(unittest.TestCase):
             / "clean-home-plan.html"
         )
         self.assertTrue(html_path.is_file())
+
+
+class UniversalInstallerTests(unittest.TestCase):
+    """Exercise the repo-root universal installer.
+
+    The universal installer delegates to each adapter installer, so its
+    tests run against a temporary HOME and assert both the adapter-specific
+    artifacts and the shared orchestrator executables/runtime. The adapter
+    delegation path is exercised by faking one adapter installer so a
+    simulated failure does not touch the real adapter installers.
+    """
+
+    ADAPTERS = ("opencode", "claude-code", "codex-cli", "dsh")
+
+    def setUp(self) -> None:
+        self.home = tempfile.TemporaryDirectory()
+        self.env = {**_model_env(), "HOME": self.home.name}
+        self.fake_adapters = Path(self.home.name) / "fake-adapters"
+
+    def tearDown(self) -> None:
+        self.home.cleanup()
+
+    # -- artifact-path helpers ---------------------------------------------
+
+    def _opencode_artifacts(self) -> list[Path]:
+        root = Path(self.home.name) / ".config" / "opencode"
+        return [
+            root / "skills",
+            root / "commands",
+            root / "agents",
+            root / "plugins",
+            root / "opsx-controller",
+        ]
+
+    def _claude_artifacts(self) -> list[Path]:
+        return [
+            Path(self.home.name) / ".claude" / "skills",
+            Path(self.home.name) / ".claude" / "agents",
+            Path(self.home.name) / ".claude" / "opsx-controller",
+        ]
+
+    def _codex_artifacts(self) -> list[Path]:
+        return [
+            Path(self.home.name) / ".agents" / "skills",
+            Path(self.home.name) / ".codex" / "agents",
+            Path(self.home.name) / ".codex" / "opsx-controller",
+        ]
+
+    def _dsh_artifacts(self) -> list[Path]:
+        root = Path(self.home.name) / ".config" / "opsx-controller" / "dsh"
+        return [
+            Path(self.home.name) / ".local" / "bin" / "opsx-dsh-worker",
+            root / "agents",
+            root,
+        ]
+
+    def _assert_shared_orchestrator_installed(self) -> None:
+        bin_dir = Path(self.home.name) / ".local" / "bin"
+        for name in ("opsx-plan", "opsx-run", "opsx-watch-plan"):
+            exe = bin_dir / name
+            self.assertTrue(exe.is_file(), f"shared executable missing at {exe}")
+            self.assertTrue(os.access(str(exe), os.X_OK))
+        lib = Path(self.home.name) / ".local" / "lib" / "opsx-controller" / "lib"
+        for pkg in ("metrics", "pricing", "models", "orchestrator"):
+            self.assertTrue(lib.joinpath(pkg).is_dir(),
+                            f"runtime library '{pkg}' missing in {lib}")
+
+    def _adapter_artifact_map(self) -> dict[str, list[Path]]:
+        return {
+            "opencode": self._opencode_artifacts(),
+            "claude-code": self._claude_artifacts(),
+            "codex-cli": self._codex_artifacts(),
+            "dsh": self._dsh_artifacts(),
+        }
+
+    def _assert_adapter_installed(self, adapter: str) -> None:
+        for artifact in self._adapter_artifact_map()[adapter]:
+            self.assertTrue(artifact.exists(),
+                            f"{adapter} artifact missing at {artifact}")
+
+    def _assert_adapter_not_installed(self, adapter: str) -> None:
+        for artifact in self._adapter_artifact_map()[adapter]:
+            self.assertFalse(artifact.exists(),
+                             f"{adapter} artifact unexpectedly present at {artifact}")
+
+    def _assert_all_adapters_installed(self) -> None:
+        for adapter in self.ADAPTERS:
+            self._assert_adapter_installed(adapter)
+
+    def _install(self, *args: str) -> subprocess.CompletedProcess:
+        return _run_universal(Path(self.home.name), self.env, *args)
+
+    # -- fake adapter installer helpers ------------------------------------
+
+    def _write_fake_adapter(self, name: str, exit_code: int = 0) -> Path:
+        """Install a fake ``adapters/<name>/install.sh`` in the repo mirror
+        that records the arguments it was invoked with and exits with
+        *exit_code*."""
+        dest = self.fake_adapters / "adapters" / name
+        dest.mkdir(parents=True)
+        log = self.fake_adapters / f"{name}.invocations"
+        script = dest / "install.sh"
+        script.write_text(
+            "#!/usr/bin/env bash\n"
+            f'echo "$@" >> "{log}"\n'
+            f'exit {exit_code}\n',
+            encoding="utf-8",
+        )
+        os.chmod(script, 0o755)
+        return script
+
+    def _run_universal_with_fake_adapters(
+        self, *args: str
+    ) -> subprocess.CompletedProcess:
+        """Run the universal installer against a repo mirror whose adapter
+        delegation resolves to fake adapter installers.
+
+        The mirror is a copy of the real ``install.sh`` plus fake
+        ``adapters/<name>/install.sh`` scripts and a symlinked ``lib`` so the
+        universal installer's ``install-common.sh`` source resolves. The real
+        adapter installers are never touched.
+        """
+        shutil.copy2(_UNIVERSAL_INSTALLER, self.fake_adapters / "install.sh")
+        (self.fake_adapters / "lib").symlink_to(_REPO / "lib", target_is_directory=True)
+        return subprocess.run(
+            ["bash", str(self.fake_adapters / "install.sh"), *args],
+            cwd=_REPO,
+            env={**os.environ, **self.env},
+            capture_output=True,
+            text=True,
+        )
+
+    def _invocations(self, name: str) -> list[str]:
+        log = self.fake_adapters / f"{name}.invocations"
+        if not log.is_file():
+            return []
+        return [
+            line.strip()
+            for line in log.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    # -- tests -------------------------------------------------------------
+
+    def test_universal_global_installs_every_adapter_and_shared_runtime(self) -> None:
+        proc = self._install("--global")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self._assert_all_adapters_installed()
+        self._assert_shared_orchestrator_installed()
+        output = proc.stdout + proc.stderr
+        for adapter in self.ADAPTERS:
+            self.assertIn(f"[install] {adapter}: OK", output)
+
+    def test_universal_global_only_opencode_installs_just_opencode(self) -> None:
+        proc = self._install("--global", "--only", "opencode")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self._assert_adapter_installed("opencode")
+        for adapter in ("claude-code", "codex-cli", "dsh"):
+            self._assert_adapter_not_installed(adapter)
+        self._assert_shared_orchestrator_installed()
+        output = proc.stdout + proc.stderr
+        self.assertIn("[install] opencode: OK", output)
+        self.assertNotIn("[install] claude-code", output)
+
+    def test_invalid_only_value_exits_nonzero_with_usage(self) -> None:
+        proc = self._install("--global", "--only", "bogus")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("Error: unknown adapter: bogus", proc.stderr)
+        self.assertIn("Valid adapters", proc.stderr)
+        for adapter in self.ADAPTERS:
+            self.assertIn(adapter, proc.stderr)
+
+    def test_universal_global_help_lists_all_flags(self) -> None:
+        proc = self._install("--help")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for flag in ("--global", "--project", "--verify", "--only"):
+            self.assertIn(flag, proc.stdout)
+
+    def test_failed_adapter_reports_partial_failure_and_keeps_prior_artifacts(
+        self,
+    ) -> None:
+        self._write_fake_adapter("opencode", exit_code=0)
+        self._write_fake_adapter("claude-code", exit_code=1)
+        self._write_fake_adapter("codex-cli", exit_code=0)
+        self._write_fake_adapter("dsh", exit_code=0)
+
+        proc = self._run_universal_with_fake_adapters("--global")
+        self.assertNotEqual(proc.returncode, 0)
+        output = proc.stdout + proc.stderr
+        self.assertIn("Completed adapters: opencode", output)
+        self.assertIn("Failed adapters:    claude-code", output)
+        self.assertNotIn("[install] codex-cli: OK", output)
+        self.assertIn("[install] opencode: OK", output)
+
+    def test_verify_flag_passed_through_to_each_adapter(self) -> None:
+        self._write_fake_adapter("opencode")
+        self._write_fake_adapter("claude-code")
+        self._write_fake_adapter("codex-cli")
+        self._write_fake_adapter("dsh")
+
+        proc = self._run_universal_with_fake_adapters(
+            "--global", "--only", "opencode,claude-code", "--verify"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            self._invocations("opencode"),
+            ["--global --verify"],
+            "opencode installer must receive the mode and --verify",
+        )
+        self.assertEqual(
+            self._invocations("claude-code"),
+            ["--global --verify"],
+            "claude-code installer must receive the mode and --verify",
+        )
+        self.assertEqual(self._invocations("codex-cli"), [])
+        self.assertEqual(self._invocations("dsh"), [])
+
+    def test_verify_flag_runs_each_real_adapter_verification_path(self) -> None:
+        proc = self._install("--global", "--verify")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        output = proc.stdout + proc.stderr
+        for adapter in self.ADAPTERS:
+            self.assertIn(f"[install] {adapter}: OK", output)
+        self.assertEqual(output.count("plan-authoring reference deployed and matches source"), 4)
+
+
+def _run_universal_project(
+    home: Path, project: Path, env: dict[str, str], *args: str
+) -> subprocess.CompletedProcess:
+    """Run the repo-root universal installer with --project against *project*.
+
+    *env* must include ``HOME`` (pointing at *home*) plus the
+    ``OPSX_*_MODEL`` overrides. Returns the ``CompletedProcess`` so callers
+    can inspect stdout/stderr and the return code.
+    """
+    return subprocess.run(
+        ["bash", str(_UNIVERSAL_INSTALLER), "--project", str(project), *args],
+        cwd=_REPO,
+        env={**os.environ, **env},
+        capture_output=True,
+        text=True,
+    )
+
+
+class UniversalProjectInstallTests(unittest.TestCase):
+    """Exercise the universal installer's project-scoped shared runtime.
+
+    ``--project`` must install every selected adapter's project artifacts
+    plus a self-contained shared orchestrator runtime under
+    ``<project>/.opsx-controller`` — executables and the ``metrics``,
+    ``pricing``, ``models``, and ``orchestrator`` runtime packages — that
+    runs without importing anything from the repository checkout.
+    """
+
+    ADAPTERS = ("opencode", "claude-code", "codex-cli", "dsh")
+
+    def setUp(self) -> None:
+        self.home = tempfile.TemporaryDirectory()
+        self.project = tempfile.TemporaryDirectory()
+        self.env = {**_model_env(), "HOME": self.home.name}
+
+    def tearDown(self) -> None:
+        self.home.cleanup()
+        self.project.cleanup()
+
+    def _project_root(self) -> Path:
+        return Path(self.project.name)
+
+    def _runtime_dir(self) -> Path:
+        return self._project_root() / ".opsx-controller"
+
+    def _bin_dir(self) -> Path:
+        return self._runtime_dir() / "bin"
+
+    def _lib_dir(self) -> Path:
+        return self._runtime_dir() / "lib"
+
+    def _assert_project_runtime_installed(self) -> None:
+        bin_dir = self._bin_dir()
+        for name in ("opsx-plan", "opsx-run", "opsx-watch-plan"):
+            exe = bin_dir / name
+            self.assertTrue(exe.is_file(), f"project executable missing at {exe}")
+            self.assertTrue(os.access(str(exe), os.X_OK))
+
+        lib = self._lib_dir()
+        for pkg in ("metrics", "pricing", "models", "orchestrator"):
+            self.assertTrue(
+                lib.joinpath(pkg).is_dir(),
+                f"project runtime package '{pkg}' missing in {lib}",
+            )
+
+    def _assert_adapter_project_artifacts(self) -> None:
+        root = self._project_root()
+        # The dsh adapter installs its support files under
+        # .opsx-controller/dsh, which the runtime .gitignore must not ignore.
+        expected = [
+            root / ".opencode" / "commands",
+            root / ".opencode" / "agents",
+            root / ".claude" / "skills",
+            root / ".agents" / "skills",
+            root / ".codex" / "agents",
+            root / ".opsx-controller" / "dsh" / "agents",
+        ]
+        for artifact in expected:
+            self.assertTrue(artifact.is_dir(), f"project artifact missing at {artifact}")
+
+    def test_universal_project_installs_all_adapter_artifacts_and_runtime(self) -> None:
+        proc = _run_universal_project(
+            Path(self.home.name), self._project_root(), self.env
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self._assert_adapter_project_artifacts()
+        self._assert_project_runtime_installed()
+        output = proc.stdout + proc.stderr
+        for adapter in self.ADAPTERS:
+            self.assertIn(f"[install] {adapter}: OK", output)
+
+    def test_universal_project_runtime_matches_repo_copy(self) -> None:
+        """The installed executables and runtime packages match the repo copy
+        byte-for-byte, proving they are self-contained copies."""
+        proc = _run_universal_project(
+            Path(self.home.name), self._project_root(), self.env
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        bin_dir = self._bin_dir()
+        self.assertEqual(
+            hashlib.sha256((bin_dir / "opsx-plan").read_bytes()).digest(),
+            hashlib.sha256(_REPO.joinpath("orchestrator", "opsx-plan.py").read_bytes()).digest(),
+        )
+        self.assertEqual(
+            hashlib.sha256((bin_dir / "opsx-watch-plan").read_bytes()).digest(),
+            hashlib.sha256(_REPO.joinpath("scripts", "opsx-watch-plan").read_bytes()).digest(),
+        )
+
+        installed_pkg = self._lib_dir() / "orchestrator"
+        repo_pkg = _REPO / "lib" / "orchestrator"
+        repo_files = sorted(p.relative_to(repo_pkg) for p in repo_pkg.rglob("*.py"))
+        self.assertTrue(repo_files, "expected lib/orchestrator to contain .py modules")
+        for rel in repo_files:
+            installed_file = installed_pkg / rel
+            self.assertTrue(installed_file.is_file(), f"missing installed module: {rel}")
+            self.assertEqual(
+                hashlib.sha256((repo_pkg / rel).read_bytes()).digest(),
+                hashlib.sha256(installed_file.read_bytes()).digest(),
+                f"installed module differs from repo copy: {rel}",
+            )
+
+    def test_project_installed_plan_runs_without_repo_checkout(self) -> None:
+        """The project-installed opsx-plan must run report/dashboard from the
+        installed runtime alone — no PYTHONPATH, cwd outside the checkout, so
+        any import of the repo's lib/ would fail."""
+        proc = _run_universal_project(
+            Path(self.home.name), self._project_root(), self.env
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        target = Path(self.home.name) / "target-repo"
+        target.mkdir()
+        subprocess.run(["git", "init"], cwd=target, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-c", "user.email=test@example.invalid",
+             "-c", "user.name=Test User", "commit", "-m", "init", "--allow-empty"],
+            cwd=target, check=True, capture_output=True,
+        )
+        plan_dir = target / ".opsx-plan"
+        plan_dir.mkdir(parents=True)
+        (plan_dir / "project-plan.toml").write_text(
+            '[plan]\nname = "project-plan"\nadapter = "opencode"\n\n'
+            '[[changes]]\nid = "prj-only"\nphase = 1\n',
+            encoding="utf-8",
+        )
+        (plan_dir / "telemetry").mkdir()
+        (plan_dir / "telemetry" / "project-plan.jsonl").write_text("", encoding="utf-8")
+        (plan_dir / "project-plan.state.json").write_text(
+            '{"plan": "project-plan", "approvals": [], '
+            '"changes": {"prj-only": {"status": "pending", "round": 0, "phase": "pending"}}}',
+            encoding="utf-8",
+        )
+
+        installed = self._bin_dir() / "opsx-plan"
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        env["HOME"] = self.home.name
+        run_proc = subprocess.run(
+            [str(installed), "--repo", str(target), "report", ".opsx-plan/project-plan.toml", "--json"],
+            cwd=self.home.name,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(run_proc.returncode, 0, run_proc.stderr)
+        self.assertIn("project-plan", run_proc.stdout)
+
+        dash_proc = subprocess.run(
+            [str(installed), "--repo", str(target), "dashboard", ".opsx-plan/project-plan.toml"],
+            cwd=self.home.name,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(dash_proc.returncode, 0, dash_proc.stderr)
+        self.assertTrue(
+            (target / ".opsx-plan" / "dashboards" / "project-plan.html").is_file()
+        )
+
+    def test_project_runtime_gitignore_ignores_lib_bin_but_not_dsh_support(self) -> None:
+        """The project runtime must self-ignore its installed lib/bin/samples
+        and per-change state, but must not ignore the dsh adapter's tracked
+        support files under .opsx-controller/dsh."""
+        proc = _run_universal_project(
+            Path(self.home.name), self._project_root(), self.env
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        gitignore = self._runtime_dir() / ".gitignore"
+        self.assertTrue(gitignore.is_file(), f".gitignore missing at {gitignore}")
+        content = gitignore.read_text(encoding="utf-8")
+        for line in ("lib/", "bin/", "samples/", "*.json"):
+            self.assertIn(line, content)
+        self.assertNotIn("dsh/", content)
+
+        # A per-change state file and the runtime dirs must be ignored.
+        gitignore_dir = self._project_root()
+        subprocess.run(["git", "init"], cwd=gitignore_dir, check=True, capture_output=True)
+        subprocess.run(["git", "add", "-A"], cwd=gitignore_dir, check=True, capture_output=True)
+        for path in (".opsx-controller/lib", ".opsx-controller/bin", ".opsx-controller/samples"):
+            ignored = subprocess.run(
+                ["git", "check-ignore", "--quiet", path],
+                cwd=gitignore_dir,
+                capture_output=True,
+            )
+            self.assertEqual(
+                ignored.returncode, 0,
+                f"runtime dir must be gitignored: {path}",
+            )
+
+    def test_universal_project_only_opencode_installs_just_opencode_runtime(self) -> None:
+        proc = _run_universal_project(
+            Path(self.home.name), self._project_root(), self.env,
+            "--only", "opencode",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self._assert_project_runtime_installed()
+        root = self._project_root()
+        self.assertTrue((root / ".opencode" / "commands").is_dir())
+        self.assertFalse((root / ".claude" / "skills").exists())
+        self.assertFalse((root / ".agents" / "skills").exists())
+        self.assertFalse((root / ".codex" / "agents").exists())
+        self.assertFalse((root / ".opsx-controller" / "dsh").exists())
+        output = proc.stdout + proc.stderr
+        self.assertIn("[install] opencode: OK", output)
+        self.assertNotIn("[install] claude-code", output)
 
 
 if __name__ == "__main__":

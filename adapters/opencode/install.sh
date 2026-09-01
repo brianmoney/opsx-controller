@@ -107,7 +107,13 @@ install_plugins() {
 }
 
 install_orchestrator() {
-  bash "$ROOT_DIR/scripts/install-orchestrator.sh" "$ROOT_DIR"
+  local mode="${1:---global}"
+  local project_dir="${2:-}"
+  if [[ "$mode" == "--project" ]]; then
+    bash "$ROOT_DIR/scripts/install-orchestrator.sh" "$ROOT_DIR" --project "$project_dir"
+  else
+    bash "$ROOT_DIR/scripts/install-orchestrator.sh" "$ROOT_DIR" --global
+  fi
 }
 
 ensure_project_gitignore() {
@@ -189,7 +195,7 @@ install_global() {
   install_plugins "$config_root/plugins"
   install_support_readme "$config_root/opsx-controller"
   install_plan_authoring_reference "$config_root/opsx-controller"
-  install_orchestrator
+  install_orchestrator --global
   printf '%s\n' \
     "Installed skills to $config_root/skills" \
     "Installed commands to $config_root/commands" \
@@ -223,6 +229,7 @@ install_project() {
   install_plan_authoring_reference "$project_dir/.opencode/opsx-controller"
   ensure_project_gitignore "$project_dir"
   ensure_project_config "$project_dir"
+  install_orchestrator --project "$project_dir"
 
   printf '%s\n' \
     "Installed skills to $project_dir/.opencode/skills" \
@@ -231,6 +238,10 @@ install_project() {
     "Installed plugins to $project_dir/.opencode/plugins" \
     "Installed support files to $project_dir/.opencode/opsx-controller" \
     "Installed plan-authoring reference to $project_dir/.opencode/opsx-controller/plan-authoring.md" \
+    "Installed opsx-plan runtime libraries to $project_dir/.opsx-controller/lib" \
+    "Installed opsx-plan to $project_dir/.opsx-controller/bin/opsx-plan" \
+    "Installed opsx-run to $project_dir/.opsx-controller/bin/opsx-run" \
+    "Installed opsx-watch-plan to $project_dir/.opsx-controller/bin/opsx-watch-plan" \
     "Updated $project_dir/.opencode/.gitignore"
   do_verify
   verify_plugin_deployed "$project_dir/.opencode/plugins"
