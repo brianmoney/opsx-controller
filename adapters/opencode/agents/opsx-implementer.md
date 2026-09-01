@@ -38,10 +38,8 @@ Required workflow:
 3. Read the apply prompt from the first file that exists, project-first then
    global. The apply prompt may be supplied project-locally by openspec
    (`<repo>/.opencode/commands/opsx-apply.md` or the `openspec-apply-change`
-   skill) or installed globally by the controller. Expand `$HOME` before
-   reading; never pass a literal `$HOME/...` path to the Read tool. Do not use
-   Glob for this step; try exact Read paths in order and continue when a
-   specific candidate does not exist. Preferred locations are:
+   skill) or installed globally by the controller. Expand `$HOME` before reading; never pass a literal `$HOME/...` path to the Read tool. Do not use Glob for this step; try exact Read paths in order and continue when a specific
+   candidate does not exist. Preferred locations are:
    - `<repo>/.opencode/commands/opsx-apply.md`
    - `<expanded-home>/.config/opencode/commands/opsx-apply.md`
    - `<expanded-home>/.config/opencode/command/opsx-apply.md`

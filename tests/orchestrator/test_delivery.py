@@ -344,7 +344,7 @@ class GitDeliveryCmdRunIntegrationTests(unittest.TestCase):
         def fake_preflight(repo, plan_src, adapter, cfg=None):
             pass
 
-        def fake_cmd_status_inner(cfg, state, header="", plan_arg=None):
+        def fake_cmd_status_inner(cfg, state, header="", plan_arg=None, repo=None):
             return 0
 
         with mock.patch.object(self.opsx_plan, "write_active_plan", side_effect=fake_write_active), \
@@ -380,7 +380,7 @@ class GitDeliveryCmdRunIntegrationTests(unittest.TestCase):
         def fake_preflight(repo, plan_src, adapter, cfg=None):
             pass
 
-        def fake_cmd_status_inner(cfg, state, header="", plan_arg=None):
+        def fake_cmd_status_inner(cfg, state, header="", plan_arg=None, repo=None):
             return 0
 
         with mock.patch.object(self.opsx_plan, "write_active_plan"), \
@@ -453,7 +453,7 @@ class GitDeliveryCmdRunIntegrationTests(unittest.TestCase):
         def fake_preflight(repo, plan_src, adapter, cfg=None):
             pass
 
-        def fake_cmd_status_inner(cfg, state, header="", plan_arg=None):
+        def fake_cmd_status_inner(cfg, state, header="", plan_arg=None, repo=None):
             return 0
 
         with mock.patch.object(self.opsx_plan, "write_active_plan"), \
