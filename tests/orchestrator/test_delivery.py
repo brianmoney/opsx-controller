@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import sys
 import os
 import subprocess
 import tempfile
@@ -56,6 +57,7 @@ def load_opsx_plan():
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules["opsx_plan"] = module
     spec.loader.exec_module(module)
     return module
 
@@ -344,14 +346,14 @@ class GitDeliveryCmdRunIntegrationTests(unittest.TestCase):
         def fake_preflight(repo, plan_src, adapter, cfg=None):
             pass
 
-        def fake_cmd_status_inner(cfg, state, header="", plan_arg=None):
+        def fake_cmd_status_inner(cfg, state, header="", plan_arg=None, repo=None):
             return 0
 
         with mock.patch.object(self.opsx_plan, "write_active_plan", side_effect=fake_write_active), \
              mock.patch.object(self.opsx_plan, "run_direct_change", side_effect=fake_run_direct_change), \
              mock.patch.object(self.opsx_plan, "reconcile", side_effect=fake_reconcile), \
              mock.patch.object(self.opsx_plan, "run_preflight_warnings", side_effect=fake_preflight), \
-             mock.patch.object(self.opsx_plan, "cmd_status_inner", side_effect=fake_cmd_status_inner):
+             mock.patch.object(self.opsx_plan.cmd_status, "cmd_status_inner", side_effect=fake_cmd_status_inner):
 
             args = argparse.Namespace(
                 repo=str(self.repo),
@@ -380,14 +382,14 @@ class GitDeliveryCmdRunIntegrationTests(unittest.TestCase):
         def fake_preflight(repo, plan_src, adapter, cfg=None):
             pass
 
-        def fake_cmd_status_inner(cfg, state, header="", plan_arg=None):
+        def fake_cmd_status_inner(cfg, state, header="", plan_arg=None, repo=None):
             return 0
 
         with mock.patch.object(self.opsx_plan, "write_active_plan"), \
              mock.patch.object(self.opsx_plan, "run_direct_change", side_effect=fake_run_direct_change), \
              mock.patch.object(self.opsx_plan, "reconcile", side_effect=fake_reconcile), \
              mock.patch.object(self.opsx_plan, "run_preflight_warnings", side_effect=fake_preflight), \
-             mock.patch.object(self.opsx_plan, "cmd_status_inner", side_effect=fake_cmd_status_inner):
+             mock.patch.object(self.opsx_plan.cmd_status, "cmd_status_inner", side_effect=fake_cmd_status_inner):
 
             args = argparse.Namespace(
                 repo=str(self.repo),
@@ -453,13 +455,13 @@ class GitDeliveryCmdRunIntegrationTests(unittest.TestCase):
         def fake_preflight(repo, plan_src, adapter, cfg=None):
             pass
 
-        def fake_cmd_status_inner(cfg, state, header="", plan_arg=None):
+        def fake_cmd_status_inner(cfg, state, header="", plan_arg=None, repo=None):
             return 0
 
         with mock.patch.object(self.opsx_plan, "write_active_plan"), \
              mock.patch.object(self.opsx_plan, "reconcile", side_effect=fake_reconcile), \
              mock.patch.object(self.opsx_plan, "run_preflight_warnings", side_effect=fake_preflight), \
-             mock.patch.object(self.opsx_plan, "cmd_status_inner", side_effect=fake_cmd_status_inner):
+             mock.patch.object(self.opsx_plan.cmd_status, "cmd_status_inner", side_effect=fake_cmd_status_inner):
 
             args = argparse.Namespace(
                 repo=str(self.repo),

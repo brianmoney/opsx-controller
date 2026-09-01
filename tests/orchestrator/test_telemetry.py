@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import sys
 import io
 import json
 import os
@@ -68,6 +69,7 @@ def load_opsx_plan():
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules["opsx_plan"] = module
     spec.loader.exec_module(module)
     return module
 

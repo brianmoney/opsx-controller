@@ -1,0 +1,2 @@
+Logs for plan 'golden-plan':
+  <REPO>/.opsx-plan/logs/golden-change.implement.r1.1.log

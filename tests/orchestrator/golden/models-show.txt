@@ -1,0 +1,6 @@
+adapter: opencode
+  controller   test-provider/test-controller  [ambient environment]
+  implementer  test-provider/test-implementer  [ambient environment]
+  reviewer     test-provider/test-reviewer  [ambient environment]
+  archiver     test-provider/test-archiver  [ambient environment]
+  implementer_escalation (unresolved)  [unresolved]

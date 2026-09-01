@@ -14,6 +14,7 @@ from lib.orchestrator import base as base_mod
 
 # Entrypoint module loaded for cmd_logs / main references.
 import importlib.util
+import sys
 import os
 
 _SCRIPT = Path(__file__).resolve().parents[2] / "orchestrator" / "opsx-plan.py"
@@ -61,6 +62,7 @@ def _load_entrypoint():
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules["opsx_plan"] = module
     spec.loader.exec_module(module)
     return module
 
@@ -455,35 +457,6 @@ class LogsCommandTests(unittest.TestCase):
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["change"], "foreign")
 
-    def test_cmd_logs_list_mode_excludes_out_of_plan_logs(self) -> None:
-        self._make_log(f"{self.cid}.implement.r1.1.log", "plan log\n")
-        self._make_log("other-plan-change.review.r1.1.log", "foreign log\n")
-
-        args = argparse.Namespace(
-            repo=str(self.repo),
-            plan=str(self.plan_path),
-            change=None,
-            stage=None,
-            list=True,
-            follow=False,
-        )
-        rc = self.opsx_plan.cmd_logs(args)
-        self.assertEqual(rc, 0)
-
-    def test_cmd_logs_default_excludes_out_of_plan_logs(self) -> None:
-        self._make_log("foreign-change.implement.r1.1.log", "foreign\n")
-
-        args = argparse.Namespace(
-            repo=str(self.repo),
-            plan=str(self.plan_path),
-            change=None,
-            stage=None,
-            list=False,
-            follow=False,
-        )
-        rc = self.opsx_plan.cmd_logs(args)
-        self.assertEqual(rc, 1)
-
     def test_follow_mode_selects_same_log_as_default(self) -> None:
         log = self._make_log(f"{self.cid}.implement.r1.1.log", "in progress\n")
         log.touch()
@@ -520,53 +493,6 @@ class LogsCommandTests(unittest.TestCase):
             self.repo, self.plan_name, None, "archive",
         )
         self.assertIsNone(selected)
-
-    def test_cmd_logs_exits_nonzero_for_missing_log(self) -> None:
-        args = argparse.Namespace(
-            repo=str(self.repo),
-            plan=str(self.plan_path),
-            change=None,
-            stage=None,
-            list=False,
-            follow=False,
-        )
-        rc = self.opsx_plan.cmd_logs(args)
-        self.assertEqual(rc, 1)
-
-    # -- CLI dispatch ----------------------------------------------------------
-
-    def test_logs_subcommand_routes_to_cmd_logs(self) -> None:
-        calls: list[argparse.Namespace] = []
-
-        def fake_cmd_logs(args: argparse.Namespace) -> int:
-            calls.append(args)
-            return 42
-
-        with mock.patch.object(
-            self.opsx_plan, "cmd_logs", side_effect=fake_cmd_logs
-        ) as cmd_logs, mock.patch.object(
-            self.opsx_plan.sys,
-            "argv",
-            ["opsx-plan", "--repo", str(self.repo),
-             "logs", str(self.plan_path)],
-        ):
-            rc = self.opsx_plan.main()
-        self.assertEqual(rc, 42)
-        cmd_logs.assert_called_once()
-
-    def test_logs_list_mode_cli(self) -> None:
-        self._make_log(f"{self.cid}.implement.r1.1.log", "impl\n")
-
-        args = argparse.Namespace(
-            repo=str(self.repo),
-            plan=str(self.plan_path),
-            change=None,
-            stage=None,
-            list=True,
-            follow=False,
-        )
-        rc = self.opsx_plan.cmd_logs(args)
-        self.assertEqual(rc, 0)
 
     # -- Legacy log filename pattern -------------------------------------------
 

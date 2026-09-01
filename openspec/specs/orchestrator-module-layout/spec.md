@@ -40,18 +40,44 @@ continue to own subcommand registration and dispatch. Moving a command's
 implementation into a module SHALL NOT change the subcommand's name, flags,
 defaults, exit codes, or output.
 
+The entrypoint SHALL retain the bodies of the `run` and `compile` subcommands
+and the `opsx-run` executable-name dispatch, because those share the stage
+dispatch, reconcile, and model-environment machinery that stays in the
+entrypoint. The self-contained operator command handlers — `use`, `status`,
+`approve`, `accept`, `reset`, `run-one`, `archive-plan`, the `models` group
+(`show`, `env`, `init`), `doctor`, and `logs` — SHALL live in importable
+modules under `lib/orchestrator/` named for the concern they own, and the
+entrypoint SHALL delegate each of these subcommands to its module. Each
+extracted module SHALL be importable as `lib.orchestrator.<module>` without
+executing the CLI.
+
 #### Scenario: Subcommand invocation is unchanged
 
-- **WHEN** an operator runs `opsx-plan report` or `opsx-plan dashboard` with
-  any combination of flags accepted before this change
+- **WHEN** an operator runs any `opsx-plan` subcommand with any combination of
+  flags accepted before this change
 - **THEN** the command is accepted, produces byte-identical output for
-  identical telemetry and state inputs, and exits with the same status code
+  identical repository, plan, state, and telemetry inputs, and exits with the
+  same status code
 
 #### Scenario: Help output is unchanged
 
 - **WHEN** an operator runs `opsx-plan --help` or any subcommand's `--help`
 - **THEN** the listed subcommands and their flags are the same as before the
   extraction
+
+#### Scenario: An extracted command module is imported without running the CLI
+
+- **WHEN** a test or tool imports the module that owns an extracted command
+  handler (for example the `status` module)
+- **THEN** the import succeeds, no argument parsing occurs, no process is
+  spawned, and no file under `.opsx-plan/` is read or written
+
+#### Scenario: The entrypoint still owns run and compile
+
+- **WHEN** the `run` or `compile` subcommand executes
+- **THEN** its body runs from the entrypoint module, and the stage dispatch,
+  reconcile, and model-environment machinery it relies on resolve within the
+  entrypoint
 
 ### Requirement: Cross-module references resolve through the module object
 
