@@ -1,0 +1,9 @@
+usage: opsx-plan approve [-h] [--all] [plan] [change ...]
+
+positional arguments:
+  plan        path to plan TOML
+  change
+
+options:
+  -h, --help  show this help message and exit
+  --all       approve all changes currently awaiting approval

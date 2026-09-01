@@ -1,0 +1,5 @@
+opsx-plan doctor (repo: <REPO>)
+  plan: (none; running plan-independent checks only)
+
+
+All checks passed

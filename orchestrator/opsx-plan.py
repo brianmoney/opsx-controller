@@ -31,10 +31,9 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
+import types
 import time
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 
 # Resolve bundled runtime modules before considering the host repository. The
@@ -60,15 +59,18 @@ except ModuleNotFoundError:  # pragma: no cover
     sys.exit("opsx-plan requires Python 3.11+ (tomllib)")
 
 try:
-    from lib.models.resolver import USER_CONFIG_PATH, ModelConfigError
+    from lib.models.resolver import ModelConfigError
     from lib.models.resolver import resolve as resolve_models
-    from lib.models.resolver import validate as validate_models
     from lib.models.types import ROLE_ENV, ROLE_VARIANT_ENV, ROLES, ALL_ROLES
 except ModuleNotFoundError as exc:  # pragma: no cover
     sys.exit(f"opsx-plan requires the lib.models runtime package: {exc}")
 
 try:
-    from lib.orchestrator import base, compiler, dashboard, delivery, doctor, groundtruth, logs, planref, report, telemetry
+    from lib.orchestrator import (
+        base, compiler, cmd_archive_plan, cmd_doctor, cmd_gates, cmd_logs,
+        cmd_models, cmd_run_one, cmd_status, cmd_use, dashboard, delivery,
+        doctor, groundtruth, logs, planref, report, telemetry,
+    )
     from lib.orchestrator import cost as cost_mod
     from lib.orchestrator import state as state_mod
 except ModuleNotFoundError as exc:  # pragma: no cover
@@ -2277,32 +2279,6 @@ def reconcile(repo: Path, cfg: dict, state: dict) -> None:
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
-def cmd_use(args: argparse.Namespace) -> int:
-    """opsx-plan use <plan.toml> — activate a plan for subsequent commands."""
-    repo = Path(args.repo).resolve()
-    plan_arg = args.plan
-    plan_path = (repo / plan_arg).resolve()
-    if not plan_path.is_file():
-        print(f"error: plan not found: {plan_arg}", file=sys.stderr)
-        return 2
-    # Validate through the existing plan loader before writing the pointer
-    try:
-        planref.load_plan(plan_path, repo=repo)
-    except (base.PlanError, Exception) as exc:
-        # tomllib.TOMLDecodeError and PlanError both indicate invalid plan
-        print(f"error: invalid plan: {exc}", file=sys.stderr)
-        return 2
-    try:
-        rel = str(plan_path.relative_to(repo))
-    except ValueError:
-        print(f"error: plan must be inside the repository: {plan_path}", file=sys.stderr)
-        return 2
-    write_active_plan(repo, rel)
-    base.log(f"active plan set to: {rel}")
-    print(f"Activated: {rel}")
-    return 0
-
-
 def cmd_run(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
     plan_src = planref.resolve_plan(repo, args.plan)
@@ -2393,7 +2369,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 state["git_delivery"]["remote_name"] = remote_name
 
     if args.dry_run:
-        return cmd_status_inner(cfg, state, header="dry run: planned order", repo=repo)
+        return cmd_status.cmd_status_inner(cfg, state, header="dry run: planned order", repo=repo)
 
     budget_deadline = (
         time.monotonic() + args.budget_minutes * 60 if args.budget_minutes else None
@@ -2568,7 +2544,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 # before returning an error status.
                 state_mod.save_state(repo, cfg["name"], state)
                 print()
-                return cmd_status_inner(cfg, state, header="run finished (PR delivery failed)", repo=repo)
+                return cmd_status.cmd_status_inner(cfg, state, header="run finished (PR delivery failed)", repo=repo)
             gd_state = state.get("git_delivery", {})
             if gd_state.get("delivery_status") == "pr_opened":
                 plan_notified = notified.setdefault("_plan_", [])
@@ -2581,380 +2557,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             state_mod.save_state(repo, cfg["name"], state)
 
     print()
-    return cmd_status_inner(cfg, state, header="run finished", repo=repo)
+    return cmd_status.cmd_status_inner(cfg, state, header="run finished", repo=repo)
 
 
-def cmd_status(args: argparse.Namespace) -> int:
-    repo = Path(args.repo).resolve()
-    plan_src = planref.resolve_plan(repo, args.plan)
-    cfg = planref.load_plan(planref._resolve_plan_path(repo, plan_src), repo=repo)
-    state = state_mod.load_state(repo, cfg["name"])
-    validate_dsh_state_files(repo, cfg, state)
-    reconcile(repo, cfg, state)
-    state_mod.save_state(repo, cfg["name"], state)
-    sync_direct_worker_state(repo, cfg, state)
-    header = f"plan: {cfg['name']}"
-    active = planref.read_active_plan(repo)
-    if active:
-        header += f"  (active: {active})"
-    # Determine the effective plan source for the [inspected:] note.
-    inspected = None
-    if args.plan:
-        inspected = args.plan
-    else:
-        env_plan = os.environ.get("OPSX_PLAN", "").strip()
-        if env_plan:
-            inspected = str(Path(env_plan))
-    if inspected and active and inspected != active:
-        header += f"  [inspected: {inspected}]"
-    # Short-form commands when the plan was resolved through the active-plan
-    # flow (no explicit plan argument). Long-form when an explicit plan path
-    # that differs from the active pointer is used.
-    plan_arg = (
-        None if args.plan is None or (active and args.plan == active)
-        else plan_src
-    )
-    return cmd_status_inner(cfg, state, header=header, plan_arg=plan_arg, repo=repo)
-
-
-def display_order(cfg: dict) -> list[str]:
-    """Phase-ascending for human reading (P0, P1, ...), with the scheduler's
-    topological order as a stable tiebreaker within a phase. Changes without a
-    phase sort last. cfg['order'] itself stays topological for dispatch."""
-    topo_index = {cid: i for i, cid in enumerate(cfg["order"])}
-
-    def key(cid: str) -> tuple:
-        phase = cfg["changes"][cid].get("phase")
-        return (phase is None, phase if phase is not None else 0, topo_index[cid])
-
-    return sorted(cfg["order"], key=key)
-
-
-def _print_model_banner(cfg: dict, repo: Path | None) -> None:
-    """Print the effective per-role model banner for the plan's adapter.
-
-    Resolves models through the same resolver the run uses, so the banner
-    reflects exactly what stages will invoke (repo-local > user-global >
-    [defaults] > env). Roles without a resolved model are shown as
-    '<unresolved>' rather than omitted, surfacing misconfiguration at
-    dry-run/status time instead of later.
-    """
-    adapter = cfg.get("adapter", "opencode")
-    try:
-        resolved = resolve_models(adapter, repo=repo)
-    except ModelConfigError as exc:
-        print(f"  models: <cannot resolve for adapter '{adapter}': {exc}>")
-        return
-    parts: list[str] = []
-    for role in ROLES:
-        entry = resolved.get(role)
-        model = (entry.model if entry else None) or "<unresolved>"
-        variant = entry.variant if entry and entry.variant else None
-        parts.append(f"{role}: {model}" + (f"@{variant}" if variant else ""))
-    suffix = ""
-    esc = resolved.get("implementer_escalation")
-    if esc and esc.model:
-        suffix = f"  (escalation: {esc.model})"
-    print(f"  models [{adapter}]: " + " | ".join(parts) + suffix)
-
-
-def cmd_status_inner(cfg: dict, state: dict, header: str,
-                     plan_arg: str | None = None,
-                     repo: Path | None = None) -> int:
-    print(header)
-    _print_model_banner(cfg, repo)
-    width = max(len(c) for c in cfg["order"])
-    failed = 0
-    for cid in display_order(cfg):
-        status = classify(cfg, state, cid)
-        r = state_mod.rec(state, cid)
-        extra = f"  ({r['reason']})" if r.get("reason") and status != base.DONE else ""
-        phase = cfg["changes"][cid].get("phase")
-        phase_s = f"P{phase} " if phase is not None else ""
-        print(f"  {phase_s}{cid.ljust(width)}  {status}{extra}")
-        if status in (base.FAILED, "blocked"):
-            failed += 1
-        # Next-command guidance for blocked changes
-        if status == "awaiting_approval":
-            if plan_arg:
-                print(f"    \u2192 opsx-plan approve {plan_arg} {cid}")
-            else:
-                print(f"    \u2192 opsx-plan approve {cid}")
-        elif status == "awaiting_acceptance":
-            if plan_arg:
-                print(f"    \u2192 opsx-plan accept {plan_arg} {cid}")
-            else:
-                print(f"    \u2192 opsx-plan accept {cid}")
-        elif status == base.FAILED:
-            if plan_arg:
-                print(f"    \u2192 opsx-plan reset {plan_arg} {cid}")
-            else:
-                print(f"    \u2192 opsx-plan reset {cid}")
-        if status == base.DONE and r.get("manual_tasks_pending"):
-            print("    manual follow-up (operator checklist):")
-            for task in r["manual_tasks_pending"]:
-                print(f"      - {single_line(task)}")
-    return 1 if failed else 0
-
-
-def resolve_changes(cfg: dict, args: list[str]) -> list[str] | None:
-    """Resolve each arg: P<N> maps to all changes in that phase; else exact slug."""
-    resolved: list[str] = []
-    for arg in args:
-        m = re.fullmatch(r"P(\d+)", arg)
-        if m:
-            phase = int(m.group(1))
-            matched = [c for c in cfg["order"] if cfg["changes"][c].get("phase") == phase]
-            if not matched:
-                print(f"no changes found for phase P{phase}", file=sys.stderr)
-                return None
-            resolved.extend(matched)
-        elif arg in cfg["changes"]:
-            resolved.append(arg)
-        else:
-            print(f"unknown change: {arg}", file=sys.stderr)
-            return None
-    return resolved
-
-
-def cmd_approve(args: argparse.Namespace) -> int:
-    repo = Path(args.repo).resolve()
-    # Heuristic: when the first positional doesn't look like a TOML path,
-    # reinterpret it as a change ID and resolve the plan.
-    if args.plan is not None and not (
-        args.plan.endswith(".toml") or "/" in args.plan or "\\" in args.plan
-    ):
-        args.change.insert(0, args.plan)
-        args.plan = None
-
-    plan_path = planref.resolve_plan(repo, args.plan)
-    cfg = planref.load_plan(planref._resolve_plan_path(repo, plan_path), repo=repo)
-    state = state_mod.load_state(repo, cfg["name"])
-
-    if args.approve_all:
-        affected = [
-            cid for cid in cfg["order"]
-            if classify(cfg, state, cid) == "awaiting_approval"
-        ]
-        if not affected:
-            print("No changes are currently awaiting approval.")
-            return 0
-        for cid in affected:
-            if cid not in state["approvals"]:
-                state["approvals"].append(cid)
-                base.log(f"approved: {cid}")
-        print(f"Approved: {', '.join(affected)}")
-        state_mod.save_state(repo, cfg["name"], state)
-        return 0
-
-    if not args.change:
-        print("error: at least one change id is required", file=sys.stderr)
-        return 2
-    changes = resolve_changes(cfg, args.change)
-    if changes is None:
-        return 2
-    for cid in changes:
-        if cid not in state["approvals"]:
-            state["approvals"].append(cid)
-            base.log(f"approved: {cid}")
-    state_mod.save_state(repo, cfg["name"], state)
-    return 0
-
-
-def cmd_accept(args: argparse.Namespace) -> int:
-    """Mark orchestrator-created changes as reviewed so drive may proceed."""
-    repo = Path(args.repo).resolve()
-    # Heuristic: when the first positional doesn't look like a TOML path,
-    # reinterpret it as a change ID and resolve the plan.
-    if args.plan is not None and not (
-        args.plan.endswith(".toml") or "/" in args.plan or "\\" in args.plan
-    ):
-        args.change.insert(0, args.plan)
-        args.plan = None
-
-    plan_path = planref.resolve_plan(repo, args.plan)
-    cfg = planref.load_plan(planref._resolve_plan_path(repo, plan_path), repo=repo)
-    state = state_mod.load_state(repo, cfg["name"])
-
-    if args.accept_all:
-        affected = [
-            cid for cid in cfg["order"]
-            if classify(cfg, state, cid) == "awaiting_acceptance"
-        ]
-        if not affected:
-            print("No changes are currently awaiting acceptance.")
-            return 0
-        had_failure = False
-        accepted: list[str] = []
-        for cid in affected:
-            ok, why = groundtruth.verify_change_created(repo, cfg, cid)
-            if not ok:
-                print(f"refusing to accept {cid}: {why}", file=sys.stderr)
-                had_failure = True
-                continue
-            state_mod.rec(state, cid)["accepted"] = True
-            base.log(f"accepted: {cid}")
-            accepted.append(cid)
-        if accepted:
-            print(f"Accepted: {', '.join(accepted)}")
-            state_mod.save_state(repo, cfg["name"], state)
-        return 2 if had_failure else 0
-
-    if not args.change:
-        print("error: at least one change id is required", file=sys.stderr)
-        return 2
-    changes = resolve_changes(cfg, args.change)
-    if changes is None:
-        return 2
-    had_failure = False
-    changed = False
-    for cid in changes:
-        ok, why = groundtruth.verify_change_created(repo, cfg, cid)
-        if not ok:
-            print(f"refusing to accept {cid}: {why}", file=sys.stderr)
-            had_failure = True
-            continue
-        state_mod.rec(state, cid)["accepted"] = True
-        base.log(f"accepted: {cid}")
-        changed = True
-    if changed:
-        state_mod.save_state(repo, cfg["name"], state)
-    return 2 if had_failure else 0
-
-
-def cmd_reset(args: argparse.Namespace) -> int:
-    repo = Path(args.repo).resolve()
-    # Heuristic: when the first positional doesn't look like a TOML path,
-    # reinterpret it as a change ID and resolve the plan.
-    if args.plan is not None and not (
-        args.plan.endswith(".toml") or "/" in args.plan or "\\" in args.plan
-    ):
-        args.change.insert(0, args.plan)
-        args.plan = None
-
-    plan_path = planref.resolve_plan(repo, args.plan)
-    cfg = planref.load_plan(planref._resolve_plan_path(repo, plan_path), repo=repo)
-    state = state_mod.load_state(repo, cfg["name"])
-
-    if args.failed:
-        affected = [
-            cid for cid in cfg["order"]
-            if classify(cfg, state, cid) == base.FAILED
-        ]
-        if not affected:
-            print("No failed changes to reset.")
-            return 0
-        for cid in affected:
-            state["changes"][cid] = state_mod.new_change_record()
-            state["changes"][cid]["max_rounds"] = cfg["max_rounds"]
-            state["changes"][cid]["reason"] = "reset by operator"
-            state["changes"][cid]["updated_at"] = base.utcnow()
-            base.log(f"reset: {cid}")
-        print(f"Reset: {', '.join(affected)}")
-        state_mod.save_state(repo, cfg["name"], state)
-        return 0
-
-    if not args.change:
-        print("error: at least one change id is required", file=sys.stderr)
-        return 2
-    changes = resolve_changes(cfg, args.change)
-    if changes is None:
-        return 2
-    for cid in changes:
-        state["changes"][cid] = state_mod.new_change_record()
-        state["changes"][cid]["max_rounds"] = cfg["max_rounds"]
-        state["changes"][cid]["reason"] = "reset by operator"
-        state["changes"][cid]["updated_at"] = base.utcnow()
-        base.log(f"reset: {cid}")
-    state_mod.save_state(repo, cfg["name"], state)
-    return 0
-
-
-def cmd_run_one(args: argparse.Namespace) -> int:
-    """Run exactly one authored OpenSpec change through the direct OpenCode loop.
-
-    Pinned to the OpenCode adapter via ``build_single_change_config``; there
-    is no ``--adapter`` flag to select ``claude-code`` for this entry point.
-    """
-    repo = Path(args.repo).resolve()
-    change_id = args.change
-
-    cdir = groundtruth.change_dir(repo, change_id)
-    if not cdir.is_dir():
-        print(f"error: openspec/changes/{change_id} does not exist", file=sys.stderr)
-        return 2
-    if not groundtruth.change_authored(repo, change_id):
-        print(
-            f"error: openspec/changes/{change_id} is missing required artifacts "
-            f"({', '.join(groundtruth.AUTHORED_ARTIFACTS)})",
-            file=sys.stderr,
-        )
-        return 2
-
-    cfg = build_single_change_config(repo, change_id)
-    state = state_mod.load_state(repo, cfg["name"])
-    signal.signal(signal.SIGINT, handle_sigint)
-
-    if cfg["require_clean_tracked"] and not groundtruth.tracked_tree_clean(repo):
-        print(
-            "error: tracked worktree is dirty; commit/stash then re-run",
-            file=sys.stderr,
-        )
-        return 2
-
-    # Set before serialization so the derived manifest records the skips this
-    # run actually applies, and so round-trip verification compares them.
-    cfg["skip_warning"] = bool(cfg.get("skip_warning", False)) or getattr(
-        args, "skip_warning", False
-    )
-    cfg["skip_suggestion"] = bool(cfg.get("skip_suggestion", False)) or getattr(
-        args, "skip_suggestion", False
-    )
-    write_single_change_manifest(repo, change_id, cfg)
-
-    validate_dsh_state_files(repo, cfg, state)
-    reconcile(repo, cfg, state)
-    state_mod.save_state(repo, cfg["name"], state)
-    sync_direct_worker_state(repo, cfg, state)
-
-    r = state_mod.rec(state, change_id)
-    if r["status"] == base.DONE:
-        base.log(f"{change_id} is already done")
-        return 0
-
-    base.log(f"=== {change_id} direct {cfg['adapter']} execution (round {r['round']}) ===")
-    budget_usd = (
-        float(args.budget_usd) if getattr(args, "budget_usd", 0) and float(args.budget_usd) > 0 else 0.0
-    )
-    result = run_direct_change(repo, cfg, state, change_id, budget_usd=budget_usd)
-
-    if result == base.DONE:
-        base.log(f"  done: {change_id}")
-    elif result == "spawn_error":
-        failed_stage = r.get("phase")
-        failed_invoke = (
-            cfg.get(f"{failed_stage}_invoke", "")
-            if failed_stage in {"implement", "review", "archive"}
-            else ""
-        )
-        print(
-            f"error: could not start direct worker dispatch for openspec/changes/{change_id}: "
-            f"{failed_invoke or r.get('reason', 'unknown direct worker')}",
-            file=sys.stderr,
-        )
-        return 2
-
-    manifest_rel = planref.single_change_manifest_path(repo, change_id).relative_to(repo)
-    print(f"  Report:  opsx-plan report {manifest_rel}")
-    print(f"           opsx-plan report --for-change {change_id}")
-    print(f"  Dashboard: opsx-plan dashboard {manifest_rel}")
-    print(f"             opsx-plan dashboard --for-change {change_id}")
-
-    display = r["status"]
-    if r.get("reason"):
-        display += f" ({r['reason']})"
-    print(f"  {change_id}  {display}")
-    return 0 if result == base.DONE else 1
 
 
 def cmd_compile(args: argparse.Namespace) -> int:
@@ -3088,88 +2693,7 @@ def cmd_compile(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_archive_plan(args: argparse.Namespace) -> int:
-    """opsx-plan archive-plan <manifest> — archive a plan manifest pair."""
-    repo = Path(args.repo).resolve()
-    plan_arg = args.plan
 
-    # Resolve to absolute path relative to repo
-    plan_path = (repo / plan_arg).resolve()
-    if not plan_path.is_file():
-        print(f"error: manifest not found: {plan_arg}", file=sys.stderr)
-        return 2
-
-    # Refuse targets already under archived/
-    try:
-        plan_rel = str(plan_path.relative_to(repo))
-    except ValueError:
-        print(f"error: manifest must be inside the repository: {plan_path}", file=sys.stderr)
-        return 2
-
-    if "openspec/plans/archived/" in plan_rel:
-        print(f"error: manifest is already under openspec/plans/archived/: {plan_rel}", file=sys.stderr)
-        return 2
-
-    if not plan_rel.startswith("openspec/plans/"):
-        print(f"error: manifest must be under openspec/plans/: {plan_rel}", file=sys.stderr)
-        return 2
-
-    # Determine the sibling .md path
-    md_path = plan_path.with_suffix(".md")
-    has_md = md_path.is_file()
-
-    archived_dir = repo / "openspec" / "plans" / "archived"
-    archived_dir.mkdir(parents=True, exist_ok=True)
-
-    moved: list[str] = []
-
-    # Move the .toml
-    toml_dst = archived_dir / plan_path.name
-    moved.append(str(plan_path.relative_to(repo)))
-    _git_mv_or_rename(repo, plan_path, toml_dst)
-
-    # Move the sibling .md when present
-    if has_md:
-        md_dst = archived_dir / md_path.name
-        moved.append(str(md_path.relative_to(repo)))
-        _git_mv_or_rename(repo, md_path, md_dst)
-
-    # Clear the active-plan pointer when it referenced the archived plan
-    active = planref.read_active_plan(repo)
-    if active == plan_rel:
-        pointer = planref.active_plan_pointer_path(repo)
-        if pointer.is_file():
-            pointer.unlink()
-
-    print(f"Archived:")
-    for path in moved:
-        print(f"  {path} -> openspec/plans/archived/{Path(path).name}")
-    if active == plan_rel:
-        print(f"  Cleared active-plan pointer (was: {plan_rel})")
-    print(f"  Move still needs committing; archive-plan does not create a commit.")
-    return 0
-
-
-def _git_mv_or_rename(repo: Path, src: Path, dst: Path) -> None:
-    """Move *src* to *dst* using ``git mv`` for tracked files, plain rename otherwise."""
-    try:
-        rel_src = str(src.relative_to(repo))
-    except ValueError:
-        rel_src = str(src)
-    res = subprocess.run(
-        ["git", "ls-files", "--error-unmatch", rel_src],
-        cwd=repo, capture_output=True, text=True,
-    )
-    if res.returncode == 0:
-        subprocess.run(
-            ["git", "mv", rel_src, str(dst.relative_to(repo))],
-            cwd=repo, check=True, capture_output=True,
-        )
-    else:
-        os.rename(src, dst)
-
-
-# ---------------------------------------------------------------------------
 # Report command: implementation lives in lib/orchestrator/report.py
 # ---------------------------------------------------------------------------
 
@@ -3178,304 +2702,6 @@ def _git_mv_or_rename(repo: Path, src: Path, dst: Path) -> None:
 # Dashboard command: implementation lives in lib/orchestrator/dashboard.py
 # ---------------------------------------------------------------------------
 
-
-# ---------------------------------------------------------------------------
-# models subcommand group
-# ---------------------------------------------------------------------------
-
-def _resolve_models_adapter(args: argparse.Namespace, repo: Path) -> str:
-    """Resolve the target adapter for ``models show``/``models env``.
-
-    Uses ``--adapter`` when given. Otherwise resolves the active plan the
-    same way other operator commands do, so the two subcommands can run
-    with no plan active as long as ``--adapter`` is supplied.
-    """
-    adapter = getattr(args, "adapter", None)
-    if adapter:
-        return adapter
-    plan_src = planref.resolve_plan(repo, None)
-    cfg = planref.load_plan(planref._resolve_plan_path(repo, plan_src), repo=repo)
-    return cfg["adapter"]
-
-
-def cmd_models_show(args: argparse.Namespace) -> int:
-    """opsx-plan models show [--adapter <name>] — print resolved models."""
-    repo = Path(args.repo).resolve()
-    try:
-        adapter = _resolve_models_adapter(args, repo)
-    except base.PlanError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    try:
-        resolved = resolve_models(adapter, repo=repo)
-    except ModelConfigError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-
-    print(f"adapter: {adapter}")
-    for role in ALL_ROLES:
-        entry = resolved[role]
-        value = entry.model if entry.model else "(unresolved)"
-        print(f"  {role:<12} {value}  [{entry.source}]")
-        if entry.variant:
-            print(f"  {'':<12} variant: {entry.variant}  [{entry.variant_source}]")
-
-    warnings = validate_models(adapter, resolved)
-    if warnings:
-        print("\nidentifier-syntax warnings:")
-        for warning in warnings:
-            print(f"  - {warning}")
-
-    return 0
-
-
-def cmd_models_env(args: argparse.Namespace) -> int:
-    """opsx-plan models env [--adapter <name>] — print shell export statements."""
-    repo = Path(args.repo).resolve()
-    try:
-        adapter = _resolve_models_adapter(args, repo)
-    except base.PlanError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    try:
-        resolved = resolve_models(adapter, repo=repo)
-    except ModelConfigError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-
-    unresolved = [role for role in ROLES if not resolved[role].model]
-    if unresolved:
-        print(
-            f"error: cannot emit environment for adapter '{adapter}': "
-            f"unresolved role(s): {', '.join(unresolved)}",
-            file=sys.stderr,
-        )
-        return 1
-
-    for role in ROLES:
-        print(f"export {ROLE_ENV[role]}={shlex.quote(resolved[role].model)}")
-    # Emit the escalation export only when resolved.
-    esc_entry = resolved.get("implementer_escalation")
-    if esc_entry and esc_entry.model:
-        print(f"export {ROLE_ENV['implementer_escalation']}={shlex.quote(esc_entry.model)}")
-    # Emit reasoning-variant exports only when resolved; the installer keeps
-    # the agent file's built-in default when no variant is configured.
-    for role in ALL_ROLES:
-        entry = resolved.get(role)
-        if entry and entry.variant:
-            print(f"export {ROLE_VARIANT_ENV[role]}={shlex.quote(entry.variant)}")
-    return 0
-
-
-def cmd_models_init(args: argparse.Namespace) -> int:
-    """opsx-plan models init [--force] — seed the user-global config file."""
-    path = USER_CONFIG_PATH
-    if path.exists() and not getattr(args, "force", False):
-        print(
-            f"error: {path} already exists; use --force to overwrite",
-            file=sys.stderr,
-        )
-        return 1
-
-    lines = [
-        "# Generated by `opsx-plan models init`.",
-        "# See models.example.toml in the opsx-controller repo for the full",
-        "# per-adapter precedence explanation.",
-        "",
-        "[defaults]",
-    ]
-    seeded = 0
-    for role in ALL_ROLES:
-        value = os.environ.get(ROLE_ENV[role], "").strip()
-        if value:
-            lines.append(f"{role} = {json.dumps(value)}")
-            seeded += 1
-    if seeded == 0:
-        lines.append("# no OPSX_*_MODEL variables were set in the environment;")
-        lines.append("# edit this file directly, e.g.:")
-        lines.append('# controller = "github-copilot/gpt-5.4"')
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    if seeded:
-        print(f"Created {path} ({seeded} role(s) seeded from the environment)")
-    else:
-        print(f"Created {path} (no environment values found; edit it directly)")
-    return 0
-
-
-def cmd_doctor(args: argparse.Namespace) -> int:
-    """opsx-plan doctor [plan] — run preflight checks."""
-    repo = Path(args.repo).resolve()
-
-    # Try to resolve plan; continue without plan if resolution fails and
-    # no explicit plan argument was given.
-    plan_src: str | None = None
-    if args.plan is not None:
-        # Explicit plan argument: fail hard when plan can't be resolved/loaded.
-        plan_src = args.plan
-        plan_abs = planref._resolve_plan_path(repo, plan_src)
-        if not plan_abs.is_file():
-            print(f"error: plan not found: {plan_src}", file=sys.stderr)
-            return 2
-    else:
-        try:
-            plan_src = planref.resolve_plan(repo, None)
-        except base.PlanError:
-            # Surface stale active-plan pointer errors; do not swallow them.
-            pointer = planref.read_active_plan(repo)
-            if pointer:
-                plan_path = repo / pointer
-                if not plan_path.is_file():
-                    print(
-                        f"warning: active plan pointer references missing file: {pointer}",
-                        file=sys.stderr,
-                    )
-                    print(
-                        "  Set a new active plan with: opsx-plan use <plan.toml>",
-                        file=sys.stderr,
-                    )
-                else:
-                    print(
-                        f"error: active plan could not be loaded: {pointer}",
-                        file=sys.stderr,
-                    )
-                    return 2
-            # No active plan; run plan-independent checks only.
-
-    # Determine adapter from resolved plan or explicit --adapter flag.
-    adapter = getattr(args, "adapter", None) or "opencode"
-    cfg: dict | None = None
-    if plan_src:
-        try:
-            cfg = planref.load_plan(planref._resolve_plan_path(repo, plan_src), repo=repo)
-            # A resolved plan's adapter is authoritative; --adapter is ignored.
-            adapter = cfg["adapter"]
-        except base.PlanError:
-            print(f"error: cannot load plan: {plan_src}", file=sys.stderr)
-            return 2
-
-    print(f"opsx-plan doctor (repo: {repo})")
-    if plan_src:
-        print(f"  plan: {plan_src}")
-    else:
-        print("  plan: (none; running plan-independent checks only)")
-    print()
-
-    failures = run_doctor_checks(repo, plan_src, adapter, cfg)
-
-    print()
-    if failures:
-        print(f"{failures} check(s) failed")
-        return 1
-    print("All checks passed")
-    return 0
-
-
-def cmd_logs(args: argparse.Namespace) -> int:
-    """opsx-plan logs [plan] [--change <id>] [--stage <stage>] [--list] [--follow]"""
-    repo = Path(args.repo).resolve()
-    plan_src = planref.resolve_plan(repo, args.plan)
-    cfg = planref.load_plan(planref._resolve_plan_path(repo, plan_src), repo=repo)
-    plan_name = cfg["name"]
-
-    change_filter = args.change if args.change else None
-    stage_filter = args.stage if args.stage else None
-    plan_change_ids: set[str] = set(cfg["changes"].keys())
-
-    if args.list:
-        entries = logs._collect_filtered_logs(repo, change_filter, stage_filter,
-                                         plan_change_ids=plan_change_ids)
-        if not entries:
-            filters_desc = _describe_filters(change_filter, stage_filter, plan_name)
-            print(f"No matching logs found{filters_desc}.")
-            return 0
-        print(f"Logs for plan '{plan_name}'" +
-              (_describe_filters(change_filter, stage_filter, "")) +
-              ":")
-        for entry in entries:
-            print(f"  {entry['path']}")
-        return 0
-
-    selected = logs._select_log(repo, plan_name, change_filter, stage_filter,
-                           plan_change_ids=plan_change_ids)
-    if selected is None:
-        filters_desc = _describe_filters(change_filter, stage_filter, plan_name)
-        print(f"No matching log found{filters_desc}.", file=sys.stderr)
-        return 1
-
-    log_path = Path(selected["path"])
-    print(f"==> {log_path} <==")
-    if args.follow:
-        _follow_log(log_path)
-    else:
-        _tail_log(log_path)
-    return 0
-
-
-def _describe_filters(change_filter: str | None, stage_filter: str | None,
-                      plan_name: str) -> str:
-    """Build a human-readable filter description for error messages."""
-    parts: list[str] = []
-    if change_filter is not None:
-        parts.append(f"change '{change_filter}'")
-    if stage_filter is not None:
-        parts.append(f"stage '{stage_filter}'")
-    if not parts:
-        return f" for plan '{plan_name}'" if plan_name else ""
-    plan_part = f" (plan: {plan_name})" if plan_name else ""
-    return f" for {', '.join(parts)}{plan_part}"
-
-
-def _tail_log(log_path: Path, lines: int = 20) -> None:
-    """Print the last *lines* lines of *log_path*."""
-    import io as _io
-    try:
-        # Read the last N lines efficiently for large files.
-        with open(log_path, "rb") as fh:
-            # Seek to end and read backwards.
-            buf_size = 4096
-            fh.seek(0, _io.SEEK_END)
-            file_size = fh.tell()
-            if file_size == 0:
-                return
-            collected: list[bytes] = []
-            remaining_lines = lines
-            pos = file_size
-            while pos > 0 and remaining_lines > 0:
-                read_size = min(buf_size, pos)
-                pos -= read_size
-                fh.seek(pos)
-                chunk = fh.read(read_size)
-                collected.append(chunk)
-                remaining_lines -= chunk.count(b"\n")
-            data = b"".join(reversed(collected))
-            text = data.decode("utf-8", errors="replace")
-            # Keep only the last *lines* lines.
-            all_lines = text.splitlines()
-            tail_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
-            for line in tail_lines:
-                print(line)
-    except OSError as exc:
-        print(f"error: cannot read {log_path}: {exc}", file=sys.stderr)
-
-
-def _follow_log(log_path: Path) -> None:
-    """Follow *log_path* like ``tail -f``, forwarding new lines to stdout."""
-    try:
-        with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
-            # Start at end
-            fh.seek(0, 2)
-            while True:
-                line = fh.readline()
-                if line:
-                    print(line, end="", flush=True)
-                else:
-                    time.sleep(0.25)
-    except KeyboardInterrupt:
-        pass
-    except OSError as exc:
-        print(f"error: cannot follow {log_path}: {exc}", file=sys.stderr)
 
 
 def main() -> int:
@@ -3515,7 +2741,7 @@ def main() -> int:
             return 2
 
         args = argparse.Namespace(repo=repo_arg, change=change_id, budget_usd=budget_usd)
-        return cmd_run_one(args)
+        return cmd_run_one.cmd_run_one(args)
 
     ap = argparse.ArgumentParser(prog="opsx-plan", description=__doc__)
     ap.add_argument("--repo", default=".", help="host project root (default: cwd)")
@@ -3523,7 +2749,7 @@ def main() -> int:
 
     p_use = sub.add_parser("use", help="activate a plan for subsequent commands")
     p_use.add_argument("plan", help="path to plan TOML")
-    p_use.set_defaults(fn=cmd_use)
+    p_use.set_defaults(fn=cmd_use.cmd_use)
 
     p_run = sub.add_parser("run", help="run the plan")
     p_run.add_argument("plan", nargs="?", default=None, help="path to plan TOML")
@@ -3555,7 +2781,7 @@ def main() -> int:
 
     p_status = sub.add_parser("status", help="reconcile and show plan status")
     p_status.add_argument("plan", nargs="?", default=None, help="path to plan TOML")
-    p_status.set_defaults(fn=cmd_status)
+    p_status.set_defaults(fn=cmd_status.cmd_status)
 
     p_approve = sub.add_parser("approve", help="approve pause_before changes")
     p_approve.add_argument("plan", nargs="?", default=None, help="path to plan TOML")
@@ -3564,7 +2790,7 @@ def main() -> int:
         "--all", dest="approve_all", action="store_true",
         help="approve all changes currently awaiting approval",
     )
-    p_approve.set_defaults(fn=cmd_approve)
+    p_approve.set_defaults(fn=cmd_gates.cmd_approve)
 
     p_accept = sub.add_parser(
         "accept", help="accept orchestrator-created changes for driving"
@@ -3575,7 +2801,7 @@ def main() -> int:
         "--all", dest="accept_all", action="store_true",
         help="accept all changes currently awaiting acceptance",
     )
-    p_accept.set_defaults(fn=cmd_accept)
+    p_accept.set_defaults(fn=cmd_gates.cmd_accept)
 
     p_reset = sub.add_parser("reset", help="reset a failed change to pending")
     p_reset.add_argument("plan", nargs="?", default=None, help="path to plan TOML")
@@ -3584,7 +2810,7 @@ def main() -> int:
         "--failed", action="store_true",
         help="reset all failed changes to pending",
     )
-    p_reset.set_defaults(fn=cmd_reset)
+    p_reset.set_defaults(fn=cmd_gates.cmd_reset)
 
     p_compile = sub.add_parser(
         "compile", help="compile a markdown plan to TOML"
@@ -3613,7 +2839,7 @@ def main() -> int:
         "archive-plan", help="archive a plan manifest pair to openspec/plans/archived/"
     )
     p_archive_plan.add_argument("plan", help="path to plan manifest TOML")
-    p_archive_plan.set_defaults(fn=cmd_archive_plan)
+    p_archive_plan.set_defaults(fn=cmd_archive_plan.cmd_archive_plan)
 
     p_report = sub.add_parser(
         "report",
@@ -3692,7 +2918,7 @@ def main() -> int:
     p_run_one.add_argument("--skip-suggestion", action="store_true",
                            help="treat review suggestions as non-blocking; "
                                 "critical and warning findings still prevent archive")
-    p_run_one.set_defaults(fn=cmd_run_one)
+    p_run_one.set_defaults(fn=cmd_run_one.cmd_run_one)
 
     p_doctor = sub.add_parser(
         "doctor", help="run preflight checks before a run"
@@ -3703,7 +2929,7 @@ def main() -> int:
         choices=list(compiler.COMPILE_CLIENTS) if compiler.COMPILE_CLIENTS else None,
         help="adapter to preflight (default: plan's adapter, or opencode when no plan)",
     )
-    p_doctor.set_defaults(fn=cmd_doctor)
+    p_doctor.set_defaults(fn=cmd_doctor.cmd_doctor)
 
     p_models = sub.add_parser(
         "models", help="inspect and seed per-adapter model configuration"
@@ -3717,7 +2943,7 @@ def main() -> int:
         "--adapter", default=None,
         help="adapter to resolve against (default: active plan's adapter)",
     )
-    p_models_show.set_defaults(fn=cmd_models_show)
+    p_models_show.set_defaults(fn=cmd_models.cmd_models_show)
 
     p_models_env = models_sub.add_parser(
         "env", help="print shell export statements for the four resolved variables"
@@ -3726,7 +2952,7 @@ def main() -> int:
         "--adapter", default=None,
         help="adapter to resolve against (default: active plan's adapter)",
     )
-    p_models_env.set_defaults(fn=cmd_models_env)
+    p_models_env.set_defaults(fn=cmd_models.cmd_models_env)
 
     p_models_init = models_sub.add_parser(
         "init", help="seed ~/.config/opsx-controller/models.toml from the environment"
@@ -3734,7 +2960,7 @@ def main() -> int:
     p_models_init.add_argument(
         "--force", action="store_true", help="overwrite an existing file"
     )
-    p_models_init.set_defaults(fn=cmd_models_init)
+    p_models_init.set_defaults(fn=cmd_models.cmd_models_init)
 
     p_logs = sub.add_parser(
         "logs", help="inspect the latest or filtered stage log for a resolved plan",
@@ -3761,7 +2987,7 @@ def main() -> int:
         "--follow", action="store_true",
         help="follow the selected log like tail -f for an in-progress run",
     )
-    p_logs.set_defaults(fn=cmd_logs)
+    p_logs.set_defaults(fn=cmd_logs.cmd_logs)
 
     args = ap.parse_args()
     try:
@@ -3770,6 +2996,23 @@ def main() -> int:
         print(f"plan error: {exc}", file=sys.stderr)
         return 2
 
+
+# The moved command modules reach the retained engine helpers (classify,
+# reconcile, run_doctor_checks, ...) by resolving the entrypoint module by
+# name from sys.modules at call time (design D3); they look up the fixed
+# name "opsx_plan".  The entrypoint is a script, so under direct execution
+# __name__ is "__main__", not "opsx_plan"; register a module carrying this
+# module's live top-level names under the fixed name so those by-name
+# lookups resolve in both modes.  If a test loader already registered the
+# executing module under that name (its __dict__ IS this module's globals),
+# keep it: it already carries the live names and any test patches applied to
+# it.  Otherwise build a fresh module mirroring this module's globals.
+_ENTRYPOINT_MODULE_NAME = "opsx_plan"
+_existing = sys.modules.get(_ENTRYPOINT_MODULE_NAME)
+if _existing is None or getattr(_existing, "__dict__", None) is not globals():
+    _existing = types.ModuleType(_ENTRYPOINT_MODULE_NAME)
+    _existing.__dict__.update(globals())
+    sys.modules[_ENTRYPOINT_MODULE_NAME] = _existing
 
 if __name__ == "__main__":
     sys.exit(main())

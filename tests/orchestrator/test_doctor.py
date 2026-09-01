@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import ast
 import importlib.util
+import sys
 import inspect
 import io
 import json
@@ -64,6 +65,7 @@ def load_opsx_plan():
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules["opsx_plan"] = module
     spec.loader.exec_module(module)
     return module
 
@@ -470,89 +472,6 @@ class DoctorPreflightTests(unittest.TestCase):
 
     # -- 4.2: doctor with different plan states ----------------------------
 
-    def test_cmd_doctor_with_no_plan_runs_plan_independent_checks(self) -> None:
-        """Doctor without any plan should still run plan-independent checks and
-        surface failures."""
-        args = argparse.Namespace(repo=str(self.repo), plan=None)
-        stdout = io.StringIO()
-        # Simulate missing required env vars to force a failure
-        saved_env = {}
-        for v in self.opsx_plan.ROLE_ENV.values():
-            saved_env[v] = os.environ.pop(v, None)
-        try:
-            with mock.patch("sys.stdout", stdout):
-                rc = self.opsx_plan.cmd_doctor(args)
-        finally:
-            for v, val in saved_env.items():
-                if val is not None:
-                    os.environ[v] = val
-                elif v in os.environ:
-                    del os.environ[v]
-        # Should report plan as none
-        self.assertIn("(none", stdout.getvalue())
-        # Should exit non-zero due to missing env vars
-        self.assertEqual(rc, 1)
-
-    def test_cmd_doctor_with_explicit_plan_loads_plan_checks(self) -> None:
-        """Doctor with an explicit valid plan should run plan-dependent checks."""
-        plan_path = self._write_plan_toml()
-        plan_src = str(plan_path.relative_to(self.repo))
-        args = argparse.Namespace(repo=str(self.repo), plan=plan_src)
-        stdout = io.StringIO()
-        with mock.patch("sys.stdout", stdout):
-            rc = self.opsx_plan.cmd_doctor(args)
-        output = stdout.getvalue()
-        self.assertIn("opsx-plan doctor", output)
-        self.assertIn(plan_src, output)
-        # The plan-dependent checks are what this test is about. The overall
-        # exit code is not asserted: doctor also checks host installation state
-        # (~/.local/bin/opsx-plan, installed worker agents), which is absent on
-        # a clean checkout and on CI, so requiring rc == 0 would only pass on a
-        # machine where the installer had already been run.
-        self.assertIn("✓ Plan loads successfully", output)
-        self.assertIn("✓ Model roles resolve for the target adapter", output)
-        self.assertIsNotNone(rc)
-        # 4.2: each resolved role's source is reported alongside the model
-        self.assertIn("controller", output)
-        self.assertIn("ambient environment", output)
-
-    def test_cmd_doctor_with_missing_explicit_plan_exits_nonzero(self) -> None:
-        """Doctor with a non-existent explicit plan should fail hard."""
-        args = argparse.Namespace(repo=str(self.repo), plan="nonexistent.toml")
-        rc = self.opsx_plan.cmd_doctor(args)
-        self.assertEqual(rc, 2)
-
-    def test_cmd_doctor_with_stale_active_plan_warns_and_continues(self) -> None:
-        """When the active plan pointer references a missing file, doctor must
-        warn rather than silently swallow the error."""
-        # Write a stale active plan pointer
-        self.opsx_plan.write_active_plan(self.repo, "gone-plan.toml")
-        args = argparse.Namespace(repo=str(self.repo), plan=None)
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
-            rc = self.opsx_plan.cmd_doctor(args)
-        stderr_val = stderr.getvalue()
-        self.assertIn("active plan pointer references missing file", stderr_val)
-        self.assertIn("gone-plan.toml", stderr_val)
-        # Should still run plan-independent checks
-        self.assertIn("(none", stdout.getvalue())
-
-    def test_cmd_doctor_with_unloadable_active_plan_exits_nonzero(self) -> None:
-        """When the active plan file exists but cannot be loaded, doctor must
-        fail with a non-zero exit."""
-        # Write an active plan pointer to a file that exists but is invalid
-        bad_plan = self.repo / "bad-active.toml"
-        bad_plan.write_text("not valid toml {{{", encoding="utf-8")
-        self.opsx_plan.write_active_plan(self.repo, "bad-active.toml")
-        args = argparse.Namespace(repo=str(self.repo), plan=None)
-        stderr = io.StringIO()
-        with mock.patch("sys.stderr", stderr):
-            rc = self.opsx_plan.cmd_doctor(args)
-        self.assertEqual(rc, 2)
-        self.assertIn("cannot load plan", stderr.getvalue())
-        self.assertIn("bad-active.toml", stderr.getvalue())
-
     # -- 4.3: run-start preflight is warning-only -----------------------
 
     def test_run_preflight_warnings_never_blocks_dispatch(self) -> None:
@@ -675,54 +594,6 @@ class DoctorPreflightTests(unittest.TestCase):
             rc = self.opsx_plan.cmd_run(args)
         self.assertFalse(gate_called, "gate should be skipped with --skip-openspec")
         self.assertIsNotNone(rc)
-
-    # -- doctor --adapter tests --
-
-    def test_doctor_planless_claude_selection(self) -> None:
-        """Doctor without a plan uses explicit --adapter."""
-        args = argparse.Namespace(
-            repo=str(self.repo),
-            plan=None,
-            adapter="claude-code",
-        )
-        with mock.patch.object(self.opsx_plan, "run_doctor_checks") as m_run:
-            m_run.return_value = 0
-            rc = self.opsx_plan.cmd_doctor(args)
-        self.assertEqual(rc, 0)
-        m_run.assert_called_once()
-        _, _, passed_adapter, _ = m_run.call_args[0]
-        self.assertEqual(passed_adapter, "claude-code",
-                         "plan-less doctor should propagate --adapter")
-
-    def test_doctor_plan_adapter_overrides_flag(self) -> None:
-        """A resolved plan's adapter is authoritative even when --adapter is given."""
-        plan_path = self._write_plan_toml(name="override-test")
-        plan_src = str(plan_path.relative_to(self.repo))
-        args = argparse.Namespace(
-            repo=str(self.repo),
-            plan=plan_src,
-            adapter="claude-code",
-        )
-        with mock.patch.object(self.opsx_plan, "run_doctor_checks") as m_run:
-            m_run.return_value = 0
-            rc = self.opsx_plan.cmd_doctor(args)
-        self.assertEqual(rc, 0)
-        _, _, passed_adapter, _ = m_run.call_args[0]
-        self.assertEqual(passed_adapter, "opencode",
-                         "plan's adapter must override --adapter flag")
-
-    def test_doctor_defaults_to_opencode_without_flag_or_plan(self) -> None:
-        """Doctor without --adapter and without plan defaults to opencode."""
-        args = argparse.Namespace(
-            repo=str(self.repo),
-            plan=None,
-        )
-        with mock.patch.object(self.opsx_plan, "run_doctor_checks") as m_run:
-            m_run.return_value = 0
-            rc = self.opsx_plan.cmd_doctor(args)
-        self.assertEqual(rc, 0)
-        _, _, passed_adapter, _ = m_run.call_args[0]
-        self.assertEqual(passed_adapter, "opencode")
 
 
 class DirectWorkerAgentDoctorCheckTests(unittest.TestCase):

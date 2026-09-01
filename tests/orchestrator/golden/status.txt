@@ -1,0 +1,3 @@
+plan: golden-plan
+  models [opencode]: controller: test-provider/test-controller | implementer: test-provider/test-implementer | reviewer: test-provider/test-reviewer | archiver: test-provider/test-archiver
+  golden-change  ready
