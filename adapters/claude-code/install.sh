@@ -131,7 +131,7 @@ install_global() {
   install_agents "$config_root/agents"
   install_support_readme "$config_root/opsx-controller"
   install_plan_authoring_reference "$config_root/opsx-controller"
-  bash "$ROOT_DIR/scripts/install-orchestrator.sh" "$ROOT_DIR"
+  bash "$ROOT_DIR/scripts/install-orchestrator.sh" "$ROOT_DIR" --global
   printf '%s\n' \
     "Installed skills to $config_root/skills" \
     "Installed agents to $config_root/agents" \
@@ -153,12 +153,17 @@ install_project() {
   install_support_readme "$project_dir/.claude/opsx-controller"
   install_plan_authoring_reference "$project_dir/.claude/opsx-controller"
   ensure_project_gitignore "$project_dir"
+  bash "$ROOT_DIR/scripts/install-orchestrator.sh" "$ROOT_DIR" --project "$project_dir"
 
   printf '%s\n' \
     "Installed skills to $project_dir/.claude/skills" \
     "Installed agents to $project_dir/.claude/agents" \
     "Installed support files to $project_dir/.claude/opsx-controller" \
     "Installed plan-authoring reference to $project_dir/.claude/opsx-controller/plan-authoring.md" \
+    "Installed opsx-plan runtime libraries to $project_dir/.opsx-controller/lib" \
+    "Installed opsx-plan to $project_dir/.opsx-controller/bin/opsx-plan" \
+    "Installed opsx-run to $project_dir/.opsx-controller/bin/opsx-run" \
+    "Installed opsx-watch-plan to $project_dir/.opsx-controller/bin/opsx-watch-plan" \
     "Updated $project_dir/.claude/.gitignore"
   do_verify
   verify_plan_authoring_reference "$project_dir/.claude/opsx-controller"

@@ -229,14 +229,24 @@ def resolve_sample_plan_pair() -> tuple[Path, Path | None] | None:
     Returns ``(md_path, toml_path)`` or ``None`` when neither location
     exists.
     """
-    # 1. Installed samples (authoritative copy).
+    # 1. Installed samples (authoritative copy): the global runtime under
+    # ~/.local/lib/opsx-controller/samples and the project-scoped runtime
+    # under <project>/.opsx-controller/samples (via _RUNTIME_ROOTS).
     installed = Path.home() / ".local" / "lib" / "opsx-controller" / "samples"
     md_path = installed / "sample-plan.md"
     toml_path = installed / "sample-plan.toml"
     if md_path.is_file() and toml_path.is_file():
         return md_path, toml_path
 
-    # 2. Checkout fallback (mirrors _SCRIPT_ROOT / _RUNTIME_ROOTS).
+    # 2. Project-scoped installed samples.
+    for root in base._RUNTIME_ROOTS:
+        samples_dir = root / "samples"
+        md_path = samples_dir / "sample-plan.md"
+        toml_path = samples_dir / "sample-plan.toml"
+        if md_path.is_file() and toml_path.is_file():
+            return md_path, toml_path
+
+    # 3. Checkout fallback (mirrors _SCRIPT_ROOT / _RUNTIME_ROOTS).
     for root in base._RUNTIME_ROOTS:
         samples_dir = root / "orchestrator" / "samples"
         md_path = samples_dir / "sample-plan.md"

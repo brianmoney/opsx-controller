@@ -36,10 +36,21 @@ import time
 import uuid
 from pathlib import Path
 
-# Resolve bundled runtime modules before considering the host repository. The
-# global installer places these under ~/.local/lib/opsx-controller.
+# Resolve bundled runtime modules before considering the host repository.
+#
+# The installed entrypoints live in a sibling of the installed runtime package:
+#   global:   ~/.local/bin/opsx-plan  ->  ~/.local/lib/opsx-controller/lib
+#   project:  <project>/.opsx-controller/bin/opsx-plan
+#           ->  <project>/.opsx-controller/lib
+# The checkout tree (_SCRIPT_ROOT) is only a development fallback: an
+# installed executable must resolve its runtime by its own location, never by
+# importing from a repository checkout.
 _SCRIPT_ROOT = Path(__file__).resolve().parents[1]
-_RUNTIME_ROOTS = (_SCRIPT_ROOT, _SCRIPT_ROOT / "lib" / "opsx-controller")
+_RUNTIME_ROOTS = (
+    _SCRIPT_ROOT,
+    _SCRIPT_ROOT / "lib" / "opsx-controller",
+    _SCRIPT_ROOT / ".opsx-controller",
+)
 
 
 def _ensure_runtime_modules() -> None:

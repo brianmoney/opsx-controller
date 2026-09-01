@@ -140,7 +140,7 @@ install_global() {
   install_role_files "$config_root/agents"
   install_support_readme "$config_root"
   install_plan_authoring_reference "$config_root"
-  bash "$ROOT_DIR/scripts/install-orchestrator.sh" "$ROOT_DIR"
+  bash "$ROOT_DIR/scripts/install-orchestrator.sh" "$ROOT_DIR" --global
   warn_node_typescript
 
   printf '%s\n' \
@@ -170,12 +170,17 @@ install_project() {
   install_role_files "$support_dir/agents"
   install_support_readme "$support_dir"
   install_plan_authoring_reference "$support_dir"
+  bash "$ROOT_DIR/scripts/install-orchestrator.sh" "$ROOT_DIR" --project "$project_dir"
   warn_node_typescript
 
   printf '%s\n' \
     "Installed role instruction files to $support_dir/agents" \
     "Installed support files to $support_dir" \
-    "Installed plan-authoring reference to $support_dir/plan-authoring.md"
+    "Installed plan-authoring reference to $support_dir/plan-authoring.md" \
+    "Installed opsx-plan runtime libraries to $project_dir/.opsx-controller/lib" \
+    "Installed opsx-plan to $project_dir/.opsx-controller/bin/opsx-plan" \
+    "Installed opsx-run to $project_dir/.opsx-controller/bin/opsx-run" \
+    "Installed opsx-watch-plan to $project_dir/.opsx-controller/bin/opsx-watch-plan"
   do_verify
   verify_plan_authoring_reference "$support_dir"
 }

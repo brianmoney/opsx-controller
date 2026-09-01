@@ -45,11 +45,15 @@ keeps running locally.
 installer(s) to deploy it:**
 
 ```bash
-bash adapters/opencode/install.sh --global --verify
-bash adapters/claude-code/install.sh --global --verify   # if Claude Code adapter changed
-bash adapters/codex-cli/install.sh --global --verify      # if Codex CLI adapter changed
-bash adapters/dsh/install.sh --global --verify            # if dsh adapter changed
+bash install.sh --global --verify
 ```
+
+The repo-root `install.sh` is the single reinstall step: it installs every
+adapter (opencode, claude-code, codex-cli, dsh) and the shared orchestrator
+in one invocation. Adapter-specific re-runs remain available for a narrower
+deploy, e.g. `bash install.sh --global --only claude-code --verify` or by
+running an individual adapter installer directly (e.g.
+`bash adapters/opencode/install.sh --global --verify`).
 
 Any global installer now deploys the shared `opsx-plan` and `opsx-run`
 executables (via `scripts/install-orchestrator.sh`), so a maintainer only

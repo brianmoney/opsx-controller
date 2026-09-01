@@ -25,9 +25,13 @@ invoked against.
 Each global adapter installer SHALL additionally deploy the client-neutral
 plan-authoring reference to `~/.local/lib/opsx-controller/plan-authoring.md`.
 
+The universal installer SHALL deploy the shared orchestrator through the same
+mechanism as the adapter installers, producing an installed layout identical
+to an adapter-only install.
+
 The installed executable paths, runtime layout, sample paths, and reference
 path SHALL be identical regardless of whether OpenCode, Claude Code, Codex
-CLI, or dsh performed the installation.
+CLI, dsh, or the universal installer performed the installation.
 
 #### Scenario: Claude global install provides the executables
 
@@ -47,9 +51,15 @@ CLI, or dsh performed the installation.
 - **THEN** `~/.local/bin/opsx-plan`, `~/.local/bin/opsx-run`,
   `~/.local/bin/opsx-watch-plan`, and their runtime libraries are installed
 
+#### Scenario: Universal global install provides the executables
+
+- **WHEN** an operator runs `bash install.sh --global`
+- **THEN** `~/.local/bin/opsx-plan`, `~/.local/bin/opsx-run`,
+  `~/.local/bin/opsx-watch-plan`, and their runtime libraries are installed
+
 #### Scenario: Global install provides the orchestrator runtime package
 
-- **WHEN** an operator runs any adapter's global installer
+- **WHEN** an operator runs any adapter's global installer or the universal installer
 - **THEN** `~/.local/lib/opsx-controller/lib/orchestrator` is installed
   alongside the `metrics`, `pricing`, and `models` packages
 - **AND** the installed `opsx-plan` runs its subcommands without importing
@@ -117,4 +127,3 @@ alone SHALL NOT be sufficient to report the installation as current.
 - **THEN** the installed `orchestrator` package is replaced with the current
   repository version, and modules deleted from the repository do not persist
   in the installed copy
-

@@ -155,13 +155,30 @@ resolves.
 **2. Install the adapter for your coding client.**
 
 ```bash
-bash adapters/opencode/install.sh --global      # or claude-code, codex-cli, or dsh
+bash install.sh --global      # installs opencode, claude-code, codex-cli, and dsh
 ```
 
-Use `--project /path/to/repo` instead of `--global` to install into a single
-project. Install the adapter for whichever coding client you plan to use (or
-more than one — they coexist). Every adapter's global installer deploys
-`opsx-plan` and `opsx-run` to `~/.local/bin/`.
+The repo-root `install.sh` installs every adapter plus the shared orchestrator
+in one invocation. It accepts the same flags as the individual adapter
+installers:
+
+- `--global` — install globally (adapter config under `~/.config`, orchestrator
+  to `~/.local/bin` and `~/.local/lib`).
+- `--project /path/to/repo` — install into a single project instead. The
+  shared orchestrator is installed self-contained under
+  `<project>/.opsx-controller` (executables in `bin/`, runtime in `lib/`), so
+  `opsx-plan` runs from the project without needing the checkout.
+- `--only <adapters>` — comma-separated subset, e.g.
+  `bash install.sh --global --only opencode`. Defaults to all four.
+- `--verify` — run each adapter's verification path and report missing
+  artifacts.
+
+Individual adapter installers remain directly runnable, e.g.
+`bash adapters/opencode/install.sh --global`. Use `--project /path/to/repo`
+instead of `--global` to install into a single project. Install the adapter
+for whichever coding client you plan to use (or more than one — they coexist).
+Every adapter's global installer deploys `opsx-plan` and `opsx-run` to
+`~/.local/bin/`.
 
 **3. Initialize OpenSpec in your project, once.**
 
