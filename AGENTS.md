@@ -17,6 +17,32 @@ client-neutral reference is `core/plan-authoring.md`. Plan-authoring agents
 and operators should follow that document; adapter-specific surfaces should
 point to it rather than restating authoring rules.
 
+## Delegation: sub-agents are the default
+
+Operators run expensive models in this repo, so primary-agent tokens and
+context are the scarce resource. **Delegate by default, not as a last
+resort.** Do the cheap thing (hand off) unless a task genuinely needs the
+primary model's context. Push work down with the client's Task/sub-agent
+facility:
+
+- **Code exploration and search** — finding files, tracing symbols, mapping
+  call sites, answering "where/how does X work" — belongs to a cheap
+  exploration sub-agent (e.g. `explore`/`general` under opencode). Ask for a
+  concise synthesis, not raw file dumps, so only the answer enters the
+  primary context.
+- **Minor, well-scoped tasks** — single-file edits, mechanical refactors,
+  running tests/formatters, boilerplate — belong to a coding sub-agent (e.g.
+  `coder`).
+- **Controller rounds** — the `opsx-implementer`, `opsx-reviewer`, and
+  `opsx-archiver` sub-agents are the intended delegation boundary for one
+  OpenSpec round; invoke them rather than performing their work inline.
+- When a task splits into independent pieces, fan out several sub-agents in
+  one message and aggregate their results instead of serializing them
+  through the primary model.
+
+Keep in the primary context only the decisions and synthesis that require
+it.
+
 ## Validation
 
 - Tests: `python3 -m unittest discover -t . -s tests` and `node
