@@ -109,14 +109,22 @@ activating a new plan with `opsx-plan use`.
 Model selection is stored per adapter and per role in
 `~/.config/opsx-controller/models.toml`, with an optional machine-local
 `<repo>/.opsx-plan/models.toml` override (gitignored by `write_active_plan`).
-Roles are `controller`, `implementer`, `reviewer`, `archiver`, with an
-optional fifth role `implementer_escalation` used by `escalate_after_review_fails`.
+The required roles are `controller`, `implementer`, `reviewer`, `archiver`.
+The optional roles are `implementer_escalation` (used by
+`escalate_after_review_fails`) plus the supervised roles `supervisor`,
+`supervised_author`, `acceptance_reviewer`, `fixer`, and `verifier`.
 `opsx-plan` resolves all roles for the active plan's adapter when the plan
 loads and exports them as `OPSX_*_MODEL` for the rest of the process, so
 the active plan's adapter automatically gets the right model set with no
-manual switching. The escalation role exports as
-`OPSX_IMPLEMENTER_ESCALATION_MODEL` and is optional: leaving it unresolved
-does not block runs unless `escalate_after_review_fails > 0`.
+manual switching. A resolved optional role exports its
+`OPSX_<ROLE>_MODEL` variable; an unresolved optional role is left unset and
+never blocks a run on its own. The escalation role is optional: leaving it
+unresolved does not block runs unless `escalate_after_review_fails > 0`.
+
+The supervised roles are inert until the supervision enforcement changes
+land: registering or resolving one does not change legacy resolution,
+activation, or dispatch, and a configuration that defines none of them
+resolves and dispatches exactly as before.
 
 ```bash
 opsx-plan models init                       # seed the file from the current environment
@@ -132,6 +140,27 @@ then the ambient `OPSX_<ROLE>_MODEL` environment variable (the sole
 mechanism before this file existed, kept as a fallback so existing `.env`
 setups keep working until you create `models.toml`). See
 `models.example.toml` at the repository root for the full file shape.
+
+### The inexpensive-model allowlist
+
+Supervised jobs additionally use an operator-maintained inexpensive-model
+allowlist, stored in the same `models.toml` files in an `[allowlist]` table:
+
+```toml
+[allowlist]
+models = ["deepseek/deepseek-v4-flash", "moonshotai/kimi-k2"]
+```
+
+The allowlist has the same file locations and precedence as roles (repo-local
+first, then user-global) and **no** environment-variable source. A repo-local
+`[allowlist].models` replaces the user-global list wholesale — lists never
+merge, including when the local list is explicitly empty. When neither file
+has the table the effective allowlist is empty and resolution still succeeds;
+a present-but-malformed table fails with a named error naming the offending
+file. The allowlist is never consulted for legacy, unsupervised runs.
+`opsx-plan models show` prints the effective allowlist and its source when
+configured, plus each supervised dispatch role's membership; `opsx-plan
+doctor` reports the same information without failing on unconfigured roles.
 
 A model change in `models.toml` takes effect on the next `opsx-plan run` —
 no installer re-run needed for direct dispatch, the default execution path
@@ -161,6 +190,7 @@ opsx-plan doctor --adapter claude-code
 | Installed orchestrator matches repo copy | SHA-256 comparison of `~/.local/bin/opsx-plan` against `orchestrator/opsx-plan.py` |
 | Model roles resolve for the target adapter | All four roles (`controller`, `implementer`, `reviewer`, `archiver`) resolve for the resolved plan's adapter via `models.toml`/ambient environment; reports each resolved model with its source. When no plan is active, `--adapter` selects the adapter to resolve against (defaults to `opencode`). |
 | Resolved model identifiers match adapter syntax | Flags a provider-prefixed identifier under `claude-code` or a bare identifier under `opencode`, before it fails at dispatch |
+| Supervised model configuration is reported | Prints the effective `[allowlist]` and its source (or `absent`), plus each supervised dispatch role's resolution and membership. Informational: an unconfigured supervised role is never an error. |
 | `openspec` available (repo or global) | OpenSpec CLI resolves repo-locally first (`<repo>/node_modules/.bin/openspec`), falling back to a global install on `PATH` |
 | OpenSpec initialized in repo | The repo has a durable `openspec/config.yaml` (written by `openspec init`) **and** `openspec list --json` resolves a healthy root from the repo directory. Direct-dispatch workers read their per-project phase prompts from files `openspec init` writes, so an uninitialized repo ships workers that fail mid-run; the check fails closed with the exact `openspec init` command and the installed CLI version. |
 | Adapter client on PATH | e.g. `opencode`, `claude`, or `codex`. When `--adapter` is set without a plan, validates the specified adapter's client. |

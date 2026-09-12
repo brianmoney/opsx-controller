@@ -113,6 +113,70 @@ Policy rows are **insert-only** and explicitly revised:
 The manifest-snapshot hash makes a silently edited manifest detectable at
 revalidation time.
 
+### Model policy
+
+The protected job policy's `model_selection` and `inexpensive_allowlist`
+fields carry a versioned content schema owned by
+`lib/supervisor/model_policy.py`. Both payloads share one nested
+`MODEL_POLICY_VERSION = 1`, which is **independent** of the outer ledger
+`policy_version` column (both currently equal 1 by coincidence and are
+validated separately). Reads are forward-only: a recorded nested version newer
+than the code supports raises a named `ModelPolicyVersionError` rather than
+silently interpreting unknown fields.
+
+`model_selection` has the shape
+`{"version": 1, "roles": {<role>: <exact model identifier>}, "stages":
+{<stage>: <role>}}`. `roles` pins an exact identifier per role the job selects
+(no wildcard, pattern, prefix, or default entry); `stages` is the explicit
+stage-to-role mapping, and every role a stage names has a corresponding pin.
+The standard mapping is `create → supervised_author`, `implement →
+implementer`, `review → reviewer`, `archive → archiver`, `acceptance →
+acceptance_reviewer`, `fix → fixer`, `verify → verifier`, and `escalate →
+implementer_escalation`; a job records only the stages it uses. The
+supervised create stage maps to `supervised_author`; the legacy `controller`
+compile role is distinct and governs only non-supervised compilation.
+
+`inexpensive_allowlist` has the shape `{"version": 1, "models": [<exact model
+identifier>, ...], "source": <resolved source description>}`, freezing the
+allowlist selection the job was registered with so a later configuration edit
+cannot silently change a running job's policy.
+
+**Fail-closed classification.** `supervisor` is a pinned operator-selected
+model classified as exempt from the inexpensive allowlist and as
+budget-counted. "Frontier" is descriptive only, not an automatically
+verifiable property. The supervised dispatch roles are the existing dispatch
+roles `implementer`, `reviewer`, and `archiver`, plus `supervised_author`,
+`acceptance_reviewer`, `fixer`, `verifier`, and `implementer_escalation`; each
+must resolve to an allowlisted inexpensive model. The legacy `controller` role
+is not a supervised dispatch role. There is no silent fallback, inheritance,
+or defaulting between roles: an unresolved, identifier-syntax-invalid, or
+off-pin role is reported as blocking. A model is "unavailable" for this policy
+only when its resolved identifier fails the adapter's existing
+identifier-syntax validation; live availability probing and pricing are out of
+scope.
+
+**Boundary validation and compatibility.** The ledger validates both payloads
+through the model-policy module on write and decodes them through it on read.
+New writes are strict and versioned. A stored value with no `version` key —
+including the pre-schema list-shaped allowlist — is classified
+`legacy_unversioned`, returned unmodified, and never reinterpreted as a
+current payload; a consumer treats it as carrying no pins and fails closed. No
+schema migration is performed; replacing a legacy payload requires an explicit
+operator revision recording a versioned payload.
+
+**Dispatch identity record.** Dispatch model identity is action/evidence data,
+separate from the insert-only policy payload, with the shape `{"action_id":
+<int>, "role": <policy role>, "requested_model": <exact identifier>,
+"observed_model": <exact identifier or null>, "observation_state":
+<requested|observed|unknown|interrupted>, "reservation_state":
+<reserved|retained|reconciled>}`. At dispatch intent `requested_model` equals
+the exact policy pin for the role. The policy provides a pure `mismatch`
+predicate (true only when `observed_model` is non-null and differs from
+`requested_model`) and a pure retention decision (`unknown` or `interrupted`
+classifies the reservation as `retained`, so unresolved consumption is never
+treated as free). These are pure decisions; recording identities during
+dispatch and enforcing reservations belong to later changes.
+
 ### Identity and `run_id` linkage
 
 Job, action, and incident identifiers are generated at insert time and are

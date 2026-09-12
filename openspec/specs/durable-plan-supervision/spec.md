@@ -260,3 +260,200 @@ unsupervised runs handle gates.
 - **WHEN** a change sets neither `pause_before = true` nor
   `pause_before_human_only`
 - **THEN** no approval authority applies and the change loads unchanged
+
+### Requirement: The job policy carries versioned model-selection and allowlist payloads
+
+The protected job policy's `model_selection` and `inexpensive_allowlist`
+fields SHALL each be a JSON-compatible object carrying a `version` key. Both
+payloads SHALL share one model-policy schema version, `MODEL_POLICY_VERSION =
+1`, independent of the outer ledger `policy_version` column. The two values
+currently both start at 1 but SHALL be validated independently. A nested
+payload version newer than the code supports SHALL be rejected with a named
+error rather than silently interpreted (forward-only).
+
+`model_selection` SHALL be a JSON-compatible object of the shape
+`{"version": <int>, "roles": {<role>: <exact model identifier>}, "stages":
+{<stage>: <role>}}`:
+
+- `roles` pins an exact model identifier per supervised role the job selects;
+  there SHALL be no wildcard, pattern, prefix, or default entry.
+- `stages` is the explicit supervised stage-to-role mapping. Every role named
+  by a stage SHALL have a corresponding pin in `roles`. The standard mapping
+  is `create` to `supervised_author`, `implement` to `implementer`, `review`
+  to `reviewer`, `archive` to `archiver`, `acceptance` to
+  `acceptance_reviewer`, `fix` to `fixer`, `verify` to `verifier`, and
+  `escalate` to `implementer_escalation`; a job records only stages it uses.
+  The legacy `controller` compile role remains distinct.
+
+`inexpensive_allowlist` SHALL be a JSON-compatible object of the shape
+`{"version": <int>, "models": [<exact model identifier>, ...], "source":
+<resolved source description>}`, freezing the allowlist selection the job was
+registered with so a later configuration edit cannot silently change a running
+job's policy.
+
+Model selection SHALL be supervision policy data. It SHALL NOT be expressed as
+new plan manifest keys: the manifest stays the plan's change graph, and the
+supervised model policy lives in the protected job policy, which changes only
+through an explicit operator revision.
+
+The ledger SHALL validate both payloads on write and decode them through the
+same model-policy functions on read. Except for the explicitly recognized
+pre-policy case below, a payload that is not a JSON object, or whose shape or
+version is unsupported, SHALL be rejected with a named model-policy error. A
+payload stored before this schema existed (a JSON value with no `version` key)
+SHALL remain readable as `legacy_unversioned`: no schema migration is
+performed, it SHALL NOT be reinterpreted as a current payload, and a consumer
+SHALL treat it as carrying no pins and fail closed rather than defaulting. The
+ledger SHALL preserve the raw field value and expose its decoder state in a
+`model_policy_state` mapping with
+`model_selection` and `inexpensive_allowlist` keys whose values are
+`versioned` or `legacy_unversioned`. Replacing a legacy payload requires an
+explicit operator revision recording a versioned payload.
+
+#### Scenario: Registration persists the pinned model policy
+
+- **WHEN** a supervised job is registered
+- **THEN** its policy record persists the per-role pinned model identifiers,
+   the explicit stage-to-role mapping, the frozen allowlist selection and source,
+  and `MODEL_POLICY_VERSION`, at operator revision 1
+
+#### Scenario: Changing the model selection requires an explicit revision
+
+- **WHEN** a write attempts to change a persisted model-selection or
+  allowlist field without increasing the operator revision
+- **THEN** the write is rejected and the stored model policy is unchanged
+
+#### Scenario: A newer model-policy version is rejected
+
+- **WHEN** a job policy records a model-policy version newer than
+  `MODEL_POLICY_VERSION`
+- **THEN** reading the model policy fails with a named model-policy version
+  error rather than silently interpreting the unknown fields
+
+#### Scenario: A malformed payload is rejected on write
+
+- **WHEN** a write supplies a model-selection or allowlist value that is not a
+  JSON object of the defined shape
+- **THEN** the write is rejected with a named model-policy error and the
+  stored policy is unchanged
+
+#### Scenario: A pre-policy payload reads as legacy-unversioned
+
+- **WHEN** a policy row written before this schema (a JSON value with no
+  `version` key) is read
+- **THEN** it is classified `legacy_unversioned` and returned unmodified, and
+  a consumer treats it as carrying no pins and fails closed rather than
+  defaulting
+
+### Requirement: The model policy separates the allowlist-exempt supervisor from allowlisted supervised dispatch roles
+
+Under a supervised job's policy, `supervisor` SHALL be a pinned operator-
+selected model classified as exempt from the inexpensive allowlist and as
+budget-counted. "Frontier" is descriptive only and is not an automatically
+verifiable model property.
+The supervised dispatch roles SHALL be the existing dispatch roles
+`implementer`, `reviewer`, and `archiver`, plus `supervised_author`,
+`acceptance_reviewer`, `fixer`, `verifier`, and `implementer_escalation`.
+Each supervised dispatch role SHALL be subject to the allowlist check. A
+supervised job's `stages.create` mapping SHALL name `supervised_author`; the
+legacy `controller` compile role SHALL govern only non-supervised compilation
+and SHALL NOT be a supervised dispatch role. Live routing through this mapping
+belongs to the later dispatch and lifecycle changes.
+
+The policy SHALL classify `supervisor` usage as budget-counted as policy data
+and as a pure decision. This change does not perform the counting or enforce a
+budget; `add-supervision-budgets` applies that classification.
+
+There SHALL be no silent fallback, inheritance, or defaulting between roles: a
+supervised dispatch role that is unresolved, fails identifier-syntax
+validation, or resolves to an identifier different from its exact
+`model_selection.roles` pin SHALL be reported by the policy check as blocking
+rather than substituting another role's model.
+
+A model is "unavailable" for this policy only when its resolved identifier
+fails the target adapter's existing identifier-syntax validation. Live model
+availability probing and pricing are out of scope.
+
+#### Scenario: The frontier supervisor is allowlist-exempt and budget-counted
+
+- **WHEN** the policy check evaluates the `supervisor` role
+- **THEN** it reports no allowlist-membership requirement for that role and
+  classifies its usage as budget-counted
+
+#### Scenario: A supervised dispatch role must be allowlisted
+
+- **WHEN** the policy check evaluates an `implementer`, `reviewer`,
+  `archiver`, `supervised_author`, `acceptance_reviewer`, `fixer`, `verifier`,
+  or `implementer_escalation` role whose resolved model is not on the job's
+  allowlist
+- **THEN** it reports the role as blocking with a named reason, and no
+  fallback or inherited model is substituted
+
+#### Scenario: An identifier-syntax-invalid model is unavailable
+
+- **WHEN** the policy check evaluates a supervised dispatch role whose
+  resolved identifier fails the adapter's existing identifier-syntax
+  validation
+- **THEN** it reports the role as blocking with a named reason, without making
+  any live availability claim
+
+#### Scenario: The supervised create stage maps to the supervised author
+
+- **WHEN** a supervised job's policy is decoded
+- **THEN** its `stages` mapping resolves the create stage to
+  `supervised_author`, while the legacy `controller` compile role is unchanged
+
+### Requirement: Dispatch model identity is action evidence with pure mismatch and retention decisions
+
+The model policy SHALL define a dispatch identity record as action/evidence
+data, separate from the insert-only policy payload. The record SHALL carry:
+`action_id` (integer), `role` (the `supervisor` role or a supervised dispatch
+role), `requested_model` (exact identifier), `observed_model` (exact identifier
+or null), `observation_state`, and `reservation_state`.
+
+`observation_state` SHALL be one of `requested`, `observed`, `unknown`, or
+`interrupted`. `reservation_state` SHALL be one of `reserved`, `retained`, or
+`reconciled`.
+
+The policy SHALL provide a pure mismatch predicate that reports a mismatch
+only when `observed_model` is non-null and differs from `requested_model`, and
+reports no mismatch when `observed_model` is null.
+
+At dispatch intent, `requested_model` SHALL equal the exact policy pin for the
+record's role. A requested identity that does not equal that pin is a named
+policy block; it SHALL not be repaired by selecting another role or model.
+
+The policy SHALL provide a pure retention decision: when `observation_state`
+is `unknown` or `interrupted`, the reservation SHALL be classified `retained`
+rather than released, so unresolved consumption is never treated as free.
+
+These are pure decisions over the record. Recording the identities during
+dispatch and applying the decisions to a live journal belongs to
+`add-action-journal-dispatch`, and reservation enforcement belongs to
+`add-supervision-budgets`; this change defines and validates the shapes and
+decisions only.
+
+#### Scenario: A requested/observed mismatch is reported
+
+- **WHEN** the mismatch predicate evaluates a dispatch identity record whose
+  non-null `observed_model` differs from its `requested_model`
+- **THEN** it reports a mismatch, and both identities remain separately
+  recorded
+
+#### Scenario: A missing observation is not a mismatch
+
+- **WHEN** the mismatch predicate evaluates a dispatch identity record whose
+  `observed_model` is null
+- **THEN** it reports no mismatch
+
+#### Scenario: An unknown or interrupted reservation is retained
+
+- **WHEN** the retention decision evaluates a dispatch identity record whose
+  `observation_state` is `unknown` or `interrupted`
+- **THEN** it classifies the reservation as `retained` rather than released
+
+#### Scenario: The identity record is action data, not policy data
+
+- **WHEN** a dispatch identity record is written for an action
+- **THEN** it is stored as action/evidence data and does not mutate the
+  insert-only job-policy payload

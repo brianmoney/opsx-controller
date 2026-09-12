@@ -8,8 +8,17 @@ from typing import Optional
 # The four roles every run needs — unresolved required role → fatal.
 ROLES: tuple[str, ...] = ("controller", "implementer", "reviewer", "archiver")
 
-# Roles that individual configurations may use but are not mandatory.
-OPTIONAL_ROLES: tuple[str, ...] = ("implementer_escalation",)
+# Roles that individual configurations may use but are not mandatory. The
+# supervised roles are optional roles used only by supervised jobs; no legacy
+# run requires them.
+OPTIONAL_ROLES: tuple[str, ...] = (
+    "implementer_escalation",
+    "supervisor",
+    "supervised_author",
+    "acceptance_reviewer",
+    "fixer",
+    "verifier",
+)
 
 # Every role the resolver inspects (required + optional).
 ALL_ROLES: tuple[str, ...] = ROLES + OPTIONAL_ROLES
@@ -45,3 +54,18 @@ class ResolvedModel:
     source: str
     variant: Optional[str] = None
     variant_source: str = "unresolved"
+
+
+@dataclass(frozen=True)
+class AllowlistResult:
+    """The resolved inexpensive-model allowlist.
+
+    ``models`` is the effective list of exact identifiers (possibly empty).
+    ``source`` names the selected configuration file and ``[allowlist]`` table,
+    or is ``"unconfigured"`` when no file defines the table. ``configured``
+    distinguishes an explicitly empty list from an absent table.
+    """
+
+    models: tuple[str, ...]
+    source: str
+    configured: bool

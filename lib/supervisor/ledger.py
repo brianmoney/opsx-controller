@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from lib.supervisor import clock
+from lib.supervisor import model_policy
 
 CURRENT_SCHEMA_VERSION = 1
 CURRENT_POLICY_VERSION = 1
@@ -550,7 +551,17 @@ class Ledger:
             raise PolicyRevisionError(
                 "policy is missing required field(s): " + ", ".join(missing)
             )
-        return {field: policy[field] for field in REQUIRED_POLICY_FIELDS}
+        fields = {field: policy[field] for field in REQUIRED_POLICY_FIELDS}
+        # Route the model-policy fields through the shared schema so new
+        # writes are strict and versioned. New writes may not create
+        # unversioned legacy payloads.
+        fields["model_selection"] = model_policy.encode_model_selection(
+            fields["model_selection"]
+        )
+        fields["inexpensive_allowlist"] = model_policy.encode_allowlist(
+            fields["inexpensive_allowlist"]
+        )
+        return fields
 
     def _insert_policy(
         self,
@@ -639,6 +650,17 @@ class Ledger:
         }
         for field in REQUIRED_POLICY_FIELDS:
             record[field] = json.loads(row[field])
+
+        # Route the model-policy fields through the shared decoders so a newer
+        # recorded nested version raises ModelPolicyVersionError, and a stored
+        # value with no 'version' key is classified legacy_unversioned rather
+        # than rejected or reinterpreted. Preserve the raw field value.
+        selection = model_policy.decode_model_selection(record["model_selection"])
+        allowlist = model_policy.decode_allowlist(record["inexpensive_allowlist"])
+        record["model_policy_state"] = {
+            "model_selection": selection["state"],
+            "inexpensive_allowlist": allowlist["state"],
+        }
         return record
 
     def current_policy(self, job_id: int) -> dict[str, Any]:

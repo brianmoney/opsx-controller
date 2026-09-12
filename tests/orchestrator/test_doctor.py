@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -756,6 +757,148 @@ class DshAdapterDoctorTests(unittest.TestCase):
         self.assertFalse(passed)
         self.assertIn("dsh", label)
         self.assertIn("npx", remediation)
+
+
+class SupervisedModelDoctorTests(unittest.TestCase):
+    """4.2 / 4.3 / 6.6: doctor reports the supervised model configuration and
+    the installation staleness probe covers lib/supervisor."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        self._models_patch = mock.patch.object(
+            resolver, "USER_CONFIG_PATH", self.repo / "unused-home" / "models.toml"
+        )
+        self._models_patch.start()
+        self.addCleanup(self._models_patch.stop)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _write_repo_config(self, content: str) -> None:
+        cfg = self.repo / ".opsx-plan" / "models.toml"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text(textwrap.dedent(content), encoding="utf-8")
+
+    def test_unconfigured_supervised_roles_never_fail(self) -> None:
+        passed, label, remediation = doctor_mod._check_supervised_models(
+            self.repo, "opencode"
+        )
+        self.assertTrue(passed, remediation)
+
+    def test_reports_supervised_roles_and_allowlist(self) -> None:
+        self._write_repo_config(
+            """\
+            [adapters.opencode]
+            implementer = "cheap/implementer"
+            supervised_author = "cheap/author"
+
+            [allowlist]
+            models = ["cheap/author"]
+            """
+        )
+        passed, label, remediation = doctor_mod._check_supervised_models(
+            self.repo, "opencode"
+        )
+        self.assertTrue(passed, remediation)
+        self.assertIn("allowlist", remediation)
+        self.assertIn("cheap/author", remediation)
+        self.assertIn("supervised_author", remediation)
+        self.assertIn("unconfigured", remediation)
+
+    def test_report_detail_prints_supervised_section(self) -> None:
+        self._write_repo_config(
+            """\
+            [adapters.opencode]
+            implementer = "cheap/implementer"
+
+            [allowlist]
+            models = ["cheap/implementer"]
+            """
+        )
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            doctor_mod._print_supervised_model_detail(self.repo, "opencode")
+        text = out.getvalue()
+        self.assertIn("allowlist", text)
+        self.assertIn("supervised_author", text)
+        self.assertIn("supervisor", text)
+        self.assertIn("allowlist-exempt", text)
+
+    def test_malformed_allowlist_surfaces_named_error(self) -> None:
+        # A present-but-malformed [allowlist] table is a configuration error,
+        # not an absent allowlist: doctor must not report success.
+        self._write_repo_config(
+            """\
+            [allowlist]
+            models = "not-an-array"
+            """
+        )
+        passed, label, remediation = doctor_mod._check_supervised_models(
+            self.repo, "opencode"
+        )
+        self.assertFalse(passed)
+        self.assertIn("allowlist", remediation)
+        self.assertIn("models.toml", remediation)
+
+    def test_absent_allowlist_still_passes(self) -> None:
+        self._write_repo_config(
+            """\
+            [adapters.opencode]
+            implementer = "cheap/implementer"
+            """
+        )
+        passed, label, remediation = doctor_mod._check_supervised_models(
+            self.repo, "opencode"
+        )
+        self.assertTrue(passed, remediation)
+        self.assertIn("allowlist: absent", remediation)
+
+    def test_configured_supervisor_reported_as_allowlist_exempt(self) -> None:
+        self._write_repo_config(
+            """\
+            [adapters.opencode]
+            supervisor = "frontier/supervisor"
+            implementer = "cheap/implementer"
+
+            [allowlist]
+            models = ["cheap/implementer"]
+            """
+        )
+        passed, label, remediation = doctor_mod._check_supervised_models(
+            self.repo, "opencode"
+        )
+        self.assertTrue(passed, remediation)
+        self.assertIn("supervisor: configured 'frontier/supervisor'", remediation)
+        self.assertIn("allowlist-exempt", remediation)
+        # The supervisor is not demanded as an allowlist member.
+        self.assertNotIn("supervisor: configured 'frontier/supervisor' (not a member)", remediation)
+
+    def test_stale_probe_detects_missing_supervisor_module(self) -> None:
+        repo = Path(self.tmp.name) / "repo"
+        repo_lib = repo / "lib" / "supervisor"
+        repo_lib.mkdir(parents=True)
+        (repo_lib / "model_policy.py").write_text("x = 1\n", encoding="utf-8")
+
+        fake_home = Path(self.tmp.name) / "fake-home"
+        installed = (
+            fake_home / ".local" / "lib" / "opsx-controller" / "lib" / "supervisor"
+        )
+        installed.mkdir(parents=True)
+        # model_policy.py missing from the installed copy.
+
+        with mock.patch.object(Path, "home", return_value=fake_home):
+            reason = load_opsx_plan()._diff_supervisor_package(repo_lib, installed)
+        self.assertIn("stale", reason.lower())
+
+    def test_stale_probe_passes_when_supervisor_matches(self) -> None:
+        repo_lib = Path(self.tmp.name) / "repo-lib"
+        installed = Path(self.tmp.name) / "installed-lib"
+        for target in (repo_lib, installed):
+            target.mkdir(parents=True)
+            (target / "model_policy.py").write_text("x = 1\n", encoding="utf-8")
+        reason = load_opsx_plan()._diff_supervisor_package(repo_lib, installed)
+        self.assertEqual(reason, "")
 
 
 class DoctorProbeCoverageTests(unittest.TestCase):

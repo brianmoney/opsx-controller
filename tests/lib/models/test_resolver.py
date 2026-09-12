@@ -9,8 +9,14 @@ from textwrap import dedent
 from unittest import mock
 
 from lib.models import resolver
-from lib.models.resolver import ModelConfigError, config_paths, resolve, validate
-from lib.models.types import ROLES, ALL_ROLES, ResolvedModel
+from lib.models.resolver import (
+    ModelConfigError,
+    config_paths,
+    resolve,
+    resolve_allowlist,
+    validate,
+)
+from lib.models.types import ROLES, ALL_ROLES, OPTIONAL_ROLES, ResolvedModel
 
 
 def _write(path: Path, content: str) -> None:
@@ -32,6 +38,201 @@ class TempDirCase(unittest.TestCase):
 
     def repo_config_path(self) -> Path:
         return self.repo / ".opsx-plan" / "models.toml"
+
+
+class AllowlistResolverTests(TempDirCase):
+    def test_allowlist_resolves_from_repo_local_file(self) -> None:
+        _write(
+            self.repo_config_path(),
+            """\
+            [allowlist]
+            models = ["cheap/model-a", "cheap/model-b"]
+            """,
+        )
+        result = resolve_allowlist(self.repo)
+        self.assertTrue(result.configured)
+        self.assertEqual(result.models, ("cheap/model-a", "cheap/model-b"))
+        self.assertIn(str(self.repo_config_path()), result.source)
+
+    def test_repo_local_allowlist_replaces_user_global_wholesale(self) -> None:
+        _write(
+            self.repo_config_path(),
+            """\
+            [allowlist]
+            models = ["repo-only"]
+            """,
+        )
+        _write(
+            self.user_config,
+            """\
+            [allowlist]
+            models = ["user-a", "user-b"]
+            """,
+        )
+        result = resolve_allowlist(self.repo)
+        self.assertEqual(result.models, ("repo-only",))
+        self.assertIn(str(self.repo_config_path()), result.source)
+
+    def test_missing_repo_local_table_falls_through_to_user_global(self) -> None:
+        _write(
+            self.repo_config_path(),
+            """\
+            [defaults]
+            controller = "x/y"
+            """,
+        )
+        _write(
+            self.user_config,
+            """\
+            [allowlist]
+            models = ["user-a"]
+            """,
+        )
+        result = resolve_allowlist(self.repo)
+        self.assertEqual(result.models, ("user-a",))
+        self.assertIn(str(self.user_config), result.source)
+
+    def test_absent_table_yields_empty_unconfigured(self) -> None:
+        result = resolve_allowlist(self.repo)
+        self.assertFalse(result.configured)
+        self.assertEqual(result.models, ())
+        self.assertEqual(result.source, "unconfigured")
+
+    def test_explicit_empty_local_table_replaces_and_reports_configured(self) -> None:
+        _write(
+            self.repo_config_path(),
+            """\
+            [allowlist]
+            models = []
+            """,
+        )
+        _write(
+            self.user_config,
+            """\
+            [allowlist]
+            models = ["user-a"]
+            """,
+        )
+        result = resolve_allowlist(self.repo)
+        self.assertTrue(result.configured)
+        self.assertEqual(result.models, ())
+        self.assertIn(str(self.repo_config_path()), result.source)
+
+    def test_no_environment_source(self) -> None:
+        # An ambient OPSX_* variable must never contribute allowlist entries.
+        result = resolve_allowlist(self.repo)
+        self.assertEqual(result.models, ())
+        self.assertFalse(result.configured)
+
+    def test_malformed_models_not_array_raises_naming_file(self) -> None:
+        _write(
+            self.repo_config_path(),
+            """\
+            [allowlist]
+            models = "not-an-array"
+            """,
+        )
+        with self.assertRaises(ModelConfigError) as ctx:
+            resolve_allowlist(self.repo)
+        self.assertIn(str(self.repo_config_path()), str(ctx.exception))
+
+    def test_malformed_entry_raises_naming_file(self) -> None:
+        _write(
+            self.repo_config_path(),
+            """\
+            [allowlist]
+            models = ["ok/model", "   "]
+            """,
+        )
+        with self.assertRaises(ModelConfigError) as ctx:
+            resolve_allowlist(self.repo)
+        self.assertIn(str(self.repo_config_path()), str(ctx.exception))
+
+    def test_non_string_entry_raises(self) -> None:
+        _write(
+            self.repo_config_path(),
+            """\
+            [allowlist]
+            models = ["ok/model", 7]
+            """,
+        )
+        with self.assertRaises(ModelConfigError):
+            resolve_allowlist(self.repo)
+
+    def test_allowlist_does_not_change_role_resolution(self) -> None:
+        _write(
+            self.repo_config_path(),
+            """\
+            [allowlist]
+            models = ["cheap/model-a"]
+
+            [adapters.opencode]
+            implementer = "deepseek/deepseek-v4-pro"
+            """,
+        )
+        resolved = resolve("opencode", repo=self.repo, environ={})
+        self.assertEqual(resolved["implementer"].model, "deepseek/deepseek-v4-pro")
+
+
+class SupervisedRoleResolutionTests(TempDirCase):
+    SUPERVISED = (
+        "supervisor",
+        "supervised_author",
+        "acceptance_reviewer",
+        "fixer",
+        "verifier",
+    )
+
+    def test_supervised_roles_are_optional(self) -> None:
+        for role in self.SUPERVISED:
+            self.assertIn(role, OPTIONAL_ROLES)
+        for role in self.SUPERVISED:
+            self.assertNotIn(role, ROLES)
+
+    def test_supervised_role_resolves_like_any_role(self) -> None:
+        _write(
+            self.repo_config_path(),
+            """\
+            [adapters.opencode]
+            acceptance_reviewer = "cheap/acceptance"
+            """,
+        )
+        resolved = resolve("opencode", repo=self.repo, environ={})
+        entry = resolved["acceptance_reviewer"]
+        self.assertEqual(entry.model, "cheap/acceptance")
+        self.assertIn(str(self.repo_config_path()), entry.source)
+
+    def test_unset_supervised_roles_are_unresolved_not_errors(self) -> None:
+        resolved = resolve("opencode", repo=self.repo, environ={})
+        for role in self.SUPERVISED:
+            self.assertIsNone(resolved[role].model)
+            self.assertEqual(resolved[role].source, "unresolved")
+        for role in ROLES:
+            self.assertEqual(resolved[role].source, "unresolved")
+
+    def test_supervised_role_resolves_from_ambient_env(self) -> None:
+        resolved = resolve(
+            "opencode", repo=self.repo,
+            environ={"OPSX_FIXER_MODEL": "cheap/fixer"},
+        )
+        self.assertEqual(resolved["fixer"].model, "cheap/fixer")
+        self.assertEqual(resolved["fixer"].source, "ambient environment")
+
+    def test_custom_required_roles_unchanged_when_supervised_configured(self) -> None:
+        _write(
+            self.user_config,
+            """\
+            [defaults]
+            controller = "base/controller"
+            implementer = "base/implementer"
+            reviewer = "base/reviewer"
+            archiver = "base/archiver"
+            supervised_author = "cheap/author"
+            """,
+        )
+        resolved = resolve("opencode", repo=self.repo, environ={})
+        self.assertEqual(resolved["controller"].model, "base/controller")
+        self.assertEqual(resolved["supervised_author"].model, "cheap/author")
 
 
 class PrecedenceLadderTests(TempDirCase):

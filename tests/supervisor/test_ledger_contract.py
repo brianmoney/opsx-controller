@@ -23,8 +23,16 @@ from lib.supervisor import clock, ledger
 def _policy(**overrides: object) -> dict:
     base = {
         "authority_config": {"mode": "policy-bound", "approval": "supervisor"},
-        "model_selection": {"implementer": "cheap/model-a"},
-        "inexpensive_allowlist": ["cheap/model-a", "cheap/model-b"],
+        "model_selection": {
+            "version": 1,
+            "roles": {"implementer": "cheap/model-a"},
+            "stages": {"implement": "implementer"},
+        },
+        "inexpensive_allowlist": {
+            "version": 1,
+            "models": ["cheap/model-a", "cheap/model-b"],
+            "source": "repo-local config (/repo/.opsx-plan/models.toml, [allowlist])",
+        },
         "manifest_snapshot_hash": "deadbeef",
         "budgets": {"tokens": 100000, "incidents": 3},
         "deadlines": {"wall_seconds": 3600},
@@ -234,6 +242,132 @@ class TrustedLocationTests(LedgerTestCase):
             self.worktree / "src" / "main.py", self.repo
         )
         self.assertEqual(relative, os.path.join("worktree", "src", "main.py"))
+
+
+class ModelPolicyLedgerTests(LedgerTestCase):
+    """The ledger routes policy model fields through the model-policy module."""
+
+    def test_versioned_policy_round_trips_and_reports_state(self) -> None:
+        handle = self.open()
+        job_id = self.register(handle)
+        policy = handle.current_policy(job_id)
+        self.assertEqual(policy["model_policy_state"]["model_selection"], "versioned")
+        self.assertEqual(
+            policy["model_policy_state"]["inexpensive_allowlist"], "versioned"
+        )
+        self.assertEqual(policy["model_selection"]["version"], 1)
+        self.assertEqual(policy["inexpensive_allowlist"]["version"], 1)
+
+    def test_malformed_model_selection_rejected_on_write(self) -> None:
+        handle = self.open()
+        bad = _policy(model_selection={"implementer": "cheap/model-a"})
+        with self.assertRaises(ledger.model_policy.ModelPolicyError):
+            self.register(handle, policy=bad)
+        self.assertEqual(handle.list_jobs(), [])
+
+    def test_newer_nested_version_rejected_on_write(self) -> None:
+        handle = self.open()
+        bad = _policy(
+            model_selection={
+                "version": 99,
+                "roles": {"implementer": "cheap/model-a"},
+                "stages": {"implement": "implementer"},
+            }
+        )
+        with self.assertRaises(ledger.model_policy.ModelPolicyVersionError):
+            self.register(handle, policy=bad)
+
+    def test_newer_nested_version_rejected_on_read(self) -> None:
+        handle = self.open()
+        job_id = self.register(handle)
+        # Corrupt the stored nested version via raw SQL. The insert-only guard
+        # trigger is dropped for this raw fixture write (it is recreated on
+        # reopen), so the version mismatch is what gets detected at decode.
+        handle.connection.execute("DROP TRIGGER job_policies_guard_update")
+        handle.connection.execute(
+            "UPDATE job_policies SET model_selection = ? WHERE job_id = ? "
+            "AND is_current = 1",
+            (
+                json_dumps(
+                    {
+                        "version": 42,
+                        "roles": {"implementer": "x"},
+                        "stages": {"implement": "implementer"},
+                    }
+                ),
+                job_id,
+            ),
+        )
+        with self.assertRaises(ledger.model_policy.ModelPolicyVersionError):
+            handle.current_policy(job_id)
+
+    def test_raw_legacy_row_reads_as_legacy_unversioned(self) -> None:
+        """A pre-schema row (no nested version key) is readable as-is and
+        tagged legacy_unversioned for both old payload shapes."""
+        handle = self.open()
+        job_id = self.register(handle)
+        # Overwrite with pre-policy shapes: a bare dict model_selection and the
+        # old list-shaped allowlist, both without a version key.
+        handle.connection.execute("DROP TRIGGER job_policies_guard_update")
+        handle.connection.execute(
+            "UPDATE job_policies SET model_selection = ?, inexpensive_allowlist = ? "
+            "WHERE job_id = ? AND is_current = 1",
+            (
+                json_dumps({"implementer": "cheap/model-a"}),
+                json_dumps(["cheap/model-a", "cheap/model-b"]),
+                job_id,
+            ),
+        )
+        policy = handle.current_policy(job_id)
+        self.assertEqual(
+            policy["model_policy_state"]["model_selection"], "legacy_unversioned"
+        )
+        self.assertEqual(
+            policy["model_policy_state"]["inexpensive_allowlist"],
+            "legacy_unversioned",
+        )
+        # The original values are preserved unmodified.
+        self.assertEqual(policy["model_selection"], {"implementer": "cheap/model-a"})
+        self.assertEqual(
+            policy["inexpensive_allowlist"], ["cheap/model-a", "cheap/model-b"]
+        )
+
+    def test_nested_version_is_distinct_from_outer_policy_version(self) -> None:
+        handle = self.open()
+        job_id = self.register(handle)
+        policy = handle.current_policy(job_id)
+        outer = policy["policy_version"]
+        nested = policy["model_selection"]["version"]
+        self.assertEqual(outer, ledger.CURRENT_POLICY_VERSION)
+        self.assertEqual(nested, ledger.model_policy.MODEL_POLICY_VERSION)
+        # Both coincide today but are validated independently.
+        self.assertEqual(outer, nested)
+
+    def test_revision_preserves_versioned_policy(self) -> None:
+        handle = self.open()
+        job_id = self.register(handle)
+        handle.revise_policy(
+            job_id,
+            revision=2,
+            policy=_policy(
+                model_selection={
+                    "version": 1,
+                    "roles": {"reviewer": "cheap/model-c"},
+                    "stages": {"review": "reviewer"},
+                },
+                inexpensive_allowlist={
+                    "version": 1,
+                    "models": ["cheap/model-c"],
+                    "source": "user-global config (/home/u/models.toml, [allowlist])",
+                },
+            ),
+            operator="operator",
+        )
+        current = handle.current_policy(job_id)
+        self.assertEqual(
+            current["model_selection"]["roles"]["reviewer"], "cheap/model-c"
+        )
+        self.assertEqual(current["model_policy_state"]["model_selection"], "versioned")
 
 
 class PolicyRevisionTests(LedgerTestCase):

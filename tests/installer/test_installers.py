@@ -19,6 +19,7 @@ import importlib.util
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -168,6 +169,41 @@ class SharedInstallerHelperTests(unittest.TestCase):
                 (installed_pkg / name).is_file(),
                 f"missing installed supervisor module: {name}",
             )
+
+    def test_helper_deploys_supervisor_model_policy_importable_without_repo(self) -> None:
+        """The installed lib/supervisor package includes model_policy.py and it
+        imports and validates a payload using only the installed runtime."""
+        self._run_helper()
+        installed_pkg = self.lib_dir / "supervisor"
+        model_policy_file = installed_pkg / "model_policy.py"
+        self.assertTrue(
+            model_policy_file.is_file(),
+            "installed lib/supervisor is missing model_policy.py",
+        )
+
+        # Import the installed module with only the installed runtime root on
+        # sys.path (never the repository checkout).
+        runtime_root = self.lib_dir.parent  # ~/.local/lib/opsx-controller
+        script = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(runtime_root)!r})\n"
+            "from lib.supervisor import model_policy as mp\n"
+            "payload = {'version': 1, 'models': ['cheap/x'], 'source': 's'}\n"
+            "assert mp.encode_allowlist(payload)['models'] == ['cheap/x']\n"
+            "assert mp.decode_allowlist(['old']).get('state') == 'legacy_unversioned'\n"
+            "print('ok')\n"
+        )
+        env = {**os.environ, "HOME": self.home.name}
+        env.pop("PYTHONPATH", None)
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(self.home.name),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("ok", proc.stdout)
 
     def test_helper_deploys_orchestrator_package_matching_repo(self) -> None:
         """The installed lib.orchestrator tree matches the repo copy byte-for-byte."""

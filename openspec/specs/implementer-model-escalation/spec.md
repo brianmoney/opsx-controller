@@ -147,3 +147,36 @@ The compile-time schema guidance supplied to the plan-authoring model SHALL incl
 
 - **WHEN** the orchestrator builds the schema guidance used to compile an authored plan document into a manifest
 - **THEN** the guidance describes `escalate_after_review_fails`, its default, and its counting rule
+
+### Requirement: Under supervision the escalation role is subject to the allowlist policy check
+
+When the pure model-policy check evaluates a supervised job's promotion of an
+implement dispatch to the escalation model, the `implementer_escalation` role
+SHALL be treated as a supervised dispatch role, exactly like every other
+supervised dispatch role: its resolved model SHALL be on the job's
+inexpensive-model allowlist, SHALL equal the exact policy pin, and SHALL pass
+the target adapter's existing identifier-syntax validation.
+
+When the `implementer_escalation` role is unresolved, unallowlisted, or unavailable, the supervised model-policy check SHALL report the escalation role as blocking with a named reason and SHALL NOT substitute a fallback or inherited model. Applying that decision to a live dispatch belongs to the dispatch/lifecycle changes.
+
+Legacy, unsupervised escalation SHALL be unchanged: the existing fail-closed behavior for a configured threshold without a resolved escalation model continues to apply, and the allowlist is never consulted outside a supervised job.
+
+#### Scenario: A supervised escalation with an allowlisted model passes the check
+
+- **WHEN** a supervised job evaluates an escalation dispatch and the `implementer_escalation` role resolves to an allowlisted inexpensive model that passes identifier-syntax validation
+- **THEN** the policy check reports that the escalation dispatch may proceed with that model
+
+#### Scenario: An unallowlisted escalation model is reported as blocking under supervision
+
+- **WHEN** a supervised job evaluates an escalation dispatch whose resolved escalation model is not on the job's allowlist
+- **THEN** the policy check reports the escalation role as blocking with a named reason, and no unallowlisted substitute is used
+
+#### Scenario: An identifier-syntax-invalid escalation model is unavailable
+
+- **WHEN** a supervised job evaluates an escalation dispatch whose resolved escalation identifier fails the adapter's existing identifier-syntax validation
+- **THEN** the policy check reports the escalation role as blocking with a named reason, without making any live availability claim
+
+#### Scenario: Legacy escalation is unaffected
+
+- **WHEN** an unsupervised run escalates an implement dispatch
+- **THEN** the escalation model is applied exactly as before, with no allowlist check introduced

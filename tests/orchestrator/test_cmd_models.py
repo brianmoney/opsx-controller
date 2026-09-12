@@ -189,6 +189,75 @@ class ModelsCommandTests(unittest.TestCase):
         output = stdout.getvalue()
         self.assertIn("OPSX_IMPLEMENTER_ESCALATION_MODEL", output)
 
+    def test_models_env_exports_resolved_supervised_role(self) -> None:
+        """A resolved optional role is exported; an unresolved one is omitted."""
+        os.environ.pop("OPSX_SUPERVISED_AUTHOR_MODEL", None)
+        self._write_config(
+            """\
+            [adapters.opencode]
+            controller = "github-copilot/gpt-5.4"
+            implementer = "deepseek/deepseek-v4-pro"
+            reviewer = "github-copilot/gpt-5.4"
+            archiver = "github-copilot/gpt-5.4"
+            supervised_author = "cheap/author"
+            """
+        )
+        args = argparse.Namespace(repo=str(self.repo), adapter="opencode")
+        stdout = io.StringIO()
+        with mock.patch("sys.stdout", stdout):
+            rc = self.opsx_plan.cmd_models.cmd_models_env(args)
+        self.assertEqual(rc, 0)
+        output = stdout.getvalue()
+        self.assertIn("OPSX_SUPERVISED_AUTHOR_MODEL", output)
+        self.assertNotIn("OPSX_FIXER_MODEL", output)
+
+    def test_models_show_reports_supervised_roles_and_allowlist(self) -> None:
+        """models show prints supervised roles and the effective allowlist."""
+        self._write_config(
+            """\
+            [adapters.opencode]
+            controller = "github-copilot/gpt-5.4"
+            implementer = "deepseek/deepseek-v4-pro"
+            reviewer = "github-copilot/gpt-5.4"
+            archiver = "github-copilot/gpt-5.4"
+            supervised_author = "cheap/author"
+
+            [allowlist]
+            models = ["cheap/author"]
+            """
+        )
+        args = argparse.Namespace(repo=str(self.repo), adapter="opencode")
+        stdout = io.StringIO()
+        with mock.patch("sys.stdout", stdout):
+            rc = self.opsx_plan.cmd_models.cmd_models_show(args)
+        self.assertEqual(rc, 0)
+        output = stdout.getvalue()
+        self.assertIn("supervisor", output)
+        self.assertIn("supervised_author", output)
+        self.assertIn("allowlist", output)
+        self.assertIn("cheap/author", output)
+        self.assertIn("member", output)
+
+    def test_models_show_succeeds_without_supervised_config(self) -> None:
+        """Inspection never fails for a configuration with no supervised roles."""
+        self._write_config(
+            """\
+            [adapters.opencode]
+            controller = "github-copilot/gpt-5.4"
+            implementer = "deepseek/deepseek-v4-pro"
+            reviewer = "github-copilot/gpt-5.4"
+            archiver = "github-copilot/gpt-5.4"
+            """
+        )
+        args = argparse.Namespace(repo=str(self.repo), adapter="opencode")
+        stdout = io.StringIO()
+        with mock.patch("sys.stdout", stdout):
+            rc = self.opsx_plan.cmd_models.cmd_models_show(args)
+        self.assertEqual(rc, 0)
+        output = stdout.getvalue()
+        self.assertIn("(unresolved)", output)
+        self.assertIn("allowlist: (absent)", output)
+
     def test_models_init_seeds_escalation_from_environment(self) -> None:
         """5.4: models init seeds escalation role from env"""
         saved_controller = os.environ.get("OPSX_CONTROLLER_MODEL", "")

@@ -72,7 +72,13 @@ except ModuleNotFoundError:  # pragma: no cover
 try:
     from lib.models.resolver import ModelConfigError
     from lib.models.resolver import resolve as resolve_models
-    from lib.models.types import ROLE_ENV, ROLE_VARIANT_ENV, ROLES, ALL_ROLES
+    from lib.models.types import (
+        ROLE_ENV,
+        ROLE_VARIANT_ENV,
+        ROLES,
+        ALL_ROLES,
+        OPTIONAL_ROLES,
+    )
 except ModuleNotFoundError as exc:  # pragma: no cover
     sys.exit(f"opsx-plan requires the lib.models runtime package: {exc}")
 
@@ -508,14 +514,17 @@ def apply_model_env(cfg: dict) -> None:
     for role in ROLES:
         os.environ[ROLE_ENV[role]] = models[role].model
 
-    # Export the optional escalation role only when resolved.
-    # When unresolved, explicitly unset the variable so a previously-set
-    # value from an earlier apply_model_env call does not leak into a
-    # non-escalation dispatch.
-    if escalation_entry and escalation_entry.model:
-        os.environ[ROLE_ENV[escalation_role]] = escalation_entry.model
-    else:
-        os.environ.pop(ROLE_ENV[escalation_role], None)
+    # Export every resolved optional role; explicitly unset every unresolved
+    # optional role so a previously-set value from an earlier
+    # apply_model_env call does not leak into a dispatch. This generalizes
+    # the former hard-coded implementer_escalation handling to all optional
+    # roles (escalation plus the supervised roles).
+    for role in OPTIONAL_ROLES:
+        entry = models.get(role)
+        if entry and entry.model:
+            os.environ[ROLE_ENV[role]] = entry.model
+        else:
+            os.environ.pop(ROLE_ENV[role], None)
 
     # Reasoning variants are optional per role. Export the resolved variant
     # (if any) for every role; an unresolved variant is set to an empty
@@ -2023,7 +2032,50 @@ def _check_stale_install(repo: Path) -> tuple[bool, str, str]:
         if stale_reason:
             return (False, label, stale_reason)
 
+    repo_supervisor = repo / "lib" / "supervisor"
+    if repo_supervisor.is_dir():
+        installed_supervisor = (
+            Path.home() / ".local" / "lib" / "opsx-controller" / "lib" / "supervisor"
+        )
+        stale_reason = _diff_supervisor_package(repo_supervisor, installed_supervisor)
+        if stale_reason:
+            return (False, label, stale_reason)
+
     return (True, label, "")
+
+
+def _diff_supervisor_package(repo_pkg: Path, installed_pkg: Path) -> str:
+    """Compare the installed lib.supervisor tree against the repo copy.
+
+    Returns a non-empty reason string when a module (including
+    ``model_policy.py``) differs, is missing, or exists only in the installed
+    copy; returns "" when they match.
+    """
+    import hashlib
+
+    if not installed_pkg.is_dir():
+        return (
+            "Installed lib.supervisor runtime package is missing; rerun a "
+            "global installer"
+        )
+
+    def hashes(root: Path) -> dict[str, bytes]:
+        return {
+            str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).digest()
+            for p in sorted(root.rglob("*.py"))
+        }
+
+    try:
+        repo_hashes = hashes(repo_pkg)
+        installed_hashes = hashes(installed_pkg)
+    except OSError:
+        return ""
+
+    if repo_hashes.keys() != installed_hashes.keys() or any(
+        repo_hashes[name] != installed_hashes[name] for name in repo_hashes
+    ):
+        return "Installed lib.supervisor runtime package is stale; rerun a global installer"
+    return ""
 
 
 def run_doctor_checks(repo: Path, plan_src: str | None,
@@ -2035,6 +2087,7 @@ def run_doctor_checks(repo: Path, plan_src: str | None,
     checks.append(_check_stale_install(repo))
     checks.append(doctor._check_model_resolution(repo, adapter))
     checks.append(doctor._check_model_identifier_syntax(repo, adapter))
+    checks.append(doctor._check_supervised_models(repo, adapter))
     checks.append(doctor._check_openspec_on_path(repo))
     checks.append(doctor._check_openspec_initialized(repo))
     checks.append(doctor._check_adapter_client_on_path(adapter))
@@ -2057,6 +2110,8 @@ def run_doctor_checks(repo: Path, plan_src: str | None,
             failures += 1
         if label == "Model roles resolve for the target adapter":
             doctor._print_model_resolution_detail(repo, adapter)
+        if label == "Supervised model configuration is reported":
+            doctor._print_supervised_model_detail(repo, adapter)
 
     return failures
 
@@ -2069,6 +2124,7 @@ def run_preflight_warnings(repo: Path, plan_src: str | None,
     checks.append(_check_stale_install(repo))
     checks.append(doctor._check_model_resolution(repo, adapter))
     checks.append(doctor._check_model_identifier_syntax(repo, adapter))
+    checks.append(doctor._check_supervised_models(repo, adapter))
     checks.append(doctor._check_openspec_on_path(repo))
     checks.append(doctor._check_openspec_initialized(repo))
     checks.append(doctor._check_adapter_client_on_path(adapter))

@@ -2136,6 +2136,68 @@ class ModelResolutionWiringTests(unittest.TestCase):
             "stale escalation env var must be unset when escalation is unresolved",
         )
 
+    def test_apply_model_env_exports_resolved_supervised_role(self) -> None:
+        """A resolved supervised role is exported as OPSX_<ROLE>_MODEL."""
+        self._write_config(
+            """\
+            [adapters.opencode]
+            controller = "github-copilot/gpt-5.4"
+            implementer = "deepseek/deepseek-v4-pro"
+            reviewer = "github-copilot/gpt-5.4"
+            archiver = "github-copilot/gpt-5.4"
+            supervisor = "frontier/supervisor"
+            supervised_author = "cheap/author"
+            """
+        )
+        plan = self._write_plan("plan.toml", "opencode")
+        cfg = self.opsx_plan.planref.load_plan(plan, repo=self.repo)
+        os.environ.pop("OPSX_SUPERVISOR_MODEL", None)
+        os.environ.pop("OPSX_SUPERVISED_AUTHOR_MODEL", None)
+        try:
+            self.opsx_plan.apply_model_env(cfg)
+            self.assertEqual(os.environ.get("OPSX_SUPERVISOR_MODEL"), "frontier/supervisor")
+            self.assertEqual(os.environ.get("OPSX_SUPERVISED_AUTHOR_MODEL"), "cheap/author")
+        finally:
+            for key in ("OPSX_SUPERVISOR_MODEL", "OPSX_SUPERVISED_AUTHOR_MODEL"):
+                os.environ.pop(key, None)
+
+    def test_apply_model_env_unsets_unresolved_supervised_roles(self) -> None:
+        """An unresolved optional role is explicitly unset during activation."""
+        self._write_config(
+            """\
+            [adapters.opencode]
+            controller = "github-copilot/gpt-5.4"
+            implementer = "deepseek/deepseek-v4-pro"
+            reviewer = "github-copilot/gpt-5.4"
+            archiver = "github-copilot/gpt-5.4"
+            """
+        )
+        plan = self._write_plan("plan.toml", "opencode")
+        cfg = self.opsx_plan.planref.load_plan(plan, repo=self.repo)
+        os.environ["OPSX_FIXER_MODEL"] = "stale/leftover"
+        try:
+            self.opsx_plan.apply_model_env(cfg)
+            self.assertNotIn("OPSX_FIXER_MODEL", os.environ)
+        finally:
+            os.environ.pop("OPSX_FIXER_MODEL", None)
+
+    def test_apply_model_env_legacy_unchanged_without_supervised_roles(self) -> None:
+        """No supervised roles configured: required roles export exactly as before."""
+        self._write_config(
+            """\
+            [adapters.opencode]
+            controller = "github-copilot/gpt-5.4"
+            implementer = "deepseek/deepseek-v4-pro"
+            reviewer = "github-copilot/gpt-5.4"
+            archiver = "github-copilot/gpt-5.4"
+            """
+        )
+        plan = self._write_plan("plan.toml", "opencode")
+        cfg = self.opsx_plan.planref.load_plan(plan, repo=self.repo)
+        self.opsx_plan.apply_model_env(cfg)
+        self.assertEqual(os.environ["OPSX_CONTROLLER_MODEL"], "github-copilot/gpt-5.4")
+        self.assertEqual(os.environ["OPSX_IMPLEMENTER_MODEL"], "deepseek/deepseek-v4-pro")
+
 
 class InvokeDirectStageEnvExpansionTests(unittest.TestCase):
     def setUp(self) -> None:

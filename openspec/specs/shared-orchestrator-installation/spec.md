@@ -4,7 +4,9 @@
 
 Define the common orchestrator deployment performed by every global adapter
 installer.
+
 ## Requirements
+
 ### Requirement: Every global adapter install deploys the shared orchestrator
 
 Each global adapter installer SHALL deploy the client-neutral `opsx-plan`,
@@ -140,3 +142,39 @@ alone SHALL NOT be sufficient to report the installation as current.
 - **THEN** the installed `orchestrator` package is replaced with the current
   repository version, and modules deleted from the repository do not persist
   in the installed copy
+
+### Requirement: The installed supervisor package includes the model-policy module
+
+Every global adapter installer and the universal installer SHALL deploy the `lib/supervisor` package including its model-policy module (`model_policy.py`), so the installed runtime can validate and decode supervised model policy without importing from the repository checkout. The deployed `lib/supervisor` package SHALL remain standard-library only and SHALL NOT import `lib.models` or any other runtime package. An installation whose deployed `lib/supervisor` package omits the model-policy module SHALL be treated as stale, consistent with the existing runtime-package staleness rule.
+
+`opsx-plan doctor` SHALL diagnose the supervised model configuration alongside the existing installation checks: it SHALL report each supervised role's resolution state and the effective allowlist's presence and coverage. An unresolved supervised role or an absent allowlist SHALL NOT make an installation stale or fail the doctor check for an operator who configures no supervised roles.
+
+The installation staleness probe SHALL also compare the deployed
+`lib/supervisor` package, including `model_policy.py`, with the repository
+package. A missing or differing supervisor module SHALL make the installation
+stale and SHALL direct the operator to rerun an installer.
+
+#### Scenario: A global install deploys the model-policy module
+
+- **WHEN** an operator runs any adapter's global installer or the universal installer into a temporary installation sandbox
+- **THEN** the deployed `lib/supervisor` package includes `model_policy.py`, and it imports without referencing the repository checkout
+
+#### Scenario: The installed model-policy module preserves the package boundary
+
+- **WHEN** the installed `model_policy.py` is imported with only the installed runtime on `sys.path`
+- **THEN** it imports and validates policy payloads using only the standard library and the `lib.supervisor` package
+
+#### Scenario: A stale supervisor module is detected
+
+- **WHEN** the installed `lib/supervisor/model_policy.py` is missing or differs from the repository copy
+- **THEN** `opsx-plan doctor` reports the installation as stale and directs the operator to rerun an installer
+
+#### Scenario: Doctor reports the supervised model configuration
+
+- **WHEN** an operator runs `opsx-plan doctor` with supervised roles and an allowlist configured
+- **THEN** doctor reports each supervised role's resolution state and the effective allowlist's presence and coverage alongside the existing checks
+
+#### Scenario: Doctor stays green without supervised roles
+
+- **WHEN** an operator runs `opsx-plan doctor` with no supervised roles and no allowlist configured
+- **THEN** the installation is reported exactly as before, with the supervised roles shown as unconfigured rather than as an error
