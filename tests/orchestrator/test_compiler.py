@@ -748,6 +748,24 @@ class CompileTests(unittest.TestCase):
             self.assertIn(field, guidance,
                           f"schema guidance must mention field '{field}' consumed by load_plan()")
 
+    def test_schema_guidance_documents_pause_before_human_only(self) -> None:
+        """3.1 — the [[changes]] key table covers the key, its human-only
+        default, the delegation opt-out, and the valid-combination rule."""
+        guidance = compiler_mod.build_schema_guidance()
+        self.assertIn("pause_before_human_only", guidance)
+        self.assertIn("human-only", guidance)
+        self.assertIn("delegate", guidance)
+        self.assertIn("pause_before = true", guidance)
+
+    def test_compile_prompt_preserves_pause_before_human_only(self) -> None:
+        """3.2 — the 'Preserve manual gates' rule covers both keys."""
+        prompt = compiler_mod.build_compile_prompt(
+            "content", Path("/tmp/fake.md"), self.repo
+        )
+        self.assertIn("Preserve manual gates", prompt)
+        self.assertIn("pause_before_human_only", prompt)
+        self.assertIn("pause_before", prompt)
+
     def test_build_schema_guidance_toml_block_parses_for_each_adapter(self) -> None:
         """The TOML fenced block rendered by schema guidance must be valid TOML."""
         import tomllib
@@ -1579,8 +1597,51 @@ class SamplePlanTests(unittest.TestCase):
             changes["add-unit-tests"]["pause_before"],
             "add-unit-tests must have pause_before = false",
         )
+        # pause_before_human_only resolution
+        self.assertFalse(
+            changes["integrate-payment-gateway-v2"]["pause_before_human_only"],
+            "integrate-payment-gateway-v2 delegates approval explicitly",
+        )
+        self.assertTrue(
+            changes["add-input-validation"]["pause_before_human_only"],
+            "add-input-validation (gated, key absent) resolves human-only",
+        )
+        self.assertFalse(
+            changes["add-unit-tests"]["pause_before_human_only"],
+            "ungated add-unit-tests resolves no approval authority",
+        )
         gated = cfg["order"][0]
         self.assertEqual(gated, "add-input-validation")
+
+    def test_sample_pause_flag_round_trips_via_derived_manifest(self):
+        """5.4 — the sample's delegated gated change survives a derived
+        single-change manifest render → load round-trip."""
+        sample_dir = (
+            Path(__file__).resolve().parents[2] / "orchestrator" / "samples"
+        )
+        toml_path = sample_dir / "sample-plan.toml"
+        cfg = self.opsx_plan.planref.load_plan(toml_path)
+        cid = "integrate-payment-gateway-v2"
+        self.assertIn(cid, cfg["changes"])
+        # Restrict the loaded multi-change cfg to the one change so the
+        # derived single-change renderer/round-trip applies. The full sample
+        # target id is not a real change dir, but write_single_change_manifest
+        # only serializes and round-trips — it does not inspect openspec/.
+        change = dict(cfg["changes"][cid])
+        change["depends_on"] = []
+        cfg["changes"] = {cid: change}
+        cfg["order"] = [cid]
+        self.opsx_plan.write_single_change_manifest(self.repo, cid, cfg)
+
+        manifest_path = self.opsx_plan.planref.single_change_manifest_path(
+            self.repo, cid
+        )
+        serialized = manifest_path.read_text(encoding="utf-8")
+        self.assertIn("pause_before_human_only = false", serialized)
+        reloaded = self.opsx_plan.planref.load_plan(manifest_path)
+        change = reloaded["changes"][cid]
+        self.assertTrue(change["pause_before"])
+        self.assertFalse(change["pause_before_human_only"])
 
     def test_sample_exercises_full_surface(self):
         """7.11"""
@@ -1622,6 +1683,7 @@ class SamplePlanTests(unittest.TestCase):
 
         known_change_keys = {
             "id", "phase", "depends_on", "pause_before", "enabled",
+            "pause_before_human_only",
             "timeout_minutes", "create_invoke", "create_max_attempts",
         }
         all_change_keys: set[str] = set()

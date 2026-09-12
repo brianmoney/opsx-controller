@@ -143,6 +143,14 @@ automation DAG.
    `` `name` (proposed; see Capability Ownership). `` The first change per
    proposed capability compiles to a `pause_before` approval gate.
 
+   A gated change is human-only by default: its gate can only be released by
+   a human operator. When the gate should instead be releasable by the
+   supervised job's policy-bound authority, state that explicitly in prose
+   on the change; the compiler emits `pause_before_human_only = false` for
+   it. `pause_before_human_only = true` is only valid on a change that also
+   sets `pause_before = true` — the combination without a gate is a
+   plan-load error.
+
 9. **Unique slugs.** Slugs are unique kebab-case OpenSpec change ids,
    verb-led (e.g. `add-`, `enforce-`, `extract-`, `replace-`), and collide
    with no existing or archived change id.
@@ -330,6 +338,13 @@ proceeding:
 
 Do not gate merely because a change is large or touches many files. That is
 what the reviewer is for.
+
+By default a gate is human-only (`pause_before_human_only` absent): only a
+human operator can release it. To delegate gate release to the supervised
+job's policy-bound authority, set `pause_before_human_only = false` on the
+change (which requires `pause_before = true`). Setting
+`pause_before_human_only = true` without `pause_before = true` is invalid and
+fails at plan load.
 
 ### Runnable-Horizon Rule
 

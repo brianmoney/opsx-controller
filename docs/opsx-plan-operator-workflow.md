@@ -234,6 +234,7 @@ The plan manifest is a TOML file with a `[plan]` table and one or more
 | `phase` | int | none | Phase number for display ordering |
 | `depends_on` | list\[str\] | `[]` | IDs of changes that must complete first |
 | `pause_before` | bool | `false` | Wait for `opsx-plan approve` before running |
+| `pause_before_human_only` | bool | gated: `true`; ungated: `false` | Approval authority for a `pause_before` gate: absent on a gated change means human-only; `false` delegates release to the supervised job's policy-bound authority; `true` without `pause_before = true` is a load error |
 | `enabled` | bool | `true` | Set `false` to defer a change |
 | `timeout_minutes` | float | plan-level timeout | Per-change stage timeout override |
 | `create_invoke` | string | plan-level create_invoke | Per-change authoring command override |
@@ -487,6 +488,14 @@ do not contribute to the cumulative total.
 A change with `pause_before = true` waits for explicit approval before the
 orchestrator dispatches it. Use for human judgment gates such as
 new-capability approvals or phase exit reviews.
+
+Gates are human-only by default: only a human operator can release them. To
+delegate release to the supervised job's policy-bound authority, set
+`pause_before_human_only = false` on the gated change. Setting
+`pause_before_human_only = true` on a change without `pause_before = true`
+is a plan-load error, and non-boolean values are rejected rather than
+coerced. Manifests that never set the key keep their existing human-approved
+semantics.
 
 ```bash
 # Approve a single change

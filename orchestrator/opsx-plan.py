@@ -237,6 +237,7 @@ def build_single_change_config(repo: Path, change_id: str) -> dict:
             "phase": None,
             "depends_on": [],
             "pause_before": False,
+            "pause_before_human_only": False,
             "enabled": True,
             "timeout_minutes": 90,
             "create_invoke": "",
@@ -335,6 +336,14 @@ def render_single_change_manifest(cfg: dict) -> str:
         else:
             lines.append("depends_on = []")
         lines.append(f"pause_before = {_toml_bool(c.get('pause_before', False))}")
+        # The loader default is context-dependent (absent on a gated change
+        # resolves human-only), so the key is written only when it changes the
+        # loaded result: a gated change that delegates.  `true` is never
+        # written — redundant on a gated change, invalid on an ungated one.
+        if c.get("pause_before", False) and not c.get(
+            "pause_before_human_only", True
+        ):
+            lines.append("pause_before_human_only = false")
         lines.append(f"enabled = {_toml_bool(c.get('enabled', True))}")
         lines.append(f"timeout_minutes = {float(c.get('timeout_minutes', cfg.get('timeout_minutes', 90)))}")
         lines.append(f'create_invoke = "{compiler._escape_toml_value(c.get("create_invoke", ""))}"')
@@ -410,7 +419,8 @@ def _compare_configs(
             diverging.append(key)
 
     _SERIALIZED_CHANGE_KEYS = [
-        "id", "phase", "depends_on", "pause_before", "enabled",
+        "id", "phase", "depends_on", "pause_before", "pause_before_human_only",
+        "enabled",
         "timeout_minutes", "create_invoke", "create_max_attempts",
     ]
 

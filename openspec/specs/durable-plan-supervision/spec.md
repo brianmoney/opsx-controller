@@ -213,3 +213,50 @@ the trusted-location path semantics consistent with the isolation boundary.
 - **WHEN** `core/plan-supervision.md` is reviewed against this capability
 - **THEN** every element listed above is defined in it, and the document
   states them without reference to any specific client adapter
+
+### Requirement: A gated change's approval authority is human-only unless explicitly delegated
+
+Every change gated with `pause_before = true` SHALL have a defined approval
+authority: human-only, meaning only a human operator can release the gate, or
+delegated, meaning the supervised job's policy-bound authority may release
+it.
+
+The manifest key `pause_before_human_only` SHALL select the approval
+authority for a gated change. When the key is absent on a gated change, the
+gate SHALL resolve to human-only, so legacy manifests keep their existing
+human-approved semantics. An explicit `pause_before_human_only = false`
+SHALL delegate approval to the supervised job's policy-bound authority.
+
+`pause_before_human_only = true` SHALL be invalid on a change that is not
+gated with `pause_before = true`: a human-only approval requirement is
+meaningless without a gate, so the combination SHALL be rejected rather than
+silently accepted.
+
+The resolution SHALL be preserved as manifest data so a supervision broker
+can enforce it in a later change; the resolution itself SHALL NOT change how
+unsupervised runs handle gates.
+
+#### Scenario: Legacy gate resolves to human-only
+
+- **WHEN** a change sets `pause_before = true` and omits
+  `pause_before_human_only`
+- **THEN** its approval authority resolves to human-only
+
+#### Scenario: Explicit opt-out delegates approval
+
+- **WHEN** a change sets `pause_before = true` and
+  `pause_before_human_only = false`
+- **THEN** its approval authority resolves to the supervised job's
+  policy-bound delegated authority
+
+#### Scenario: Human-only without a gate is invalid
+
+- **WHEN** a change sets `pause_before_human_only = true` without
+  `pause_before = true`
+- **THEN** the manifest is rejected as invalid rather than silently accepted
+
+#### Scenario: Ungated changes resolve no approval authority
+
+- **WHEN** a change sets neither `pause_before = true` nor
+  `pause_before_human_only`
+- **THEN** no approval authority applies and the change loads unchanged

@@ -93,11 +93,16 @@ def load_plan(path: Path, repo: Path | None = None) -> dict:
             raise base.PlanError("a [[changes]] entry is missing 'id'")
         if cid in by_id:
             raise base.PlanError(f"duplicate change id: {cid}")
+        pause_before = bool(c.get("pause_before", False))
+        pause_before_human_only = _parse_pause_before_human_only(
+            c.get("pause_before_human_only"), cid, pause_before
+        )
         by_id[cid] = {
             "id": cid,
             "phase": c.get("phase"),
             "depends_on": list(c.get("depends_on", [])),
-            "pause_before": bool(c.get("pause_before", False)),
+            "pause_before": pause_before,
+            "pause_before_human_only": pause_before_human_only,
             "enabled": bool(c.get("enabled", True)),
             "timeout_minutes": float(
                 c.get("timeout_minutes", cfg["timeout_minutes"])
@@ -238,6 +243,38 @@ def is_direct_mode(cfg: dict) -> bool:
     return all(
         cfg.get(name) for name in ("implement_invoke", "review_invoke", "archive_invoke")
     )
+
+
+def _parse_pause_before_human_only(
+    value: object | None, change_id: str, pause_before: bool
+) -> bool:
+    """Validate and resolve ``pause_before_human_only`` for one change.
+
+    The key is optional.  When present it must be a real boolean: a
+    non-boolean value raises ``PlanError`` naming the key and the change
+    rather than being coerced by truthiness.  ``true`` is only meaningful on
+    a gated change, so ``true`` without ``pause_before = true`` raises a
+    named error.
+
+    Resolution is normalized to a concrete bool:
+
+    - absent with a gate -> ``True`` (legacy human-only default)
+    - absent without a gate -> ``False`` (inert; no approval authority)
+    - explicit values are preserved
+    """
+    if value is None:
+        return pause_before
+    if not isinstance(value, bool):
+        raise base.PlanError(
+            f"{change_id}: pause_before_human_only must be a boolean, "
+            f"got {type(value).__name__}"
+        )
+    if value and not pause_before:
+        raise base.PlanError(
+            f"{change_id}: pause_before_human_only = true requires "
+            f"pause_before = true on the same change"
+        )
+    return value
 
 
 def _parse_escalation_threshold(value: object) -> int:

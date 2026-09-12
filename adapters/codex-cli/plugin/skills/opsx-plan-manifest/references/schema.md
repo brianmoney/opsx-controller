@@ -72,6 +72,7 @@ adapter name works.
 | `phase` | int | none | Display grouping only — carries no ordering semantics |
 | `depends_on` | list[str] | `[]` | Ids that must complete first; the only ordering mechanism |
 | `pause_before` | bool | `false` | Wait for `opsx-plan approve` before running |
+| `pause_before_human_only` | bool | gated: `true`; ungated: `false` | Approval authority for a `pause_before` gate. Absent on a gated change resolves human-only; `false` delegates release to the supervised job's policy-bound authority. `true` without `pause_before = true` is a plan-load error; non-boolean values are rejected rather than coerced |
 | `enabled` | bool | `true` | `false` defers the change; shows as `skipped` |
 | `timeout_minutes` | float | plan-level | Per-change override |
 | `create_invoke` | string | plan-level | Per-change authoring override |

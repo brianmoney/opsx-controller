@@ -133,3 +133,57 @@ handling with no dependency on the supervisor package or ledger.
 - **WHEN** a supervisor ledger is created for a supervised job
 - **THEN** the ledger file resides in service-owned storage outside the
   repository worktree, and no ledger file appears under `.opsx-plan/`
+
+### Requirement: The plan loader validates and resolves `pause_before_human_only`
+
+The plan loader SHALL accept an optional boolean `pause_before_human_only`
+key on each `[[changes]]` entry. A non-boolean value SHALL be rejected with
+a named error identifying the key and the change, rather than coerced by
+truthiness. `pause_before_human_only = true` without `pause_before = true`
+on the same change SHALL be rejected with a named error identifying the key
+and the change.
+
+The loader SHALL resolve the key into the loaded change configuration: when
+`pause_before = true` is set and the key is absent, the resolved value SHALL
+be human-only (`true`); an explicit `false` SHALL be preserved as `false`.
+Manifests that never set the key SHALL load with exactly the same values for
+every previously existing field.
+
+Derived single-change manifests SHALL preserve the resolved value through
+the existing serialize-and-round-trip verification path, so a regenerated
+manifest cannot silently drop or alter the flag.
+
+#### Scenario: Legacy manifest loading is unchanged
+
+- **WHEN** a manifest with `pause_before = true` and no
+  `pause_before_human_only` key is loaded
+- **THEN** the change configuration resolves `pause_before_human_only` to
+  `true` and every previously existing field loads exactly as before
+
+#### Scenario: Explicit delegation survives loading
+
+- **WHEN** a manifest sets `pause_before = true` and
+  `pause_before_human_only = false` on a change
+- **THEN** the loaded change configuration carries `pause_before = true` and
+  `pause_before_human_only = false`
+
+#### Scenario: Human-only without a gate is a named error
+
+- **WHEN** a manifest sets `pause_before_human_only = true` on a change
+  without `pause_before = true`
+- **THEN** loading fails with a named error identifying the key and the
+  change
+
+#### Scenario: Non-boolean values are rejected
+
+- **WHEN** a manifest sets `pause_before_human_only` to a non-boolean value
+  such as a string or an integer
+- **THEN** loading fails with a named error identifying the key and the
+  change rather than coercing the value
+
+#### Scenario: Derived manifests round-trip the flag
+
+- **WHEN** a derived single-change manifest is generated for a change whose
+  resolved `pause_before_human_only` differs from the loader default
+- **THEN** the serialized manifest states the key explicitly and the
+  round-trip verification preserves the resolved value

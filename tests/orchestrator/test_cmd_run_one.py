@@ -1332,6 +1332,47 @@ class SingleChangeManifestTests(unittest.TestCase):
         )
         self.assertEqual(reloaded["finding_recurrence_limit"], 3)
 
+    def test_delegated_gate_serializes_and_round_trips(self):
+        """5.2: a delegated gated change serializes the key and survives
+        the round-trip comparison."""
+        self.write_authored_change(self.cid)
+        cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
+        cfg["changes"][self.cid]["pause_before"] = True
+        cfg["changes"][self.cid]["pause_before_human_only"] = False
+        # render → load → compare; must not raise.
+        self.opsx_plan.write_single_change_manifest(self.repo, self.cid, cfg)
+
+        manifest_path = self.opsx_plan.planref.single_change_manifest_path(
+            self.repo, self.cid
+        )
+        serialized = manifest_path.read_text(encoding="utf-8")
+        self.assertIn("pause_before_human_only = false", serialized)
+
+        reloaded = self.opsx_plan.planref.load_plan(manifest_path, repo=self.repo)
+        change = reloaded["changes"][self.cid]
+        self.assertTrue(change["pause_before"])
+        self.assertFalse(change["pause_before_human_only"])
+
+    def test_human_only_gate_omits_key_and_still_round_trips(self):
+        """5.2: a human-only gated change omits the key (redundant) and the
+        round-trip resolves it back to human-only."""
+        self.write_authored_change(self.cid)
+        cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
+        cfg["changes"][self.cid]["pause_before"] = True
+        cfg["changes"][self.cid]["pause_before_human_only"] = True
+        self.opsx_plan.write_single_change_manifest(self.repo, self.cid, cfg)
+
+        manifest_path = self.opsx_plan.planref.single_change_manifest_path(
+            self.repo, self.cid
+        )
+        serialized = manifest_path.read_text(encoding="utf-8")
+        self.assertNotIn("pause_before_human_only = true", serialized)
+
+        reloaded = self.opsx_plan.planref.load_plan(manifest_path, repo=self.repo)
+        self.assertTrue(
+            reloaded["changes"][self.cid]["pause_before_human_only"]
+        )
+
 
 class RunOneCommandTests(unittest.TestCase):
     """opsx-run executable dispatch and single-change run-one command."""

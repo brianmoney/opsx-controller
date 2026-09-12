@@ -231,7 +231,10 @@ compatibility worker-state snapshots used as phase inputs live under
 See `orchestrator/samples/sample-plan.toml` for a canonical example. Per-change fields: `id` (required), `depends_on`,
 `phase` (informational), `pause_before` (requires explicit `approve` before
 dispatch — use for human gates like new-capability approvals or phase exit
-reviews), `enabled` (set `false` for deferred changes), and per-change
+reviews), `pause_before_human_only` (approval authority for a gate: absent on
+a gated change means human-only; `false` delegates release to the supervised
+job's policy-bound authority; `true` without `pause_before = true` is a load
+error), `enabled` (set `false` for deferred changes), and per-change
 `timeout_minutes` override.
 
 Review the `depends_on` graph by hand before an unattended run. The

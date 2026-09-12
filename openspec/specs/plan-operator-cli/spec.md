@@ -669,3 +669,17 @@ At minimum, the documentation SHALL explicitly describe:
   optional, or invocation-scoped
 - **THEN** the documentation states the default behavior and names the
   precedence rule or flag that changes it
+
+### Requirement: Operator documentation covers the `pause_before_human_only` key
+
+Operator-facing documentation for `opsx-plan` manifests SHALL describe the
+`pause_before_human_only` key: its human-only default when absent on a gated
+change, the explicit `false` delegation opt-out, and the invalidity of
+`true` without `pause_before = true`.
+
+#### Scenario: Workflow documentation explains the flag
+
+- **WHEN** an operator reads the manifest key documentation and the
+  manual-gates section of the operator workflow documentation
+- **THEN** the key, its human-only default, the delegation opt-out, and the
+  invalid combination are all described
