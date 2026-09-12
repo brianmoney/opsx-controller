@@ -148,6 +148,26 @@ class SharedInstallerHelperTests(unittest.TestCase):
         self.assertTrue(self.lib_dir.joinpath("pricing").is_dir())
         self.assertTrue(self.lib_dir.joinpath("models").is_dir())
         self.assertTrue(self.lib_dir.joinpath("orchestrator").is_dir())
+        self.assertTrue(self.lib_dir.joinpath("supervisor").is_dir())
+
+    def test_helper_deploys_supervisor_package_with_init(self) -> None:
+        """A temporary installer sandbox must deploy lib/supervisor including
+        its ``__init__.py``, and the installed modules must import."""
+        self._run_helper()
+        installed_pkg = self.lib_dir / "supervisor"
+        self.assertTrue(installed_pkg.is_dir(), "lib/supervisor not installed")
+        self.assertTrue(
+            (installed_pkg / "__init__.py").is_file(),
+            "installed lib/supervisor is missing __init__.py",
+        )
+        repo_pkg = _REPO / "lib" / "supervisor"
+        repo_files = sorted(p.name for p in repo_pkg.glob("*.py"))
+        self.assertTrue(repo_files, "expected lib/supervisor to contain .py modules")
+        for name in repo_files:
+            self.assertTrue(
+                (installed_pkg / name).is_file(),
+                f"missing installed supervisor module: {name}",
+            )
 
     def test_helper_deploys_orchestrator_package_matching_repo(self) -> None:
         """The installed lib.orchestrator tree matches the repo copy byte-for-byte."""
@@ -260,7 +280,7 @@ class AdapterInstallerTests(unittest.TestCase):
 
     def _assert_runtime_libraries_installed(self) -> None:
         lib = self._lib_dir()
-        for pkg in ("metrics", "pricing", "models", "orchestrator"):
+        for pkg in ("metrics", "pricing", "models", "orchestrator", "supervisor"):
             self.assertTrue(
                 lib.joinpath(pkg).is_dir(),
                 f"runtime library '{pkg}' missing in {lib}",

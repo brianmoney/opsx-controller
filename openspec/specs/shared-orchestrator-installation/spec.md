@@ -9,13 +9,18 @@ installer.
 
 Each global adapter installer SHALL deploy the client-neutral `opsx-plan`,
 `opsx-run`, and `opsx-watch-plan` executables to `~/.local/bin` and the
-required `metrics`, `pricing`, `models`, and `orchestrator` runtime packages to
-`~/.local/lib/opsx-controller/lib`.
+required `metrics`, `pricing`, `models`, `orchestrator`, and `supervisor`
+runtime packages to `~/.local/lib/opsx-controller/lib`.
 
 The `orchestrator` runtime package carries the orchestrator implementation
 modules that the `opsx-plan` entrypoint imports at startup. The entrypoint is
 not self-contained: an installation that omits this package is incomplete and
 SHALL be treated as stale.
+
+The `supervisor` runtime package carries the durable supervision ledger
+modules. It SHALL be deployed on every global install even though no
+subcommand imports it yet, so that intermediate installs performed while
+supervision changes land always carry the complete runtime.
 
 Each global adapter installer SHALL additionally deploy the canonical sample
 plan pair to `~/.local/lib/opsx-controller/samples`, so that compile prompts
@@ -61,9 +66,17 @@ CLI, dsh, or the universal installer performed the installation.
 
 - **WHEN** an operator runs any adapter's global installer or the universal installer
 - **THEN** `~/.local/lib/opsx-controller/lib/orchestrator` is installed
-  alongside the `metrics`, `pricing`, and `models` packages
+  alongside the `metrics`, `pricing`, `models`, and `supervisor` packages
 - **AND** the installed `opsx-plan` runs its subcommands without importing
   anything from the repository checkout
+
+#### Scenario: Global install provides the supervisor runtime package
+
+- **WHEN** an operator runs any adapter's global installer or the universal
+  installer
+- **THEN** `~/.local/lib/opsx-controller/lib/supervisor` is installed
+  alongside the other runtime packages, and its modules import without
+  referencing the repository checkout
 
 #### Scenario: Global install provides the canonical sample pair
 

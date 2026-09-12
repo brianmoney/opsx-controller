@@ -106,7 +106,30 @@ The sample SHALL NOT contain keys the current loader ignores.
 Completed authored plans SHALL retire to `openspec/plans/archived/`, retaining both the markdown source and the compiled manifest as a pair.
 
 Archived plan pairs SHALL remain available to the orchestrator as repository template plan references.
-
 #### Scenario: Archived pair keeps both artifacts together
+
 - **WHEN** a completed plan `openspec/plans/example.md` and `openspec/plans/example.toml` is retired
 - **THEN** both files reside at `openspec/plans/archived/example.md` and `openspec/plans/archived/example.toml`
+
+### Requirement: Supervision storage leaves JSON execution state authoritative and unchanged
+
+The JSON execution state under `.opsx-plan/` SHALL remain the authoritative
+state record for plan execution, whether or not any supervisor ledger exists.
+The supervisor ledger SHALL NOT be stored under `.opsx-plan/` or anywhere else
+inside the repository worktree, and introducing supervision storage SHALL NOT
+change the JSON execution state's format, location, or read/write semantics.
+Legacy jobs without a supervised registration SHALL keep their existing JSON
+handling with no dependency on the supervisor package or ledger.
+
+#### Scenario: Legacy runs are untouched by the supervisor package
+
+- **WHEN** an ordinary (non-supervised) plan run executes with the supervisor
+  package present
+- **THEN** its JSON execution state handling is unchanged and no supervisor
+  ledger is created or consulted
+
+#### Scenario: The ledger never lands in the worktree
+
+- **WHEN** a supervisor ledger is created for a supervised job
+- **THEN** the ledger file resides in service-owned storage outside the
+  repository worktree, and no ledger file appears under `.opsx-plan/`

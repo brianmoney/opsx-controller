@@ -208,3 +208,39 @@ traceback in this case.
 
 - **WHEN** `opsx-plan doctor` runs against that same installation
 - **THEN** it reports the installed runtime as stale
+
+### Requirement: The supervisor runtime package follows the shared runtime-module discipline
+
+The supervisor ledger SHALL live in a `lib/supervisor/` package alongside the
+existing `lib/metrics`, `lib/pricing`, `lib/models`, and `lib/orchestrator`
+runtime packages, and SHALL be resolved by the same `sys.path` mechanism the
+entrypoint already uses for those packages. Each module in the package SHALL
+be importable as `lib.supervisor.<module>` without executing the CLI, SHALL be
+named for the single concern it owns, and SHALL NOT shadow a Python builtin or
+standard-library module name. The package SHALL depend only on the Python
+standard library and SHALL NOT import `lib.orchestrator` or any other runtime
+package, so its dependency graph is acyclic by construction; the absence of
+cycles SHALL be verified mechanically against the package.
+
+Cross-module references within the package SHALL resolve through the owning
+module object rather than name imports, under the same discipline as the
+orchestrator package.
+
+#### Scenario: A supervisor module is imported without running the CLI
+
+- **WHEN** a test or tool imports a `lib.supervisor.<module>` module
+- **THEN** the import succeeds, no argument parsing occurs, no process is
+  spawned, and no file under `.opsx-plan/` is read or written
+
+#### Scenario: The supervisor package dependency direction is checked mechanically
+
+- **WHEN** the `lib/supervisor/` package is analyzed for inter-module imports
+- **THEN** the resulting graph is acyclic and contains no import of another
+  runtime package, and the check is repeatable without reading the design
+  document
+
+#### Scenario: A patched definition is observed across supervisor modules
+
+- **WHEN** a test rebinds a definition on the supervisor module that owns it,
+  and code in a different supervisor module calls that definition
+- **THEN** the call reaches the replacement, not the original
