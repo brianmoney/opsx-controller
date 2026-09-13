@@ -341,6 +341,7 @@ def _print_report_json(result, plan_name: str, run_id: str,
             _dataclass_to_dict(c) for c in result.change_metrics
         ],
         "stage_aggregates": _dataclass_to_dict(result.stage_aggregates),
+        "core_metrics": _dataclass_to_dict(result.core_metrics),
         "model_leaderboard": [
             _dataclass_to_dict(e) for e in result.model_leaderboard
         ],
@@ -403,6 +404,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         _read_telemetry,
         _select_run,
         aggregate,
+        filter_leaderboard_records,
     )
 
     # When --for-change resolves through the state-file fallback (no manifest
@@ -455,7 +457,7 @@ def cmd_report(args: argparse.Namespace) -> int:
             state_for_lb, change_records, plan_name, [],
         )
         result.model_leaderboard = _build_leaderboard(
-            cm_list, change_records,
+            cm_list, filter_leaderboard_records(change_records),
         )
 
     if args.stage:

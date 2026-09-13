@@ -34,8 +34,15 @@ def _policy(**overrides: object) -> dict:
             "source": "repo-local config (/repo/.opsx-plan/models.toml, [allowlist])",
         },
         "manifest_snapshot_hash": "deadbeef",
-        "budgets": {"tokens": 100000, "incidents": 3},
-        "deadlines": {"wall_seconds": 3600},
+        "budgets": {
+            "version": 1,
+            "total_cost_usd": 100.0,
+            "per_action_cost_usd": None,
+            "total_elapsed_minutes": None,
+            "per_action_elapsed_minutes": None,
+            "max_incident_attempts": 3,
+        },
+        "deadlines": {"version": 1, "execution_deadline_minutes": None},
     }
     base.update(overrides)
     return base
@@ -388,17 +395,24 @@ class PolicyRevisionTests(LedgerTestCase):
         handle.revise_policy(
             job_id,
             revision=2,
-            policy=_policy(budgets={"tokens": 500, "incidents": 1}),
+            policy=_policy(budgets={
+                "version": 1,
+                "total_cost_usd": 5.0,
+                "per_action_cost_usd": None,
+                "total_elapsed_minutes": None,
+                "per_action_elapsed_minutes": None,
+                "max_incident_attempts": 1,
+            }),
             operator="operator",
         )
 
         current = handle.current_policy(job_id)
         self.assertEqual(current["revision"], 2)
-        self.assertEqual(current["budgets"], {"tokens": 500, "incidents": 1})
+        self.assertEqual(current["budgets"]["total_cost_usd"], 5.0)
 
         prior = handle.policy_revision(job_id, 1)
         self.assertEqual(prior["revision"], 1)
-        self.assertEqual(prior["budgets"], {"tokens": 100000, "incidents": 3})
+        self.assertEqual(prior["budgets"]["max_incident_attempts"], 3)
         self.assertEqual(len(handle.list_policy_revisions(job_id)), 2)
 
     def test_non_incrementing_revision_rejected_and_unchanged(self) -> None:
@@ -411,7 +425,14 @@ class PolicyRevisionTests(LedgerTestCase):
                 handle.revise_policy(
                     job_id,
                     revision=bad_revision,
-                    policy=_policy(budgets={"tokens": 1}),
+                    policy=_policy(budgets={
+                        "version": 1,
+                        "total_cost_usd": 1.0,
+                        "per_action_cost_usd": None,
+                        "total_elapsed_minutes": None,
+                        "per_action_elapsed_minutes": None,
+                        "max_incident_attempts": None,
+                    }),
                     operator="operator",
                 )
 
@@ -424,7 +445,7 @@ class PolicyRevisionTests(LedgerTestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             handle.connection.execute(
                 "UPDATE job_policies SET budgets = ? WHERE job_id = ? AND is_current = 1",
-                (json_dumps({"tokens": 1}), job_id),
+                (json_dumps({"version": 1}), job_id),
             )
 
 

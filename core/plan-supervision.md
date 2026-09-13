@@ -532,3 +532,119 @@ ownership is distinct from the ephemeral
 a mutating command executes and is recorded separately (in the lock's fencing
 record and, for supervised jobs, as ledger fencing records). The ledger itself
 only provides transactional writes.
+
+## Budget contract
+
+The protected job policy's `budgets` and `deadlines` fields carry the
+versioned supervision-budget schema owned by `lib/supervisor/budgets.py`. Both
+payloads share one nested `BUDGET_SCHEMA_VERSION = 1`, which is
+**independent** of the outer ledger `policy_version` column and of
+`MODEL_POLICY_VERSION`. Reads are forward-only: a recorded nested version newer
+than the code supports raises a named `BudgetVersionError` rather than silently
+interpreting unknown fields.
+
+`budgets` has the shape `{"version": 1, "total_cost_usd": <number|null>,
+"per_action_cost_usd": <number|null>, "total_elapsed_minutes": <number|null>,
+"per_action_elapsed_minutes": <number|null>, "max_incident_attempts":
+<integer|null>}`. A null value disables that limit; at least one limit must be
+non-null for a supervised job. `deadlines` has the shape `{"version": 1,
+"execution_deadline_minutes": <number|null>}` and carries execution-time limits
+only: human-wait duration is governed by the deadline-separation rule below and
+never appears here as a wait budget.
+
+**Fail-closed classification.** A stored value with no `version` key is
+classified `legacy_unversioned`, returned unmodified, and never reinterpreted
+as a current payload. A consumer treats it as carrying no enforceable limits
+and fails closed for supervised dispatch rather than defaulting to unlimited
+spend; replacing it requires an explicit operator revision recording a
+versioned payload. The ledger validates both payloads through the budget module
+on write and decodes them through it on read, exposing the classification as
+`budget_policy_state`.
+
+### Reserve-before-dispatch and reconciliation
+
+Every supervised model call — the `supervisor` primary, `implementer` /
+`reviewer` / `archiver` workers, the `supervised_author` create stage,
+`acceptance_reviewer` / `fixer` / `verifier` auxiliaries, every retry, and
+`implementer_escalation` — is accounted against the job's budgets. The
+`supervisor` role is exempt from the inexpensive allowlist but is **not**
+exempt from budget counting.
+
+Each dispatch reserves budget before any side effect: the reservation row is
+committed in the supervisor ledger with the action identity, role, requested
+model, and estimated amounts before the dispatch proceeds. A reservation that
+cannot be durably recorded blocks the dispatch rather than running
+unaccounted. After the dispatch, observed usage is reconciled against the same
+reservation, replacing the estimate with the observed amounts; the reservation
+and its reconciliation are one accounting entry per action, so a duplicate
+completion or usage record is deduplicated and never billed twice. A
+reservation whose outcome is `unknown` or `interrupted` is classified
+`retained` at its reserved estimate rather than released, so unresolved
+consumption is never treated as free. The `reservations` and
+`incident_attempts` tables are added by a strictly additive, head-chained
+forward-only migration.
+
+### Headroom honesty for hard limits
+
+The reservation estimate is `rate(pinned model) x token-cap envelope x headroom
+margin`, computed at the orchestrator boundary from the pricing catalog using
+the exact model identifier pinned for the dispatch's role (no cross-role or
+ambient fallback), and recorded per-reservation with the catalog version.
+Because observed usage is known only after dispatch, a hard USD limit is
+enforced with this stated headroom: **overshoot beyond a hard limit is bounded
+by at most one in-flight action's headroom**. The contract makes no claim of an
+exact, immediately enforced real-time ceiling.
+
+### Execution deadline versus human wait
+
+Deadline accounting tracks execution-elapsed time separately from human-wait
+duration. Execution elapsed is accumulated from ledger dispatch intervals
+(`dispatches.dispatched_at` to completion); a human wait is durable job state
+and is **not** a dispatch interval, so it is excluded by construction rather
+than subtracted after the fact. Only active execution consumes
+`execution_deadline_minutes` and the elapsed budgets. On resume after a wait,
+accounting continues from the pre-wait accumulated value.
+
+### Incident attempt signatures and bounded attempts
+
+Each incident is recorded against a stable signature
+`sha256(kind | change_id | stage | failure discriminator)`, which identifies
+"the same incident" without embedding volatile detail. `record_incident_attempt`
+increments the durable `(job_id, signature)` count and returns it; the gate
+refuses a further identical attempt with `BoundedAttemptsExceededError` once
+the policy's `max_incident_attempts` is reached. No incident-repair policy is
+decided here.
+
+### Reset survival and operator-only increases
+
+All budget state — reservations, reconciled consumption, retained estimates,
+and attempt counts — lives in the durable supervisor ledger in trusted external
+storage, never in the worktree JSON execution state. An `opsx-plan reset` does
+not erase, reduce, or refresh a supervised job's accounted consumption, and
+does not clear an attempt bound.
+
+Budget and deadline values change only through an explicit operator policy
+revision under the ledger's existing revision-increment rule. No worker,
+agent, reset, incident-recovery, or exhaustion path may raise, clear, or
+re-baseline a limit, and an increase applies only to subsequent reservations
+because previously reconciled or retained consumption is never rewritten.
+
+### Bounded backoff and terminal human blockers
+
+Transient budget-gate failures — such as a temporarily unwritable ledger or a
+retryable pricing-catalog load failure — are retried with bounded exponential
+backoff (base 0.5 s, cap 8 s, max 3 attempts), each retry recorded. Exhausting
+the bound surfaces a blocked state with its named reason rather than retrying
+indefinitely. A genuine human blocker — an exhausted budget awaiting an
+operator increase, a bounded-attempts refusal, or a legacy-unversioned policy —
+is a terminal, actionable state naming the required operator action, and is
+never retried or self-repaired.
+
+### Supervised gates and legacy runs
+
+Budget enforcement applies only to worktrees with a registered supervised job.
+For such a job, the run path reserves before each stage dispatch and reconciles
+after it; the legacy `--budget-minutes` / `--budget-usd` gates keep their exact
+behavior for unregistered runs, which create, open, and require no durable
+budget layer.
+

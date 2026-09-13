@@ -869,6 +869,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         _read_telemetry,
         _select_run,
         aggregate,
+        filter_leaderboard_records,
     )
 
     for_change = getattr(args, "for_change", None)
@@ -923,7 +924,9 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         cm_list, _ = _change_aggregation(
             state_for_lb, change_records, plan_name, [],
         )
-        result.model_leaderboard = _build_leaderboard(cm_list, change_records)
+        result.model_leaderboard = _build_leaderboard(
+            cm_list, filter_leaderboard_records(change_records)
+        )
 
         # Narrow timeline to this change
         timeline_records = change_records

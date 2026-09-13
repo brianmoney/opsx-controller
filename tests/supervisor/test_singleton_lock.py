@@ -154,8 +154,15 @@ def _policy() -> dict:
             "source": "test fixture",
         },
         "manifest_snapshot_hash": "deadbeef",
-        "budgets": {"tokens": 1000},
-        "deadlines": {"wall_seconds": 60},
+        "budgets": {
+            "version": 1,
+            "total_cost_usd": 1.0,
+            "per_action_cost_usd": None,
+            "total_elapsed_minutes": None,
+            "per_action_elapsed_minutes": None,
+            "max_incident_attempts": None,
+        },
+        "deadlines": {"version": 1, "execution_deadline_minutes": None},
     }
 
 

@@ -99,6 +99,7 @@ class ReportCommandTests(unittest.TestCase):
                       critical: int = 0, warning: int = 0, note: int = 0,
                       stage_status: str | None = None,
                       started_at: str = "2026-07-01T10:00:00Z",
+                      role: str | None = None,
                       ) -> dict:
         """Build a single telemetry JSONL record dict."""
         import uuid as _uuid_module
@@ -143,6 +144,8 @@ class ReportCommandTests(unittest.TestCase):
                 "note_count": note,
             },
         }
+        if role is not None:
+            rec["role"] = role
         return rec
 
     def _write_telemetry(self, plan_name: str, records: list[dict]) -> None:
@@ -1417,5 +1420,91 @@ class ReportCommandTests(unittest.TestCase):
                       "All-unresolved plan cost must show 'unresolved', not '—'")
         self.assertNotIn("$", cost_line,
                          "All-unresolved plan cost must not show a dollar amount")
+
+    # -- supervisor-family leaderboard exclusion (add-supervision-budgets) ----
+
+    def test_supervisor_family_excluded_from_leaderboard_only(self) -> None:
+        plan_name = "supervised-plan"
+        cid = "ch-supervised"
+        plan_path = self._write_plan_toml(plan_name, [cid])
+        records = [
+            self._build_record(
+                stage="implement", change_id=cid, plan_name=plan_name,
+                provider="openai", model_id="gpt-4o", estimated_cost=0.20,
+                role="implementer",
+            ),
+            self._build_record(
+                stage="review", change_id=cid, plan_name=plan_name,
+                provider="openai", model_id="gpt-4o", estimated_cost=0.08,
+                verdict="pass", role="reviewer",
+            ),
+            self._build_record(
+                stage="archive", change_id=cid, plan_name=plan_name,
+                provider="openai", model_id="gpt-4o", estimated_cost=0.03,
+                role="archiver",
+            ),
+            self._build_record(
+                stage="create", change_id=cid, plan_name=plan_name,
+                provider="anthropic", model_id="super-frontier",
+                estimated_cost=0.50, role="supervised_author",
+            ),
+            self._build_record(
+                stage="acceptance", change_id=cid, plan_name=plan_name,
+                provider="anthropic", model_id="aux-model",
+                estimated_cost=0.30, role="acceptance_reviewer",
+            ),
+        ]
+        self._write_telemetry(plan_name, records)
+        self._write_state(plan_name, {
+            "plan": plan_name, "approvals": [],
+            "changes": {cid: {"status": "done", "round": 1, "phase": "done"}},
+        })
+
+        rc, stdout_json, _ = self._run_report(
+            plan_path=plan_path, plan_name=plan_name, json=True,
+        )
+        self.assertEqual(rc, 0)
+        data = json.loads(stdout_json)
+        for entry in data["model_leaderboard"]:
+            for model in (entry.get("implementer_model"),
+                          entry.get("reviewer_model"),
+                          entry.get("archiver_model")):
+                self.assertNotIn(model, ("anthropic:super-frontier", "anthropic:aux-model"))
+        # Supervisor-family usage remains visible in core metrics.
+        roles = {r["role"] for r in data["core_metrics"]["roles"]}
+        self.assertIn("supervised_author", roles)
+        self.assertIn("acceptance_reviewer", roles)
+
+    def test_roleless_report_json_shape_unchanged(self) -> None:
+        plan_name = "roleless-plan"
+        cid = "ch-roleless"
+        plan_path = self._write_plan_toml(plan_name, [cid])
+        records = [
+            self._build_record(stage="implement", change_id=cid, plan_name=plan_name),
+            self._build_record(stage="review", change_id=cid, plan_name=plan_name,
+                               verdict="pass"),
+            self._build_record(stage="archive", change_id=cid, plan_name=plan_name),
+        ]
+        self._write_telemetry(plan_name, records)
+        self._write_state(plan_name, {
+            "plan": plan_name, "approvals": [],
+            "changes": {cid: {"status": "done", "round": 1, "phase": "done"}},
+        })
+        rc, stdout_json, _ = self._run_report(
+            plan_path=plan_path, plan_name=plan_name, json=True,
+        )
+        self.assertEqual(rc, 0)
+        data = json.loads(stdout_json)
+        # Legacy keys are all still present.
+        for key in ("command", "plan_name", "run_id", "filters", "plan_metrics",
+                    "change_metrics", "stage_aggregates", "model_leaderboard",
+                    "warnings"):
+            self.assertIn(key, data)
+        self.assertGreater(len(data["model_leaderboard"]), 0)
+        for entry in data["model_leaderboard"]:
+            for model in (entry.get("implementer_model"),
+                          entry.get("reviewer_model"),
+                          entry.get("archiver_model")):
+                self.assertIsNotNone(model)
 
 

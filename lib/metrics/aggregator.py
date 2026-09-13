@@ -91,6 +91,43 @@ class ModelLeaderboardEntry:
 
 
 @dataclass
+class RoleMetrics:
+    """Per-role core metrics assembled from telemetry and ledger records."""
+
+    role: str
+    tokens: Optional[int] = None
+    estimated_cost: Optional[float] = None
+    duration_ms: Optional[int] = None
+    record_count: int = 0
+    reserved_cost_usd: float = 0.0
+    reserved_elapsed_minutes: float = 0.0
+
+
+@dataclass
+class CoreMetrics:
+    """The budget-relevant core-metric set collected before aggregation.
+
+    Assembled read-only from telemetry (per-role tokens, cost, duration) and
+    the supervisor ledger's reservation records (job-level reserved/retained
+    estimates). Report and dashboard aggregation consume this collected set.
+    """
+
+    roles: list[RoleMetrics] = field(default_factory=list)
+    total_tokens: Optional[int] = None
+    total_estimated_cost: Optional[float] = None
+    total_duration_ms: Optional[int] = None
+    reserved_cost_usd: float = 0.0
+    reserved_elapsed_minutes: float = 0.0
+    reservation_count: int = 0
+
+    def role(self, name: str) -> Optional[RoleMetrics]:
+        for entry in self.roles:
+            if entry.role == name:
+                return entry
+        return None
+
+
+@dataclass
 class AggregationResult:
     """Top-level aggregation result."""
 
@@ -98,6 +135,7 @@ class AggregationResult:
     change_metrics: list[ChangeMetrics] = field(default_factory=list)
     stage_aggregates: StageAggregates = field(default_factory=StageAggregates)
     model_leaderboard: list[ModelLeaderboardEntry] = field(default_factory=list)
+    core_metrics: CoreMetrics = field(default_factory=CoreMetrics)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -951,6 +989,176 @@ def _build_leaderboard(
 
 
 # ---------------------------------------------------------------------------
+# Core metrics collection
+# ---------------------------------------------------------------------------
+
+# The supervisor-family roles excluded from the legacy per-change model
+# leaderboard projection. Their usage remains visible in per-role telemetry
+# views and in the collected core metrics.
+SUPERVISOR_FAMILY_ROLES: tuple[str, ...] = (
+    "supervisor",
+    "supervised_author",
+    "acceptance_reviewer",
+    "fixer",
+    "verifier",
+)
+
+
+def is_supervisor_family_role(role: Any) -> bool:
+    """True when *role* is one of the supervisor-family roles."""
+    return isinstance(role, str) and role in SUPERVISOR_FAMILY_ROLES
+
+
+def filter_leaderboard_records(records: list[dict]) -> list[dict]:
+    """Return *records* without supervisor-family role records.
+
+    This is the call-site input filter for the legacy leaderboard: it removes
+    records whose ``role`` names a supervisor-family role. Role-less records
+    and non-supervisor roles pass through unchanged, so leaderboard entries for
+    changes with no supervisor-family records are computed exactly as before.
+    """
+    return [r for r in records if not is_supervisor_family_role(r.get("role"))]
+
+
+def _ledger_reservation_totals(
+    repo_root: Optional[Path] = None,
+) -> tuple[float, float, int, list[str]]:
+    """Read reservation totals for *repo_root* from the supervisor ledger.
+
+    Strictly read-only: the ledger is opened through SQLite's read-only URI mode
+    so collection never creates, migrates, or modifies a schema or record. The
+    ledger lives in external trusted storage and is absent for an ordinary,
+    unsupervised run, which is not an error. Scoped to the repository's
+    registered jobs so an unrelated ledger on the host cannot leak figures into
+    this plan's report. Returns
+    ``(reserved_cost, reserved_elapsed, count, warnings)``.
+    """
+    import sqlite3
+
+    try:
+        from lib.supervisor import ledger as ledger_mod
+    except Exception as exc:  # pragma: no cover - import graph guard
+        return 0.0, 0.0, 0, [f"supervisor ledger unavailable: {exc}"]
+
+    environment = os.environ
+    configured = environment.get("OPSX_SUPERVISOR_STATE_FILE", "").strip()
+    try:
+        path = (
+            ledger_mod._canonical(configured)
+            if configured
+            else ledger_mod.default_ledger_path()
+        )
+    except Exception as exc:  # pragma: no cover - host-state dependent
+        return 0.0, 0.0, 0, [f"supervisor ledger path could not be resolved: {exc}"]
+
+    if not Path(path).exists():
+        return 0.0, 0.0, 0, []
+
+    try:
+        # mode=ro never creates the file and never migrates the schema.
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return 0.0, 0.0, 0, []
+    connection.row_factory = sqlite3.Row
+    try:
+        if repo_root is None:
+            rows = connection.execute(
+                "SELECT state, reserved_cost_usd, reserved_elapsed_minutes, "
+                "observed_cost_usd, observed_elapsed_minutes FROM reservations"
+            ).fetchall()
+        else:
+            repo_key = str(ledger_mod._canonical(repo_root))
+            rows = connection.execute(
+                "SELECT r.state, r.reserved_cost_usd, r.reserved_elapsed_minutes, "
+                "r.observed_cost_usd, r.observed_elapsed_minutes "
+                "FROM reservations r JOIN jobs j ON j.id = r.job_id "
+                "WHERE j.repo_root = ?",
+                (repo_key,),
+            ).fetchall()
+    except sqlite3.Error:
+        # A ledger that predates the reservation tables, or is otherwise
+        # unreadable, simply contributes nothing.
+        rows = []
+    finally:
+        connection.close()
+    cost = 0.0
+    elapsed = 0.0
+    count = 0
+    for row in rows:
+        count += 1
+        if row["state"] == "reconciled":
+            cost += float(row["observed_cost_usd"] or 0.0)
+            elapsed += float(row["observed_elapsed_minutes"] or 0.0)
+        else:
+            cost += float(row["reserved_cost_usd"] or 0.0)
+            elapsed += float(row["reserved_elapsed_minutes"] or 0.0)
+    return cost, elapsed, count, []
+
+
+def collect_core_metrics(
+    records: list[dict], *, repo_root: Optional[Path] = None
+) -> tuple[CoreMetrics, list[str]]:
+    """Assemble the budget-relevant core-metric set, read-only.
+
+    Per-role token usage, estimated cost, and execution duration are summed
+    from the telemetry *records*; job-level reserved/retained totals come from
+    the supervisor ledger's reservation records for *repo_root*. Nothing is
+    mutated.
+    """
+    warnings: list[str] = []
+    per_role: dict[str, RoleMetrics] = {}
+    total_tokens: Optional[int] = None
+    total_cost: Optional[float] = None
+    total_duration: Optional[int] = None
+
+    for record in records:
+        usage = record.get("usage", {})
+        tokens = usage.get("total_tokens") if isinstance(usage, dict) else None
+        cost = record.get("cost", {})
+        cost_status = cost.get("status", "unavailable") if isinstance(cost, dict) else "unavailable"
+        estimated = cost.get("estimated_cost") if isinstance(cost, dict) else None
+        duration = record.get("duration_ms")
+
+        if isinstance(tokens, (int, float)) and tokens >= 0:
+            total_tokens = (total_tokens or 0) + int(tokens)
+        if cost_status == "estimated" and isinstance(estimated, (int, float)):
+            total_cost = (total_cost or 0.0) + float(estimated)
+        if isinstance(duration, (int, float)) and duration >= 0:
+            total_duration = (total_duration or 0) + int(duration)
+
+        role = record.get("role")
+        if not isinstance(role, str) or not role:
+            continue
+        entry = per_role.setdefault(role, RoleMetrics(role=role))
+        entry.record_count += 1
+        if isinstance(tokens, (int, float)) and tokens >= 0:
+            entry.tokens = (entry.tokens or 0) + int(tokens)
+        if cost_status == "estimated" and isinstance(estimated, (int, float)):
+            entry.estimated_cost = (entry.estimated_cost or 0.0) + float(estimated)
+        if isinstance(duration, (int, float)) and duration >= 0:
+            entry.duration_ms = (entry.duration_ms or 0) + int(duration)
+
+    reserved_cost, reserved_elapsed, reservation_count, ledger_warnings = (
+        _ledger_reservation_totals(repo_root)
+    )
+    warnings.extend(ledger_warnings)
+
+    roles = [per_role[name] for name in sorted(per_role)]
+    return (
+        CoreMetrics(
+            roles=roles,
+            total_tokens=total_tokens,
+            total_estimated_cost=total_cost,
+            total_duration_ms=total_duration,
+            reserved_cost_usd=reserved_cost,
+            reserved_elapsed_minutes=reserved_elapsed,
+            reservation_count=reservation_count,
+        ),
+        warnings,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main aggregation entry point
 # ---------------------------------------------------------------------------
 
@@ -991,6 +1199,11 @@ def aggregate(
     )
     all_warnings.extend(run_warnings)
 
+    # 2b. Collect the budget-relevant core metrics before aggregation so report
+    # and dashboard consume the same collected set. Read-only.
+    core_metrics, core_warnings = collect_core_metrics(selected_records, repo_root=repo)
+    all_warnings.extend(core_warnings)
+
     # 3. Read state
     state, state_warnings = _read_state(repo, plan_name)
     all_warnings.extend(state_warnings)
@@ -1018,13 +1231,17 @@ def aggregate(
     ]
     stage_aggregates = _stage_aggregation(completed, selected_records)
 
-    # 7. Model leaderboard (all changes, not only completed)
-    leaderboard = _build_leaderboard(change_metrics_list, selected_records)
+    # 7. Model leaderboard (all changes, not only completed). Supervisor-family
+    # roles are filtered from the input stream at this call site only; the
+    # grouping/attribution logic in ``_build_leaderboard`` is untouched.
+    leaderboard_records = filter_leaderboard_records(selected_records)
+    leaderboard = _build_leaderboard(change_metrics_list, leaderboard_records)
 
     return AggregationResult(
         plan_metrics=plan_metrics,
         change_metrics=change_metrics_list,
         stage_aggregates=stage_aggregates,
         model_leaderboard=leaderboard,
+        core_metrics=core_metrics,
         warnings=all_warnings,
     )

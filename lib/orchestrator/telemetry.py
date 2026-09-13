@@ -46,8 +46,9 @@ def build_telemetry_record(
     critical_count: int | None = None,
     warning_count: int | None = None,
     note_count: int | None = None,
+    role: str | None = None,
 ) -> dict:
-    return {
+    record = {
         "schema_version": TELEMETRY_SCHEMA_VERSION,
         "uid": str(uuid.uuid4()),
         "plan_name": plan_name,
@@ -98,6 +99,12 @@ def build_telemetry_record(
             "estimated_cost": None,
         },
     }
+    # Additive, optional role dimension. Existing readers ignore the unknown
+    # key; absence means the legacy interpretation. A record with no role is
+    # byte-identical to the pre-change record.
+    if role is not None:
+        record["role"] = role
+    return record
 
 
 def write_telemetry_record(repo: Path, plan_name: str, record: dict) -> None:
@@ -367,10 +374,29 @@ def _parse_invocation_model_value(model_value):
 
 
 _STAGE_ROLE = {
+    "create": "supervised_author",
     "implement": "implementer",
     "review": "reviewer",
     "archive": "archiver",
+    "acceptance": "acceptance_reviewer",
+    "fix": "fixer",
+    "verify": "verifier",
+    "escalate": "implementer_escalation",
 }
+
+
+def resolve_stage_role(stage: str, *, escalation_active: bool = False) -> str | None:
+    """Return the telemetry role for *stage*, or ``None`` when unmapped.
+
+    An implement dispatch that runs with escalation active is attributed to
+    ``implementer_escalation``; every other stage maps through the standard
+    stage-to-role table. An unmapped legacy stage returns ``None`` and its
+    record simply omits the additive ``role`` field.
+    """
+    role = _STAGE_ROLE.get(stage)
+    if role == "implementer" and escalation_active:
+        return "implementer_escalation"
+    return role
 
 
 def _resolved_role_model(cfg: dict, stage: str) -> dict:
@@ -921,7 +947,8 @@ def _record_stage_telemetry(
     log_path: Path,
     sidecar_path: Path | None = None,
     envelope: dict | None = None,
-) -> None:
+    role: str | None = None,
+) -> dict:
     run_id = get_or_create_run_id(repo, cfg, state)
     plan_name = cfg["name"]
     is_normal = telemetry_status == "completed"
@@ -959,6 +986,7 @@ def _record_stage_telemetry(
         critical_count=critical_count,
         warning_count=warning_count,
         note_count=note_count,
+        role=role,
     )
     # Populate usage and model metadata when a payload was parsed
     # (extraction is best-effort; never fail telemetry write).
@@ -1011,4 +1039,5 @@ def _record_stage_telemetry(
 
     write_telemetry_record(repo, cfg["name"], record)
     state_mod.rec(state, cid)["telemetry"] = {"latest_telemetry": record["uid"]}
+    return record
 

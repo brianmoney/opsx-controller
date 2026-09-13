@@ -33,6 +33,7 @@ from lib.supervisor.ledger import (
     default_ledger_path,
     open_ledger,
 )
+from lib.supervisor import budgets as budgets
 
 __all__ = [
     "CURRENT_POLICY_VERSION",
@@ -50,6 +51,7 @@ __all__ = [
     "SupervisorLedger",
     "TrustedLocationError",
     "UnknownRecordError",
+    "budgets",
     "default_ledger_path",
     "open_ledger",
 ]

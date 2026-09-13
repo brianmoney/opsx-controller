@@ -29,10 +29,11 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from lib.supervisor import budgets
 from lib.supervisor import clock
 from lib.supervisor import model_policy
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 CURRENT_POLICY_VERSION = 1
 
 # Fencing-record events. A fencing record describes one execution-lock
@@ -335,9 +336,71 @@ def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+# The reservation state vocabulary is authored in ``lib.supervisor.budgets``
+# (mirroring the dispatch-identity vocabulary) and pinned here for the CHECK
+# constraint. Kept as a SQL literal so the schema is self-describing and the
+# migration is independent of the import graph at connection time.
+_RESERVATION_STATES_SQL = "'reserved','retained','reconciled'"
+
+_SCHEMA_V3_STATEMENTS = (
+    f"""
+    CREATE TABLE IF NOT EXISTS reservations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id INTEGER NOT NULL REFERENCES jobs (id),
+        action_id INTEGER NOT NULL REFERENCES actions (id),
+        role TEXT NOT NULL,
+        requested_model TEXT NOT NULL,
+        reserved_cost_usd REAL NOT NULL,
+        reserved_elapsed_minutes REAL NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ({_RESERVATION_STATES_SQL})),
+        observed_input_tokens INTEGER,
+        observed_output_tokens INTEGER,
+        observed_cached_tokens INTEGER,
+        observed_reasoning_tokens INTEGER,
+        observed_cost_usd REAL,
+        observed_elapsed_minutes REAL,
+        pricing_catalog_version TEXT,
+        created_at TEXT NOT NULL,
+        reconciled_at TEXT,
+        UNIQUE (action_id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_reservations_job ON reservations (job_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_reservations_action ON reservations (action_id)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS incident_attempts (
+        job_id INTEGER NOT NULL REFERENCES jobs (id),
+        signature TEXT NOT NULL,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        PRIMARY KEY (job_id, signature)
+    )
+    """,
+)
+
+
+def _migrate_2_to_3(conn: sqlite3.Connection) -> None:
+    """Add the durable reservation and incident-attempt tables.
+
+    Strictly additive: reservations are one accounting entry per action with a
+    state machine (``reserved`` -> ``retained``/``reconciled``), and
+    ``incident_attempts`` accumulates a durable, bounded count per
+    ``(job_id, signature)``. Both survive ``opsx-plan reset`` because they live
+    in the external supervisor ledger, not worktree JSON.
+    """
+    for statement in _SCHEMA_V3_STATEMENTS:
+        conn.execute(statement)
+
+
 MIGRATIONS: dict[int, Any] = {
     1: _migrate_0_to_1,
     2: _migrate_1_to_2,
+    3: _migrate_2_to_3,
 }
 
 
@@ -598,6 +661,11 @@ class Ledger:
         fields["inexpensive_allowlist"] = model_policy.encode_allowlist(
             fields["inexpensive_allowlist"]
         )
+        # The protected budget/deadline payloads carry their own nested version
+        # schema. New writes are strict: an unversioned or malformed payload is
+        # rejected here, mirroring the model-policy fields.
+        fields["budgets"] = budgets.encode_budgets(fields["budgets"])
+        fields["deadlines"] = budgets.encode_deadlines(fields["deadlines"])
         return fields
 
     def _insert_policy(
@@ -698,6 +766,11 @@ class Ledger:
             "model_selection": selection["state"],
             "inexpensive_allowlist": allowlist["state"],
         }
+        # Budget/deadline payloads share the same read contract: a newer nested
+        # version raises BudgetVersionError, and a stored value with no
+        # 'version' key is classified legacy_unversioned and returned
+        # unmodified.
+        record["budget_policy_state"] = budgets.budget_policy_state(record)
         return record
 
     def current_policy(self, job_id: int) -> dict[str, Any]:
@@ -812,6 +885,266 @@ class Ledger:
                 (job_id,),
             )
         )
+
+    # -- reservations and incident attempts --------------------------------
+
+    def budget_policy_state(self, job_id: int) -> dict[str, str]:
+        """Return the current policy's budget/deadline classification.
+
+        Routes the stored payloads through :mod:`lib.supervisor.budgets` (the
+        same decoder used for reads) so a legacy payload is classified
+        ``legacy_unversioned`` and a newer nested version raises the named
+        version error.
+        """
+        policy = self.current_policy(job_id)
+        return dict(policy["budget_policy_state"])
+
+    def insert_reservation(
+        self,
+        job_id: int,
+        *,
+        action_id: int,
+        role: str,
+        requested_model: str,
+        reserved_cost_usd: float,
+        reserved_elapsed_minutes: float,
+        pricing_catalog_version: str | None = None,
+    ) -> int:
+        """Insert one durable reservation, committed before any side effect.
+
+        One accounting entry exists per action (``UNIQUE (action_id)``), so a
+        re-dispatch of the same action is refused here rather than silently
+        double-billed; callers deduplicate at the reconciliation boundary.
+        """
+        self.get_job(job_id)
+        self.get_action(action_id)
+        now = _utcnow()
+        with self._transaction():
+            cursor = self._conn.execute(
+                """
+                INSERT INTO reservations (
+                    job_id, action_id, role, requested_model,
+                    reserved_cost_usd, reserved_elapsed_minutes, state,
+                    pricing_catalog_version, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'reserved', ?, ?)
+                """,
+                (
+                    job_id, action_id, role, requested_model,
+                    float(reserved_cost_usd), float(reserved_elapsed_minutes),
+                    pricing_catalog_version, now,
+                ),
+            )
+            reservation_id = int(cursor.lastrowid)
+        return reservation_id
+
+    def get_reservation(self, reservation_id: int) -> sqlite3.Row:
+        row = self._conn.execute(
+            "SELECT * FROM reservations WHERE id = ?", (reservation_id,)
+        ).fetchone()
+        if row is None:
+            raise UnknownRecordError(f"no such reservation: {reservation_id}")
+        return row
+
+    def reservations_for_job(self, job_id: int) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute(
+                "SELECT * FROM reservations WHERE job_id = ? ORDER BY id",
+                (job_id,),
+            )
+        )
+
+    def reservation_for_action(self, action_id: int) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT * FROM reservations WHERE action_id = ?", (action_id,)
+        ).fetchone()
+
+    def reconcile_reservation(
+        self,
+        reservation_id: int,
+        *,
+        observed_input_tokens: int | None = None,
+        observed_output_tokens: int | None = None,
+        observed_cached_tokens: int | None = None,
+        observed_reasoning_tokens: int | None = None,
+        observed_cost_usd: float | None = None,
+        observed_elapsed_minutes: float | None = None,
+    ) -> None:
+        """Replace a reservation's estimate with observed usage, exactly once.
+
+        A reservation that is already ``reconciled`` is left unchanged, so a
+        duplicate completion or usage record is deduplicated and never billed
+        twice. A ``retained`` reservation is an unresolved consumption and is
+        not silently rewritten by a later observation.
+        """
+        now = _utcnow()
+        with self._transaction():
+            reservation = self.get_reservation(reservation_id)
+            state = reservation["state"]
+            if state == "reconciled":
+                return
+            if state != "reserved":
+                raise JournalStateError(
+                    f"reservation {reservation_id} is {state}; only a reserved "
+                    "reservation is reconciled"
+                )
+            result = self._conn.execute(
+                """
+                UPDATE reservations SET
+                    state = 'reconciled',
+                    observed_input_tokens = ?,
+                    observed_output_tokens = ?,
+                    observed_cached_tokens = ?,
+                    observed_reasoning_tokens = ?,
+                    observed_cost_usd = ?,
+                    observed_elapsed_minutes = ?,
+                    reconciled_at = ?
+                WHERE id = ? AND state = 'reserved'
+                """,
+                (
+                    observed_input_tokens, observed_output_tokens,
+                    observed_cached_tokens, observed_reasoning_tokens,
+                    observed_cost_usd, observed_elapsed_minutes, now,
+                    reservation_id,
+                ),
+            )
+            if result.rowcount != 1:
+                raise JournalStateError(
+                    f"reservation {reservation_id} changed state while "
+                    "reconciling; retry"
+                )
+
+    def retain_reservation(self, reservation_id: int) -> None:
+        """Classify a reservation ``retained`` so unresolved usage is not free.
+
+        Unknown/interrupted consumption stays charged at the reserved estimate.
+        An already reconciled or retained reservation is left unchanged, so
+        this is idempotent against duplicate unknown observations.
+        """
+        with self._transaction():
+            reservation = self.get_reservation(reservation_id)
+            if reservation["state"] in ("retained", "reconciled"):
+                return
+            result = self._conn.execute(
+                "UPDATE reservations SET state = 'retained' "
+                "WHERE id = ? AND state = 'reserved'",
+                (reservation_id,),
+            )
+            if result.rowcount != 1:
+                raise JournalStateError(
+                    f"reservation {reservation_id} changed state while "
+                    "retaining; retry"
+                )
+
+    def consumption_for_job(self, job_id: int) -> dict[str, Any]:
+        """Derive a job's consumption from its reservations.
+
+        Reconciled observed amounts plus reserved/retained estimates, with the
+        component totals broken out. Routed through
+        :mod:`lib.supervisor.budgets` so the estimate semantics live in one
+        place.
+        """
+        self.get_job(job_id)
+        rows = self.reservations_for_job(job_id)
+        records = [dict(row) for row in rows]
+        return budgets.sum_reservations(records)
+
+    def record_incident_attempt(self, job_id: int, *, signature: str) -> int:
+        """Increment and return the durable attempt count for a signature.
+
+        The count is stored per ``(job_id, signature)`` and accumulates across
+        ``opsx-plan reset`` because it lives in the external ledger.
+        """
+        self.get_job(job_id)
+        now = _utcnow()
+        with self._transaction():
+            _ = self._conn.execute(
+                """
+                INSERT INTO incident_attempts (
+                    job_id, signature, attempt_count, first_seen_at, last_seen_at
+                ) VALUES (?, ?, 1, ?, ?)
+                ON CONFLICT (job_id, signature) DO UPDATE SET
+                    attempt_count = attempt_count + 1,
+                    last_seen_at = excluded.last_seen_at
+                """,
+                (job_id, signature, now, now),
+            )
+            row = self._conn.execute(
+                "SELECT attempt_count FROM incident_attempts "
+                "WHERE job_id = ? AND signature = ?",
+                (job_id, signature),
+            ).fetchone()
+        return int(row["attempt_count"])
+
+    def incident_attempt_count(self, job_id: int, signature: str) -> int:
+        row = self._conn.execute(
+            "SELECT attempt_count FROM incident_attempts "
+            "WHERE job_id = ? AND signature = ?",
+            (job_id, signature),
+        ).fetchone()
+        return int(row["attempt_count"]) if row is not None else 0
+
+    def list_incident_attempts(self, job_id: int) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute(
+                "SELECT * FROM incident_attempts WHERE job_id = ? "
+                "ORDER BY signature",
+                (job_id,),
+            )
+        )
+
+    # -- execution-elapsed accounting --------------------------------------
+
+    def dispatch_intervals(self, job_id: int) -> list[dict[str, Any]]:
+        """Return each dispatch's ``(started_at, ended_at, open)`` interval.
+
+        An interval closes at the reservation's ``reconciled_at`` when the
+        reservation is reconciled, otherwise at the action's ``updated_at``
+        once the action is terminal or its reservation retained. An in-flight
+        interval has ``ended_at`` ``None`` and is closed by the caller at the
+        current time. A human wait is not a dispatch interval at all, so it is
+        excluded by construction rather than subtracted after the fact.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT d.dispatched_at AS dispatched_at,
+                   a.id AS action_id,
+                   a.state AS action_state,
+                   a.updated_at AS action_updated_at,
+                   r.state AS reservation_state,
+                   r.reconciled_at AS reconciled_at
+            FROM dispatches d
+            JOIN actions a ON a.id = d.action_id
+            LEFT JOIN reservations r ON r.action_id = a.id
+            WHERE d.job_id = ?
+            ORDER BY d.id
+            """,
+            (job_id,),
+        ).fetchall()
+        intervals: list[dict[str, Any]] = []
+        for row in rows:
+            res_state = row["reservation_state"]
+            action_state = row["action_state"]
+            if res_state == "reconciled":
+                ended_at = row["reconciled_at"] or row["action_updated_at"]
+                open_interval = False
+            elif res_state == "retained":
+                ended_at = row["action_updated_at"]
+                open_interval = False
+            elif action_state in ("completed", "failed"):
+                ended_at = row["action_updated_at"]
+                open_interval = False
+            else:
+                ended_at = None
+                open_interval = True
+            intervals.append(
+                {
+                    "action_id": int(row["action_id"]),
+                    "started_at": row["dispatched_at"],
+                    "ended_at": ended_at,
+                    "open": open_interval,
+                }
+            )
+        return intervals
 
     # -- journal: intents, dispatch, evidence, uncertainty -----------------
 

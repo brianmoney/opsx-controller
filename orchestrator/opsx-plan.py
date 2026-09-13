@@ -29,11 +29,13 @@ import re
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import types
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Resolve bundled runtime modules before considering the host repository.
@@ -90,6 +92,8 @@ try:
     )
     from lib.orchestrator import cost as cost_mod
     from lib.orchestrator import state as state_mod
+    from lib.supervisor import budgets as budget_mod
+    from lib.supervisor import ledger as ledger_mod
     from lib.supervisor import lock as lock_mod
 except ModuleNotFoundError as exc:  # pragma: no cover
     sys.exit(f"opsx-plan requires the lib.orchestrator runtime package: {exc}")
@@ -1734,6 +1738,414 @@ def _escalation_active_for_dispatch(cfg: dict, r: dict) -> bool:
     return (r["round"] - 1) >= threshold
 
 
+# ---------------------------------------------------------------------------
+# Supervised budget gate (durable reservations and reconciliation)
+# ---------------------------------------------------------------------------
+
+
+def _supervisor_ledger_path(repo: Path) -> Path | None:
+    """Resolve the external supervisor ledger path for this host.
+
+    Prefers the explicit ``OPSX_SUPERVISOR_STATE_FILE`` contract used by the
+    authority boundary, then the trusted default. Returns ``None`` when no
+    candidate is configured, so an ordinary run stays backend-free.
+    """
+    configured = os.environ.get("OPSX_SUPERVISOR_STATE_FILE", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    try:
+        return ledger_mod.default_ledger_path()
+    except Exception:
+        return None
+
+
+def open_supervised_gate(repo: Path) -> dict | None:
+    """Return the supervised budget gate for *repo*, or ``None``.
+
+    A gate exists only for a worktree with a non-terminal registered supervised
+    job; an ordinary, unregistered run returns ``None`` and keeps the legacy
+    ``--budget-minutes`` / ``--budget-usd`` behavior with no durable budget
+    layer. Opening is best-effort and read-only: a missing or unreadable ledger
+    is not an error.
+    """
+    path = _supervisor_ledger_path(repo)
+    if path is None:
+        return None
+    try:
+        handle = ledger_mod.open_ledger(path, repository_root=repo, create=False)
+    except Exception:
+        return None
+    try:
+        job = handle.find_job_by_worktree(repo, repository_root=repo)
+        if job is None or job["state"] in ledger_mod.TERMINAL_JOB_STATES:
+            return None
+        policy = handle.current_policy(int(job["id"]))
+    except Exception:
+        handle.close()
+        return None
+    return {
+        "ledger": handle,
+        "job_id": int(job["id"]),
+        "policy": policy,
+    }
+
+
+def close_supervised_gate(gate: dict | None) -> None:
+    if not gate:
+        return
+    try:
+        gate["ledger"].close()
+    except Exception:
+        pass
+
+
+def _pinned_model_for_role(policy: dict, role: str) -> str | None:
+    selection = policy.get("model_selection")
+    if not isinstance(selection, dict):
+        return None
+    roles = selection.get("roles")
+    if not isinstance(roles, dict):
+        return None
+    pin = roles.get(role)
+    return pin if isinstance(pin, str) and pin.strip() else None
+
+
+def _split_model_identity(model: str) -> tuple[str, str] | None:
+    if "/" not in model:
+        return None
+    provider, model_id = model.split("/", 1)
+    provider, model_id = provider.strip(), model_id.strip()
+    if not provider or not model_id:
+        return None
+    return provider, model_id
+
+
+def reservation_estimate_for_dispatch(
+    repo: Path, policy: dict, role: str,
+) -> tuple[float, str | None]:
+    """Estimate one dispatch's reserved cost from the pricing catalog.
+
+    Uses the exact model identifier pinned for *role* in the job policy's
+    ``model_selection`` (no ambient or cross-role fallback). The estimate is
+    the worst-case catalog rate times the token-cap envelope and the headroom
+    margin. Raises :class:`budget_mod.UnknownPricingError` when the pin is
+    missing, cannot be split into provider/model, or resolves to an unresolved
+    result — before any dispatch side effect.
+    """
+    pin = _pinned_model_for_role(policy, role)
+    if pin is None:
+        raise budget_mod.UnknownPricingError(
+            f"role '{role}' has no model_selection pin to price"
+        )
+    identity = _split_model_identity(pin)
+    if identity is None:
+        raise budget_mod.UnknownPricingError(
+            f"role '{role}' pin '{pin}' is not a provider/model identifier"
+        )
+    try:
+        base.ensure_own_root_on_syspath()
+        from lib.pricing import PricingCatalog, UnresolvedPrice
+    except Exception as exc:  # pragma: no cover - pricing runtime missing
+        raise budget_mod.UnknownPricingError(
+            f"pricing catalog unavailable for role '{role}': {exc}"
+        ) from exc
+    catalog_info = cost_mod._get_catalog(repo)
+    if catalog_info is None:
+        raise budget_mod.UnknownPricingError(
+            f"pricing catalog unavailable for role '{role}'"
+        )
+    catalog, UnresolvedPriceCls = catalog_info
+    provider, model_id = identity
+    price = catalog.resolve(provider, model_id)
+    if isinstance(price, UnresolvedPriceCls):
+        raise budget_mod.UnknownPricingError(
+            f"role '{role}' pin '{pin}' is unpriceable: {price.reason}"
+        )
+    if price.billing_mode != "per_token":
+        raise budget_mod.UnknownPricingError(
+            f"role '{role}' pin '{pin}' is {price.billing_mode}; no per-token "
+            "rate is available to bound a reservation"
+        )
+    rate = max(
+        rate for rate in (
+            price.input_price_per_mtok,
+            price.output_price_per_mtok,
+            price.cached_input_price_per_mtok,
+            price.reasoning_price_per_mtok,
+        )
+        if isinstance(rate, (int, float)) and rate > 0
+    ) if any(
+        isinstance(rate, (int, float)) and rate > 0
+        for rate in (
+            price.input_price_per_mtok,
+            price.output_price_per_mtok,
+            price.cached_input_price_per_mtok,
+            price.reasoning_price_per_mtok,
+        )
+    ) else 0.0
+    if rate <= 0:
+        raise budget_mod.UnknownPricingError(
+            f"role '{role}' pin '{pin}' has no positive per-token rate"
+        )
+    estimate = budget_mod.reservation_estimate(rate)
+    return estimate, catalog.get_catalog_version()
+
+
+def execution_elapsed_minutes(ledger, job_id: int) -> float:
+    """Accumulate execution-elapsed minutes from ledger dispatch intervals.
+
+    Human-wait time is not a dispatch interval, so it is excluded by
+    construction rather than subtracted after the fact.
+    """
+    total = 0.0
+    for interval in ledger.dispatch_intervals(job_id):
+        started = _parse_iso(interval["started_at"])
+        ended = _parse_iso(interval["ended_at"]) if interval["ended_at"] else None
+        if started is None:
+            continue
+        if ended is None:
+            ended = datetime.now(timezone.utc)
+        total += max(0.0, (ended - started).total_seconds() / 60.0)
+    return total
+
+
+def _parse_iso(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def supervised_gate_reserve(
+    repo: Path, cfg: dict, gate: dict, cid: str, stage: str, round_num: int,
+    r: dict, run_id: str,
+) -> dict:
+    """Reserve budget for one supervised dispatch, blocking on any failure.
+
+    Returns ``{"reservation_id", "action_id", "role", "estimate"}`` on success
+    or ``{"blocked": reason, "last_result": <state>}`` when the dispatch must
+    not proceed. Raises nothing: every budget failure becomes an actionable
+    blocked state so the run loop can surface it.
+    """
+    ledger = gate["ledger"]
+    job_id = gate["job_id"]
+    policy = gate["policy"]
+    escalation_active = bool(r.get("escalation", {}).get("active"))
+    role = telemetry.resolve_stage_role(stage, escalation_active=escalation_active)
+    if role is None:
+        return {"skipped": True}
+    try:
+        budgets_payload, deadlines_payload = budget_mod.enforce_policy(policy)
+    except budget_mod.BudgetError as exc:
+        return {
+            "blocked": f"supervised budget policy blocked: {exc}",
+            "last_result": "budget_policy_blocked",
+        }
+    # Execution deadline is checked against execution elapsed only.
+    try:
+        elapsed_now = execution_elapsed_minutes(ledger, job_id)
+        budget_mod.check_execution_deadline(
+            deadlines_payload, execution_elapsed_minutes=elapsed_now
+        )
+    except budget_mod.BudgetError as exc:
+        return {
+            "blocked": (
+                f"supervised execution deadline blocked: {exc}; operator action "
+                "required: record an explicit policy revision extending "
+                "execution_deadline_minutes"
+            ),
+            "last_result": "budget_deadline_exhausted",
+        }
+    # A repeated identical failure class is bounded before it is retried. The
+    # counter is incremented when a dispatch actually fails (see
+    # ``supervised_gate_record_incident``), so a clean dispatch never consumes
+    # the bound and normal multi-round retries are unaffected.
+    signature = budget_mod.incident_signature(
+        kind=stage, change_id=cid, stage=stage, discriminator="dispatch"
+    )
+    try:
+        limit = budget_mod.max_incident_attempts(policy)
+    except budget_mod.BudgetError as exc:
+        return {
+            "blocked": f"supervised budget gate blocked: {exc}",
+            "last_result": "budget_policy_blocked",
+        }
+    if limit is not None and ledger.incident_attempt_count(job_id, signature) >= limit:
+        exc = budget_mod.BoundedAttemptsExceededError(
+            f"incident signature {signature} reached max_incident_attempts "
+            f"({limit}); an operator revision is required to attempt it again"
+        )
+        return {
+            "blocked": (
+                f"supervised bounded attempts blocked: {exc}; operator action "
+                "required: resolve the incident or raise max_incident_attempts "
+                "through an explicit policy revision"
+            ),
+            "last_result": "bounded_attempts_exceeded",
+        }
+    try:
+        estimate, catalog_version = reservation_estimate_for_dispatch(repo, policy, role)
+    except budget_mod.UnknownPricingError as exc:
+        return {
+            "blocked": (
+                f"supervised unknown pricing blocked: {exc}; operator action "
+                "required: qualify the role's pinned model in the pricing "
+                "catalog, then register an updated policy revision"
+            ),
+            "last_result": "unknown_pricing",
+        }
+    timeout_minutes = float(cfg["changes"][cid]["timeout_minutes"])
+
+    def _attempt_reservation() -> tuple[int, int]:
+        action_id = ledger.begin_action(job_id, kind=stage, run_id=run_id)
+        ledger.dispatch_action(action_id)
+        reservation_id = budget_mod.reserve(
+            ledger,
+            job_id=job_id,
+            action_id=action_id,
+            role=role,
+            requested_model=_pinned_model_for_role(policy, role) or "",
+            reserved_cost_usd=estimate,
+            reserved_elapsed_minutes=timeout_minutes,
+            policy=policy,
+            pricing_catalog_version=catalog_version,
+        )
+        return action_id, int(reservation_id)
+
+    retry_signature = budget_mod.incident_signature(
+        kind="budget_gate_retry", change_id=cid, stage=stage,
+        discriminator="ledger_write",
+    )
+
+    def _record_retry(attempt: int, delay: float, exc: BaseException) -> None:
+        try:
+            ledger.record_incident_attempt(job_id, signature=retry_signature)
+        except Exception:
+            pass
+        base.log(
+            f"  supervised budget gate transient failure ({exc}); retrying "
+            f"({attempt}/{budget_mod.BACKOFF_MAX_ATTEMPTS}) in {delay:g}s"
+        )
+
+    def _is_transient(exc: BaseException) -> bool:
+        # Only a temporarily unwritable ledger or a retryable catalog load is
+        # retried; budget exhaustion, unknown pricing, and policy blocks are
+        # terminal human blockers.
+        import sqlite3 as _sqlite3
+        return isinstance(exc, _sqlite3.OperationalError)
+
+    try:
+        action_id, reservation_id = budget_mod.run_with_bounded_backoff(
+            _attempt_reservation,
+            on_retry=_record_retry,
+            should_retry=_is_transient,
+        )
+    except budget_mod.BudgetExhaustedError as exc:
+        return {
+            "blocked": (
+                f"supervised budget exhausted: {exc}; operator action required: "
+                "record an explicit policy revision raising the limit"
+            ),
+            "last_result": "budget_exhausted",
+        }
+    except budget_mod.BudgetError as exc:
+        return {
+            "blocked": (
+                f"supervised budget policy blocked: {exc}; operator action "
+                "required: record an explicit policy revision with a versioned "
+                "budget payload"
+            ),
+            "last_result": "budget_policy_blocked",
+        }
+    except Exception as exc:
+        return {
+            "blocked": (
+                "supervised reservation could not be recorded after bounded "
+                f"retries: {exc}"
+            ),
+            "last_result": "reservation_failed",
+        }
+    return {
+        "reservation_id": reservation_id,
+        "action_id": action_id,
+        "role": role,
+        "estimate": estimate,
+    }
+
+
+def supervised_gate_record_incident(
+    gate: dict, cid: str, stage: str, *, discriminator: str = "dispatch",
+) -> None:
+    """Record one failing dispatch attempt against its stable signature.
+
+    The counter is incremented only when a dispatch actually fails, so a clean
+    dispatch never consumes the bounded-attempts budget and the count survives
+    ``opsx-plan reset`` in the external ledger.
+    """
+    try:
+        signature = budget_mod.incident_signature(
+            kind=stage, change_id=cid, stage=stage, discriminator=discriminator
+        )
+        gate["ledger"].record_incident_attempt(gate["job_id"], signature=signature)
+    except Exception:
+        pass
+
+
+def supervised_gate_reconcile(
+    gate: dict, reservation_id: int, record: dict | None, outcome: str,
+) -> None:
+    """Reconcile observed usage against a reservation without double billing.
+
+    An ``observed`` outcome with estimated cost is reconciled; a timeout or an
+    error outcome is ``interrupted`` and an unobservable usage record is
+    ``unknown``. Both retain the reservation at its reserved estimate, so
+    unresolved consumption is never treated as free.
+    """
+    ledger = gate["ledger"]
+    try:
+        usage = record.get("usage", {}) if isinstance(record, dict) else {}
+        cost = record.get("cost", {}) if isinstance(record, dict) else {}
+        usage_available = bool(usage.get("usage_available"))
+        cost_status = cost.get("status")
+        if outcome in ("timeout", "spawn_error", "env_error"):
+            observation_state = "interrupted"
+        elif usage_available and cost_status == "estimated":
+            observation_state = "observed"
+        else:
+            observation_state = "unknown"
+        if observation_state == "observed":
+            budget_mod.reconcile(
+                ledger,
+                reservation_id=reservation_id,
+                observation_state="observed",
+                observed_input_tokens=usage.get("input_tokens"),
+                observed_output_tokens=usage.get("output_tokens"),
+                observed_cached_tokens=usage.get("cached_input_tokens"),
+                observed_reasoning_tokens=usage.get("reasoning_tokens"),
+                observed_cost_usd=cost.get("estimated_cost"),
+                observed_elapsed_minutes=(
+                    float(record.get("duration_ms", 0)) / 60000.0
+                    if isinstance(record, dict) else None
+                ),
+            )
+        else:
+            budget_mod.reconcile(
+                ledger, reservation_id=reservation_id,
+                observation_state=observation_state,
+            )
+    except budget_mod.BudgetError:
+        # A reconciliation failure never double-bills: the reservation stays in
+        # its prior state and the job's consumption remains bound.
+        pass
+    except Exception:
+        pass
+
+
 def run_direct_change(
     repo: Path,
     cfg: dict,
@@ -1743,6 +2155,28 @@ def run_direct_change(
     budget_usd: float = 0.0,
 ) -> str:
     r = state_mod.rec(state, cid)
+    # A worktree with a registered supervised job gets the durable budget gate;
+    # an ordinary, unregistered run gets ``None`` and keeps the legacy gates
+    # below byte-identical.
+    supervised_gate = open_supervised_gate(repo)
+    try:
+        return _run_direct_change_loop(
+            repo, cfg, state, cid, r, budget_deadline, budget_usd, supervised_gate
+        )
+    finally:
+        close_supervised_gate(supervised_gate)
+
+
+def _run_direct_change_loop(
+    repo: Path,
+    cfg: dict,
+    state: dict,
+    cid: str,
+    r: dict,
+    budget_deadline: float | None,
+    budget_usd: float,
+    supervised_gate: dict | None,
+) -> str:
     while True:
         if budget_deadline and time.monotonic() > budget_deadline:
             state_mod.set_status(state, cid, base.PENDING, f"budget exhausted while waiting to run {r['phase']}")
@@ -1758,8 +2192,14 @@ def run_direct_change(
                 state_mod.set_status(state, cid, base.FAILED, f"completed state no longer verifiable: {why}")
             persist_direct_state(repo, cfg, state, cid)
             return r["status"]
-        # --- spend-budget pre-dispatch check ---
-        if budget_usd > 0:
+        # --- supervised budget pre-dispatch gate ---
+        # Active only for a registered supervised job; it replaces the legacy
+        # spend gate for that job while leaving the legacy path untouched. The
+        # actual reservation is taken after the escalation decision so an
+        # escalated implement dispatch is reserved under its own role.
+        gate_reservation: dict | None = None
+        # --- spend-budget pre-dispatch check (legacy, unregistered runs only) ---
+        if supervised_gate is None and budget_usd > 0:
             run_id_for_check = state.get("run_id", "")
             if run_id_for_check:
                 spend = compute_run_spend(repo, cfg["name"], run_id_for_check)
@@ -1817,18 +2257,51 @@ def run_direct_change(
         _arm_usage_sidecar()
 
         def _write_telemetry(telemetry_status: str, error_message: str | None) -> None:
-            """Write a telemetry record. Logs a warning on failure; never raises."""
+            """Write a telemetry record. Logs a warning on failure; never raises.
+
+            Returns the written record (or ``None`` on failure) so the
+            supervised gate can reconcile observed usage from the definitive
+            record.
+            """
             try:
-                telemetry._record_stage_telemetry(
+                return telemetry._record_stage_telemetry(
                     repo, cfg, state, cid, stage, round_num,
                     started_at, ended_at, duration_ms,
                     telemetry_status, error_message,
                     payload, log_path,
                     sidecar_path=sidecar_path,
                     envelope=envelope,
+                    role=telemetry.resolve_stage_role(
+                        stage,
+                        escalation_active=bool(
+                            r.get("escalation", {}).get("active")
+                        ),
+                    ),
                 )
             except Exception as exc:
                 base.log(f"warning: failed to write telemetry for {cid}/{stage} r{round_num}: {exc}")
+                return None
+
+        def _reconcile_supervised(outcome: str, record: dict | None) -> None:
+            """Reconcile the current reservation after a dispatch attempt."""
+            if supervised_gate is None:
+                return
+            entry = gate_reservation or {}
+            reservation_id = entry.get("reservation_id")
+            if reservation_id is None:
+                return
+            supervised_gate_reconcile(
+                supervised_gate, reservation_id, record, outcome
+            )
+            # A non-clean outcome is one failing attempt at this stage's stable
+            # signature; a clean outcome does not consume the bound.
+            if outcome not in ("completed", "exited"):
+                supervised_gate_record_incident(
+                    supervised_gate, cid, stage, discriminator="dispatch"
+                )
+            # The reconciled record is current; clear the pending reservation so
+            # a retry within this stage cannot reconcile the same action twice.
+            entry["reservation_id"] = None
 
         # ---- escalation: swap OPSX_IMPLEMENTER_MODEL before each implement dispatch ----
         if stage == "implement":
@@ -1876,6 +2349,30 @@ def run_direct_change(
         parse_why = ""
         envelope: dict | None = None
         while True:
+            # ---- supervised budget pre-dispatch gate ----
+            # Reserve before any dispatch side effect. A reserve that cannot
+            # be durably written, a known exhaustion, an unknown price, a
+            # bounded attempt, or a legacy policy blocks the dispatch rather
+            # than running unaccounted. Each dispatch attempt (including an
+            # invalid-output retry) is its own action and gets its own
+            # reservation.
+            if supervised_gate is not None:
+                run_id_for_gate = state.get("run_id", "") or telemetry.get_or_create_run_id(
+                    repo, cfg, state
+                )
+                gate_reservation = supervised_gate_reserve(
+                    repo, cfg, supervised_gate, cid, stage, round_num, r, run_id_for_gate
+                )
+                if gate_reservation.get("blocked"):
+                    reason = gate_reservation["blocked"]
+                    r["last_result"] = gate_reservation.get(
+                        "last_result", "budget_blocked"
+                    )
+                    state_mod.set_status(state, cid, base.PENDING, reason)
+                    base.log(f"  {reason}")
+                    persist_direct_state(repo, cfg, state, cid)
+                    return "budget"
+
             outcome, log_path = invoke_direct_stage(repo, cfg, cid, stage, round_num, attempt_input)
 
             # ---- restore os.environ after subprocess invocation ----
@@ -1891,7 +2388,8 @@ def run_direct_change(
 
             if outcome == "env_error":
                 reason = log_path.read_text(encoding="utf-8").splitlines()[0].split(": ", 1)[-1]
-                _write_telemetry("spawn_error", reason)
+                telemetry_record = _write_telemetry("spawn_error", reason)
+                _reconcile_supervised("env_error", telemetry_record)
                 state_mod.rec(state, cid)["last_result"] = f"{stage}_env_error"
                 state_mod.set_status(state, cid, base.FAILED, reason)
                 _try_notify(cfg, "change_failed", reason, change_id=cid)
@@ -1899,10 +2397,11 @@ def run_direct_change(
                 return "spawn_error"
 
             if outcome == "spawn_error":
-                _write_telemetry(
+                telemetry_record = _write_telemetry(
                     "spawn_error",
                     f"could not spawn {stage}: {cfg[f'{stage}_invoke']}",
                 )
+                _reconcile_supervised("spawn_error", telemetry_record)
                 state_mod.rec(state, cid)["last_result"] = f"{stage}_spawn_error"
                 state_mod.set_status(state, cid, base.FAILED, f"could not spawn {stage}: {cfg[f'{stage}_invoke']}")
                 _try_notify(cfg, "change_failed", f"could not spawn {stage}", change_id=cid)
@@ -1910,7 +2409,8 @@ def run_direct_change(
                 return "spawn_error"
 
             if outcome == "timeout":
-                _write_telemetry("timeout", f"{stage} timed out")
+                telemetry_record = _write_telemetry("timeout", f"{stage} timed out")
+                _reconcile_supervised("timeout", telemetry_record)
                 state_mod.rec(state, cid)["last_result"] = f"{stage}_timeout"
                 state_mod.set_status(state, cid, base.FAILED, f"{stage} timed out")
                 _try_notify(cfg, "change_failed", f"{stage} timed out", change_id=cid)
@@ -1922,7 +2422,8 @@ def run_direct_change(
                 break
             if _is_retriable_invalid_output(parse_why) and invalid_attempt < invalid_retries_max:
                 invalid_attempt += 1
-                _write_telemetry("invalid_output", parse_why)
+                telemetry_record = _write_telemetry("invalid_output", parse_why)
+                _reconcile_supervised("invalid_output", telemetry_record)
                 base.log(
                     f"  {stage} round {round_num}: output invalid ({parse_why}); "
                     f"retrying ({invalid_attempt}/{invalid_retries_max})"
@@ -1931,7 +2432,8 @@ def run_direct_change(
                 _arm_usage_sidecar()
                 attempt_input = input_block + "\n" + _INVALID_OUTPUT_RETRY_HINT
                 continue
-            _write_telemetry("invalid_output", parse_why)
+            telemetry_record = _write_telemetry("invalid_output", parse_why)
+            _reconcile_supervised("invalid_output", telemetry_record)
             state_mod.rec(state, cid)["last_result"] = "subagent_output_invalid"
             if stage == "archive":
                 state_mod.rec(state, cid)["archive"]["status"] = "failed"
@@ -1963,7 +2465,11 @@ def run_direct_change(
             telemetry_status = "completed"
             error_message = None
 
-        _write_telemetry(telemetry_status, error_message)
+        telemetry_record = _write_telemetry(telemetry_status, error_message)
+        _reconcile_supervised(
+            "completed" if telemetry_status == "completed" else telemetry_status,
+            telemetry_record,
+        )
 
         if action == "continue":
             continue
@@ -2563,10 +3069,54 @@ def _cmd_run_body(args: argparse.Namespace, repo: Path, plan_src: str, cfg: dict
             state_mod.save_state(repo, cfg["name"], state)
             before_tracked = groundtruth.tracked_worktree_snapshot(repo)
 
-            outcome, log_path = run_stage(
-                repo, cfg, cid, "create", change_cfg["create_invoke"],
-                cfg["create_timeout_minutes"], c_attempt,
-            )
+            # --- supervised budget pre-dispatch gate for the create stage ---
+            create_gate = open_supervised_gate(repo)
+            create_reservation: dict | None = None
+            try:
+                if create_gate is not None:
+                    create_run_id = state.get("run_id", "") or telemetry.get_or_create_run_id(
+                        repo, cfg, state
+                    )
+                    create_reservation = supervised_gate_reserve(
+                        repo, cfg, create_gate, cid, "create", c_attempt, r,
+                        create_run_id,
+                    )
+                    if create_reservation.get("blocked"):
+                        reason = create_reservation["blocked"]
+                        r["last_result"] = create_reservation.get(
+                            "last_result", "budget_blocked"
+                        )
+                        state_mod.set_status(state, cid, base.PENDING, reason)
+                        base.log(f"  {reason}")
+                        state_mod.save_state(repo, cfg["name"], state)
+                        continue
+
+                outcome, log_path = run_stage(
+                    repo, cfg, cid, "create", change_cfg["create_invoke"],
+                    cfg["create_timeout_minutes"], c_attempt,
+                )
+                if create_gate is not None and create_reservation:
+                    # No telemetry for the create stage: retain the reservation
+                    # on a non-clean outcome, reconcile a clean one at zero
+                    # observed (the primary's live usage arrives via the bridge).
+                    reservation_id = create_reservation.get("reservation_id")
+                    if reservation_id is not None:
+                        if outcome == "exited":
+                            budget_mod.reconcile(
+                                create_gate["ledger"],
+                                reservation_id=reservation_id,
+                                observation_state="observed",
+                                observed_cost_usd=0.0,
+                                observed_elapsed_minutes=0.0,
+                            )
+                        else:
+                            budget_mod.reconcile(
+                                create_gate["ledger"],
+                                reservation_id=reservation_id,
+                                observation_state="interrupted",
+                            )
+            finally:
+                close_supervised_gate(create_gate)
             r["last_log"] = str(log_path)
 
             if outcome == "env_error":
