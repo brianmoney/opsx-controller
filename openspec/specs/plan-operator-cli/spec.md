@@ -683,3 +683,80 @@ change, the explicit `false` delegation opt-out, and the invalidity of
   manual-gates section of the operator workflow documentation
 - **THEN** the key, its human-only default, the delegation opt-out, and the
   invalid combination are all described
+
+### Requirement: The `opsx-plan supervise` namespace reports backend capability
+
+The orchestrator SHALL provide an `opsx-plan supervise` command namespace.
+Its capability report SHALL state whether the host provides a supported
+isolation backend for the operator authority boundary, naming the detected
+backend status plainly so an operator can tell whether supervision can be
+enabled before attempting it.
+
+The capability report SHALL be a read-only diagnostic: it SHALL NOT create
+accounts, install service units, write the authority store, or change any
+host configuration, and it SHALL run without requiring the boundary to be
+active.
+
+#### Scenario: A supported host reports the backend
+
+- **WHEN** an operator runs the `opsx-plan supervise` capability report on a
+  host with a supported isolation backend
+- **THEN** the report states that the backend is available and exits
+  successfully
+
+#### Scenario: An unsupported host reports unavailability
+
+- **WHEN** an operator runs the `opsx-plan supervise` capability report on a
+  host without a supported isolation backend
+- **THEN** the report states that no supported backend is available, and the
+  report itself makes no change to the host
+
+### Requirement: Enabling supervision fails closed on an unsupported host
+
+When the capability surface is asked to enable supervision and the isolation
+backend is unavailable, the command SHALL exit non-zero with a named
+unsupported-host error. The command SHALL NOT silently downgrade to a weaker
+isolation posture and SHALL NOT provision accounts or services automatically:
+provisioning is a separate, manual operator step the error output points to.
+
+#### Scenario: Enablement refused with a named error
+
+- **WHEN** an operator attempts to enable supervision through `opsx-plan
+  supervise` on a host without a supported backend
+- **THEN** the command exits non-zero, names the unsupported-host error,
+  enables nothing, and substitutes no weaker posture
+
+#### Scenario: Enablement never auto-provisions
+
+- **WHEN** an operator attempts to enable supervision on any host
+- **THEN** the command creates no accounts, installs no service units, and
+  directs the operator to the manual provisioning step instead
+
+### Requirement: Existing diagnostics remain available without the boundary
+
+The independent diagnostic commands `opsx-plan doctor`, `opsx-plan status`,
+`opsx-plan logs`, and `opsx-plan report` SHALL remain fully available on a
+host without a supported isolation backend and without any supervision
+enablement, so legacy unsupervised operation keeps its observability
+unchanged.
+
+#### Scenario: Diagnostics run on an unsupported host
+
+- **WHEN** an operator runs `doctor`, `status`, `logs`, or `report` on a host
+  with no supported isolation backend and no supervised job
+- **THEN** each command behaves exactly as it does for legacy unsupervised
+  runs, with no boundary-related failure
+
+### Requirement: Operator documentation describes the boundary behavior
+
+The operator-facing `opsx-plan` documentation SHALL describe the `supervise`
+namespace's capability report, the named unsupported-host error, the
+fail-closed refusal with no silent downgrade, and the manual provisioning
+stance.
+
+#### Scenario: The boundary behavior is documented
+
+- **WHEN** an operator reads the documented `opsx-plan` supervision surface
+- **THEN** it shows the capability report, names the unsupported-host error,
+  states that no downgrade or automatic provisioning occurs, and points to
+  the manual provisioning step

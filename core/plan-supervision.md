@@ -206,10 +206,176 @@ ledger file, WAL file, or directory appears at the rejected path.
 symlink and relative-path spellings, which are the realistic accident cases.
 A determined process can still alias the repository through a mount namespace
 or bind mount. The principal-level boundary — running supervision components
-under an isolated OS principal that cannot write the worktree — is owned by
-the later authority-boundary change; this contract fixes the path semantics
-that boundary enforces on top of, including the default location being
-outside any worktree.
+under an isolated OS principal that cannot write the worktree — is enforced on
+top of these path semantics by the
+[operator authority boundary](#operator-authority-boundary) below, including
+the default location being outside any worktree.
+
+## Operator authority boundary
+
+The path rule above fixes *where* trusted assets may live; this section fixes
+*who* can reach them. It is the boundary the trusted-location section defers
+to, and it is enforced by the kernel, not by application-level conventions.
+
+### Selected backend and trust root
+
+The selected backend is **Linux isolated principals**. The local OS owner is
+the trust root; isolation is ordinary Linux user isolation (filesystem
+ownership and mode bits, peer credentials), with the Python standard library
+only and no new runtime dependency. There is exactly one supported backend
+today. A host that cannot provide it is reported unsupported and supervision
+enablement fails closed; there is no lesser backend.
+
+### Three principals, and the primary is a worker
+
+Three OS identities participate:
+
+- **Operator** — the human's own login uid. Only it may invoke the operator
+  endpoint.
+- **Service** — a dedicated, manually provisioned OS user (for example
+  `opsx-supervisor`) that owns the installed service code, configuration, the
+  supervisor ledger, the protected job policy, and the manifest snapshot, all
+  with owner-only permissions.
+- **Worker** — a dedicated, manually provisioned unprivileged OS user (for
+  example `opsx-worker`) under which **every** model session runs, including
+  the frontier primary. No model session is ever a privileged daemon.
+
+The three identities must be pairwise distinct. A collapsed configuration (for
+example a single-user host where all three would share a uid) is rejected by
+detection: it cannot enforce the boundary, so it is treated as unsupported and
+the gate refuses.
+
+### Endpoint split and kernel authentication
+
+The service exposes two Unix-domain sockets with **disjoint dispatch tables**:
+
+- The **operator endpoint** accepts only peers whose kernel-reported uid is the
+  configured operator principal; a mismatched peer is closed before any request
+  is read. It is authenticated with `SO_PEERCRED`, not a token.
+- The **worker-actions endpoint** serves only the scoped job-service verbs a
+  worker may request. No operator-only verb is reachable through it, by
+  construction rather than by a flag on a shared handler.
+
+There is no bearer token, capability file, or environment variable that could
+leak into a worker domain. Authentication is the kernel-reported peer identity;
+nothing in the worker's environment, filesystem domain, or transport can invoke
+the operator endpoint.
+
+### Trusted assets and the untrusted repo
+
+Service code, configuration, the ledger, the policy, and the manifest snapshot
+live outside the worktree under the trusted-location semantics above, writable
+only by the service principal. The editable repository copy is **untrusted
+input**: the privileged service never loads or executes its privileged assets
+from the writable checkout, and treats repository paths purely as data to hash
+and snapshot. Repository hooks, tests, and repo commands execute in the worker
+domain, never in the privileged service, so a repo-controlled script cannot
+smuggle itself into the trusted identity.
+
+### Capability detection, the probe, and fail-closed enablement
+
+Detection (`lib/supervisor/authority.py`) is pure, unprivileged, and
+side-effect free. It reports one of:
+
+- `available` — Linux, peer credentials present, principals exist and are
+  distinct, the store path resolves under the trusted-location rule, and the
+  explicit **service-owned store-file contract** holds;
+- `unprovisioned` — backend supported but prerequisites are missing, with the
+  manual provisioning pointer;
+- `unsupported` — the platform cannot provide the backend.
+
+The authority store is an explicit **regular file**, never its parent
+directory. The default is derived from the **service** principal's home
+(`<service-home>/.local/share/opsx-controller/supervisor/supervisor.sqlite3`)
+or, before that principal is provisioned, from the root-owned system directory
+`/var/lib/opsx-controller/supervisor/supervisor.sqlite3`. It never follows the
+invoking user's home, which a caller could make writable. An explicit
+`OPSX_SUPERVISOR_STATE_FILE` overrides the default.
+
+The target is **canonicalized** (expand `~`, absolutize, resolve symlinks and
+`..`) *before* validation, so a symlink or relative spelling cannot conceal a
+worktree or a worker-owned location from the trusted-location rule or the
+ownership checks. Detection then requires the target to exist as a regular
+file, be owned by the service principal, and carry a mode that denies the
+worker principal write access. It additionally validates the whole mutable
+**parent chain** up to the filesystem root: every ancestor directory must be
+owned by the root trust root or the service principal and must deny the worker
+a write, so a worker-writable directory cannot replace the protected store (or
+a parent symlink) after the probe. Because ownership and mode bits do not
+express a *named* POSIX ACL grant, the denial decision also inspects the
+`system.posix_acl_access` xattr, decoding the real Linux wire layout (a single
+little-endian `u32` version header followed by 8-byte `(tag, perm, id)`
+records with the count implied by the payload length) and applying kernel
+precedence with the mask filtering named-user/group and owning-group entries: a
+named ACL entry that grants the worker
+write is a failure, and an ACL that is present but unreadable or malformed
+(bad version or a payload length that is not `4 + 8n`) fails closed rather than
+falling back to the safe-looking mode bits. A missing
+file, a directory target, wrong ownership, a worker-writable mode, an
+ACL-granted worker write, or a worker-writable/non-service ancestor is
+reported `unprovisioned` with the failing condition named.
+
+Detection creates no accounts and writes nothing, so `opsx-plan supervise
+status` works for any user on any host. Before supervision is enabled for the
+first time, a **mandatory activation probe** spawns a real subprocess under the
+worker principal and requires it to prove its execution before its write
+attempt against the store file is accepted as denied with `EACCES`. The probe
+reports the child's effective uid and the real `open` result as evidence; a
+bare exit status is never proof. A successful write, a wrong or unproven
+identity, an inability to spawn the restricted process, or any indeterminate
+result is a named failure and supervision is not enabled.
+
+The switch mechanism is part of the trusted base and is **authenticated**:
+launchers are resolved only from a fixed list of trusted system directories
+(never the ambient `PATH`), and the executable must be a regular executable
+file owned by the root trust root or the service principal in a
+non-worker-writable directory chain (ACL-aware, exactly like the store
+parents). Allowlisted `setpriv`/`runuser` are recognised by basename; any
+other basename is accepted only when it passes the same trusted-ownership
+checks, which is how an explicitly provisioned absolute helper qualifies. A
+bare name, a worker-owned helper, or an untrusted directory is refused. The
+launcher path is **canonicalized before it is both checked and executed**: a
+symlink is resolved once and only the canonical verified file is spawned, so a
+worker that repoints the pre-canonical spelling after validation cannot
+interpose a wrapper before the identity switch. The probe child runs with a
+**scrubbed, non-inherited environment** (only a small allowlist such as
+`PATH`/`LANG` survives, so `PYTHONPATH`, `LD_PRELOAD`, and shell startup hooks
+are dropped) in Python **isolated mode** (`-I -S`, no `site`), so
+`sitecustomize`/`usercustomize` hooks cannot inject code. Each invocation
+carries a fresh **nonce** that the child must echo: pre-baked or replayed
+evidence is rejected. There is no no-probe enablement route: fixture
+simulation never substitutes for the real probe on an enablement path.
+
+One function, `require_authority_backend(...)`, composes detection and the
+probe into the single fail-closed gate. On an unavailable backend it raises the
+named `UnsupportedHostError`; a failing probe raises the named
+`ActivationProbeError`. It never provisions and never substitutes a weaker
+posture. `opsx-plan supervise probe` exposes this gate, and later enablement
+paths (job registration, service activation) call the same function.
+
+Provisioning of the accounts and service is manual, an explicit operator step
+the error output points to. The independent diagnostics (`doctor`, `status`,
+`logs`, `report`) remain available on a host without the boundary, so legacy
+unsupervised operation keeps its observability.
+
+### Rejected alternatives
+
+The plan's carried-forward semantics reject every application-level scheme
+below as insufficient, because each is reachable by the very model processes it
+is meant to exclude:
+
+- **`--human` flag** — a flag is parsed by the same process that decides
+  whether to honor it; a model session can pass it.
+- **TTY check** — a model session can allocate or attach a pseudo-terminal, so
+  a TTY is not an identity.
+- **Token in the worker environment** — anything in the worker's environment is
+  readable by the worker, so it authenticates the worker to itself.
+- **Same-UID `chmod`** — permission bits are meaningless when the writer and
+  the protected asset share a uid; the writer can simply change the bits.
+
+A scheme a worker process can reach does not satisfy the boundary. Only a
+distinct principal enforced by the kernel does.
+
 
 ## Journal semantics
 

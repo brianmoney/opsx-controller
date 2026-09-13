@@ -85,8 +85,8 @@ except ModuleNotFoundError as exc:  # pragma: no cover
 try:
     from lib.orchestrator import (
         base, compiler, cmd_archive_plan, cmd_doctor, cmd_gates, cmd_logs,
-        cmd_models, cmd_run_one, cmd_status, cmd_use, dashboard, delivery,
-        doctor, groundtruth, logs, planref, report, telemetry,
+        cmd_models, cmd_run_one, cmd_status, cmd_supervise, cmd_use, dashboard,
+        delivery, doctor, groundtruth, logs, planref, report, telemetry,
     )
     from lib.orchestrator import cost as cost_mod
     from lib.orchestrator import state as state_mod
@@ -3038,6 +3038,27 @@ def main() -> int:
         "--force", action="store_true", help="overwrite an existing file"
     )
     p_models_init.set_defaults(fn=cmd_models.cmd_models_init)
+
+    p_supervise = sub.add_parser(
+        "supervise",
+        help="report the operator authority backend and run its fail-closed gate",
+    )
+    supervise_sub = p_supervise.add_subparsers(dest="supervise_cmd", required=True)
+
+    p_supervise_status = supervise_sub.add_parser(
+        "status",
+        help="read-only capability report (available / unprovisioned / unsupported)",
+    )
+    p_supervise_status.add_argument(
+        "--json", action="store_true", help="emit the capability report as JSON"
+    )
+    p_supervise_status.set_defaults(fn=cmd_supervise.cmd_supervise_status)
+
+    p_supervise_probe = supervise_sub.add_parser(
+        "probe",
+        help="run the fail-closed gate and the mandatory activation probe",
+    )
+    p_supervise_probe.set_defaults(fn=cmd_supervise.cmd_supervise_probe)
 
     p_logs = sub.add_parser(
         "logs", help="inspect the latest or filtered stage log for a resolved plan",

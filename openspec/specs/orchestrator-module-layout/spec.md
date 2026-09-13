@@ -244,3 +244,49 @@ orchestrator package.
 - **WHEN** a test rebinds a definition on the supervisor module that owns it,
   and code in a different supervisor module calls that definition
 - **THEN** the call reaches the replacement, not the original
+
+### Requirement: The authority boundary machinery lives in concern-named supervisor modules
+
+Backend detection, the capability report, the endpoint plumbing, and the
+activation probe SHALL live in concern-named modules of the
+`lib/supervisor/` runtime package, importable as `lib.supervisor.<module>`
+without executing the CLI and without reading or writing anything under
+`.opsx-plan/` at import time. The modules SHALL follow the existing
+supervisor-package discipline: standard library only, no import of another
+runtime package, and cross-module references resolved through the owning
+module object.
+
+Backend detection and the capability report SHALL be operable from the
+worker domain without any privileged operation: determining whether the host
+supports the boundary SHALL NOT require the trusted service identity, SHALL
+NOT open the authority store for writing, and SHALL NOT provision anything.
+
+#### Scenario: A boundary module is imported without running the CLI
+
+- **WHEN** a test or tool imports an authority-boundary module
+- **THEN** the import succeeds, no argument parsing occurs, no process is
+  spawned, and no file under `.opsx-plan/` is read or written
+
+#### Scenario: Detection runs unprivileged
+
+- **WHEN** backend capability detection runs as an ordinary worker-domain
+  process
+- **THEN** it reports the backend status without requiring the trusted
+  service identity, writing the authority store, or changing host
+  configuration
+
+### Requirement: The `supervise` command handler follows the command-module discipline
+
+The `opsx-plan supervise` namespace SHALL be registered in the
+`orchestrator/opsx-plan.py` entrypoint and SHALL delegate to a concern-named,
+importable module under `lib/orchestrator/`, under the same extraction
+discipline as the other self-contained operator commands: import without
+side effects, cross-module references through the owning module object, and
+no import cycle.
+
+#### Scenario: The supervise module is imported without running the CLI
+
+- **WHEN** a test or tool imports the module that owns the `supervise`
+  command handler
+- **THEN** the import succeeds, no argument parsing occurs, no process is
+  spawned, and no file under `.opsx-plan/` is read or written

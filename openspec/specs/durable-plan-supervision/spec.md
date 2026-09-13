@@ -457,3 +457,274 @@ decisions only.
 - **WHEN** a dispatch identity record is written for an action
 - **THEN** it is stored as action/evidence data and does not mutate the
   insert-only job-policy payload
+
+### Requirement: The trust root is the local OS owner and every model session runs in the worker domain
+
+The supervision trust model SHALL treat the local OS owner as the trust root
+and SHALL use isolated OS principals as the baseline isolation backend, with
+Linux as the first supported platform. The supervision service SHALL run under
+a trusted OS identity distinct from any identity a model session runs under.
+
+Every model session — including the frontier primary session — SHALL run in
+the constrained worker domain. The primary SHALL NOT run as, or hold the
+privileges of, the trusted service identity: no model session is ever a
+privileged daemon, so a compromised or manipulated model session cannot reach
+operator authority by construction.
+
+#### Scenario: The service and the workers are distinct principals
+
+- **WHEN** the supervision service and a model session are both running on a
+  supported host
+- **THEN** the service runs under the trusted OS identity and the model
+  session runs under a separate, constrained worker identity that cannot
+  impersonate the service identity
+
+#### Scenario: The frontier primary is confined to the worker domain
+
+- **WHEN** the frontier primary session executes under supervision
+- **THEN** it runs in the worker domain with no service-identity privileges,
+  exactly like any other model session, and cannot perform a privileged
+  service operation
+
+### Requirement: Operator authority and worker actions use separate endpoints
+
+The service SHALL expose a separate operator endpoint and a restricted
+worker-actions endpoint. The operator endpoint SHALL be authenticated by OS
+peer credentials, so only a process running under the operator's OS identity
+can invoke it. The worker-actions endpoint SHALL carry no operator authority:
+it SHALL expose only the scoped job-service actions a worker may request.
+
+Operator credentials SHALL NOT be exposed to a model session: no token,
+credential, or capability that can invoke the operator endpoint SHALL be
+present in a worker's environment, filesystem domain, or transport. An
+authority scheme that a worker process can reach — a flag, a TTY check, a
+token in the worker environment, or a same-UID permission bit — SHALL NOT
+satisfy this requirement.
+
+#### Scenario: A worker principal cannot invoke the operator endpoint
+
+- **WHEN** a process running under the worker identity attempts to connect to
+  the operator endpoint
+- **THEN** the OS peer-credential check rejects the connection before any
+  operation is evaluated
+
+#### Scenario: The worker endpoint carries no operator authority
+
+- **WHEN** a worker process invokes the worker-actions endpoint
+- **THEN** only the scoped job-service actions are available, and no
+  operator-only operation is reachable through it
+
+#### Scenario: No operator credential exists in the worker domain
+
+- **WHEN** a worker session's environment, filesystem domain, and transport
+  are inspected
+- **THEN** no credential capable of invoking the operator endpoint is present
+
+### Requirement: Service assets live outside the worktree and the repo copy is untrusted
+
+Service code, service configuration, the supervisor ledger, the protected job
+policy, and the manifest snapshot SHALL reside outside the worktree under the
+trusted-location semantics already defined for the ledger, writable only by
+the trusted service identity. The editable repository copy of service code
+and configuration SHALL be treated as untrusted input: the privileged service
+SHALL NOT execute or load its privileged assets from the writable checkout.
+
+Repository hooks, tests, and repo commands SHALL execute in the worker
+domain, never in the privileged service, so a repo-controlled script cannot
+smuggle worker-domain code into the trusted identity.
+
+#### Scenario: A worker-domain write to the authority store is denied
+
+- **WHEN** a process running under the worker identity attempts to write the
+  supervisor ledger, the protected job policy, the manifest snapshot, or the
+  service configuration
+- **THEN** the write is denied by the OS-level isolation, and the attempt is
+  observable as a denial rather than silently succeeding
+
+#### Scenario: A repo hook never executes as the service
+
+- **WHEN** a repository hook, test, or repo command runs while supervision is
+  active
+- **THEN** it executes under the worker identity and cannot act as the
+  trusted service identity
+
+### Requirement: Backend capability detection fails closed
+
+The system SHALL detect whether the host provides a supported isolation
+backend. Enabling supervision on a host without a supported backend SHALL be
+refused, fail closed, with a named unsupported-host error. There SHALL be no
+silent downgrade: supervision SHALL NOT fall back to a weaker isolation
+posture (for example same-UID conventions) when the baseline backend is
+unavailable.
+
+Provisioning of the accounts and service the backend requires SHALL be
+manual: detection and enablement SHALL NOT create accounts, install service
+units, or otherwise provision the host automatically.
+
+#### Scenario: An unsupported host is refused
+
+- **WHEN** supervision enablement is attempted on a host where the isolation
+  backend is unavailable
+- **THEN** the attempt fails with a named unsupported-host error, nothing is
+  enabled, and no weaker posture is substituted
+
+#### Scenario: Detection never provisions
+
+- **WHEN** backend capability detection runs on any host
+- **THEN** it creates no accounts, installs no service units, and changes no
+  host configuration
+
+### Requirement: An activation probe is mandatory before supervision is enabled
+
+Before supervision is enabled for the first time on a host, an activation
+probe SHALL verify that the boundary actually holds: a probe process running
+in the worker domain SHALL attempt to write the authority store, and the
+attempt SHALL be denied. Supervision SHALL NOT be enabled when the probe
+fails or cannot run, and the failure SHALL be reported with a named error.
+
+The probe SHALL exercise the real platform backend when one is available;
+fixture-only simulation SHALL NOT be sufficient evidence that a host
+satisfies the boundary.
+
+#### Scenario: A passing probe enables supervision
+
+- **WHEN** the activation probe runs on a host with a supported backend and
+  the worker-domain write attempt is denied
+- **THEN** the probe reports success and supervision may be enabled
+
+#### Scenario: A failed probe blocks enablement
+
+- **WHEN** the activation probe's worker-domain write attempt succeeds, or
+  the probe cannot run
+- **THEN** the probe reports failure with a named error and supervision is
+  not enabled
+
+### Requirement: The contract documents the selected backend and the rejected alternatives
+
+`core/plan-supervision.md` SHALL record the selected isolation backend, the
+trust-root model, the operator/worker endpoint split, the worker-domain
+confinement of every model session including the primary, the untrusted-repo
+rule, the mandatory activation probe, and the fail-closed unsupported-host
+behavior. It SHALL also record the rejected alternatives — a `--human` flag,
+a TTY check, a token in the worker environment, and a same-UID `chmod`
+scheme — with the reason each is insufficient.
+
+#### Scenario: The reference records the boundary decision
+
+- **WHEN** `core/plan-supervision.md` is reviewed against this capability
+- **THEN** it names the selected backend, covers every element listed above,
+  and states why each rejected alternative is insufficient
+
+### Requirement: The authority store is an explicit, validated service-owned file
+
+The authority store SHALL be an explicit regular file, never its parent
+directory, owned by the service principal and writable only by it. Detection
+SHALL canonicalize the target (resolving symlinks and `..`) before validating
+it, and SHALL reject a target whose parent chain is writable by the worker
+principal, so a worker cannot replace the protected store — or a parent symlink
+— after the activation probe.
+
+The write-denial decision SHALL account for POSIX ACL grants, not only mode
+bits, because mode bits do not express a *named* grant. An ACL that is present
+but unreadable, truncated, or structurally malformed SHALL fail closed rather
+than fall back to the safe-looking mode bits.
+
+#### Scenario: A worker-reachable parent chain is refused
+
+- **WHEN** the store file itself denies the worker a write but an ancestor
+  directory is writable by the worker principal
+- **THEN** the store is reported unprovisioned with the failing ancestor named,
+  because the worker could replace the protected file
+
+#### Scenario: A named ACL grant to the worker is refused
+
+- **WHEN** the store file's mode bits deny the worker a write but a POSIX ACL
+  entry grants the worker principal write access
+- **THEN** the write decision denies the worker and the store is reported
+  unprovisioned
+
+#### Scenario: An unreadable or malformed ACL fails closed
+
+- **WHEN** an ACL is present on the store file or an ancestor but cannot be read
+  or does not decode to a valid structure
+- **THEN** detection reports the target unprovisioned rather than accepting the
+  mode bits
+
+### Requirement: The restricted-process launcher is authenticated before use
+
+The switch mechanism the activation probe uses to drop to the worker principal
+SHALL be part of the trusted base. It SHALL be resolved only from a fixed list
+of trusted system directories — never the ambient `PATH` — and SHALL be a
+regular executable owned by the trust root or the service principal in a
+directory chain the worker cannot write (ACL-aware, like the store parents).
+
+The launcher path SHALL be canonicalized before it is both validated and
+executed, so a worker cannot repoint a pre-canonical spelling at a wrapper
+between validation and execution. A bare name, a worker-owned helper, or an
+untrusted directory SHALL be refused without executing anything.
+
+#### Scenario: A PATH-shadowed launcher is not used
+
+- **WHEN** an attacker-controlled directory earlier in `PATH` contains a
+  same-named switch executable
+- **THEN** the launcher is resolved from the trusted directories only and the
+  attacker-controlled file is never executed
+
+#### Scenario: A symlink repoint cannot interpose a wrapper
+
+- **WHEN** the launcher's pre-canonical spelling is a symlink that is repointed
+  after validation
+- **THEN** the probe executes the canonical verified file resolved before
+  validation, not the repointed target
+
+### Requirement: The activation probe requires verifiable execution evidence
+
+The probe's acceptance SHALL rest on execution evidence the worker-domain child
+reports — its effective uid and the real `open` result — bound to a fresh
+per-invocation nonce, not on the child's exit status alone. The child SHALL run
+in Python isolated mode with a scrubbed, non-inherited environment so that
+`PYTHONPATH`, `sitecustomize`/`usercustomize`, and shell startup hooks cannot
+forge the evidence.
+
+A bare exit status, a wrong identity, replayed evidence, or an indeterminate
+result SHALL be a named failure and supervision SHALL NOT be enabled.
+
+#### Scenario: Forged exit status alone is rejected
+
+- **WHEN** the child exits with the denial status but reports no matching
+  execution evidence
+- **THEN** the probe fails with a named error and supervision is not enabled
+
+#### Scenario: Replayed evidence is rejected
+
+- **WHEN** evidence from a previous probe invocation is replayed without the
+  current invocation's nonce
+- **THEN** the probe fails with a named error
+
+#### Scenario: Injected startup hooks cannot forge evidence
+
+- **WHEN** `PYTHONPATH` or a `sitecustomize` hook is set in the ambient
+  environment
+- **THEN** the scrubbed, isolated child does not load it and cannot be made to
+  emit false evidence
+
+### Requirement: Repository-controlled code never executes as the service identity
+
+No operator or worker endpoint verb SHALL execute a repository-controlled path:
+the privileged service executes no repository hooks, tests, or commands and
+treats repository paths purely as data. Repository hooks, tests, and repo
+commands SHALL execute in the worker domain, never in the privileged service,
+so a repo-controlled script cannot act as the trusted identity.
+
+#### Scenario: The dispatched surface has no execution primitive
+
+- **WHEN** the operator and worker dispatch tables are inspected
+- **THEN** no verb and no handler reaches a process-execution primitive, so no
+  repository-controlled code can be run through either endpoint
+
+#### Scenario: A repository path is never executed by the service
+
+- **WHEN** a repository hook, test, or repo command runs while supervision is
+  active
+- **THEN** it executes under the worker identity and cannot act as the trusted
+  service identity

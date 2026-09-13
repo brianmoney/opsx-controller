@@ -1170,6 +1170,61 @@ opsx-plan status [plan.toml]
 ```
 Reconcile state against the repository and print per-change status.
 
+### `opsx-plan supervise`
+
+```
+opsx-plan supervise status [--json]
+opsx-plan supervise probe
+```
+
+Inspect and gate the operator authority boundary. `supervise status` is a
+read-only capability report: it prints the detected backend (`available`,
+`unprovisioned`, or `unsupported`), the three principals and their uids, the
+authority-store file location, and any reasons. It never creates accounts,
+installs units, writes the authority store, or changes host configuration, and
+it exits 0 in all cases — including `unsupported` — because it only reports.
+When the status is `unprovisioned`, the report points at the manual
+provisioning step.
+
+The authority store is an explicit service-owned regular file. Its default is
+derived from the **service** principal's home (`<service-home>/.local/share/
+opsx-controller/supervisor/supervisor.sqlite3`) or, before that principal is
+provisioned, from the root-owned `/var/lib/opsx-controller/supervisor/
+supervisor.sqlite3`; it never follows the invoking user's home. Override it
+with `OPSX_SUPERVISOR_STATE_FILE`. The target is canonicalized (symlinks and
+`..` resolved) before validation, and detection requires the file to exist, be
+owned by the service principal, carry a mode that denies the worker principal
+a write, and sit in a parent chain owned by the root trust root or the service
+principal and not writable by the worker. Denial is evaluated against the
+POSIX ACL as well as the mode bits, so a named ACL grant to the worker is
+caught and an unreadable ACL fails closed. A missing file, a directory target,
+wrong ownership, a worker-writable mode, an ACL-granted worker write, or a
+worker-writable/non-service ancestor is reported `unprovisioned` with the
+failing condition named.
+
+`supervise probe` runs the fail-closed enablement gate. On a host without a
+supported backend it exits non-zero naming the `UnsupportedHostError`; on an
+available host it runs the mandatory activation probe — a real
+worker-principal process proves its effective uid and its attempt to open the
+store file for writing is denied with `EACCES`, and the reported execution
+evidence must agree with the exit status and a fresh per-invocation nonce —
+and exits non-zero naming the `ActivationProbeError` when the boundary does
+not hold or cannot be proven. The restricted-spawn launcher is authenticated
+from trusted system directories with owner/mode/ACL checks (never the ambient
+`PATH`, never an untrusted helper), and its path is canonicalized before it is
+both validated and executed, so only the verified real file is run; the probe
+child runs in Python isolated mode with a scrubbed environment, so
+`PYTHONPATH`, `sitecustomize`, and shell startup hooks cannot forge the
+evidence. There is deliberately no no-probe route: every available path runs
+the real probe.
+Neither subcommand provisions anything, and there is no silent downgrade to a
+weaker isolation posture: provisioning accounts and the service is a manual
+operator step. See `core/plan-supervision.md` ("Operator authority boundary")
+for the trust model and provisioning guidance.
+
+`doctor`, `status`, `logs`, and `report` acquire no boundary dependency and
+keep working unchanged on hosts where the boundary is unavailable.
+
 ### `opsx-plan doctor`
 
 ```

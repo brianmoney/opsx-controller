@@ -34,6 +34,7 @@ from lib.orchestrator import (
     cmd_models,
     cmd_run_one,
     cmd_status,
+    cmd_supervise,
     cmd_use,
 )
 
@@ -180,6 +181,9 @@ class ImportSideEffectFreedomTests(unittest.TestCase):
 
     def test_import_cmd_run_one_has_no_side_effects(self) -> None:
         self._fresh_import("lib.orchestrator.cmd_run_one")
+
+    def test_import_cmd_supervise_has_no_side_effects(self) -> None:
+        self._fresh_import("lib.orchestrator.cmd_supervise")
 
 
 if __name__ == "__main__":
