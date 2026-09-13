@@ -290,3 +290,37 @@ no import cycle.
   command handler
 - **THEN** the import succeeds, no argument parsing occurs, no process is
   spawned, and no file under `.opsx-plan/` is read or written
+
+### Requirement: The execution lock module is importable and operable without the supervisor ledger
+
+The worktree execution lock SHALL live in a concern-named module of the
+`lib/supervisor/` runtime package, importable as `lib.supervisor.<module>`
+without executing the CLI and without reading or writing anything under
+`.opsx-plan/` at import time. The module SHALL follow the existing
+supervisor-package discipline: standard library only, no import of another
+runtime package, and cross-module references resolved through the owning
+module object.
+
+Lock acquisition for an ordinary, unsupervised run SHALL be operable
+without opening or requiring the supervisor ledger: the ledger-backed
+fencing persistence SHALL be an optional, explicitly supplied dependency so
+legacy runs carry no backend dependency.
+
+#### Scenario: The lock module is imported without running the CLI
+
+- **WHEN** a test or tool imports the execution-lock module
+- **THEN** the import succeeds, no argument parsing occurs, no process is
+  spawned, and no file under `.opsx-plan/` is read or written
+
+#### Scenario: Ordinary acquisition needs no ledger
+
+- **WHEN** an ordinary run acquires the worktree execution lock with no
+  ledger supplied and no ledger reachable
+- **THEN** the acquisition succeeds and the run proceeds without any ledger
+  dependency
+
+#### Scenario: Supervised acquisition persists fencing through the supplied ledger
+
+- **WHEN** a supervised execution acquires the lock with a ledger supplied
+- **THEN** the fencing record is persisted through that ledger, and the lock
+  module itself never constructs or opens one

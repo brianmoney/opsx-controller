@@ -573,6 +573,54 @@ opsx-plan reset --failed
 opsx-plan reset P2
 ```
 
+### Worktree execution lock
+
+The mutating commands `opsx-plan run`, `opsx-plan reset`, `opsx-run`, and its
+alias `opsx-plan run-one` acquire a per-worktree **execution lock** before
+performing any mutating work and hold it until they exit, releasing it on both
+success and failure. All four names serialise against the same lock in the
+same worktree, including `opsx-run` against `opsx-plan run-one`.
+
+When another mutating process already holds the lock, the command fails fast
+with the named `LockContentionError` and a non-zero exit code rather than
+waiting or proceeding unlocked:
+
+```
+error: worktree /path/to/repo execution lock is already held by 'opsx-plan run (my-plan)'; refusing to proceed
+```
+
+When the lock is held by a **supervised** execution, an ordinary mutating
+command is refused with the named `SupervisedOwnershipError`, the one
+intentional behavior change for legacy runs:
+
+```
+error: worktree /path/to/repo is owned by a supervised execution ('...', job 3); refusing to proceed
+```
+
+An ordinary run still works with no supervisor ledger and no separate
+principal; this refusal is the only new rejection.
+
+The lock is **not** acquired by the gate commands (`approve`, `accept`) or by
+the read-only diagnostics (`doctor`, `status`, `logs`, `report`,
+`dashboard`). Those run to completion even while a mutating command holds the
+lock, so an operator can always release a gate or inspect a run.
+
+The lock lives in two files under `.opsx-plan/`: `execution.lock` (the
+kernel-held inode that provides mutual exclusion) and `execution-lock.json`
+(a fencing record carrying the owner and its process identity — pid, process
+start time, boot identity — so a stale owner is distinguishable from a live
+one across PID reuse and reboots). A stale owner is fenced only after
+verified quiescence — both the kernel-held lock released **and** no live
+process matching the recorded identity (matching boot identity plus matching
+process start time) — so a live owner is refused even if its flock was
+released. When the platform exposes no boot identity or process start time,
+identity liveness cannot be established and the kernel-held flock alone
+arbitrates. Release rewrites the record to its released state
+before unlocking; if that write or the supervised release event cannot be
+persisted, the kernel lock is still released but the command reports a named
+release failure rather than a false success. See `core/plan-supervision.md`
+for the full contract.
+
 ---
 
 ## Monitoring

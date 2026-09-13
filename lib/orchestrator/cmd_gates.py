@@ -16,6 +16,7 @@ from pathlib import Path
 
 from lib.orchestrator import base, groundtruth, planref
 from lib.orchestrator import state as state_mod
+from lib.supervisor import lock as lock_mod
 
 # Populated by the entrypoint immediately after import (design D3).
 def _entry():
@@ -170,6 +171,26 @@ def cmd_reset(args: argparse.Namespace) -> int:
 
     plan_path = planref.resolve_plan(repo, args.plan)
     cfg = planref.load_plan(planref._resolve_plan_path(repo, plan_path), repo=repo)
+
+    # Acquire the worktree execution lock after plan resolution and before any
+    # state mutation, releasing on every exit path.
+    try:
+        with lock_mod.acquire(
+            repo, owner=f"opsx-plan reset ({cfg['name']})", owner_kind="ordinary"
+        ):
+            return _cmd_reset_body(args, repo, cfg)
+    except lock_mod.SupervisedOwnershipError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except lock_mod.LockContentionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except lock_mod.LockReleaseError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+def _cmd_reset_body(args: argparse.Namespace, repo: Path, cfg: dict) -> int:
     state = state_mod.load_state(repo, cfg["name"])
 
     if args.failed:

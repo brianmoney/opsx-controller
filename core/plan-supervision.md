@@ -416,6 +416,98 @@ supervised job for a worktree that already has an active job is refused with a
 named `DuplicateJobError`, and the existing job is left unchanged. A new
 registration becomes legal only once the prior job reaches a terminal state.
 
+## Worktree execution lock
+
+Permanent job ownership (the ledger's ownership fields and single-job
+invariant above) is distinct from the **worktree execution lock**. Ownership
+is durable ledger state: registering, owning, pausing, or completing a job
+changes ledger records, never a lock file, and releasing the execution lock
+never releases or alters ownership. The execution lock is ephemeral
+arbitration held only while a mutating command executes. A supervised job
+waiting on a human approval retains its permanent ownership while holding no
+execution lock, so the wait cannot block an approval.
+
+The lock is two files under `.opsx-plan/` in the worktree:
+
+- `.opsx-plan/execution.lock` — a dedicated, never-renamed inode the holder
+  `flock(LOCK_EX)`s for the command's lifetime. The kernel releases it when
+  the holder dies, so a free flock is the necessary arbitration for a new
+  acquirer; but a released flock is not by itself proof of quiescence, because
+  the prior owner may have released or inherited the descriptor away while its
+  process is still alive. The recorded identity must also be quiesced before
+  takeover.
+- `.opsx-plan/execution-lock.json` — the fencing record, written with atomic
+  temp-file-then-rename. It carries the owner label, owner kind
+  (`ordinary`/`supervised`), optional job id, process identity, host,
+  acquisition timestamp, and a `state` that is `held` while the owner holds
+  the lock and rewritten to `released` (identity preserved) *before* the
+  kernel lock is released.
+
+Splitting the two files matters: renaming a record over a flock'ed path would
+hand later openers a different inode and break mutual exclusion. With a
+stable lock inode, `flock` arbitrates contention while the fencing record
+carries the identity used to decide whether a prior holder is quiesced.
+
+### Mutual exclusion and acquisition set
+
+At most one mutating process per worktree holds the execution lock at any
+time. A contended acquirer is refused fail-fast with a named
+`LockContentionError` (or `SupervisedOwnershipError` when the recorded holder
+is supervised) rather than waiting or proceeding unlocked. The acquisition
+set is `run`, `reset`, and the single-change handler shared by `opsx-run` and
+its alias `opsx-plan run-one`; a command exposed under multiple names acquires
+the same lock. Future supervised mutating paths (such as supervised recovery)
+acquire the same lock when introduced. Approval/acceptance receipts and the
+read-only diagnostics (`doctor`, `status`, `logs`, `report`, `dashboard`)
+never acquire it.
+
+### Fencing identity, not a bare PID
+
+The record carries the owning process id, its process start time
+(`/proc/<pid>/stat` field 22), and the host boot identity
+(`/proc/sys/kernel/random/boot_id`). A bare PID is **never** proof of
+ownership or liveness. A record from a different boot is always stale. On the
+current boot, a holder is live while **both** identity discriminators match a
+live process: the recorded boot identity equals the current boot identity and
+the recorded start time equals the observed start time for that PID. That
+liveness is independent of whether the kernel-held lock is still held. A reused
+PID with a different start time never matches. When the platform exposes no
+boot identity or no process start time, identity liveness cannot be
+established and the kernel-held flock is the only arbitration; a bare PID is
+still never proof of ownership or liveness.
+
+### Quiesced-verified takeover
+
+Takeover of a stale lock happens only after the acquirer verifies the
+previous worker is quiesced: the kernel-held flock is no longer held **and** no
+live process matches the recorded identity. Takeover of a live owner is
+refused with a named error and the owner's work is not interrupted, including
+when the flock has already been released but the recorded identity is still
+live. Every takeover is recorded so the fencing history shows which owner was
+fenced and which replaced it. A takeover is classified as a fencing **only**
+when the prior record was not cleanly released (`state == "held"`): a clean
+release rewrites the record to `released` before the kernel lock is released,
+and a subsequent acquisition of a cleanly released or absent record records an
+ordinary acquisition rather than a fencing.
+
+### Fencing persistence and receipt exclusion
+
+For a registered supervised job, every acquisition, release, and takeover is
+persisted in the supervisor ledger as an insert-only fencing record against
+that job, carrying the process identity and boot identity, so a later
+reconstitution can reconstruct who last held the worktree. Fencing records
+describe *executions* and never reassign ownership, which stays on the job
+row. An ordinary, unsupervised run creates, opens, and requires none of these
+records: its lock acquisition is operable without the ledger and carries no
+backend dependency.
+
+Approval, acceptance, and pause/steer receipts never require acquiring or
+waiting for the execution lock. For supervised jobs these receipts are (or, in
+the broker change, become) durable broker database transactions with a
+durable wake-up for the owning job, so a human wait that retains permanent
+ownership never blocks an approval, and a receipt recorded while another
+process holds the lock is not lost.
+
 ## Separation from execution state
 
 The supervisor ledger is storage separate from the authoritative JSON
@@ -434,7 +526,9 @@ execution state under `.opsx-plan/`:
 
 Ownership is recorded on the job as the owner label plus, where the platform
 provides them, the owner principal, host, and boot identity. These fields
-fence which process currently owns the job and survive restarts. The broker
-and process-singleton changes build on these fields; arbitration between
-mutating processes (the worktree execution lock) is a later change, and the
-ledger itself only provides transactional writes.
+fence which process currently owns the job and survive restarts. Permanent job
+ownership is distinct from the ephemeral
+[worktree execution lock](#worktree-execution-lock), which is held only while
+a mutating command executes and is recorded separately (in the lock's fencing
+record and, for supervised jobs, as ledger fencing records). The ledger itself
+only provides transactional writes.

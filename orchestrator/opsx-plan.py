@@ -90,6 +90,7 @@ try:
     )
     from lib.orchestrator import cost as cost_mod
     from lib.orchestrator import state as state_mod
+    from lib.supervisor import lock as lock_mod
 except ModuleNotFoundError as exc:  # pragma: no cover
     sys.exit(f"opsx-plan requires the lib.orchestrator runtime package: {exc}")
 base._RUNTIME_ROOTS = _RUNTIME_ROOTS
@@ -2374,10 +2375,33 @@ def cmd_run(args: argparse.Namespace) -> int:
     except base.PlanError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    # Acquire the worktree execution lock after plan resolution and before any
+    # state mutation. The lock is released on every exit path, including the
+    # SIGINT handler (a context manager's finally runs on SystemExit).
+    try:
+        with lock_mod.acquire(
+            repo, owner=f"opsx-plan run ({cfg['name']})", owner_kind="ordinary"
+        ):
+            return _cmd_run_body(args, repo, plan_src, cfg)
+    except lock_mod.SupervisedOwnershipError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except lock_mod.LockContentionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except lock_mod.LockReleaseError as exc:
+        # The flock is already released; surface the non-durable release so the
+        # invocation cannot be mistaken for a clean success.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+def _cmd_run_body(args: argparse.Namespace, repo: Path, plan_src: str, cfg: dict) -> int:
     # Auto-activate when an explicit path was supplied (only after load_plan
     # succeeds to avoid rewriting the pointer on failed explicit runs).
     if args.plan:
         try:
+            plan_abs = planref._resolve_plan_path(repo, plan_src)
             rel = str(plan_abs.relative_to(repo))
             write_active_plan(repo, rel)
             base.log(f"active plan set to: {rel}")

@@ -32,8 +32,13 @@ from typing import Any, Iterable, Mapping
 from lib.supervisor import clock
 from lib.supervisor import model_policy
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 CURRENT_POLICY_VERSION = 1
+
+# Fencing-record events. A fencing record describes one execution-lock
+# acquisition, release, or takeover for a supervised job; it never reassigns
+# job ownership.
+FENCING_EVENTS = ("acquired", "released", "fenced")
 
 JOB_STATES = ("registered", "active", "paused", "completed", "failed", "cancelled")
 TERMINAL_JOB_STATES = ("completed", "failed", "cancelled")
@@ -299,8 +304,40 @@ def _migrate_0_to_1(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+_SCHEMA_V2_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS fencing_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id INTEGER NOT NULL REFERENCES jobs (id),
+        event TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        pid INTEGER,
+        process_start REAL,
+        boot_id TEXT,
+        host TEXT,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_fencing_records_job
+        ON fencing_records (job_id)
+    """,
+)
+
+
+def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
+    """Add the insert-only, execution-scoped ``fencing_records`` table.
+
+    Fencing records describe executions only; permanent job ownership stays on
+    the job row and is never reassigned by this table.
+    """
+    for statement in _SCHEMA_V2_STATEMENTS:
+        conn.execute(statement)
+
+
 MIGRATIONS: dict[int, Any] = {
     1: _migrate_0_to_1,
+    2: _migrate_1_to_2,
 }
 
 
@@ -728,6 +765,51 @@ class Ledger:
         return list(
             self._conn.execute(
                 "SELECT * FROM incidents WHERE job_id = ? ORDER BY id", (job_id,)
+            )
+        )
+
+    # -- fencing records ---------------------------------------------------
+
+    def record_fencing(
+        self,
+        job_id: int,
+        *,
+        event: str,
+        owner: str,
+        pid: int | None = None,
+        process_start: float | None = None,
+        boot_id: str | None = None,
+        host: str | None = None,
+    ) -> int:
+        """Append one execution-lock fencing record against *job_id*.
+
+        *event* is one of ``acquired``, ``released``, or ``fenced``. Records
+        are insert-only and describe executions; they never reassign job
+        ownership. The write uses the same explicit-transaction discipline as
+        the other journal writes.
+        """
+        if event not in FENCING_EVENTS:
+            raise LedgerError(f"unknown fencing event: {event}")
+        self.get_job(job_id)
+        now = _utcnow()
+        with self._transaction():
+            cursor = self._conn.execute(
+                """
+                INSERT INTO fencing_records (
+                    job_id, event, owner, pid, process_start, boot_id, host, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (job_id, event, owner, pid, process_start, boot_id, host, now),
+            )
+            fencing_id = int(cursor.lastrowid)
+        return fencing_id
+
+    def list_fencing(self, job_id: int) -> list[sqlite3.Row]:
+        """Return the fencing records for *job_id* in insertion order."""
+        return list(
+            self._conn.execute(
+                "SELECT * FROM fencing_records WHERE job_id = ? ORDER BY id",
+                (job_id,),
             )
         )
 

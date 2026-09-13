@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change add-active-plan-resolution. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: Operators can archive a completed plan
 
 The orchestrator SHALL provide `opsx-plan archive-plan <plan.toml>` that retires a completed authored plan by moving its compiled manifest, and its markdown source when present, into `openspec/plans/archived/`.
@@ -760,3 +762,100 @@ stance.
 - **THEN** it shows the capability report, names the unsupported-host error,
   states that no downgrade or automatic provisioning occurs, and points to
   the manual provisioning step
+
+### Requirement: Mutating commands acquire the worktree execution lock
+
+The mutating commands `opsx-plan run`, `opsx-plan reset`, and the
+single-change handler shared by `opsx-run` and its documented alias
+`opsx-plan run-one` SHALL acquire the worktree execution lock before
+performing any mutating work and SHALL hold it for the duration of the
+command, releasing it on every exit path, normal or failed.
+
+When the lock is already held, the command SHALL fail with a named
+lock-contention error and a non-zero exit code rather than waiting for the
+lock or proceeding without it. Future supervised mutating paths (such as
+supervised recovery) SHALL acquire the same lock when they are introduced.
+
+#### Scenario: A mutating command holds the lock for its duration
+
+- **WHEN** an operator runs `opsx-plan run`, `opsx-plan reset`, `opsx-run`,
+  or `opsx-plan run-one` and no other process holds the worktree lock
+- **THEN** the command acquires the lock before mutating anything, holds it
+  until it exits, and releases it on both success and failure
+
+#### Scenario: Both names of the single-change command serialize
+
+- **WHEN** `opsx-run` holds the worktree lock and `opsx-plan run-one` is
+  invoked in the same worktree (or the reverse)
+- **THEN** the second invocation exits non-zero with the named
+  lock-contention error and performs no mutating work, because both names
+  dispatch to the same handler and acquire the same lock
+
+#### Scenario: Contention fails fast with a named error
+
+- **WHEN** a mutating command is invoked while another process holds the
+  worktree lock
+- **THEN** it exits non-zero with a named lock-contention error, performs no
+  mutating work, and leaves the holder undisturbed
+
+### Requirement: An ordinary mutating command is refused when it would race a supervised execution
+
+When the worktree lock is held by a supervised execution, an ordinary
+mutating command (`run`, `reset`, `opsx-run`, or its alias
+`opsx-plan run-one`) SHALL be refused with a documented named error stating
+that the worktree is owned by a supervised execution. This refusal is the one
+intentional behavior change for legacy runs; every other legacy behavior
+SHALL be preserved.
+
+#### Scenario: Ordinary run refused during supervised execution
+
+- **WHEN** a supervised execution holds the worktree lock and an operator
+  runs `opsx-plan run` or `opsx-plan reset` in that worktree
+- **THEN** the command exits non-zero with the documented named
+  supervised-ownership error and performs no mutating work
+
+#### Scenario: Ordinary run proceeds after the supervised execution releases
+
+- **WHEN** the supervised execution has released the worktree lock
+- **THEN** an ordinary mutating command acquires the lock and proceeds with
+  its normal legacy behavior
+
+### Requirement: Diagnostics and gate commands do not acquire the execution lock
+
+The read-only diagnostic commands `opsx-plan doctor`, `opsx-plan status`,
+`opsx-plan logs`, `opsx-plan report`, and `opsx-plan dashboard` SHALL run
+without acquiring the worktree execution lock, including while another
+process holds it.
+
+The gate commands `opsx-plan approve` and `opsx-plan accept` SHALL record
+their receipts without acquiring the worktree execution lock, so an
+operator can always release a gate while an execution is running or
+waiting.
+
+#### Scenario: Diagnostics run during a held lock
+
+- **WHEN** a mutating command holds the worktree lock
+- **THEN** `doctor`, `status`, `logs`, `report`, and `dashboard` still run
+  to completion in that worktree
+
+#### Scenario: A gate command succeeds during a held lock
+
+- **WHEN** a mutating command holds the worktree lock and a change is
+  awaiting approval
+- **THEN** `opsx-plan approve <change-id>` records the approval without
+  acquiring the lock and without failing for lock contention
+
+### Requirement: Operator documentation describes the execution lock behavior
+
+The operator-facing `opsx-plan` documentation SHALL describe the worktree
+execution lock: which commands acquire it, the named lock-contention error,
+the documented refusal of an ordinary mutating command that would race a
+supervised execution, and that diagnostics and gate commands never block on
+the lock.
+
+#### Scenario: The lock behavior is documented
+
+- **WHEN** an operator reads the documented `opsx-plan` workflow
+- **THEN** it names the lock-acquiring commands, shows the contention and
+  supervised-ownership errors, and states that diagnostics and approvals
+  run without the lock

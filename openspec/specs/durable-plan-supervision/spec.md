@@ -205,8 +205,12 @@ supervision backend for legacy runs.
 The supervision contract SHALL be documented in `core/plan-supervision.md` as
 a client-neutral reference covering: the job, action, and incident lifecycles;
 journal-before-side-effects ordering; evidence reconciliation; the ownership
-fields on each record; the single-supervised-job-per-worktree invariant; and
-the trusted-location path semantics consistent with the isolation boundary.
+fields on each record; the single-supervised-job-per-worktree invariant; the
+trusted-location path semantics consistent with the isolation boundary; the
+distinction between permanent job ownership and the worktree execution lock;
+the fencing-record identity semantics (process start time and boot identity,
+not a bare PID); quiesced-verified takeover; and the exclusion of approval
+and acceptance receipts from the execution lock.
 
 #### Scenario: The reference covers the contract elements
 
@@ -728,3 +732,244 @@ so a repo-controlled script cannot act as the trusted identity.
   active
 - **THEN** it executes under the worker identity and cannot act as the trusted
   service identity
+
+### Requirement: Permanent job ownership is distinct from the worktree execution lock
+
+Permanent ownership of a supervised job SHALL be durable ledger state,
+independent of any lock acquisition: registering, owning, pausing, or
+completing a job changes ledger records, not a lock file. The worktree
+execution lock SHALL be a separate, ephemeral arbitration mechanism held
+only while a mutating command executes.
+
+Releasing the execution lock SHALL NOT release or alter job ownership, and
+holding job ownership SHALL NOT by itself hold the execution lock. A
+supervised job waiting on a human approval SHALL retain its permanent
+ownership without holding the execution lock, so the wait cannot block an
+approval or another job's diagnostics.
+
+#### Scenario: Ownership survives lock release
+
+- **WHEN** a supervised execution acquires the worktree execution lock,
+  finishes its mutating work, and releases the lock
+- **THEN** the job's permanent ownership record in the ledger is unchanged
+  and the job remains the worktree's owner
+
+#### Scenario: A human wait holds ownership without the lock
+
+- **WHEN** a supervised job stops at a human-only gate and records the wait
+- **THEN** the job retains permanent ownership of the worktree while holding
+  no execution lock, so an approval receipt can be recorded without waiting
+  for a lock
+
+### Requirement: The worktree execution lock enforces mutual exclusion between mutating processes
+
+At most one mutating process per worktree SHALL hold the execution lock at
+any time. A mutating process that cannot acquire the lock because another
+process holds it SHALL be refused with a named lock-contention error rather
+than waiting, proceeding unlocked, or corrupting the holder's state. This
+SHALL hold regardless of the command name a mutating command is invoked
+under: a command exposed under multiple names (for example `opsx-run` and
+`opsx-plan run-one`) SHALL acquire the same lock.
+
+The lock SHALL refuse a second supervised execution for the same worktree
+independently of job registration, so the single-supervised-job-per-worktree
+invariant holds at the execution layer even if registration state is
+bypassed.
+
+#### Scenario: A second mutating process is refused
+
+- **WHEN** one process holds the worktree execution lock and a second
+  mutating process attempts to acquire it for the same worktree
+- **THEN** the second process fails with a named lock-contention error and
+  performs no mutating work
+
+#### Scenario: A second supervised execution for the worktree is refused
+
+- **WHEN** a supervised execution holds the lock for a worktree and another
+  supervised execution for the same worktree attempts to acquire it
+- **THEN** the acquisition is refused with a named error, regardless of how
+  the second execution was started
+
+### Requirement: Lock ownership is fenced by process identity, not a bare PID
+
+The execution lock SHALL record its owner as a fencing record carrying the
+owning process id, the process start time, and the boot identity of the
+host, so a stale owner remains distinguishable from a live one across PID
+reuse and reboots. A bare PID SHALL NOT be treated as proof of ownership or
+liveness.
+
+A holder whose recorded boot identity differs from the current boot SHALL be
+treated as stale. On the current boot, a holder whose recorded identity matches
+a live process SHALL be treated as live, whether or not its kernel-held file
+lock is still held; the kernel-held lock remains the arbitration for
+contention, and its release alone SHALL NOT be accepted as proof of quiescence
+while a matching live process remains. On a platform that does not expose a
+process start time or boot identity, liveness SHALL be established by the
+kernel-held lock alone; a bare PID SHALL still never be treated as proof of
+ownership or liveness.
+
+#### Scenario: PID reuse does not impersonate the owner
+
+- **WHEN** a fencing record names a process id that has since been reused by
+  an unrelated process with a different start time
+- **THEN** the recorded owner is not treated as live on the strength of the
+  reused PID alone
+
+#### Scenario: A record from a previous boot is stale
+
+- **WHEN** a fencing record carries a boot identity different from the
+  current boot identity
+- **THEN** the recorded owner is treated as stale regardless of whether a
+  process with the recorded PID exists
+
+#### Scenario: A released lock with a live recorded identity is not quiescence
+
+- **WHEN** a held fencing record names a process identity that is still live
+  on the current boot but the kernel-held flock has been released
+- **THEN** the recorded owner is still treated as live and takeover is
+  refused with a named error rather than fenced
+
+### Requirement: Stale owners are fenced only after verified quiescence
+
+Takeover of a stale execution lock SHALL happen only after the acquiring
+process verifies the previous worker is quiesced: the kernel-held file lock
+is no longer held, and no live process matching the recorded fencing
+identity remains. Takeover while the previous owner is live SHALL be
+refused with a named error, including when the kernel-held lock has been
+released but the recorded process identity is still live. The refusal SHALL
+apply for every owner kind.
+
+Every takeover SHALL be recorded, so the fencing history shows which owner
+was fenced and which owner replaced it. A takeover SHALL be classified as a
+fencing only when the prior fencing record was not cleanly released: a clean
+release SHALL rewrite the record to a released state before the kernel lock
+is released, and a subsequent acquisition of a cleanly released or absent
+record SHALL record an ordinary acquisition rather than a fencing.
+
+#### Scenario: Verified-quiesced takeover succeeds
+
+- **WHEN** the previous holder exited without cleanly releasing (its record
+  is still held), its kernel-held lock is released, no process matches its
+  recorded identity, and a new mutating process acquires the lock
+- **THEN** the acquisition succeeds and records that the prior owner was
+  fenced
+
+#### Scenario: Takeover of a live owner is refused
+
+- **WHEN** the previous holder is still alive and holding the kernel-held
+  lock
+- **THEN** the acquiring process is refused with a named error and the live
+  owner's work is not interrupted
+
+#### Scenario: A free flock with a live identity is not taken over
+
+- **WHEN** the previous holder's flock has been released but its recorded
+  process identity still matches a live process on the current boot
+- **THEN** the acquisition is refused with a named error and no `fenced`
+  event is recorded, for both ordinary and supervised owners
+
+#### Scenario: A clean handoff is not recorded as fencing
+
+- **WHEN** a holder releases the execution lock cleanly and a new mutating
+  process subsequently acquires it
+- **THEN** the handoff is recorded as a release followed by a normal
+  acquisition, and the prior owner is not reported as fenced
+
+### Requirement: Supervised executions persist fencing records in the supervisor ledger
+
+For a registered supervised job, every execution-lock acquisition, release,
+and takeover SHALL be persisted in the supervisor ledger as a fencing record
+against that job, carrying the process identity and boot identity, so a
+later reconstitution can reconstruct who last held the worktree. The ledger
+schema SHALL evolve forward-only to hold these records, and opening an older
+ledger SHALL migrate it.
+
+An ordinary, unsupervised run SHALL NOT create, open, or require these
+ledger records.
+
+#### Scenario: A supervised acquisition is journaled
+
+- **WHEN** a supervised execution acquires the worktree execution lock
+- **THEN** the ledger records a fencing record against the job with the
+  acquiring process identity and boot identity, and the record survives a
+  ledger reopen
+
+#### Scenario: An older ledger migrates to hold fencing records
+
+- **WHEN** a ledger written before fencing records existed is opened
+- **THEN** it migrates forward in one transaction, existing job, action,
+  incident, and policy records are preserved, and fencing records can be
+  written
+
+### Requirement: Lock release is durable or it is reported as failed
+
+Releasing the execution lock SHALL rewrite the fencing record to its
+released state and persist the supervised `released` event when a ledger is
+supplied, and SHALL NOT treat either step as best-effort. The kernel-held
+lock and descriptor SHALL always be released so exclusion is never leaked,
+but if the released record cannot be written or the ledger event cannot be
+persisted, the release SHALL surface a named failure after cleanup rather
+than returning as if the release succeeded.
+
+#### Scenario: A failed release record write is surfaced
+
+- **WHEN** the holder releases the lock and rewriting the fencing record to
+  its released state fails
+- **THEN** the kernel-held lock is still released, and a named release
+  failure is raised instead of a silent success
+
+#### Scenario: A failed release journal write is surfaced
+
+- **WHEN** a supervised holder releases the lock and persisting the
+  `released` fencing event fails
+- **THEN** the kernel-held lock is still released and the on-disk record is
+  still rewritten to released, and a named release failure is raised
+
+### Requirement: Approval and acceptance receipts do not require the execution lock
+
+Recording an approval, an acceptance, or a pause/steer request SHALL NOT
+require acquiring or waiting for the worktree execution lock. For
+supervised jobs these receipts SHALL be durable broker database
+transactions with a durable wake-up for the owning job, so a human wait
+that retains permanent ownership never blocks an approval, and a receipt
+recorded while another process holds the lock is not lost.
+
+#### Scenario: A receipt is recorded during a held lock
+
+- **WHEN** the worktree execution lock is held by a running execution and an
+  approval or acceptance receipt is recorded for that worktree's job
+- **THEN** the receipt is durably recorded without acquiring the lock and
+  the owning job is woken to observe it
+
+#### Scenario: A human wait cannot block approval
+
+- **WHEN** a supervised job is waiting on a human-only approval and holds
+  no execution lock
+- **THEN** recording the operator's approval requires no lock acquisition
+  and cannot deadlock against the waiting job
+
+### Requirement: Ordinary runs use the lock without the supervision backend
+
+An ordinary, unsupervised mutating run SHALL acquire the worktree execution
+lock without opening or requiring the supervisor ledger and without running
+under a separate principal. Aside from the new contention and supervised-race
+refusals, ordinary runs SHALL behave exactly as before.
+
+An ordinary mutating run that would race a supervised execution — one whose
+worktree lock is held by a supervised owner — SHALL be refused with a
+documented named error identifying the supervised ownership, rather than
+proceeding or waiting.
+
+#### Scenario: A legacy run works with no ledger present
+
+- **WHEN** an ordinary `opsx-plan run` executes in a repository with no
+  registered supervised job and no reachable supervisor ledger
+- **THEN** the run acquires the lock, completes as before, and never opens
+  or requires the ledger
+
+#### Scenario: An ordinary run racing a supervised execution is refused
+
+- **WHEN** a supervised execution holds the worktree lock and an operator
+  runs an ordinary mutating command in the same worktree
+- **THEN** the command fails with a documented named error stating the
+  worktree is owned by a supervised execution

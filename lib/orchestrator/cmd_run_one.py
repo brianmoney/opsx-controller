@@ -17,6 +17,7 @@ from pathlib import Path
 
 from lib.orchestrator import base, groundtruth, planref
 from lib.orchestrator import state as state_mod
+from lib.supervisor import lock as lock_mod
 
 # Populated by the entrypoint immediately after import (design D3).
 def _entry():
@@ -56,6 +57,31 @@ def cmd_run_one(args: argparse.Namespace) -> int:
         return 2
 
     cfg = _entry().build_single_change_config(repo, change_id)
+    # Both `opsx-run` and `opsx-plan run-one` dispatch here, so the lock lives
+    # in this shared handler; wrapping only one name would leave the other
+    # alias unserialized. Acquire after config resolution and before the first
+    # state mutation, releasing on every exit path.
+    try:
+        with lock_mod.acquire(
+            repo,
+            owner=f"opsx-run {change_id}",
+            owner_kind="ordinary",
+        ):
+            return _cmd_run_one_body(args, repo, change_id, cfg)
+    except lock_mod.SupervisedOwnershipError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except lock_mod.LockContentionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except lock_mod.LockReleaseError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+def _cmd_run_one_body(
+    args: argparse.Namespace, repo: Path, change_id: str, cfg: dict
+) -> int:
     state = state_mod.load_state(repo, cfg["name"])
     signal.signal(signal.SIGINT, _entry().handle_sigint)
 
