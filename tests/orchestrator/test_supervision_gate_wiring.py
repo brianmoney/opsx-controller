@@ -8,6 +8,7 @@ call site, using a registered supervised job and a patched stage dispatcher.
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 import os
@@ -16,10 +17,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from lib.supervisor import budgets, ledger, model_policy
+from lib.supervisor import budgets, clock, ledger, model_policy
 
 SCRIPT = Path(__file__).resolve().parents[2] / "orchestrator" / "opsx-plan.py"
 
@@ -366,6 +368,161 @@ class ReservationWiringTests(SupervisedGateTestCase):
         self.assertEqual(result, "budget")
         self.assertEqual(invoked, [])
 
+    def _sidecar_env_keys(self) -> list[str]:
+        sample = self.opsx_plan._build_usage_sidecar_env(
+            "p", "r", "c", "s", 1, Path("/tmp/sidecar-sample.jsonl")
+        )
+        self.assertIn("OPSX_USAGE_PATH", sample)
+        return list(sample.keys())
+
+    def test_blocked_direct_dispatch_restores_clean_environment(self) -> None:
+        """A budget-blocked direct dispatch leaves a clean env clean.
+
+        Regression for the review finding: the loop arms the OPSX_* sidecar
+        variables before the budget gate, so a blocked reservation must still
+        restore the environment. Variables absent before the run must not be
+        materialized.
+        """
+        self.write_authored_change()
+        self.register_job(
+            policy=_policy(total_cost_usd=1.0, per_action_cost_usd=1000.0)
+        )
+        self.enable_gate_env()
+        for key in self._sidecar_env_keys():
+            os.environ.pop(key, None)
+        invoked: list[str] = []
+        self.opsx_plan.invoke_direct_stage = lambda *a, **k: invoked.append("called")
+        result = self.run_change()
+        self.assertEqual(result, "budget")
+        self.assertEqual(invoked, [])
+        for key in self._sidecar_env_keys():
+            self.assertNotIn(
+                key, os.environ,
+                f"{key} must be removed when the budget gate blocks dispatch",
+            )
+
+    def test_blocked_direct_dispatch_restores_prior_values(self) -> None:
+        """A budget-blocked direct dispatch restores pre-existing sidecar values."""
+        self.write_authored_change()
+        self.register_job(
+            policy=_policy(total_cost_usd=1.0, per_action_cost_usd=1000.0)
+        )
+        self.enable_gate_env()
+        for key in self._sidecar_env_keys():
+            os.environ.pop(key, None)
+        prior = {
+            "OPSX_USAGE_PATH": "/prior/usage.jsonl",
+            "OPSX_PLAN_NAME": "prior-plan",
+            "OPSX_RUN_ID": "prior-run",
+            "OPSX_CHANGE_ID": "prior-change",
+            "OPSX_STAGE": "prior-stage",
+            "OPSX_ROUND": "7",
+        }
+        patcher = mock.patch.dict(os.environ, prior)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        invoked: list[str] = []
+        self.opsx_plan.invoke_direct_stage = lambda *a, **k: invoked.append("called")
+        result = self.run_change()
+        self.assertEqual(result, "budget")
+        self.assertEqual(invoked, [])
+        for key, value in prior.items():
+            self.assertEqual(os.environ.get(key), value)
+
+    def _gate(self) -> dict:
+        return {
+            "ledger": self.ledger,
+            "job_id": 1,
+            "policy": self.ledger.current_policy(1),
+        }
+
+    def test_exhausted_reservation_leaves_no_phantom_dispatch(self) -> None:
+        """A refused reservation must leave no dispatched action or interval.
+
+        Regression for the review finding: the reservation is durably written
+        before the dispatch is recorded, so budget exhaustion blocks the
+        dispatch without charging execution-elapsed deadline time.
+        """
+        self.write_authored_change()
+        self.register_job(
+            policy=_policy(total_cost_usd=1.0, per_action_cost_usd=1000.0)
+        )
+        entry = self.opsx_plan.supervised_gate_reserve(
+            self.repo, self.cfg, self._gate(), self.cid, "implement", 1,
+            {"escalation": {"active": False}}, "run-1",
+        )
+        self.assertIn("blocked", entry)
+        self.assertEqual(entry["last_result"], "budget_exhausted")
+        self.assertEqual(self.ledger.reservations_for_job(1), [])
+        self.assertEqual(self.ledger.dispatch_intervals(1), [])
+        self.assertEqual(
+            self.opsx_plan.execution_elapsed_minutes(self.ledger, 1), 0.0
+        )
+
+    def test_transient_reservation_failure_leaves_one_dispatched_reservation(
+        self,
+    ) -> None:
+        """A retried reservation failure yields exactly one dispatch+reservation."""
+        self.write_authored_change()
+        self.register_job()
+        attempts = {"n": 0}
+        real_reserve = budgets.reserve
+
+        def flaky_reserve(*args, **kwargs):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return real_reserve(*args, **kwargs)
+
+        with mock.patch.object(self.opsx_plan.budget_mod, "reserve",
+                               side_effect=flaky_reserve), \
+                mock.patch.object(self.opsx_plan.budget_mod, "backoff_delay",
+                                  return_value=0.0):
+            entry = self.opsx_plan.supervised_gate_reserve(
+                self.repo, self.cfg, self._gate(), self.cid, "implement", 1,
+                {"escalation": {"active": False}}, "run-1",
+            )
+        self.assertEqual(attempts["n"], 2)
+        self.assertNotIn("blocked", entry)
+        reservations = self.ledger.reservations_for_job(1)
+        self.assertEqual(len(reservations), 1)
+        self.assertEqual(reservations[0]["state"], "reserved")
+        self.assertEqual(len(self.ledger.dispatch_intervals(1)), 1)
+        # A dispatch retried through a transient failure accrues no phantom
+        # elapsed time beyond its single real dispatch interval.
+        self.assertGreaterEqual(
+            self.opsx_plan.execution_elapsed_minutes(self.ledger, 1), 0.0
+        )
+
+    def test_exhausted_reservation_retries_leave_no_dispatch_or_elapsed(
+        self,
+    ) -> None:
+        """Bounded retries that all fail leave no dispatch, reservation, or elapsed."""
+        self.write_authored_change()
+        self.register_job()
+        attempts = {"n": 0}
+
+        def always_fail(*args, **kwargs):
+            attempts["n"] += 1
+            raise sqlite3.OperationalError("database is locked")
+
+        with mock.patch.object(self.opsx_plan.budget_mod, "reserve",
+                               side_effect=always_fail), \
+                mock.patch.object(self.opsx_plan.budget_mod, "backoff_delay",
+                                  return_value=0.0):
+            entry = self.opsx_plan.supervised_gate_reserve(
+                self.repo, self.cfg, self._gate(), self.cid, "implement", 1,
+                {"escalation": {"active": False}}, "run-1",
+            )
+        self.assertGreaterEqual(attempts["n"], 1)
+        self.assertIn("blocked", entry)
+        self.assertEqual(entry["last_result"], "reservation_failed")
+        self.assertEqual(self.ledger.reservations_for_job(1), [])
+        self.assertEqual(self.ledger.dispatch_intervals(1), [])
+        self.assertEqual(
+            self.opsx_plan.execution_elapsed_minutes(self.ledger, 1), 0.0
+        )
+
     def test_bounded_attempts_refuses_identical_failures(self) -> None:
         self.write_authored_change()
         self.register_job(policy=_policy(max_incident_attempts=1))
@@ -449,6 +606,544 @@ class ReservationWiringTests(SupervisedGateTestCase):
         self.assertGreaterEqual(
             self.ledger.incident_attempt_count(1, retry_signature), 1
         )
+
+    def test_unavailable_ledger_blocks_without_spawning(self) -> None:
+        """A registered job whose supervision backend is unreadable blocks.
+
+        The gate must fail closed: the change is left pending with a budget
+        state and no stage dispatch happens, rather than silently taking the
+        unregistered legacy path.
+        """
+        self.write_authored_change()
+        self.register_job()
+        # Point at a path that exists but is not a usable ledger file, so the
+        # open fails while a supervision backend is clearly configured.
+        broken = self.storage / "broken.sqlite3"
+        broken.write_bytes(b"not a sqlite database")
+        patcher = mock.patch.dict(
+            os.environ, {"OPSX_SUPERVISOR_STATE_FILE": str(broken)}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        invoked: list[str] = []
+        self.opsx_plan.invoke_direct_stage = lambda *a, **k: invoked.append("called")
+        result = self.run_change()
+        self.assertEqual(result, "budget")
+        self.assertEqual(invoked, [], "no dispatch may run without a reservation")
+        rec = self.opsx_plan.state_mod.rec(self.state, self.cid)
+        self.assertEqual(rec.get("last_result"), "supervision_gate_unavailable")
+
+
+class CreateStageTelemetryTests(SupervisedGateTestCase):
+    """End-to-end create-dispatch telemetry and reconciliation (fix round 2)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.cfg["create_invoke"] = (
+            f"python3 -c \"import json,sys; "
+            f"print(json.dumps({{'status':'created','usage':"
+            f"{{'input_tokens':50,'output_tokens':25}}}}))\""
+        )
+        self.cfg["changes"][self.cid]["create_invoke"] = self.cfg["create_invoke"]
+        self.cfg["created_check"] = ""
+        self.cfg["require_clean_tracked"] = False
+        self._saved_run_stage = self.opsx_plan.run_stage
+
+    def tearDown(self) -> None:
+        self.opsx_plan.run_stage = self._saved_run_stage
+        super().tearDown()
+
+    def _fake_run_stage(self, usage: dict | None, outcome: str = "exited"):
+        def fake(repo, cfg, cid, stage, invoke_tpl, timeout_minutes, attempt):
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, attempt)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            body = "create output\n"
+            if usage is not None:
+                body += json.dumps({
+                    "status": "created",
+                    "usage": usage,
+                    "model": {"provider": "openai", "model_id": "gpt-4o"},
+                }) + "\n"
+            log_path.write_text(body, encoding="utf-8")
+            # Simulate the change being authored by the create dispatch so the
+            # run loop can verify creation.
+            cdir = repo / "openspec" / "changes" / cid
+            cdir.mkdir(parents=True, exist_ok=True)
+            (cdir / "proposal.md").write_text("## Why\n", encoding="utf-8")
+            (cdir / "tasks.md").write_text("- [ ] 1.1 task\n", encoding="utf-8")
+            return outcome, log_path
+
+        self.opsx_plan.run_stage = fake
+
+    def _create_reservation(self):
+        reservations = self.ledger.reservations_for_job(1)
+        create = [r for r in reservations if r["role"] == "supervised_author"]
+        self.assertEqual(len(create), 1)
+        return create[0]
+
+    def test_successful_create_emits_role_telemetry_and_reconciles(self) -> None:
+        self.register_job()
+        self.enable_gate_env()
+        self._fake_run_stage(usage={"input_tokens": 50, "output_tokens": 25})
+        # Capture the reservation state right after the create dispatch.
+        result = self.opsx_plan.dispatch_create_stage(
+            self.repo, self.cfg, self.state, self.cid, 1,
+            self.cfg["create_invoke"],
+            {"escalation": {"active": False}}, "run-1",
+        )
+        self.assertIsInstance(result, tuple)
+        reservation = self._create_reservation()
+        self.assertEqual(reservation["role"], "supervised_author")
+        # Observed usage was reconciled, not zero cost.
+        self.assertEqual(reservation["state"], "reconciled")
+        self.assertEqual(reservation["observed_input_tokens"], 50)
+        self.assertEqual(reservation["observed_output_tokens"], 25)
+        self.assertGreater(reservation["observed_cost_usd"] or 0.0, 0.0)
+        # The create telemetry record carries the supervised_author role.
+        jsonl = (self.repo / ".opsx-plan" / "telemetry" /
+                 f"{self.plan_name}.jsonl")
+        records = [
+            json.loads(line) for line in jsonl.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        create_records = [r for r in records if r.get("stage") == "create"]
+        self.assertTrue(create_records)
+        self.assertEqual(create_records[-1].get("role"), "supervised_author")
+
+    def test_create_without_observed_usage_retains_reservation(self) -> None:
+        self.register_job()
+        self.enable_gate_env()
+        # A create with no parseable usage: the reservation must be retained at
+        # its reserved estimate, never reconciled as free.
+        self._fake_run_stage(usage=None)
+        self.opsx_plan.dispatch_create_stage(
+            self.repo, self.cfg, self.state, self.cid, 1,
+            self.cfg["create_invoke"],
+            {"escalation": {"active": False}}, "run-1",
+        )
+        reservation = self._create_reservation()
+        self.assertEqual(reservation["state"], "retained")
+        consumption = self.ledger.consumption_for_job(1)
+        self.assertGreater(consumption["cost_usd"], 0.0)
+        self.assertGreater(consumption["elapsed_minutes"], 0.0)
+
+    def _sidecar_env_keys(self) -> list[str]:
+        sample = self.opsx_plan._build_usage_sidecar_env(
+            "p", "r", "c", "s", 1, Path("/tmp/sidecar-sample.jsonl")
+        )
+        keys = list(sample.keys())
+        self.assertIn("OPSX_USAGE_PATH", keys)
+        return keys
+
+    def test_sidecar_cleanup_removes_vars_absent_before_create(self) -> None:
+        """A clean environment stays clean: absent vars are not materialized."""
+        self.register_job()
+        self.enable_gate_env()
+        self._fake_run_stage(usage={"input_tokens": 5, "output_tokens": 5})
+        keys = self._sidecar_env_keys()
+        for key in keys:
+            os.environ.pop(key, None)
+        self.opsx_plan.dispatch_create_stage(
+            self.repo, self.cfg, self.state, self.cid, 1,
+            self.cfg["create_invoke"],
+            {"escalation": {"active": False}}, "run-1",
+        )
+        for key in keys:
+            self.assertNotIn(
+                key, os.environ,
+                f"{key} must be removed when it was absent before the create",
+            )
+
+    def test_sidecar_cleanup_restores_prior_values(self) -> None:
+        """Vars present before the create are restored to their prior values."""
+        self.register_job()
+        self.enable_gate_env()
+        self._fake_run_stage(usage={"input_tokens": 5, "output_tokens": 5})
+        prior = {
+            "OPSX_USAGE_PATH": "/prior/usage.jsonl",
+            "OPSX_PLAN_NAME": "prior-plan",
+            "OPSX_RUN_ID": "prior-run",
+            "OPSX_CHANGE_ID": "prior-change",
+            "OPSX_STAGE": "prior-stage",
+            "OPSX_ROUND": "7",
+        }
+        patcher = mock.patch.dict(os.environ, prior)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.opsx_plan.dispatch_create_stage(
+            self.repo, self.cfg, self.state, self.cid, 1,
+            self.cfg["create_invoke"],
+            {"escalation": {"active": False}}, "run-1",
+        )
+        for key, value in prior.items():
+            self.assertEqual(os.environ.get(key), value)
+
+    def test_sidecar_cleanup_mixed_presence(self) -> None:
+        """Present vars are restored while absent vars stay absent."""
+        self.register_job()
+        self.enable_gate_env()
+        self._fake_run_stage(usage={"input_tokens": 5, "output_tokens": 5})
+        for key in self._sidecar_env_keys():
+            os.environ.pop(key, None)
+        patcher = mock.patch.dict(
+            os.environ, {"OPSX_STAGE": "prior-stage", "OPSX_ROUND": "9"}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.opsx_plan.dispatch_create_stage(
+            self.repo, self.cfg, self.state, self.cid, 1,
+            self.cfg["create_invoke"],
+            {"escalation": {"active": False}}, "run-1",
+        )
+        self.assertEqual(os.environ.get("OPSX_STAGE"), "prior-stage")
+        self.assertEqual(os.environ.get("OPSX_ROUND"), "9")
+        for key in ("OPSX_USAGE_PATH", "OPSX_PLAN_NAME", "OPSX_RUN_ID",
+                    "OPSX_CHANGE_ID"):
+            self.assertNotIn(key, os.environ)
+
+
+class CreateRunLoopEndToEndTests(SupervisedGateTestCase):
+    """The real ``_cmd_run_body`` create path accounts and reconciles usage."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._saved_run_stage = self.opsx_plan.run_stage
+        self._saved_run_direct = self.opsx_plan.run_direct_change
+
+    def tearDown(self) -> None:
+        self.opsx_plan.run_stage = self._saved_run_stage
+        self.opsx_plan.run_direct_change = self._saved_run_direct
+        super().tearDown()
+
+    def _write_plan(self, *, name: str) -> Path:
+        plan = self.repo / "plan.toml"
+        plan.write_text(
+            "[plan]\n"
+            f'name = "{name}"\n'
+            'adapter = "opencode"\n'
+            "require_clean_tracked = false\n"
+            "create_timeout_minutes = 1\n"
+            'created_check = ""\n'
+            "review_created = false\n"
+            "skip_warning = true\n"
+            "\n"
+            "[[changes]]\n"
+            f'id = "{self.cid}"\n'
+            'create_invoke = "python3 --version"\n',
+            encoding="utf-8",
+        )
+        return plan
+
+    def _install_stage(self, usage: dict | None) -> None:
+        def fake(repo, cfg, cid, stage, invoke_tpl, timeout_minutes, attempt):
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, attempt)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            body = "create output\n"
+            if usage is not None:
+                body += json.dumps({
+                    "status": "created",
+                    "usage": usage,
+                    "model": {"provider": "openai", "model_id": "gpt-4o"},
+                }) + "\n"
+            log_path.write_text(body, encoding="utf-8")
+            cdir = repo / "openspec" / "changes" / cid
+            cdir.mkdir(parents=True, exist_ok=True)
+            (cdir / "proposal.md").write_text("## Why\n", encoding="utf-8")
+            (cdir / "tasks.md").write_text("- [ ] 1.1 task\n", encoding="utf-8")
+            return "exited", log_path
+
+        self.opsx_plan.run_stage = fake
+        self.opsx_plan.run_direct_change = lambda *a, **k: self.opsx_plan.base.DONE
+
+    def _run(self, plan: Path) -> int:
+        args = argparse.Namespace(
+            repo=str(self.repo), plan=str(plan.relative_to(self.repo)),
+            dry_run=False, only=None, max_changes=1, budget_minutes=0,
+            budget_usd=0, create_only=False, no_branch=True, no_pr=True,
+            skip_openspec=True, skip_warning=False, skip_suggestion=False,
+        )
+        return self.opsx_plan.cmd_run(args)
+
+    def test_cmd_run_create_reconciles_observed_usage(self) -> None:
+        plan_name = "run-add-gate-test"
+        plan = self._write_plan(name=plan_name)
+        job_id = self.ledger.register_job(
+            run_id="run-1", worktree=self.repo, owner="service",
+            policy=_policy(), operator="operator",
+        )
+        self.enable_gate_env()
+        self._install_stage(usage={"input_tokens": 50, "output_tokens": 25})
+        self._run(plan)
+        reservations = self.ledger.reservations_for_job(job_id)
+        create = [r for r in reservations if r["role"] == "supervised_author"]
+        self.assertEqual(len(create), 1)
+        self.assertEqual(create[0]["state"], "reconciled")
+        self.assertEqual(create[0]["observed_input_tokens"], 50)
+        self.assertGreater(create[0]["observed_cost_usd"] or 0.0, 0.0)
+        jsonl = self.repo / ".opsx-plan" / "telemetry" / f"{plan_name}.jsonl"
+        records = [
+            json.loads(line) for line in jsonl.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        create_records = [r for r in records if r.get("stage") == "create"]
+        self.assertTrue(create_records)
+        self.assertEqual(create_records[-1].get("role"), "supervised_author")
+
+    def test_cmd_run_create_without_usage_retains_reservation(self) -> None:
+        plan_name = "run-add-gate-test"
+        plan = self._write_plan(name=plan_name)
+        job_id = self.ledger.register_job(
+            run_id="run-1", worktree=self.repo, owner="service",
+            policy=_policy(), operator="operator",
+        )
+        self.enable_gate_env()
+        self._install_stage(usage=None)
+        self._run(plan)
+        create = [
+            r for r in self.ledger.reservations_for_job(job_id)
+            if r["role"] == "supervised_author"
+        ]
+        self.assertEqual(len(create), 1)
+        self.assertEqual(create[0]["state"], "retained")
+        self.assertGreater(self.ledger.consumption_for_job(job_id)["cost_usd"], 0.0)
+
+    def test_cmd_run_create_blocks_without_spawning_when_gate_unavailable(self) -> None:
+        plan_name = "run-add-gate-test"
+        plan = self._write_plan(name=plan_name)
+        self.ledger.register_job(
+            run_id="run-1", worktree=self.repo, owner="service",
+            policy=_policy(), operator="operator",
+        )
+        broken = self.storage / "broken.sqlite3"
+        broken.write_bytes(b"not a sqlite database")
+        patcher = mock.patch.dict(
+            os.environ, {"OPSX_SUPERVISOR_STATE_FILE": str(broken)}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        spawned: list[str] = []
+        self.opsx_plan.run_stage = (
+            lambda *a, **k: spawned.append("called") or ("exited", self.repo)
+        )
+        self._run(plan)
+        self.assertEqual(spawned, [], "no create may spawn without a reservation")
+        state = self.opsx_plan.state_mod.load_state(self.repo, plan_name)
+        rec = state["changes"][self.cid]
+        self.assertNotEqual(rec["status"], self.opsx_plan.base.DONE)
+        self.assertIn("supervised gate unavailable", rec.get("reason", ""))
+
+
+class RetryableCatalogLoadTests(SupervisedGateTestCase):
+    """A retryable catalog load is retried and durably recorded."""
+
+    def test_catalog_load_failure_retries_with_recorded_backoff(self) -> None:
+        self.write_authored_change()
+        self.register_job()
+        self.enable_gate_env()
+        attempts = {"n": 0}
+        real_catalog = self.opsx_plan.cost_mod._get_catalog
+
+        def flaky_catalog(repo=None):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                return None  # simulates a transiently unavailable catalog
+            return real_catalog(repo)
+
+        invoked: list[str] = []
+        self.opsx_plan.invoke_direct_stage = lambda *a, **k: invoked.append("called")
+        with mock.patch.object(self.opsx_plan.cost_mod, "_get_catalog",
+                               side_effect=flaky_catalog), \
+                mock.patch.object(self.opsx_plan.budget_mod, "backoff_delay",
+                                  return_value=0.0):
+            self.opsx_plan.supervised_gate_reserve(
+                self.repo, self.cfg,
+                {"ledger": self.ledger, "job_id": 1,
+                 "policy": self.ledger.current_policy(1)},
+                self.cid, "implement", 1,
+                {"escalation": {"active": False}}, "run-1",
+            )
+        self.assertGreaterEqual(attempts["n"], 2)
+        retry_signature = budgets.incident_signature(
+            kind="budget_gate_retry", change_id=self.cid, stage="implement",
+            discriminator="ledger_write",
+        )
+        self.assertGreaterEqual(
+            self.ledger.incident_attempt_count(1, retry_signature), 1
+        )
+        # The successful retry still produced a durable reservation.
+        self.assertEqual(len(self.ledger.reservations_for_job(1)), 1)
+
+    def test_exhausted_catalog_load_blocks_without_reservation(self) -> None:
+        self.write_authored_change()
+        self.register_job()
+        self.enable_gate_env()
+        self.opsx_plan.invoke_direct_stage = lambda *a, **k: None
+        with mock.patch.object(self.opsx_plan.cost_mod, "_get_catalog",
+                               return_value=None), \
+                mock.patch.object(self.opsx_plan.budget_mod, "backoff_delay",
+                                  return_value=0.0):
+            entry = self.opsx_plan.supervised_gate_reserve(
+                self.repo, self.cfg,
+                {"ledger": self.ledger, "job_id": 1,
+                 "policy": self.ledger.current_policy(1)},
+                self.cid, "implement", 1,
+                {"escalation": {"active": False}}, "run-1",
+            )
+        self.assertIn("blocked", entry)
+        self.assertEqual(entry["last_result"], "catalog_unavailable")
+        self.assertEqual(self.ledger.reservations_for_job(1), [])
+
+
+class _FakeClock:
+    """Deterministic ledger clock; ``advance`` moves wall time without stamping."""
+
+    def __init__(self, start: datetime, step_seconds: float = 1.0) -> None:
+        self.now = start
+        self.step = timedelta(seconds=step_seconds)
+
+    def __call__(self) -> str:
+        stamp = self.now
+        self.now += self.step
+        return stamp.isoformat(timespec="seconds")
+
+    def advance(self, minutes: float) -> None:
+        self.now += timedelta(minutes=minutes)
+
+
+class RetainedDispatchElapsedTests(SupervisedGateTestCase):
+    """A retained dispatch charges the execution deadline for the time it ran.
+
+    Regression for the review finding: an interrupted (timeout/spawn_error/
+    env_error) or unknown-usage dispatch recorded no outcome timestamp, so its
+    interval closed at dispatch time and the work it actually did was free
+    against ``execution_deadline_minutes``.
+    """
+
+    def _clock(self, dispatch_minutes: float) -> _FakeClock:
+        """Patch the ledger clock and bill *dispatch_minutes* per dispatch."""
+        fake = _FakeClock(datetime(2026, 9, 13, 12, 0, 0, tzinfo=timezone.utc))
+        patcher = mock.patch.object(clock, "utcnow", fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self._dispatch_minutes = dispatch_minutes
+        self._fake_clock = fake
+        return fake
+
+    def _advancing_runner(self, payloads: list[dict],
+                          outcomes: list[str] | None = None) -> None:
+        """Wrap the stage runner so the fake clock advances while a stage runs."""
+        self.stage_runner(payloads, outcomes=outcomes)
+        inner = self.opsx_plan.invoke_direct_stage
+
+        def advancing(*args, **kwargs):
+            try:
+                return inner(*args, **kwargs)
+            finally:
+                self._fake_clock.advance(self._dispatch_minutes)
+
+        self.opsx_plan.invoke_direct_stage = advancing
+
+    def _closed_intervals(self) -> list[dict]:
+        intervals = self.ledger.dispatch_intervals(1)
+        self.assertTrue(intervals)
+        self.assertFalse(
+            any(interval["open"] for interval in intervals),
+            "a reconciled dispatch must not leave an open interval",
+        )
+        return intervals
+
+    def _interval_for(self, action_id: int) -> dict:
+        matches = [
+            interval for interval in self._closed_intervals()
+            if interval["action_id"] == action_id
+        ]
+        self.assertEqual(len(matches), 1)
+        return matches[0]
+
+    @staticmethod
+    def _minutes(interval: dict) -> float:
+        return (
+            datetime.fromisoformat(interval["ended_at"])
+            - datetime.fromisoformat(interval["started_at"])
+        ).total_seconds() / 60.0
+
+    def test_timed_out_dispatch_counts_elapsed_through_reconciliation(self) -> None:
+        self._clock(dispatch_minutes=9.0)
+        self.write_authored_change()
+        self.register_job(policy=_policy(max_incident_attempts=1))
+        self.enable_gate_env()
+        self._advancing_runner([], outcomes=["timeout"])
+        self.assertEqual(self.run_change(), "failed")
+
+        reservations = self.ledger.reservations_for_job(1)
+        self.assertEqual(len(reservations), 1)
+        self.assertEqual(reservations[0]["state"], "retained")
+        self.assertIsNotNone(reservations[0]["retained_at"])
+        interval = self._interval_for(reservations[0]["action_id"])
+        self.assertEqual(interval["ended_at"], reservations[0]["retained_at"])
+        self.assertGreaterEqual(self._minutes(interval), 9.0)
+        self.assertGreaterEqual(
+            self.opsx_plan.execution_elapsed_minutes(self.ledger, 1), 9.0
+        )
+
+    def test_unknown_usage_dispatch_counts_elapsed_through_reconciliation(
+        self,
+    ) -> None:
+        self._clock(dispatch_minutes=4.0)
+        self.write_authored_change()
+        self.register_job()
+        self.enable_gate_env()
+        # A clean exit whose stage emitted no usage record is an unknown
+        # observation: the reservation is retained, not released.
+        self._advancing_runner([{
+            "stage": "implement",
+            "result": {
+                "status": "implemented", "change": self.cid, "round": 1,
+                "progress_made": True, "completed_tasks": ["1.1"],
+                "remaining_tasks": [], "task_counts": {"complete": 1, "total": 1},
+                "files_touched": [], "known_change_files": [],
+                "summary": "done",
+            },
+        }])
+        self.run_change()
+
+        implement = [
+            row for row in self.ledger.reservations_for_job(1)
+            if row["role"] == "implementer"
+        ]
+        self.assertEqual(len(implement), 1)
+        self.assertEqual(implement[0]["state"], "retained")
+        interval = self._interval_for(implement[0]["action_id"])
+        self.assertEqual(interval["ended_at"], implement[0]["retained_at"])
+        self.assertGreaterEqual(self._minutes(interval), 4.0)
+        self.assertGreaterEqual(
+            self.opsx_plan.execution_elapsed_minutes(self.ledger, 1), 4.0
+        )
+
+    def test_human_wait_after_reconciliation_is_not_execution_time(self) -> None:
+        fake = self._clock(dispatch_minutes=5.0)
+        self.write_authored_change()
+        self.register_job(policy=_policy(max_incident_attempts=1))
+        self.enable_gate_env()
+        self._advancing_runner([], outcomes=["timeout"])
+        self.run_change()
+
+        charged = self.opsx_plan.execution_elapsed_minutes(self.ledger, 1)
+        self.assertGreaterEqual(charged, 5.0)
+        consumption_before = self.ledger.consumption_for_job(1)
+
+        # A three-hour human wait follows the retained outcome. It opens no
+        # dispatch, so execution elapsed and budget consumption both stand.
+        fake.advance(180.0)
+        self.ledger.set_job_state(1, "paused")
+        self.ledger.set_job_state(1, "active")
+        self.assertEqual(
+            self.opsx_plan.execution_elapsed_minutes(self.ledger, 1), charged
+        )
+        self.assertEqual(self.ledger.consumption_for_job(1), consumption_before)
+        # The retained reservation still carries its reserved estimate.
+        self.assertGreater(consumption_before["retained_cost_usd"], 0.0)
+        self.assertEqual(consumption_before["reserved_cost_usd"], 0.0)
 
 
 if __name__ == "__main__":  # pragma: no cover

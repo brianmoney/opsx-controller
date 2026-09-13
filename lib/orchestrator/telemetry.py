@@ -948,6 +948,7 @@ def _record_stage_telemetry(
     sidecar_path: Path | None = None,
     envelope: dict | None = None,
     role: str | None = None,
+    worker_command: str | None = None,
 ) -> dict:
     run_id = get_or_create_run_id(repo, cfg, state)
     plan_name = cfg["name"]
@@ -965,6 +966,9 @@ def _record_stage_telemetry(
             warning_count = counts.get("warning")
             note_count = counts.get("note")
     rel_log_path = str(log_path.relative_to(repo)) if log_path else ""
+    # The create stage may be invoked per-change, so callers can pass the
+    # command that actually ran instead of the plan-level template.
+    effective_invoke = worker_command if worker_command is not None else cfg[f"{stage}_invoke"]
 
     record = build_telemetry_record(
         plan_name=cfg["name"],
@@ -977,7 +981,7 @@ def _record_stage_telemetry(
         ended_at=ended_at,
         duration_ms=duration_ms,
         adapter=cfg["adapter"],
-        worker_command=cfg[f"{stage}_invoke"],
+        worker_command=effective_invoke,
         timeout_seconds=int(cfg["changes"][cid]["timeout_minutes"] * 60),
         log_path=rel_log_path,
         stage_status=stage_status,
@@ -1003,7 +1007,7 @@ def _record_stage_telemetry(
             envelope=envelope,
         )
         if model["provider"] is None and model["model_id"] is None:
-            expanded_invoke = _best_effort_expand_invoke(cfg[f"{stage}_invoke"])
+            expanded_invoke = _best_effort_expand_invoke(effective_invoke)
             invocation_model = _extract_invocation_model(expanded_invoke, cfg["adapter"], repo)
             invocation_filled = False
             for key in ("provider", "model_id", "model_alias"):

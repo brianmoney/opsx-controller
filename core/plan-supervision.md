@@ -646,5 +646,7 @@ Budget enforcement applies only to worktrees with a registered supervised job.
 For such a job, the run path reserves before each stage dispatch and reconciles
 after it; the legacy `--budget-minutes` / `--budget-usd` gates keep their exact
 behavior for unregistered runs, which create, open, and require no durable
-budget layer.
-
+budget layer. When a supervision backend is present but its ledger or policy
+cannot be read, the run fails closed: it blocks before dispatch rather than
+falling back to the unbudgeted legacy path, so a registered job is never
+dispatched without a reservation.

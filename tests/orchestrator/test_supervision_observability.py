@@ -99,6 +99,33 @@ class TelemetryRoleFieldTests(unittest.TestCase):
         # A consumer that only reads legacy fields is unaffected.
         self.assertEqual(parsed["stage"], "implement")
 
+    def test_create_record_is_supervised_author_with_effective_invoke(self):
+        # A create dispatch records under the supervised_author role and uses
+        # the command that actually ran (the per-change create_invoke), not the
+        # plan-level ``create_invoke`` template, for model attribution.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            cfg = {
+                "name": "p", "adapter": "opencode",
+                "create_invoke": "plan-level-template",
+                "changes": {"c": {"timeout_minutes": 1}},
+            }
+            state = {"plan": "p", "approvals": [], "changes": {}}
+            log_path = repo / "c.create1.log"
+            log_path.write_text("{}\n", encoding="utf-8")
+            record = telemetry_mod._record_stage_telemetry(
+                repo, cfg, state, "c", "create", 1,
+                "2025-01-01T00:00:00+00:00", "2025-01-01T00:01:00+00:00",
+                60000, "completed", None, None, log_path,
+                role=telemetry_mod.resolve_stage_role("create"),
+                worker_command="python3 -c per-change-invoke",
+            )
+            self.assertEqual(record["role"], "supervised_author")
+            self.assertEqual(
+                record["invocation"]["worker_command"],
+                "python3 -c per-change-invoke",
+            )
+
 
 class SupervisorFamilyFilterTests(unittest.TestCase):
     def test_supervisor_family_roles_identified(self):

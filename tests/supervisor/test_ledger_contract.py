@@ -14,6 +14,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -636,6 +637,210 @@ class JournalTests(LedgerTestCase):
             ).fetchone()[0],
             dispatches_before,
         )
+
+
+class _FakeClock:
+    """Deterministic ledger clock: each stamp advances by a fixed step.
+
+    ``advance`` moves the clock without stamping, so a test can simulate wall
+    time passing between ledger writes (a dispatch that runs for minutes, or a
+    human wait that must not be charged as execution time).
+    """
+
+    def __init__(self, start: datetime, step_seconds: float = 1.0) -> None:
+        self.now = start
+        self.step = timedelta(seconds=step_seconds)
+
+    def __call__(self) -> str:
+        stamp = self.now
+        self.now += self.step
+        return stamp.isoformat(timespec="seconds")
+
+    def advance(self, minutes: float) -> None:
+        self.now += timedelta(minutes=minutes)
+
+
+def _elapsed_minutes(started_at: str, ended_at: str) -> float:
+    return (
+        datetime.fromisoformat(ended_at) - datetime.fromisoformat(started_at)
+    ).total_seconds() / 60.0
+
+
+class RetainedDispatchIntervalTests(LedgerTestCase):
+    """An interrupted or unknown dispatch contributes the time it really ran.
+
+    Regression for the review finding: a retained reservation recorded no
+    outcome timestamp, so its interval closed at the action's ``updated_at``
+    (still the dispatch time) and the dispatch counted as zero elapsed against
+    the execution deadline.
+    """
+
+    def _clock(self, step_seconds: float = 1.0) -> _FakeClock:
+        fake = _FakeClock(
+            datetime(2026, 9, 13, 12, 0, 0, tzinfo=timezone.utc),
+            step_seconds=step_seconds,
+        )
+        patcher = mock.patch.object(clock, "utcnow", fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return fake
+
+    def _dispatch(self, handle: ledger.Ledger, job_id: int) -> tuple[int, int]:
+        """Reserve before dispatch, mirroring the gate's ordering."""
+        action_id = handle.begin_action(job_id, kind="implement", run_id="run-1")
+        reservation_id = handle.insert_reservation(
+            job_id,
+            action_id=action_id,
+            role="implementer",
+            requested_model="cheap/model-a",
+            reserved_cost_usd=1.5,
+            reserved_elapsed_minutes=2.0,
+        )
+        handle.dispatch_action(action_id)
+        return action_id, reservation_id
+
+    def test_retained_dispatch_spans_dispatch_through_reconciliation(self) -> None:
+        fake = self._clock()
+        handle = self.open()
+        job_id = self.register(handle)
+        action_id, reservation_id = self._dispatch(handle, job_id)
+        dispatched_at = handle.get_action(action_id)["dispatched_at"]
+        # The dispatch runs for seven minutes and then times out.
+        fake.advance(7.0)
+        handle.retain_reservation(reservation_id)
+
+        reservation = handle.get_reservation(reservation_id)
+        self.assertEqual(reservation["state"], "retained")
+        self.assertIsNotNone(reservation["retained_at"])
+        intervals = handle.dispatch_intervals(job_id)
+        self.assertEqual(len(intervals), 1)
+        self.assertFalse(intervals[0]["open"])
+        self.assertEqual(intervals[0]["started_at"], dispatched_at)
+        self.assertEqual(intervals[0]["ended_at"], reservation["retained_at"])
+        self.assertGreaterEqual(
+            _elapsed_minutes(intervals[0]["started_at"], intervals[0]["ended_at"]),
+            7.0,
+        )
+        # The action itself never moved, so closing at its ``updated_at`` would
+        # have yielded zero elapsed: that is the defect being pinned here.
+        self.assertEqual(handle.get_action(action_id)["updated_at"], dispatched_at)
+
+    def test_human_wait_after_reconciliation_is_not_execution_time(self) -> None:
+        fake = self._clock()
+        handle = self.open()
+        job_id = self.register(handle)
+        _, reservation_id = self._dispatch(handle, job_id)
+        fake.advance(3.0)
+        handle.retain_reservation(reservation_id)
+        closed = handle.dispatch_intervals(job_id)
+        charged = _elapsed_minutes(closed[0]["started_at"], closed[0]["ended_at"])
+
+        # A long human wait follows the retained outcome. It creates no new
+        # dispatch, so it is excluded by construction and the already-closed
+        # interval does not grow.
+        fake.advance(240.0)
+        handle.set_job_state(job_id, "paused")
+        handle.set_job_state(job_id, "active")
+        after = handle.dispatch_intervals(job_id)
+        self.assertEqual(len(after), 1)
+        self.assertEqual(after[0]["ended_at"], closed[0]["ended_at"])
+        self.assertEqual(
+            _elapsed_minutes(after[0]["started_at"], after[0]["ended_at"]), charged
+        )
+
+    def test_retain_is_idempotent_and_keeps_the_first_outcome_time(self) -> None:
+        fake = self._clock()
+        handle = self.open()
+        job_id = self.register(handle)
+        _, reservation_id = self._dispatch(handle, job_id)
+        fake.advance(4.0)
+        handle.retain_reservation(reservation_id)
+        first = handle.get_reservation(reservation_id)["retained_at"]
+        fake.advance(60.0)
+        handle.retain_reservation(reservation_id)
+        self.assertEqual(handle.get_reservation(reservation_id)["retained_at"], first)
+        self.assertEqual(handle.dispatch_intervals(job_id)[0]["ended_at"], first)
+
+    def test_reconciled_reservation_records_no_retained_at(self) -> None:
+        fake = self._clock()
+        handle = self.open()
+        job_id = self.register(handle)
+        _, reservation_id = self._dispatch(handle, job_id)
+        fake.advance(2.0)
+        handle.reconcile_reservation(
+            reservation_id, observed_cost_usd=0.5, observed_elapsed_minutes=2.0
+        )
+        reservation = handle.get_reservation(reservation_id)
+        self.assertEqual(reservation["state"], "reconciled")
+        self.assertIsNone(reservation["retained_at"])
+        self.assertEqual(
+            handle.dispatch_intervals(job_id)[0]["ended_at"],
+            reservation["reconciled_at"],
+        )
+
+    def test_retained_row_without_outcome_time_keeps_prior_behavior(self) -> None:
+        """A row written before the column existed still closes as it used to."""
+        fake = self._clock()
+        handle = self.open()
+        job_id = self.register(handle)
+        action_id, reservation_id = self._dispatch(handle, job_id)
+        fake.advance(5.0)
+        handle.retain_reservation(reservation_id)
+        handle.connection.execute(
+            "UPDATE reservations SET retained_at = NULL WHERE id = ?",
+            (reservation_id,),
+        )
+        handle.connection.commit()
+        interval = handle.dispatch_intervals(job_id)[0]
+        self.assertFalse(interval["open"])
+        self.assertEqual(
+            interval["ended_at"], handle.get_action(action_id)["updated_at"]
+        )
+
+    def test_retained_estimate_still_counts_against_the_budget(self) -> None:
+        fake = self._clock()
+        handle = self.open()
+        job_id = self.register(handle)
+        _, reservation_id = self._dispatch(handle, job_id)
+        before = handle.consumption_for_job(job_id)
+        fake.advance(6.0)
+        handle.retain_reservation(reservation_id)
+        after = handle.consumption_for_job(job_id)
+        # Stamping the outcome time changes accounting not at all: the
+        # retained reservation still carries its reserved estimate.
+        self.assertEqual(after["cost_usd"], before["cost_usd"])
+        self.assertEqual(after["retained_cost_usd"], 1.5)
+        self.assertEqual(after["retained_elapsed_minutes"], 2.0)
+        self.assertEqual(after["reserved_cost_usd"], 0.0)
+        self.assertEqual(after["reservation_count"], 1)
+
+    @unittest.skipUnless(
+        sqlite3.sqlite_version_info >= (3, 35, 0),
+        "ALTER TABLE ... DROP COLUMN requires SQLite 3.35+",
+    )
+    def test_v3_ledger_migrates_forward_and_gains_the_outcome_column(self) -> None:
+        handle = self.open()
+        job_id = self.register(handle)
+        action_id, reservation_id = self._dispatch(handle, job_id)
+        handle.close()
+
+        # Simulate a genuine v3 ledger: the reservations table without the
+        # additive column, stamped at the previous schema version.
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("ALTER TABLE reservations DROP COLUMN retained_at")
+        conn.execute("PRAGMA user_version = 3")
+        conn.commit()
+        conn.close()
+
+        migrated = self.open()
+        self.assertEqual(migrated.schema_version(), ledger.CURRENT_SCHEMA_VERSION)
+        reservation = migrated.get_reservation(reservation_id)
+        self.assertEqual(reservation["action_id"], action_id)
+        self.assertEqual(reservation["state"], "reserved")
+        self.assertIsNone(reservation["retained_at"])
+        self.assertEqual(migrated.get_job(job_id)["id"], job_id)
+        migrated.retain_reservation(reservation_id)
+        self.assertIsNotNone(migrated.get_reservation(reservation_id)["retained_at"])
 
 
 def json_dumps(value: object) -> str:

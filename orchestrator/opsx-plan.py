@@ -1743,6 +1743,25 @@ def _escalation_active_for_dispatch(cfg: dict, r: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 
+class SupervisionGateError(Exception):
+    """A registered supervised job's gate could not be read safely.
+
+    Raised instead of returning ``None`` when supervision state is present but
+    inaccessible, so a registered job fails closed: the run blocks rather than
+    treating unreadable supervision as "no supervision" and dispatching
+    unaccounted through the legacy path.
+    """
+
+
+class RetryableCatalogLoadError(budget_mod.BudgetError):
+    """A pricing-catalog load failure a bounded retry may resolve.
+
+    Distinct from :class:`budget_mod.UnknownPricingError`: an unresolvable pin
+    is a terminal human blocker, while a transiently unavailable catalog is
+    retried with the bounded, recorded backoff schedule.
+    """
+
+
 def _supervisor_ledger_path(repo: Path) -> Path | None:
     """Resolve the external supervisor ledger path for this host.
 
@@ -1765,24 +1784,35 @@ def open_supervised_gate(repo: Path) -> dict | None:
     A gate exists only for a worktree with a non-terminal registered supervised
     job; an ordinary, unregistered run returns ``None`` and keeps the legacy
     ``--budget-minutes`` / ``--budget-usd`` behavior with no durable budget
-    layer. Opening is best-effort and read-only: a missing or unreadable ledger
-    is not an error.
+    layer. A genuinely absent supervision backend — no configured/default
+    ledger file — is likewise ``None``.
+
+    Opening fails closed: when a supervision backend *exists* but the ledger or
+    its policy cannot be read, this raises :class:`SupervisionGateError` so the
+    caller blocks before any dispatch rather than silently taking the
+    unregistered legacy path.
     """
     path = _supervisor_ledger_path(repo)
     if path is None:
         return None
+    if not path.exists():
+        return None
     try:
         handle = ledger_mod.open_ledger(path, repository_root=repo, create=False)
-    except Exception:
-        return None
+    except Exception as exc:
+        raise SupervisionGateError(
+            f"supervision ledger at {path} exists but could not be opened: {exc}"
+        ) from exc
     try:
         job = handle.find_job_by_worktree(repo, repository_root=repo)
         if job is None or job["state"] in ledger_mod.TERMINAL_JOB_STATES:
             return None
         policy = handle.current_policy(int(job["id"]))
-    except Exception:
+    except Exception as exc:
         handle.close()
-        return None
+        raise SupervisionGateError(
+            f"registered supervised job for {repo} could not be read: {exc}"
+        ) from exc
     return {
         "ledger": handle,
         "job_id": int(job["id"]),
@@ -1830,7 +1860,22 @@ def reservation_estimate_for_dispatch(
     the worst-case catalog rate times the token-cap envelope and the headroom
     margin. Raises :class:`budget_mod.UnknownPricingError` when the pin is
     missing, cannot be split into provider/model, or resolves to an unresolved
-    result — before any dispatch side effect.
+    result — before any dispatch side effect. Raises
+    :class:`RetryableCatalogLoadError` when the pricing runtime or catalog
+    itself is transiently unavailable.
+    """
+    rate, catalog_version = _pinned_rate_and_catalog_version(repo, policy, role)
+    return budget_mod.reservation_estimate(rate), catalog_version
+
+
+def _pinned_rate_and_catalog_version(
+    repo: Path, policy: dict, role: str,
+) -> tuple[float, str | None]:
+    """Return the pinned role model's worst-case rate and catalog version.
+
+    The catalog acquisition and resolution happen here so that a caller
+    wrapping this in the bounded retry path retries *both* a transiently
+    unloadable catalog and a transient resolution read.
     """
     pin = _pinned_model_for_role(policy, role)
     if pin is None:
@@ -1846,13 +1891,17 @@ def reservation_estimate_for_dispatch(
         base.ensure_own_root_on_syspath()
         from lib.pricing import PricingCatalog, UnresolvedPrice
     except Exception as exc:  # pragma: no cover - pricing runtime missing
-        raise budget_mod.UnknownPricingError(
-            f"pricing catalog unavailable for role '{role}': {exc}"
+        raise RetryableCatalogLoadError(
+            f"pricing runtime unavailable for role '{role}': {exc}"
         ) from exc
     catalog_info = cost_mod._get_catalog(repo)
     if catalog_info is None:
-        raise budget_mod.UnknownPricingError(
-            f"pricing catalog unavailable for role '{role}'"
+        # ``cost_mod`` caches a failed init as a permanent sentinel; clear it so
+        # the bounded retry actually re-attempts the load instead of re-reading
+        # the cached failure.
+        cost_mod._cost_catalog = None
+        raise RetryableCatalogLoadError(
+            f"pricing catalog failed to load for role '{role}'"
         )
     catalog, UnresolvedPriceCls = catalog_info
     provider, model_id = identity
@@ -1887,8 +1936,7 @@ def reservation_estimate_for_dispatch(
         raise budget_mod.UnknownPricingError(
             f"role '{role}' pin '{pin}' has no positive per-token rate"
         )
-    estimate = budget_mod.reservation_estimate(rate)
-    return estimate, catalog.get_catalog_version()
+    return float(rate), catalog.get_catalog_version()
 
 
 def execution_elapsed_minutes(ledger, job_id: int) -> float:
@@ -1988,33 +2036,59 @@ def supervised_gate_reserve(
             ),
             "last_result": "bounded_attempts_exceeded",
         }
-    try:
-        estimate, catalog_version = reservation_estimate_for_dispatch(repo, policy, role)
-    except budget_mod.UnknownPricingError as exc:
-        return {
-            "blocked": (
-                f"supervised unknown pricing blocked: {exc}; operator action "
-                "required: qualify the role's pinned model in the pricing "
-                "catalog, then register an updated policy revision"
-            ),
-            "last_result": "unknown_pricing",
-        }
     timeout_minutes = float(cfg["changes"][cid]["timeout_minutes"])
+    estimated: dict[str, float | None] = {"value": None}
+
+    # One action intent and one reservation per supervised dispatch, reused
+    # across bounded retries. A retry caused by a transient failure after the
+    # reservation committed therefore cannot double-reserve, and a reservation
+    # that never committed leaves no dispatched action behind.
+    estimate_state: dict[str, object] = {"value": None, "catalog_version": None}
+    dispatch_state: dict[str, int | None] = {
+        "action_id": None,
+        "reservation_id": None,
+    }
 
     def _attempt_reservation() -> tuple[int, int]:
-        action_id = ledger.begin_action(job_id, kind=stage, run_id=run_id)
+        if estimate_state["value"] is None:
+            # Catalog acquisition and estimation run inside the bounded retry
+            # operation so a transiently unloadable catalog (or a transient
+            # read failure during resolution) is retried with the recorded
+            # backoff rather than terminating the dispatch unrecorded. An
+            # unresolvable pin stays a terminal UnknownPricingError, raised
+            # before any ledger side effect.
+            estimate, catalog_version = reservation_estimate_for_dispatch(
+                repo, policy, role
+            )
+            estimate_state["value"] = estimate
+            estimate_state["catalog_version"] = catalog_version
+            estimated["value"] = estimate
+        if dispatch_state["action_id"] is None:
+            dispatch_state["action_id"] = ledger.begin_action(
+                job_id, kind=stage, run_id=run_id
+            )
+        action_id = int(dispatch_state["action_id"])
+        reservation_id = dispatch_state["reservation_id"]
+        if reservation_id is None:
+            # Reserve durably before the dispatch is recorded. If the
+            # reservation is refused or its write fails, the action stays at
+            # its intent with no ``dispatches`` row, so an unspawned action can
+            # never accrue execution-elapsed deadline time.
+            reservation_id = budget_mod.reserve(
+                ledger,
+                job_id=job_id,
+                action_id=action_id,
+                role=role,
+                requested_model=_pinned_model_for_role(policy, role) or "",
+                reserved_cost_usd=float(estimate_state["value"]),
+                reserved_elapsed_minutes=timeout_minutes,
+                policy=policy,
+                pricing_catalog_version=estimate_state["catalog_version"],
+            )
+            dispatch_state["reservation_id"] = int(reservation_id)
+        # Mark the action dispatched only once its reservation is durable, as
+        # the last step before the caller spawns the worker.
         ledger.dispatch_action(action_id)
-        reservation_id = budget_mod.reserve(
-            ledger,
-            job_id=job_id,
-            action_id=action_id,
-            role=role,
-            requested_model=_pinned_model_for_role(policy, role) or "",
-            reserved_cost_usd=estimate,
-            reserved_elapsed_minutes=timeout_minutes,
-            policy=policy,
-            pricing_catalog_version=catalog_version,
-        )
         return action_id, int(reservation_id)
 
     retry_signature = budget_mod.incident_signature(
@@ -2033,11 +2107,13 @@ def supervised_gate_reserve(
         )
 
     def _is_transient(exc: BaseException) -> bool:
-        # Only a temporarily unwritable ledger or a retryable catalog load is
+        # A temporarily unwritable ledger and a retryable catalog load are
         # retried; budget exhaustion, unknown pricing, and policy blocks are
         # terminal human blockers.
         import sqlite3 as _sqlite3
-        return isinstance(exc, _sqlite3.OperationalError)
+        return isinstance(
+            exc, (_sqlite3.OperationalError, RetryableCatalogLoadError)
+        )
 
     try:
         action_id, reservation_id = budget_mod.run_with_bounded_backoff(
@@ -2052,6 +2128,24 @@ def supervised_gate_reserve(
                 "record an explicit policy revision raising the limit"
             ),
             "last_result": "budget_exhausted",
+        }
+    except budget_mod.UnknownPricingError as exc:
+        return {
+            "blocked": (
+                f"supervised unknown pricing blocked: {exc}; operator action "
+                "required: qualify the role's pinned model in the pricing "
+                "catalog, then register an updated policy revision"
+            ),
+            "last_result": "unknown_pricing",
+        }
+    except RetryableCatalogLoadError as exc:
+        return {
+            "blocked": (
+                "supervised pricing catalog unavailable after bounded retries: "
+                f"{exc}; operator action required: reinstall the matching "
+                "runtime or restore the pricing catalog"
+            ),
+            "last_result": "catalog_unavailable",
         }
     except budget_mod.BudgetError as exc:
         return {
@@ -2074,7 +2168,7 @@ def supervised_gate_reserve(
         "reservation_id": reservation_id,
         "action_id": action_id,
         "role": role,
-        "estimate": estimate,
+        "estimate": estimated["value"],
     }
 
 
@@ -2146,6 +2240,207 @@ def supervised_gate_reconcile(
         pass
 
 
+def create_outcome_state(outcome: str) -> str:
+    """Map a ``run_stage`` outcome to the reconcile outcome vocabulary.
+
+    ``exited`` is the only clean create outcome; every other value is a
+    non-completed dispatch that retains/incidents consistently with the direct
+    stage loop.
+    """
+    return "completed" if outcome == "exited" else outcome
+
+
+def _arm_stage_usage_sidecar(
+    repo: Path, plan_name: str, run_id: str, cid: str, stage: str, round_num: int,
+) -> tuple[Path | None, dict[str, str | None]]:
+    """Create a per-attempt usage sidecar and export its OPSX_* environment.
+
+    Returns ``(sidecar_path, saved_env)``; ``saved_env`` must be handed to
+    :func:`_restore_stage_usage_sidecar` after the dispatch so the orchestrator
+    environment is left exactly as it was. Each saved value records the
+    variable's prior presence: a variable that was absent is saved as ``None``
+    and removed again on restore, rather than being materialized as an empty
+    string. A no-op returning ``(None, {})`` when the plan name or run id is
+    unavailable.
+    """
+    if not (plan_name and run_id):
+        return None, {}
+    sidecar_path = _build_usage_sidecar_path(repo, plan_name, cid, stage, round_num)
+    sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+    extra_env = _build_usage_sidecar_env(
+        plan_name, run_id, cid, stage, round_num, sidecar_path
+    )
+    saved_env: dict[str, str | None] = {}
+    for key, value in extra_env.items():
+        saved_env[key] = os.environ.get(key)
+        os.environ[key] = value
+    return sidecar_path, saved_env
+
+
+def _restore_stage_usage_sidecar(saved_env: dict[str, str | None]) -> None:
+    for key, value in saved_env.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+def _restore_direct_usage_sidecar(sidecar_state: dict) -> None:
+    """Restore the OPSX_* environment armed by the direct change loop.
+
+    Called from a ``finally`` so every exit from the loop — including a
+    budget-gate early return on a blocked reservation — restores the
+    orchestrator environment exactly. A variable that was absent before the
+    arm is removed again rather than materialized as an empty string.
+    """
+    extra_env = sidecar_state.get("extra_env")
+    if not extra_env:
+        return
+    saved_env = sidecar_state.get("saved_env") or {}
+    for key in extra_env:
+        os.environ.pop(key, None)
+        if key in saved_env and saved_env[key] is not None:
+            os.environ[key] = saved_env[key]
+
+
+def record_create_stage_telemetry(
+    repo: Path,
+    cfg: dict,
+    state: dict,
+    cid: str,
+    attempt: int,
+    run_id: str,
+    started_at: str,
+    ended_at: str,
+    outcome: str,
+    log_path: Path,
+    create_invoke: str,
+    sidecar_path: Path | None,
+) -> dict | None:
+    """Write the create dispatch's telemetry record (role-attributed).
+
+    The ``create`` stage is a supervised_author model call, so a successful
+    dispatch must emit a telemetry record and be reconciled from its observed
+    usage — or retained when usage is unknown. Returns the written record (or
+    ``None`` when writing fails).
+    """
+    stage = "create"
+    round_num = attempt
+    duration_ms = telemetry.compute_duration_ms(started_at, ended_at)
+    if outcome == "env_error":
+        telemetry_status = "spawn_error"
+        error_message = log_path.read_text(
+            encoding="utf-8"
+        ).strip().lstrip("#").strip()
+    elif outcome == "spawn_error":
+        telemetry_status = "spawn_error"
+        error_message = f"could not spawn {stage}: {create_invoke}"
+    elif outcome == "timeout":
+        telemetry_status = "timeout"
+        error_message = f"{stage} timed out"
+    else:
+        telemetry_status = "completed"
+        error_message = None
+
+    payload, _parse_why, envelope = parse_stage_json(log_path)
+
+    try:
+        return telemetry._record_stage_telemetry(
+            repo, cfg, state, cid, stage, round_num,
+            started_at, ended_at, duration_ms,
+            telemetry_status, error_message,
+            payload, log_path,
+            sidecar_path=sidecar_path,
+            envelope=envelope,
+            role=telemetry.resolve_stage_role(stage),
+            worker_command=create_invoke,
+        )
+    except Exception as exc:
+        base.log(
+            f"warning: failed to write telemetry for {cid}/{stage} "
+            f"r{round_num}: {exc}"
+        )
+        return None
+
+
+def dispatch_create_stage(
+    repo: Path,
+    cfg: dict,
+    state: dict,
+    cid: str,
+    attempt: int,
+    create_invoke: str,
+    r: dict,
+    run_id: str = "",
+) -> tuple[str, Path] | dict:
+    """Run one create dispatch under the durable budget gate.
+
+    Returns ``(outcome, log_path)`` after a dispatch, or a blocked dict
+    (``{"blocked": reason, "last_result": ...}``) when the supervised gate
+    refuses to let the create proceed. For a registered supervised job the
+    create call reserves before spawning, emits a role-attributed telemetry
+    record, and reconciles the reservation from the observed usage (retaining
+    it when usage is unknown). An unregistered run takes the legacy
+    ``run_stage`` path untouched, with no run-id or state side effect.
+    """
+    try:
+        gate = open_supervised_gate(repo)
+    except SupervisionGateError as exc:
+        return {
+            "blocked": f"supervised gate unavailable: {exc}",
+            "last_result": "supervision_gate_unavailable",
+        }
+    if gate is None:
+        return run_stage(
+            repo, cfg, cid, "create", create_invoke,
+            cfg["create_timeout_minutes"], attempt,
+        )
+    if not run_id:
+        run_id = state.get("run_id", "") or telemetry.get_or_create_run_id(
+            repo, cfg, state
+        )
+    started_at = base.utcnow()
+    sidecar: Path | None = None
+    saved_env: dict[str, str | None] = {}
+    try:
+        sidecar, saved_env = _arm_stage_usage_sidecar(
+            repo, cfg.get("name", ""), run_id, cid, "create", attempt
+        )
+        reservation = supervised_gate_reserve(
+            repo, cfg, gate, cid, "create", attempt, r, run_id
+        )
+        if reservation.get("blocked"):
+            return {
+                "blocked": reservation["blocked"],
+                "last_result": reservation.get("last_result", "budget_blocked"),
+            }
+        outcome, log_path = run_stage(
+            repo, cfg, cid, "create", create_invoke,
+            cfg["create_timeout_minutes"], attempt,
+        )
+        ended_at = base.utcnow()
+        # A supervised create dispatch is role-attributed and its observed
+        # usage is reconciled: the create worker is a supervised_author model
+        # call and must be accounted, never silently reconciled as a zero-cost
+        # observed action.
+        record = record_create_stage_telemetry(
+            repo, cfg, state, cid, attempt, run_id, started_at, ended_at,
+            outcome, log_path, create_invoke, sidecar,
+        )
+        reservation_id = reservation.get("reservation_id")
+        if reservation_id is not None:
+            state_name = create_outcome_state(outcome)
+            supervised_gate_reconcile(gate, reservation_id, record, state_name)
+            if state_name != "completed":
+                supervised_gate_record_incident(
+                    gate, cid, "create", discriminator="dispatch"
+                )
+        return outcome, log_path
+    finally:
+        _restore_stage_usage_sidecar(saved_env)
+        close_supervised_gate(gate)
+
+
 def run_direct_change(
     repo: Path,
     cfg: dict,
@@ -2157,8 +2452,18 @@ def run_direct_change(
     r = state_mod.rec(state, cid)
     # A worktree with a registered supervised job gets the durable budget gate;
     # an ordinary, unregistered run gets ``None`` and keeps the legacy gates
-    # below byte-identical.
-    supervised_gate = open_supervised_gate(repo)
+    # below byte-identical. A present-but-unreadable supervision backend fails
+    # closed: the change blocks before dispatch rather than silently falling
+    # back to the unbudgeted legacy path.
+    try:
+        supervised_gate = open_supervised_gate(repo)
+    except SupervisionGateError as exc:
+        reason = f"supervised gate unavailable: {exc}"
+        r["last_result"] = "supervision_gate_unavailable"
+        state_mod.set_status(state, cid, base.PENDING, reason)
+        base.log(f"  {reason}")
+        persist_direct_state(repo, cfg, state, cid)
+        return "budget"
     try:
         return _run_direct_change_loop(
             repo, cfg, state, cid, r, budget_deadline, budget_usd, supervised_gate
@@ -2176,6 +2481,34 @@ def _run_direct_change_loop(
     budget_deadline: float | None,
     budget_usd: float,
     supervised_gate: dict | None,
+) -> str:
+    """Drive the single-change loop, restoring OPSX_* env on every exit.
+
+    The sidecar state lives outside the loop body so a ``finally`` can restore
+    the environment even when a budget-gate early return fires before a
+    dispatch. This keeps the environment byte-identical after a blocked
+    supervised dispatch, including variables that were initially absent.
+    """
+    sidecar_state: dict = {"extra_env": None, "saved_env": {}}
+    try:
+        return _run_direct_change_loop_inner(
+            repo, cfg, state, cid, r, budget_deadline, budget_usd,
+            supervised_gate, sidecar_state,
+        )
+    finally:
+        _restore_direct_usage_sidecar(sidecar_state)
+
+
+def _run_direct_change_loop_inner(
+    repo: Path,
+    cfg: dict,
+    state: dict,
+    cid: str,
+    r: dict,
+    budget_deadline: float | None,
+    budget_usd: float,
+    supervised_gate: dict | None,
+    sidecar_state: dict,
 ) -> str:
     while True:
         if budget_deadline and time.monotonic() > budget_deadline:
@@ -2229,9 +2562,11 @@ def _run_direct_change_loop(
         run_id = telemetry.get_or_create_run_id(repo, cfg, state)
 
         # ---- usage sidecar (OpenCode plugin only; harmless no-op for other adapters) ----
+        # The armed environment and the saved prior values live in
+        # ``sidecar_state`` so the loop's caller can restore them from a
+        # ``finally`` regardless of which path returns.
         sidecar_path: Path | None = None
         extra_env: dict[str, str] | None = None
-        saved_env: dict[str, str] = {}
 
         def _arm_usage_sidecar() -> None:
             """Create a fresh per-attempt sidecar and export its OPSX_* env."""
@@ -2241,18 +2576,15 @@ def _run_direct_change_loop(
             sidecar_path = _build_usage_sidecar_path(repo, plan_name, cid, stage, round_num)
             sidecar_path.parent.mkdir(parents=True, exist_ok=True)
             extra_env = _build_usage_sidecar_env(plan_name, run_id, cid, stage, round_num, sidecar_path)
+            saved_env = sidecar_state["saved_env"]
             for key, value in extra_env.items():
                 if key not in saved_env:
-                    saved_env[key] = os.environ.get(key, "")
+                    saved_env[key] = os.environ.get(key)
                 os.environ[key] = value
+            sidecar_state["extra_env"] = extra_env
 
         def _restore_usage_sidecar() -> None:
-            if not extra_env:
-                return
-            for key in extra_env:
-                os.environ.pop(key, None)
-                if key in saved_env:
-                    os.environ[key] = saved_env[key]
+            _restore_direct_usage_sidecar(sidecar_state)
 
         _arm_usage_sidecar()
 
@@ -3070,53 +3402,25 @@ def _cmd_run_body(args: argparse.Namespace, repo: Path, plan_src: str, cfg: dict
             before_tracked = groundtruth.tracked_worktree_snapshot(repo)
 
             # --- supervised budget pre-dispatch gate for the create stage ---
-            create_gate = open_supervised_gate(repo)
-            create_reservation: dict | None = None
-            try:
-                if create_gate is not None:
-                    create_run_id = state.get("run_id", "") or telemetry.get_or_create_run_id(
-                        repo, cfg, state
-                    )
-                    create_reservation = supervised_gate_reserve(
-                        repo, cfg, create_gate, cid, "create", c_attempt, r,
-                        create_run_id,
-                    )
-                    if create_reservation.get("blocked"):
-                        reason = create_reservation["blocked"]
-                        r["last_result"] = create_reservation.get(
-                            "last_result", "budget_blocked"
-                        )
-                        state_mod.set_status(state, cid, base.PENDING, reason)
-                        base.log(f"  {reason}")
-                        state_mod.save_state(repo, cfg["name"], state)
-                        continue
-
-                outcome, log_path = run_stage(
-                    repo, cfg, cid, "create", change_cfg["create_invoke"],
-                    cfg["create_timeout_minutes"], c_attempt,
+            create_result = dispatch_create_stage(
+                repo, cfg, state, cid, c_attempt, change_cfg["create_invoke"],
+                r,
+            )
+            if isinstance(create_result, dict):
+                reason = create_result["blocked"]
+                r["last_result"] = create_result.get(
+                    "last_result", "budget_blocked"
                 )
-                if create_gate is not None and create_reservation:
-                    # No telemetry for the create stage: retain the reservation
-                    # on a non-clean outcome, reconcile a clean one at zero
-                    # observed (the primary's live usage arrives via the bridge).
-                    reservation_id = create_reservation.get("reservation_id")
-                    if reservation_id is not None:
-                        if outcome == "exited":
-                            budget_mod.reconcile(
-                                create_gate["ledger"],
-                                reservation_id=reservation_id,
-                                observation_state="observed",
-                                observed_cost_usd=0.0,
-                                observed_elapsed_minutes=0.0,
-                            )
-                        else:
-                            budget_mod.reconcile(
-                                create_gate["ledger"],
-                                reservation_id=reservation_id,
-                                observation_state="interrupted",
-                            )
-            finally:
-                close_supervised_gate(create_gate)
+                state_mod.set_status(state, cid, base.PENDING, reason)
+                base.log(f"  {reason}")
+                state_mod.save_state(repo, cfg["name"], state)
+                # A budget-gated create is a terminal-for-this-run blocker, not
+                # a create retry: mark the change visited so the loop stops
+                # driving it (it stays pending for an operator) rather than
+                # consuming its create_attempts and failing it.
+                visited.add(cid)
+                continue
+            outcome, log_path = create_result
             r["last_log"] = str(log_path)
 
             if outcome == "env_error":

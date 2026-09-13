@@ -33,7 +33,7 @@ from lib.supervisor import budgets
 from lib.supervisor import clock
 from lib.supervisor import model_policy
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 CURRENT_POLICY_VERSION = 1
 
 # Fencing-record events. A fencing record describes one execution-lock
@@ -397,10 +397,29 @@ def _migrate_2_to_3(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(str(row[1]) == column for row in rows)
+
+
+def _migrate_3_to_4(conn: sqlite3.Connection) -> None:
+    """Record when a reservation was retained, alongside ``reconciled_at``.
+
+    Strictly additive: a nullable ``reservations.retained_at`` stamps the
+    reconciliation boundary for an interrupted or unknown dispatch, so its
+    execution interval closes when the outcome was classified rather than at
+    dispatch time. Pre-existing rows keep ``NULL`` and fall back to the
+    action's ``updated_at``, so the column changes no historical accounting.
+    """
+    if not _column_exists(conn, "reservations", "retained_at"):
+        conn.execute("ALTER TABLE reservations ADD COLUMN retained_at TEXT")
+
+
 MIGRATIONS: dict[int, Any] = {
     1: _migrate_0_to_1,
     2: _migrate_1_to_2,
     3: _migrate_2_to_3,
+    4: _migrate_3_to_4,
 }
 
 
@@ -1019,15 +1038,20 @@ class Ledger:
         Unknown/interrupted consumption stays charged at the reserved estimate.
         An already reconciled or retained reservation is left unchanged, so
         this is idempotent against duplicate unknown observations.
+
+        ``retained_at`` stamps the reconciliation boundary the same way
+        ``reconciled_at`` does, so the dispatch's execution interval closes
+        when its outcome was classified rather than at dispatch time.
         """
+        now = _utcnow()
         with self._transaction():
             reservation = self.get_reservation(reservation_id)
             if reservation["state"] in ("retained", "reconciled"):
                 return
             result = self._conn.execute(
-                "UPDATE reservations SET state = 'retained' "
+                "UPDATE reservations SET state = 'retained', retained_at = ? "
                 "WHERE id = ? AND state = 'reserved'",
-                (reservation_id,),
+                (now, reservation_id),
             )
             if result.rowcount != 1:
                 raise JournalStateError(
@@ -1098,8 +1122,10 @@ class Ledger:
         """Return each dispatch's ``(started_at, ended_at, open)`` interval.
 
         An interval closes at the reservation's ``reconciled_at`` when the
-        reservation is reconciled, otherwise at the action's ``updated_at``
-        once the action is terminal or its reservation retained. An in-flight
+        reservation is reconciled and at its ``retained_at`` when the
+        reservation is retained, so an interrupted or unknown dispatch still
+        contributes the time it actually ran; otherwise it closes at the
+        action's ``updated_at`` once the action is terminal. An in-flight
         interval has ``ended_at`` ``None`` and is closed by the caller at the
         current time. A human wait is not a dispatch interval at all, so it is
         excluded by construction rather than subtracted after the fact.
@@ -1111,7 +1137,8 @@ class Ledger:
                    a.state AS action_state,
                    a.updated_at AS action_updated_at,
                    r.state AS reservation_state,
-                   r.reconciled_at AS reconciled_at
+                   r.reconciled_at AS reconciled_at,
+                   r.retained_at AS retained_at
             FROM dispatches d
             JOIN actions a ON a.id = d.action_id
             LEFT JOIN reservations r ON r.action_id = a.id
@@ -1128,7 +1155,9 @@ class Ledger:
                 ended_at = row["reconciled_at"] or row["action_updated_at"]
                 open_interval = False
             elif res_state == "retained":
-                ended_at = row["action_updated_at"]
+                # A ledger written before the ``retained_at`` column existed
+                # has no outcome stamp, so it keeps its previous behavior.
+                ended_at = row["retained_at"] or row["action_updated_at"]
                 open_interval = False
             elif action_state in ("completed", "failed"):
                 ended_at = row["action_updated_at"]
