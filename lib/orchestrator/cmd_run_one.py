@@ -17,6 +17,8 @@ from pathlib import Path
 
 from lib.orchestrator import base, groundtruth, planref
 from lib.orchestrator import state as state_mod
+from lib.orchestrator import supervision as supervision_mod
+from lib.supervisor import broker as broker_mod
 from lib.supervisor import lock as lock_mod
 
 # Populated by the entrypoint immediately after import (design D3).
@@ -43,6 +45,36 @@ def cmd_run_one(args: argparse.Namespace) -> int:
     """
     repo = Path(args.repo).resolve()
     change_id = args.change
+
+    # `opsx-run` and `opsx-plan run-one` both dispatch here. A registered
+    # supervised job permits dispatch only from the supervised execution; an
+    # ordinary CLI dispatch is refused with the named mediation error before any
+    # repository inspection, lock, or state mutation. An unregistered worktree
+    # keeps the legacy path.
+    registration = None
+    try:
+        registration = supervision_mod.require_supervised_authorization(repo)
+    except broker_mod.BrokerError as exc:
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    if registration is not None:
+        try:
+            if not broker_mod.is_dispatchable(
+                registration.ledger, registration.job_id, change_id
+            ):
+                resolution = broker_mod.resolve_gate(
+                    registration.ledger, registration.job_id, change_id
+                )
+                print(
+                    f"error: {change_id} is not dispatchable: {resolution.reason}",
+                    file=sys.stderr,
+                )
+                return 2
+        except broker_mod.BrokerError as exc:
+            print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
+        finally:
+            registration.close()
 
     cdir = groundtruth.change_dir(repo, change_id)
     if not cdir.is_dir():

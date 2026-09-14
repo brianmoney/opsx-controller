@@ -19,6 +19,8 @@ from lib.supervisor.ledger import (
     CURRENT_SCHEMA_VERSION,
     JOURNAL_STATES,
     JOB_STATES,
+    RECEIPT_AUTHORITIES,
+    RECEIPT_KINDS,
     TERMINAL_JOB_STATES,
     DuplicateJobError,
     JournalStateError,
@@ -32,6 +34,7 @@ from lib.supervisor.ledger import (
     UnknownRecordError,
     default_ledger_path,
     open_ledger,
+    snapshot_digest,
 )
 from lib.supervisor import budgets as budgets
 
@@ -40,6 +43,8 @@ __all__ = [
     "CURRENT_SCHEMA_VERSION",
     "JOURNAL_STATES",
     "JOB_STATES",
+    "RECEIPT_AUTHORITIES",
+    "RECEIPT_KINDS",
     "TERMINAL_JOB_STATES",
     "DuplicateJobError",
     "JournalStateError",
@@ -54,4 +59,5 @@ __all__ = [
     "budgets",
     "default_ledger_path",
     "open_ledger",
+    "snapshot_digest",
 ]

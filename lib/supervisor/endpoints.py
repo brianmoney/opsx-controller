@@ -34,6 +34,8 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping
 
+from lib.supervisor import broker as broker_module
+
 ENDPOINT_OPERATOR = "operator"
 ENDPOINT_WORKER = "worker-actions"
 
@@ -121,11 +123,96 @@ def accept_verified_peer(conn: Any, *, allowed_uids: Iterable[int]) -> PeerCrede
 # ---------------------------------------------------------------------------
 
 
+def _principal_for(credentials: PeerCredentials, role: str, name: str | None = None) -> "broker_module.BrokerPrincipal":
+    return broker_module.BrokerPrincipal(role=role, name=name or "", uid=credentials.uid)
+
+
+def _broker_ledger(request: Mapping[str, Any]) -> tuple[Any, int]:
+    """Return the ledger handle and job id a broker handler operates on.
+
+    The transport supplies the service-owned ledger on the request; a missing
+    handle means the broker path cannot be reached, so the handler fails closed
+    with a named error rather than validating without recording.
+    """
+    ledger = request.get("ledger")
+    job_id = request.get("job_id")
+    if ledger is None or job_id is None:
+        raise broker_module.BrokerUnavailableError(
+            "the broker path is unavailable: no service-owned ledger was "
+            "supplied to the endpoint"
+        )
+    return ledger, int(job_id)
+
+
+def _requested_change_ids(request: Mapping[str, Any]) -> list[str]:
+    change_ids = request.get("change_ids")
+    if change_ids is None:
+        single = request.get("change_id")
+        change_ids = [single] if single else []
+    if isinstance(change_ids, (str, bytes)) or not isinstance(change_ids, Iterable):
+        raise broker_module.BrokerError("change_ids must be an iterable of ids")
+    return [str(cid) for cid in change_ids]
+
+
 def _operator_approve(request: Mapping[str, Any], credentials: PeerCredentials) -> dict[str, Any]:
+    ledger, job_id = _broker_ledger(request)
+    principal = _principal_for(credentials, broker_module.OPERATOR)
+    recorded = broker_module.record_approval(
+        ledger, job_id, principal=principal,
+        change_ids=_requested_change_ids(request),
+    )
     return {
         "verb": "approve",
         "operator_uid": credentials.uid,
-        "approved": request.get("action_id"),
+        "approved": [receipt.change_id for receipt in recorded],
+        "receipts": [receipt.as_dict() for receipt in recorded],
+    }
+
+
+def _operator_reset_change(
+    request: Mapping[str, Any], credentials: PeerCredentials
+) -> dict[str, Any]:
+    ledger, job_id = _broker_ledger(request)
+    principal = _principal_for(credentials, broker_module.OPERATOR)
+    change_ids = _requested_change_ids(request)
+    recorded = [
+        broker_module.reset_change(
+            ledger, job_id, principal=principal, change_id=change_id
+        )
+        for change_id in change_ids
+    ]
+    return {
+        "verb": "reset_change",
+        "operator_uid": credentials.uid,
+        "reset": [receipt.change_id for receipt in recorded],
+        "receipts": [receipt.as_dict() for receipt in recorded],
+    }
+
+
+def _worker_release_delegated_gate(
+    request: Mapping[str, Any], credentials: PeerCredentials
+) -> dict[str, Any]:
+    ledger, job_id = _broker_ledger(request)
+    identity = request.get("service_identity")
+    job = ledger.get_job(job_id)
+    registered = job["owner_principal"]
+    if not registered or identity != registered:
+        raise broker_module.BrokerMediationError(
+            f"requesting identity {identity!r} is not the job's registered "
+            f"service identity {registered!r}"
+        )
+    principal = _principal_for(credentials, broker_module.SERVICE, identity)
+    change_id = request.get("change_id")
+    if not change_id:
+        raise broker_module.BrokerError("release_delegated_gate requires a change_id")
+    receipt = broker_module.release_delegated_gate(
+        ledger, job_id, principal=principal, change_id=str(change_id)
+    )
+    return {
+        "verb": "release_delegated_gate",
+        "worker_uid": credentials.uid,
+        "released": receipt.change_id,
+        "receipt": receipt.as_dict(),
     }
 
 
@@ -180,6 +267,7 @@ def _worker_heartbeat(
 OPERATOR_HANDLERS: Mapping[str, Callable[..., Any]] = MappingProxyType(
     {
         "approve": _operator_approve,
+        "reset_change": _operator_reset_change,
         "revise_policy": _operator_revise_policy,
         "enable": _operator_enable,
         "cancel": _operator_cancel,
@@ -192,6 +280,7 @@ WORKER_HANDLERS: Mapping[str, Callable[..., Any]] = MappingProxyType(
         "request_action": _worker_request_action,
         "record_evidence": _worker_record_evidence,
         "heartbeat": _worker_heartbeat,
+        "release_delegated_gate": _worker_release_delegated_gate,
     }
 )
 

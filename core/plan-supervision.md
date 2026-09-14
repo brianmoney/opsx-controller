@@ -508,6 +508,155 @@ durable wake-up for the owning job, so a human wait that retains permanent
 ownership never blocks an approval, and a receipt recorded while another
 process holds the lock is not lost.
 
+## Broker: sole approval authority
+
+For a registered supervised job, the **broker** (`lib/supervisor/broker.py` in
+the trusted authority domain) is the sole authority that releases approval and
+acceptance gates. Direct mutation of the JSON execution state, the plan
+manifest, or any repo-writable file releases no gate, satisfies no checkpoint,
+and alters no supervised identity. Within a registered job, `approve`,
+`approve --all`, `approve P<N>`, `accept`, `reset`, `run`, `run-one`, and
+`opsx-run` are broker mediated: each is recorded as a durable broker
+transaction or refused, and execution decisions consult broker state rather
+than unmediated JSON writes. For registered jobs the JSON execution state is a
+**projection** of broker and ledger state, not a competing phase authority.
+
+Unregistered legacy jobs keep their existing JSON handling with no dependency
+on the broker, the supervisor ledger, or any supervision backend.
+
+### Receipts bind to a checkpoint and material revision
+
+A receipt is an append-only ledger row (`receipts`) recording who released (or
+requested) a checkpoint against which material revision. Receipt kinds are
+`approval`, `acceptance`, `reset`, `pause`, and `steer`; the recording
+authority is `operator`, `delegated`, or `service`.
+
+Every approval or acceptance receipt binds to:
+
+- the exact **checkpoint** — the specific gated change and gate kind; and
+- the **material revision** `H(change_id, gate_fields, snapshot_hash,
+  policy_revision)`, where `gate_fields` is the minimal gate-relevant subset of
+  the change's manifest entry (phase, `pause_before`,
+  `pause_before_human_only`, `review_created`, and the declared dependencies)
+  read from the **protected manifest snapshot**, `snapshot_hash` is the
+  policy's recorded snapshot identity, and `policy_revision` is the current
+  insert-only policy revision.
+
+Unrelated updates — task progress, telemetry, other changes' state, or
+non-gate manifest fields — do not invalidate a receipt. A receipt recorded
+against a different material revision does not satisfy the gate. Plan and
+policy revisions are explicit: the material revision changes only when an
+operator registers a new protected snapshot or records a new explicit policy
+revision, never as a side effect of worker writes to the repository.
+
+### Authority resolution
+
+`pause_before_human_only` resolves at runtime as the manifest loader defines
+it: an absent key on a gated change is human-only, an explicit `false`
+delegates to the supervised job's policy-bound authority, and an explicit
+`true` is human-only.
+
+- A **human-only** gate is released only by an operator approval receipt
+  recorded through the OS-authenticated operator path (kernel
+  `SO_PEERCRED` peer identity). The worker-actions endpoint exposes no
+  approval-family verb, so a worker cannot reach one by construction.
+- A **delegated** gate is released only by the scoped job service action
+  (`release_delegated_gate`), accepted by the broker only when the change's
+  resolved authority is delegated and the requesting identity is the job's
+  registered service identity.
+
+An operator approval of a delegated gate and a scoped service release of a
+human-only gate are both refused with the named `BrokerMediationError`.
+
+### Protected snapshot and external registration anchor
+
+A registered supervised job is anchored by two service-owned records held
+outside the worktree: the external registration record (the ledger job and its
+protected insert-only job policy) and a **protected manifest snapshot**
+(`manifest_snapshots`) capturing the manifest content the job was registered
+with. Registration writes the snapshot content and its content-addressed
+`snapshot_hash` in the same transaction as the job and policy revision 1, so a
+registered job always has protected content to evaluate gates against and a
+registered job without stored snapshot content is invalid. The policy's
+`manifest_snapshot_hash` is always the content's hash, so the two can never
+disagree.
+
+Gate and mediation decisions are evaluated from these protected records, never
+from repo-writable copies. Registration detection reuses the service-owned
+ledger lookup by worktree (the same signal the supervised budget gate uses),
+never JSON markers or the repo plan. A worker that edits the JSON execution
+state or the repo plan to drop supervised fields does not escape active
+registration: the job remains registered and broker mediated until the
+registration record itself reaches a terminal state through an authorized
+path.
+
+**Store substitution fails closed.** Registration detection does not trust a
+worker-selectable path. The authority-validated service-owned store — derived
+from the service principal's home (or the root-owned `/var/lib` directory),
+never the invoking user's home — is always consulted, so repointing
+`OPSX_SUPERVISOR_STATE_FILE` at an empty or missing location cannot hide the
+real registered job. An explicitly configured store that does not exist raises
+the named `BrokerUnavailableError` rather than returning "unregistered"; a
+store at an untrusted location, or one that exists but is unreadable, likewise
+fails closed. The legacy unmediated path is reached only when supervision is
+genuinely not provisioned (no candidate store exists at all).
+
+**Batch and phase selection come from the snapshot.** For a registered job,
+`approve --all`, `approve P<N>`, `accept --all`, `accept <id>`, and
+`reset --failed` resolve change membership, order, phase values, and the
+`review_created` flag from the protected snapshot, never the repo-writable
+plan. A worker that rewrites the plan's phases or order cannot redirect a
+`P<N>` batch or hide a gated change from `--all`.
+
+**Dispatch authorization is unforgeable.** A registered job dispatches only
+inside the supervised execution the trusted service actually started. The
+authorization is not an environment variable (a worker controls its
+environment and can set `OPSX_SUPERVISED_EXECUTION=1`), not a repo-writable
+lock record, and not an in-process marker: the control plane exposes no
+process-local flag, context manager, or importable helper that grants
+dispatch. It requires the job's **service-owned ledger fencing record** (the
+`fencing_records` table, not the repo-writable `.opsx-plan` fencing file) to
+name a currently-live supervised execution — matching boot identity and
+process start time, so PID reuse cannot impersonate it, and not since
+released or fenced — and requires the calling process to be that execution or
+a descendant of it. A worker process therefore cannot self-authorize by
+exporting a marker, by forging a repo-writable lock record, or by assigning
+the control plane's own module attributes; an unprovable or stale fence fails
+closed with the named `BrokerMediationError`, and an unreadable service store
+fails closed with `BrokerUnavailableError`.
+
+### Resume revalidation
+
+Before a supervised job resumes dispatch after a restart, a pause, or a human
+wait, the broker revalidates the material gate inputs for every gate the job
+believes is satisfied: each relied-upon receipt is matched against the current
+material revision, and any gate whose receipt no longer matches returns to
+awaiting its defined authority. The stale gate raises the named
+`StaleMaterialError` into the job's incident flow (recorded as a durable
+`stale_material` incident) instead of dispatching; a resume with every
+relied-upon receipt still matching proceeds using those receipts.
+
+### Bounded resets
+
+Within a registered supervised job a reset occurs only through an authorized
+path: an operator reset recorded through the operator OS-authenticated path, or
+a bounded service reset within the job's policy limits (an explicit
+`max_service_resets` policy bound). Authorized resets are recorded as durable
+`reset` receipts so the reset history is auditable. A reset attempted directly
+by a worker-domain process — through `opsx-plan reset`, `opsx-run`, or JSON
+mutation — is refused with the named `BrokerMediationError` and alters no
+broker or ledger state. A broker reset never acquires the worktree execution
+lock.
+
+### Durable wake-up
+
+The receipt append is the durable record. The supervised execution tracks a
+per-job receipt high-water id and, on boot or wake, scans `id > high_water`
+(`ledger.receipts_after`). An in-process/same-host notify may trigger an
+immediate scan for liveness, but the scan is the authority, so a restart never
+loses a receipt. No receipt path acquires or waits for the execution lock.
+
+
 ## Separation from execution state
 
 The supervisor ledger is storage separate from the authoritative JSON
@@ -516,11 +665,16 @@ execution state under `.opsx-plan/`:
 - The ledger is never stored under `.opsx-plan/` or anywhere else inside a
   writable worktree.
 - Introducing the ledger does not change the JSON state's location, format,
-  or read/write semantics.
+  or read/write semantics for unregistered jobs.
 - An ordinary, unsupervised run completes without opening, creating, or
   requiring the ledger.
-- The JSON state remains the authority for phase progression; the ledger is
-  additive supervision data.
+- For unregistered jobs the JSON state remains the authority for phase
+  progression; the ledger is additive supervision data. For a registered
+  supervised job the broker and ledger are the phase authority, and the JSON
+  state is a projection of broker and ledger state: a direct JSON write
+  releases no gate, satisfies no checkpoint, and alters no supervised
+  identity, and any direct JSON edit that disagrees with the broker records
+  has no authority.
 
 ## Ownership fields
 

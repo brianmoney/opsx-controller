@@ -207,6 +207,7 @@ class LockTestCase(unittest.TestCase):
             "owner": "service",
             "policy": _policy(),
             "operator": "operator",
+            "manifest_content": "[[changes]]\nid = \"change-a\"\n",
         }
         params.update(overrides)
         return handle.register_job(**params)

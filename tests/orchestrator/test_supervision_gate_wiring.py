@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import io
 import json
 import os
 import sqlite3
@@ -17,11 +18,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager, redirect_stderr
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from lib.supervisor import budgets, clock, ledger, model_policy
+from lib.supervisor import budgets, clock, ledger, model_policy, lock as lock_mod
 
 SCRIPT = Path(__file__).resolve().parents[2] / "orchestrator" / "opsx-plan.py"
 
@@ -178,8 +180,49 @@ class SupervisedGateTestCase(unittest.TestCase):
             owner="service",
             policy=policy if policy is not None else _policy(),
             operator="operator",
+            manifest_content=self._manifest_content(),
         )
+        self.job_id = job_id
         return job_id
+
+    @contextmanager
+    def supervised_execution(self):
+        """Authorize this process as the trusted supervised execution.
+
+        Dispatch authorization is the service-owned ledger fence, not an
+        in-process marker: record a live ``acquired`` fencing row bound to this
+        process (matching boot id plus process start time) for the active
+        registered job, then release it. An unregistered worktree needs no
+        fence and just runs.
+        """
+        job = self.ledger.find_job_by_worktree(self.repo)
+        if job is None:
+            yield
+            return
+        job_id = int(job["id"])
+        identity = lock_mod.current_identity()
+        self.ledger.record_fencing(
+            job_id, event="acquired", owner="test-service",
+            pid=identity["pid"], process_start=identity["process_start"],
+            boot_id=identity["boot_id"], host=identity["host"],
+        )
+        try:
+            yield
+        finally:
+            self.ledger.record_fencing(
+                job_id, event="released", owner="test-service",
+                pid=identity["pid"], process_start=identity["process_start"],
+                boot_id=identity["boot_id"], host=identity["host"],
+            )
+
+    def _manifest_content(self) -> str:
+        """Protected manifest content for the fixture's single gated change."""
+        return (
+            "[[changes]]\n"
+            f'id = "{self.cid}"\n'
+            "pause_before = false\n"
+            "depends_on = []\n"
+        )
 
     def enable_gate_env(self) -> None:
         patcher = mock.patch.dict(
@@ -218,9 +261,14 @@ class SupervisedGateTestCase(unittest.TestCase):
         return records
 
     def run_change(self, *, budget_usd: float = 0.0) -> str:
-        return self.opsx_plan.run_direct_change(
-            self.repo, self.cfg, self.state, self.cid, budget_usd=budget_usd
-        )
+        # A registered job dispatches only inside the supervised execution, i.e.
+        # as a descendant of the process the service-owned fence names. This
+        # suite drives the supervised budget gate, so it always runs under a
+        # live ledger fence.
+        with self.supervised_execution():
+            return self.opsx_plan.run_direct_change(
+                self.repo, self.cfg, self.state, self.cid, budget_usd=budget_usd
+            )
 
 
 class ReservationWiringTests(SupervisedGateTestCase):
@@ -862,7 +910,10 @@ class CreateRunLoopEndToEndTests(SupervisedGateTestCase):
             budget_usd=0, create_only=False, no_branch=True, no_pr=True,
             skip_openspec=True, skip_warning=False, skip_suggestion=False,
         )
-        return self.opsx_plan.cmd_run(args)
+        # A live service-owned ledger fence lets a registered job dispatch; an
+        # ordinary CLI run would be refused with BrokerMediationError.
+        with self.supervised_execution():
+            return self.opsx_plan.cmd_run(args)
 
     def test_cmd_run_create_reconciles_observed_usage(self) -> None:
         plan_name = "run-add-gate-test"
@@ -870,6 +921,7 @@ class CreateRunLoopEndToEndTests(SupervisedGateTestCase):
         job_id = self.ledger.register_job(
             run_id="run-1", worktree=self.repo, owner="service",
             policy=_policy(), operator="operator",
+            manifest_content="[[changes]]\nid = \"add-gate-test\"\n",
         )
         self.enable_gate_env()
         self._install_stage(usage={"input_tokens": 50, "output_tokens": 25})
@@ -895,6 +947,7 @@ class CreateRunLoopEndToEndTests(SupervisedGateTestCase):
         job_id = self.ledger.register_job(
             run_id="run-1", worktree=self.repo, owner="service",
             policy=_policy(), operator="operator",
+            manifest_content="[[changes]]\nid = \"add-gate-test\"\n",
         )
         self.enable_gate_env()
         self._install_stage(usage=None)
@@ -913,6 +966,7 @@ class CreateRunLoopEndToEndTests(SupervisedGateTestCase):
         self.ledger.register_job(
             run_id="run-1", worktree=self.repo, owner="service",
             policy=_policy(), operator="operator",
+            manifest_content="[[changes]]\nid = \"add-gate-test\"\n",
         )
         broken = self.storage / "broken.sqlite3"
         broken.write_bytes(b"not a sqlite database")
@@ -925,12 +979,13 @@ class CreateRunLoopEndToEndTests(SupervisedGateTestCase):
         self.opsx_plan.run_stage = (
             lambda *a, **k: spawned.append("called") or ("exited", self.repo)
         )
-        self._run(plan)
+        with redirect_stderr(io.StringIO()) as err:
+            rc = self._run(plan)
+        # A registered job whose supervision backend cannot be read fails
+        # closed with the named error before any create dispatch.
+        self.assertEqual(rc, 2, err.getvalue())
+        self.assertIn("BrokerUnavailableError", err.getvalue())
         self.assertEqual(spawned, [], "no create may spawn without a reservation")
-        state = self.opsx_plan.state_mod.load_state(self.repo, plan_name)
-        rec = state["changes"][self.cid]
-        self.assertNotEqual(rec["status"], self.opsx_plan.base.DONE)
-        self.assertIn("supervised gate unavailable", rec.get("reason", ""))
 
 
 class RetryableCatalogLoadTests(SupervisedGateTestCase):

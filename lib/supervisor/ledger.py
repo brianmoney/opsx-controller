@@ -23,6 +23,7 @@ Design rules enforced here:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -33,8 +34,14 @@ from lib.supervisor import budgets
 from lib.supervisor import clock
 from lib.supervisor import model_policy
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 CURRENT_POLICY_VERSION = 1
+
+# Durable broker receipt kinds and the authorities that may record them. A
+# receipt is an authority record (who released a checkpoint against which
+# material revision), not a dispatched action; it is append-only.
+RECEIPT_KINDS = ("approval", "acceptance", "reset", "pause", "steer")
+RECEIPT_AUTHORITIES = ("operator", "delegated", "service")
 
 # Fencing-record events. A fencing record describes one execution-lock
 # acquisition, release, or takeover for a supervised job; it never reassigns
@@ -104,6 +111,16 @@ def _utcnow() -> str:
     # Resolve through the owning module object so a rebound ``clock.utcnow``
     # is observed here (see the package's import discipline).
     return clock.utcnow()
+
+
+def snapshot_digest(content: str) -> str:
+    """Return the stable identity hash of protected manifest snapshot *content*.
+
+    The snapshot content is the registered manifest text; hashing it here (and
+    nowhere else) keeps the policy's ``manifest_snapshot_hash`` and the stored
+    ``manifest_snapshots`` row in lockstep by construction.
+    """
+    return hashlib.sha256(str(content).encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -415,11 +432,59 @@ def _migrate_3_to_4(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE reservations ADD COLUMN retained_at TEXT")
 
 
+_RECEIPT_KINDS_SQL = "'" + "','".join(RECEIPT_KINDS) + "'"
+_RECEIPT_AUTHORITIES_SQL = "'" + "','".join(RECEIPT_AUTHORITIES) + "'"
+
+_SCHEMA_V5_STATEMENTS = (
+    f"""
+    CREATE TABLE IF NOT EXISTS receipts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id INTEGER NOT NULL REFERENCES jobs (id),
+        change_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ({_RECEIPT_KINDS_SQL})),
+        checkpoint TEXT NOT NULL,
+        material_hash TEXT NOT NULL,
+        authority TEXT NOT NULL CHECK (authority IN ({_RECEIPT_AUTHORITIES_SQL})),
+        actor_principal TEXT,
+        detail TEXT,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_receipts_job_change_kind
+        ON receipts (job_id, change_id, kind)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS manifest_snapshots (
+        job_id INTEGER NOT NULL REFERENCES jobs (id),
+        snapshot_hash TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (job_id, snapshot_hash)
+    )
+    """,
+)
+
+
+def _migrate_4_to_5(conn: sqlite3.Connection) -> None:
+    """Add the append-only broker receipt and protected manifest snapshot tables.
+
+    Strictly additive: ``receipts`` records durable authority transactions
+    (approval, acceptance, reset, pause, steer) bound to a checkpoint and
+    material revision, and ``manifest_snapshots`` stores the protected manifest
+    content a job registered with. Both live in the external ledger, never in
+    the worktree, so a worker cannot forge a receipt or edit the snapshot.
+    """
+    for statement in _SCHEMA_V5_STATEMENTS:
+        conn.execute(statement)
+
+
 MIGRATIONS: dict[int, Any] = {
     1: _migrate_0_to_1,
     2: _migrate_1_to_2,
     3: _migrate_2_to_3,
     4: _migrate_3_to_4,
+    5: _migrate_4_to_5,
 }
 
 
@@ -556,6 +621,7 @@ class Ledger:
         owner: str,
         policy: Mapping[str, Any],
         operator: str,
+        manifest_content: str,
         owner_principal: str | None = None,
         owner_host: str | None = None,
         owner_boot_id: str | None = None,
@@ -563,11 +629,23 @@ class Ledger:
     ) -> int:
         """Register a supervised job with its initial policy revision.
 
-        The job row and policy revision 1 are written in a single transaction.
+        The job row, policy revision 1, and the protected manifest snapshot are
+        written in a single transaction. A registered job always has protected
+        snapshot content to evaluate gates against, so *manifest_content* is
+        required: a registration without it is invalid. The snapshot's identity
+        hash is computed from the content and recorded on the policy, replacing
+        any caller-supplied ``manifest_snapshot_hash`` so the two can never
+        disagree.
+
         A second registration for a worktree that already has an active job
         raises :class:`DuplicateJobError` and leaves the existing job
         unchanged.
         """
+        if not isinstance(manifest_content, str) or not manifest_content:
+            raise LedgerError(
+                "register_job requires non-empty manifest_content; a registered "
+                "job without stored protected snapshot content is invalid"
+            )
         root = repository_root if repository_root is not None else self.repository_root
         if root is None:
             raise LedgerError("register_job requires a repository_root")
@@ -575,6 +653,8 @@ class Ledger:
         worktree_rel = repository_relative(worktree, repo_root)
 
         fields = self._validate_policy(policy)
+        snapshot_hash = snapshot_digest(manifest_content)
+        fields["manifest_snapshot_hash"] = snapshot_hash
         now = _utcnow()
 
         existing = self._conn.execute(
@@ -609,6 +689,11 @@ class Ledger:
                 self._conn, job_id=job_id, revision=1,
                 policy_version=policy_version, fields=fields, operator=operator,
                 now=now, is_current=1,
+            )
+            _ = self._conn.execute(
+                "INSERT INTO manifest_snapshots "
+                "(job_id, snapshot_hash, content, created_at) VALUES (?, ?, ?, ?)",
+                (job_id, snapshot_hash, manifest_content, now),
             )
             _ = self._conn.execute(
                 "UPDATE jobs SET state = 'active', updated_at = ? WHERE id = ?",
@@ -660,6 +745,179 @@ class Ledger:
                 "UPDATE jobs SET state = ?, updated_at = ? WHERE id = ?",
                 (state, _utcnow(), job_id),
             )
+
+    # -- receipts and protected snapshots ----------------------------------
+
+    def record_receipt(
+        self,
+        job_id: int,
+        *,
+        change_id: str,
+        kind: str,
+        checkpoint: str,
+        material_hash: str,
+        authority: str,
+        actor_principal: str | None = None,
+        detail: str | None = None,
+    ) -> int:
+        """Append one durable authority receipt in a single transaction.
+
+        Receipts are insert-only: they record who released (or requested) a
+        checkpoint against which material revision. An unknown job, kind, or
+        authority is refused and nothing is written.
+        """
+        if kind not in RECEIPT_KINDS:
+            raise LedgerError(f"unknown receipt kind: {kind}")
+        if authority not in RECEIPT_AUTHORITIES:
+            raise LedgerError(f"unknown receipt authority: {authority}")
+        if not change_id or not checkpoint or not material_hash:
+            raise LedgerError(
+                "a receipt requires change_id, checkpoint, and material_hash"
+            )
+        self.get_job(job_id)
+        now = _utcnow()
+        with self._transaction():
+            cursor = self._conn.execute(
+                """
+                INSERT INTO receipts (
+                    job_id, change_id, kind, checkpoint, material_hash,
+                    authority, actor_principal, detail, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id, change_id, kind, checkpoint, material_hash,
+                    authority, actor_principal, detail, now,
+                ),
+            )
+            receipt_id = int(cursor.lastrowid)
+        return receipt_id
+
+    def record_receipts(
+        self,
+        job_id: int,
+        receipts: Iterable[Mapping[str, Any]],
+    ) -> list[int]:
+        """Append a batch of receipts in one transaction, returning their ids.
+
+        A multi-change batch (``approve --all``, ``accept --all``) is one
+        durable transaction: either every receipt is committed or none is, so a
+        partial batch can never be observed.
+        """
+        self.get_job(job_id)
+        now = _utcnow()
+        receipt_ids: list[int] = []
+        with self._transaction():
+            for receipt in receipts:
+                kind = receipt["kind"]
+                authority = receipt["authority"]
+                if kind not in RECEIPT_KINDS:
+                    raise LedgerError(f"unknown receipt kind: {kind}")
+                if authority not in RECEIPT_AUTHORITIES:
+                    raise LedgerError(f"unknown receipt authority: {authority}")
+                if not receipt.get("change_id") or not receipt.get("checkpoint") \
+                        or not receipt.get("material_hash"):
+                    raise LedgerError(
+                        "a receipt requires change_id, checkpoint, and material_hash"
+                    )
+                cursor = self._conn.execute(
+                    """
+                    INSERT INTO receipts (
+                        job_id, change_id, kind, checkpoint, material_hash,
+                        authority, actor_principal, detail, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        job_id, receipt["change_id"], kind, receipt["checkpoint"],
+                        receipt["material_hash"], authority,
+                        receipt.get("actor_principal"), receipt.get("detail"), now,
+                    ),
+                )
+                receipt_ids.append(int(cursor.lastrowid))
+        return receipt_ids
+
+    def get_receipt(self, receipt_id: int) -> sqlite3.Row:
+        row = self._conn.execute(
+            "SELECT * FROM receipts WHERE id = ?", (receipt_id,)
+        ).fetchone()
+        if row is None:
+            raise UnknownRecordError(f"no such receipt: {receipt_id}")
+        return row
+
+    def receipts_for_change(
+        self, job_id: int, change_id: str, *, kind: str | None = None
+    ) -> list[sqlite3.Row]:
+        """Return *change_id*'s receipts in insertion order, optionally filtered."""
+        if kind is None:
+            return list(
+                self._conn.execute(
+                    "SELECT * FROM receipts WHERE job_id = ? AND change_id = ? "
+                    "ORDER BY id",
+                    (job_id, change_id),
+                )
+            )
+        return list(
+            self._conn.execute(
+                "SELECT * FROM receipts WHERE job_id = ? AND change_id = ? "
+                "AND kind = ? ORDER BY id",
+                (job_id, change_id, kind),
+            )
+        )
+
+    def receipts_after(self, job_id: int, high_water: int) -> list[sqlite3.Row]:
+        """Return a job's receipts with ``id > high_water`` in insertion order.
+
+        This is the durable wake-up scan: it is authoritative regardless of any
+        in-process notify, so a restart that missed a notification still
+        observes every receipt recorded while it was down.
+        """
+        return list(
+            self._conn.execute(
+                "SELECT * FROM receipts WHERE job_id = ? AND id > ? ORDER BY id",
+                (job_id, high_water),
+            )
+        )
+
+    def receipt_high_water(self, job_id: int) -> int:
+        """Return the highest receipt id for *job_id* (0 when none exist)."""
+        row = self._conn.execute(
+            "SELECT MAX(id) AS high_water FROM receipts WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        value = row["high_water"] if row is not None else None
+        return int(value) if value is not None else 0
+
+    def record_manifest_snapshot(
+        self, job_id: int, *, content: str
+    ) -> str:
+        """Store protected manifest *content* for *job_id*, returning its hash.
+
+        The write is idempotent per ``(job_id, snapshot_hash)`` so re-recording
+        identical content is a no-op rather than an error.
+        """
+        self.get_job(job_id)
+        snapshot_hash = snapshot_digest(content)
+        now = _utcnow()
+        with self._transaction():
+            _ = self._conn.execute(
+                "INSERT OR IGNORE INTO manifest_snapshots "
+                "(job_id, snapshot_hash, content, created_at) VALUES (?, ?, ?, ?)",
+                (job_id, snapshot_hash, content, now),
+            )
+        return snapshot_hash
+
+    def manifest_snapshot(self, job_id: int, snapshot_hash: str) -> str | None:
+        """Return the protected snapshot content for *snapshot_hash*, or ``None``."""
+        row = self._conn.execute(
+            "SELECT content FROM manifest_snapshots "
+            "WHERE job_id = ? AND snapshot_hash = ?",
+            (job_id, snapshot_hash),
+        ).fetchone()
+        return None if row is None else str(row["content"])
+
+    def current_manifest_snapshot(self, job_id: int) -> str | None:
+        """Return the content identified by the current policy's snapshot hash."""
+        policy = self.current_policy(job_id)
+        return self.manifest_snapshot(job_id, policy["manifest_snapshot_hash"])
 
     # -- policy ------------------------------------------------------------
 

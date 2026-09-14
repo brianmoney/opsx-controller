@@ -78,6 +78,7 @@ class LedgerTestCase(unittest.TestCase):
             "owner": "service",
             "policy": _policy(),
             "operator": "operator",
+            "manifest_content": "[[changes]]\nid = \"change-a\"\n",
         }
         params.update(overrides)
         return handle.register_job(**params)
@@ -168,6 +169,119 @@ class MigrationTests(LedgerTestCase):
         policy = handle.current_policy(job_id)
         self.assertEqual(policy["policy_version"], ledger.CURRENT_POLICY_VERSION)
         self.assertEqual(policy["job_id"], job_id)
+
+
+class ReceiptAndSnapshotSchemaTests(LedgerTestCase):
+    """Task 1.3: the v5 receipts/manifest_snapshots migration contract."""
+
+    def test_v4_ledger_migrates_forward_preserving_existing_records(self) -> None:
+        handle = self.open()
+        job_id = self.register(handle)
+        action_id = handle.begin_action(job_id, kind="implement", run_id="run-1")
+        incident_id = handle.record_incident(job_id, kind="crash", summary="restart")
+        handle.close()
+
+        # Simulate a genuine v4 ledger: drop the v5 tables and stamp the prior
+        # schema version.
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("DROP TABLE IF EXISTS manifest_snapshots")
+        conn.execute("DROP TABLE IF EXISTS receipts")
+        conn.execute("PRAGMA user_version = 4")
+        conn.commit()
+        conn.close()
+
+        migrated = self.open()
+        self.assertEqual(migrated.schema_version(), ledger.CURRENT_SCHEMA_VERSION)
+        # Every pre-existing record survives the migration intact.
+        self.assertEqual(migrated.get_job(job_id)["id"], job_id)
+        self.assertEqual(migrated.get_action(action_id)["id"], action_id)
+        self.assertEqual(migrated.get_incident(incident_id)["id"], incident_id)
+        self.assertEqual(migrated.current_policy(job_id)["job_id"], job_id)
+        # The new tables exist and are usable immediately after migration.
+        self.assertEqual(migrated.receipts_for_change(job_id, "change-a"), [])
+        self.assertEqual(migrated.receipt_high_water(job_id), 0)
+        # A job registered before the table existed carries no stored content
+        # (it cannot be recovered), but the table is writable now.
+        digest = migrated.record_manifest_snapshot(job_id, content="[[changes]]\n")
+        self.assertEqual(migrated.manifest_snapshot(job_id, digest), "[[changes]]\n")
+
+    def test_v5_ledger_opened_by_older_code_raises(self) -> None:
+        handle = self.open()
+        self.register(handle)
+        handle.close()
+
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA user_version = 5")
+        conn.commit()
+        conn.close()
+
+        with mock.patch.object(ledger, "CURRENT_SCHEMA_VERSION", 4):
+            with self.assertRaises(ledger.LedgerVersionError):
+                ledger.open_ledger(self.db_path, repository_root=self.repo)
+
+    def test_registration_requires_protected_snapshot_content(self) -> None:
+        handle = self.open()
+        with self.assertRaises(ledger.LedgerError):
+            self.register(handle, manifest_content="")
+        with self.assertRaises(ledger.LedgerError):
+            self.register(handle, manifest_content=None)
+        self.assertEqual(handle.list_jobs(), [])
+
+    def test_registration_records_hash_bound_to_content(self) -> None:
+        handle = self.open()
+        content = "[[changes]]\nid = \"change-a\"\n"
+        job_id = self.register(handle, manifest_content=content)
+        policy = handle.current_policy(job_id)
+        self.assertEqual(
+            policy["manifest_snapshot_hash"], ledger.snapshot_digest(content)
+        )
+        self.assertEqual(handle.current_manifest_snapshot(job_id), content)
+
+    def test_receipts_are_append_only_and_queryable(self) -> None:
+        handle = self.open()
+        job_id = self.register(handle)
+        first = handle.record_receipt(
+            job_id, change_id="change-a", kind="approval",
+            checkpoint="approval:change-a", material_hash="deadbeef",
+            authority="operator", actor_principal="alice",
+        )
+        second = handle.record_receipt(
+            job_id, change_id="change-a", kind="approval",
+            checkpoint="approval:change-a", material_hash="cafef00d",
+            authority="operator",
+        )
+        approvals = handle.receipts_for_change(job_id, "change-a", kind="approval")
+        self.assertEqual([row["id"] for row in approvals], [first, second])
+        self.assertEqual(handle.receipt_high_water(job_id), second)
+        self.assertEqual(
+            [row["id"] for row in handle.receipts_after(job_id, first)], [second]
+        )
+
+    def test_unknown_receipt_kind_or_authority_is_refused(self) -> None:
+        handle = self.open()
+        job_id = self.register(handle)
+        for kind in ("bogus", ""):
+            with self.assertRaises(ledger.LedgerError):
+                handle.record_receipt(
+                    job_id, change_id="change-a", kind=kind,
+                    checkpoint="c", material_hash="h", authority="operator",
+                )
+        with self.assertRaises(ledger.LedgerError):
+            handle.record_receipt(
+                job_id, change_id="change-a", kind="approval",
+                checkpoint="c", material_hash="h", authority="root",
+            )
+        self.assertEqual(handle.receipt_high_water(job_id), 0)
+
+    def test_snapshot_store_is_idempotent_and_hash_addressed(self) -> None:
+        handle = self.open()
+        job_id = self.register(handle)
+        content = "[[changes]]\nid = \"change-b\"\n"
+        digest = handle.record_manifest_snapshot(job_id, content=content)
+        again = handle.record_manifest_snapshot(job_id, content=content)
+        self.assertEqual(digest, again)
+        self.assertEqual(handle.manifest_snapshot(job_id, digest), content)
+        self.assertIsNone(handle.manifest_snapshot(job_id, "missing"))
 
 
 class CrashRecoveryTests(LedgerTestCase):

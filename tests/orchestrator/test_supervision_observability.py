@@ -196,6 +196,9 @@ class CoreMetricsCollectionTests(unittest.TestCase):
         handle = ledger.open_ledger(db_path, repository_root=repo)
         job_id = handle.register_job(
             run_id="run-1", worktree=worktree, owner="service", operator="operator",
+            manifest_content=(
+                "[[changes]]\nid = \"add-gate-test\"\n"
+            ),
             policy={
                 "authority_config": {"mode": "policy-bound"},
                 "model_selection": {

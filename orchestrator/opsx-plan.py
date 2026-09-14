@@ -92,6 +92,8 @@ try:
     )
     from lib.orchestrator import cost as cost_mod
     from lib.orchestrator import state as state_mod
+    from lib.orchestrator import supervision as supervision
+    from lib.supervisor import broker as broker_mod
     from lib.supervisor import budgets as budget_mod
     from lib.supervisor import ledger as ledger_mod
     from lib.supervisor import lock as lock_mod
@@ -1762,61 +1764,33 @@ class RetryableCatalogLoadError(budget_mod.BudgetError):
     """
 
 
-def _supervisor_ledger_path(repo: Path) -> Path | None:
-    """Resolve the external supervisor ledger path for this host.
-
-    Prefers the explicit ``OPSX_SUPERVISOR_STATE_FILE`` contract used by the
-    authority boundary, then the trusted default. Returns ``None`` when no
-    candidate is configured, so an ordinary run stays backend-free.
-    """
-    configured = os.environ.get("OPSX_SUPERVISOR_STATE_FILE", "").strip()
-    if configured:
-        return Path(configured).expanduser()
-    try:
-        return ledger_mod.default_ledger_path()
-    except Exception:
-        return None
-
-
 def open_supervised_gate(repo: Path) -> dict | None:
     """Return the supervised budget gate for *repo*, or ``None``.
 
     A gate exists only for a worktree with a non-terminal registered supervised
     job; an ordinary, unregistered run returns ``None`` and keeps the legacy
     ``--budget-minutes`` / ``--budget-usd`` behavior with no durable budget
-    layer. A genuinely absent supervision backend — no configured/default
-    ledger file — is likewise ``None``.
+    layer. Detection routes through the same authority-validated,
+    service-owned store lookup the gate and run commands use, so a worker
+    cannot substitute the registration decision with a missing or repointed
+    path; a genuinely absent supervision backend is ``None``.
 
-    Opening fails closed: when a supervision backend *exists* but the ledger or
-    its policy cannot be read, this raises :class:`SupervisionGateError` so the
-    caller blocks before any dispatch rather than silently taking the
-    unregistered legacy path.
+    Opening fails closed: when a supervision backend is configured but the
+    ledger or its policy cannot be read — including a configured store that
+    does not exist — this raises :class:`SupervisionGateError` so the caller
+    blocks before any dispatch rather than silently taking the unregistered
+    legacy path.
     """
-    path = _supervisor_ledger_path(repo)
-    if path is None:
-        return None
-    if not path.exists():
-        return None
     try:
-        handle = ledger_mod.open_ledger(path, repository_root=repo, create=False)
-    except Exception as exc:
-        raise SupervisionGateError(
-            f"supervision ledger at {path} exists but could not be opened: {exc}"
-        ) from exc
-    try:
-        job = handle.find_job_by_worktree(repo, repository_root=repo)
-        if job is None or job["state"] in ledger_mod.TERMINAL_JOB_STATES:
-            return None
-        policy = handle.current_policy(int(job["id"]))
-    except Exception as exc:
-        handle.close()
-        raise SupervisionGateError(
-            f"registered supervised job for {repo} could not be read: {exc}"
-        ) from exc
+        registration = supervision.open_registration(repo)
+    except broker_mod.BrokerError as exc:
+        raise SupervisionGateError(str(exc)) from exc
+    if registration is None:
+        return None
     return {
-        "ledger": handle,
-        "job_id": int(job["id"]),
-        "policy": policy,
+        "ledger": registration.ledger,
+        "job_id": registration.job_id,
+        "policy": registration.policy,
     }
 
 
@@ -1827,6 +1801,32 @@ def close_supervised_gate(gate: dict | None) -> None:
         gate["ledger"].close()
     except Exception:
         pass
+
+
+def _assert_run_gates_resolvable(registration, cfg: dict) -> None:
+    """Refuse a supervised dispatch whose gates are not broker-resolved.
+
+    Gate authority for a registered job comes from broker receipts, not from
+    ``state["approvals"]``. Resume revalidation runs first so a relied-upon
+    receipt that no longer matches the current material revision re-arms its
+    gate and raises ``StaleMaterialError`` into the run rather than
+    dispatching. Legacy ``classify()`` is untouched for unregistered runs.
+    """
+    broker_mod.assert_resume_clear(registration.ledger, registration.job_id)
+    for cid in cfg["order"]:
+        change = cfg["changes"][cid]
+        if not change.get("pause_before"):
+            continue
+        if not broker_mod.is_dispatchable(
+            registration.ledger, registration.job_id, cid
+        ):
+            resolution = broker_mod.resolve_gate(
+                registration.ledger, registration.job_id, cid
+            )
+            raise broker_mod.StaleMaterialError(
+                f"change {cid} is not dispatchable: {resolution.reason}; approve "
+                "it through the operator path before running"
+            )
 
 
 def _pinned_model_for_role(policy: dict, role: str) -> str | None:
@@ -2464,6 +2464,25 @@ def run_direct_change(
         base.log(f"  {reason}")
         persist_direct_state(repo, cfg, state, cid)
         return "budget"
+    if supervised_gate is not None:
+        # Resume revalidation: before the first dispatch after a restart, pause,
+        # or human wait, every relied-upon receipt is matched against the current
+        # material revision. A stale receipt re-arms its gate and raises
+        # StaleMaterialError into this change's incident flow instead of
+        # dispatching.
+        try:
+            broker_mod.assert_resume_clear(
+                supervised_gate["ledger"], supervised_gate["job_id"],
+                change_ids=[cid],
+            )
+        except broker_mod.StaleMaterialError as exc:
+            reason = f"stale material revision: {exc}"
+            r["last_result"] = "stale_material"
+            state_mod.set_status(state, cid, base.PENDING, reason)
+            base.log(f"  {reason}")
+            persist_direct_state(repo, cfg, state, cid)
+            close_supervised_gate(supervised_gate)
+            return "budget"
     try:
         return _run_direct_change_loop(
             repo, cfg, state, cid, r, budget_deadline, budget_usd, supervised_gate
@@ -3069,8 +3088,14 @@ def handle_sigint(signum, frame):  # noqa: ARG001
 # Scheduling
 # ---------------------------------------------------------------------------
 
-def classify(cfg: dict, state: dict, cid: str) -> str:
-    """Computed status for reporting: includes blocked/awaiting_approval."""
+def classify(cfg: dict, state: dict, cid: str, gate_resolver=None) -> str:
+    """Computed status for reporting: includes blocked/awaiting_approval.
+
+    For a registered supervised job the caller supplies *gate_resolver*, a
+    ``change_id -> bool`` predicate backed by broker receipts; a gated change
+    then consults the broker instead of ``state["approvals"]``. The default
+    (``None``) keeps the legacy JSON behavior byte-identical.
+    """
     c = cfg["changes"][cid]
     r = state_mod.rec(state, cid)
     if not c["enabled"]:
@@ -3078,13 +3103,17 @@ def classify(cfg: dict, state: dict, cid: str) -> str:
     if r["status"] in (base.DONE, base.FAILED, base.RUNNING):
         return r["status"]
     for dep in c["depends_on"]:
-        dep_status = classify(cfg, state, dep)
+        dep_status = classify(cfg, state, dep, gate_resolver)
         if dep_status in (base.FAILED, "blocked"):
             return "blocked"
         if dep_status != base.DONE:
             return base.PENDING
-    if c["pause_before"] and cid not in state["approvals"]:
-        return "awaiting_approval"
+    if c["pause_before"]:
+        if gate_resolver is not None:
+            if not gate_resolver(cid):
+                return "awaiting_approval"
+        elif cid not in state["approvals"]:
+            return "awaiting_approval"
     if (
         cfg["review_created"]
         and r.get("created_by_orchestrator")
@@ -3213,6 +3242,25 @@ def cmd_run(args: argparse.Namespace) -> int:
     except base.PlanError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    # A registered supervised job dispatches only inside the supervised
+    # execution; an ordinary `opsx-plan run` is refused with the named
+    # mediation error before any lock or state mutation. The registration
+    # signal is the service-owned ledger lookup, never a repo-writable marker.
+    try:
+        supervision_registration = supervision.require_supervised_authorization(repo)
+    except broker_mod.BrokerError as exc:
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    if supervision_registration is not None:
+        try:
+            _assert_run_gates_resolvable(
+                supervision_registration, cfg
+            )
+        except broker_mod.BrokerError as exc:
+            print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
+        finally:
+            supervision_registration.close()
     # Acquire the worktree execution lock after plan resolution and before any
     # state mutation. The lock is released on every exit path, including the
     # SIGINT handler (a context manager's finally runs on SystemExit).
@@ -3248,6 +3296,33 @@ def _cmd_run_body(args: argparse.Namespace, repo: Path, plan_src: str, cfg: dict
     state = state_mod.load_state(repo, cfg["name"])
     signal.signal(signal.SIGINT, handle_sigint)
 
+    # A registered supervised job resolves gates through broker receipts, not
+    # the JSON approvals list. The resolver is ``None`` for an unregistered
+    # run, keeping legacy ``classify()`` byte-identical. An unreadable backend
+    # defers to the per-dispatch budget gate, which fails closed.
+    run_registration = supervision.require_supervised_authorization(repo)
+    gate_resolver = (
+        supervision.gate_resolver(run_registration)
+        if run_registration is not None
+        else None
+    )
+    try:
+        return _cmd_run_body_inner(
+            args, repo, plan_src, cfg, state, gate_resolver
+        )
+    finally:
+        if run_registration is not None:
+            run_registration.close()
+
+
+def _cmd_run_body_inner(
+    args: argparse.Namespace,
+    repo: Path,
+    plan_src: str,
+    cfg: dict,
+    state: dict,
+    gate_resolver,
+) -> int:
     validate_dsh_state_files(repo, cfg, state)
     reconcile(repo, cfg, state)
     state_mod.save_state(repo, cfg["name"], state)
@@ -3258,7 +3333,7 @@ def _cmd_run_body(args: argparse.Namespace, repo: Path, plan_src: str, cfg: dict
     for cid in cfg["order"]:
         if not cfg["changes"][cid]["enabled"]:
             continue
-        status = classify(cfg, state, cid)
+        status = classify(cfg, state, cid, gate_resolver)
         change_notified = notified.setdefault(cid, [])
         if status == "awaiting_approval" and "awaiting_approval" not in change_notified:
             _try_notify(cfg, "awaiting_approval", f"change {cid} awaiting approval", change_id=cid)
@@ -3330,7 +3405,7 @@ def _cmd_run_body(args: argparse.Namespace, repo: Path, plan_src: str, cfg: dict
         create_only_ok = {"ready", "awaiting_approval"} if args.create_only else {"ready"}
         ready = [
             c for c in cfg["order"]
-            if c not in visited and classify(cfg, state, c) in create_only_ok
+            if c not in visited and classify(cfg, state, c, gate_resolver) in create_only_ok
         ]
         if args.only:
             ready = [c for c in ready if c in args.only]
@@ -3339,7 +3414,7 @@ def _cmd_run_body(args: argparse.Namespace, repo: Path, plan_src: str, cfg: dict
             for cid in cfg["order"]:
                 if not cfg["changes"][cid]["enabled"]:
                     continue
-                status = classify(cfg, state, cid)
+                status = classify(cfg, state, cid, gate_resolver)
                 change_notified = notified.setdefault(cid, [])
                 if status == "awaiting_approval" and "awaiting_approval" not in change_notified:
                     _try_notify(cfg, "awaiting_approval", f"change {cid} awaiting approval", change_id=cid)
@@ -3483,7 +3558,7 @@ def _cmd_run_body(args: argparse.Namespace, repo: Path, plan_src: str, cfg: dict
     if not args.dry_run:
         no_pr = getattr(args, "no_pr", False)
         all_done = all(
-            classify(cfg, state, cid) == base.DONE
+            classify(cfg, state, cid, gate_resolver) == base.DONE
             for cid in cfg["order"]
             if cfg["changes"][cid]["enabled"]
         )

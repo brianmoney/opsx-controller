@@ -114,6 +114,31 @@ def process_start_time(pid: int) -> float | None:
         return None
 
 
+def process_parent_pid(pid: int) -> int | None:
+    """Return ``/proc/<pid>/stat`` field 4 (parent pid), or ``None``.
+
+    Mirrors :func:`process_start_time`'s parse: the ``comm`` field may contain
+    spaces and parentheses, so the parse resumes after the *last* ``)``, where
+    field 3 (state) is the first token, making ppid (field 4) index 1. Used to
+    establish real process ancestry for dispatch authorization; an unreadable
+    process yields ``None`` so an unprovable relationship fails closed.
+    """
+    try:
+        raw = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+    end = raw.rfind(")")
+    if end == -1:
+        return None
+    fields = raw[end + 2:].split()
+    if len(fields) <= 1:
+        return None
+    try:
+        return int(fields[1])
+    except ValueError:
+        return None
+
+
 def _host_name() -> str | None:
     try:
         return socket.gethostname() or None

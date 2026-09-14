@@ -538,6 +538,71 @@ opsx-plan approve --all
 opsx-plan approve P3
 ```
 
+#### Broker-mediated approval in a registered supervised job
+
+When the worktree holds a **registered supervised job**, the approval commands
+above are no longer direct JSON edits: they are **broker mediated**. The broker
+in the trusted authority domain is the sole authority that releases approval
+and acceptance gates, and each release is recorded as a durable receipt bound
+to the exact checkpoint (the change and gate kind) and to the current
+**material revision** (the gate-relevant manifest fields taken from the
+protected snapshot, plus the snapshot identity and explicit policy revision).
+
+- **Operator approvals** go through the **operator OS-authenticated path**.
+  The operator endpoint authenticates the kernel-reported peer uid
+  (`SO_PEERCRED`), not a token, so the approval is genuinely yours:
+  ```bash
+  # The operator runs these as the operator principal
+  opsx-plan approve add-security-hardening        # one change, via the operator path
+  opsx-plan approve --all                          # every human-only gate awaiting approval
+  opsx-plan accept add-new-capability              # acceptance is operator-only too
+  opsx-plan reset add-security-hardening           # an operator reset is a durable receipt
+  ```
+- **Delegated gates** (`pause_before_human_only = false`) are released only by
+  the job's scoped service action, never by an operator approval. Asking the
+  operator path to approve a delegated gate is refused.
+- **Worker refusals** carry named errors. A worker-domain or unauthenticated
+  process that runs a mediated command in a registered job fails closed:
+  ```
+  error: BrokerMediationError: this worktree holds a registered supervised job;
+  run dispatch is broker mediated and only the supervised execution may dispatch
+  ```
+  When the job is registered but the broker cannot be reached (for example the
+  supervised service is not running), the command fails closed with
+  `BrokerUnavailableError` rather than silently falling back to JSON
+  authority. A relied-upon approval whose material revision has changed is
+  reported as `StaleMaterialError` and the gate is re-armed.
+- **When a gate re-arms.** A receipt stays valid across unrelated updates
+  (task progress, telemetry, another change's state). It is invalidated — the
+  gate re-arms and awaits approval again — when you record an **explicit plan
+  or policy revision**: registering a new protected manifest snapshot, or
+  revising the job policy. Worker edits to the repo plan or JSON state never
+  move the material revision.
+- **Tampered files do not escape mediation.** A worker that removes
+  supervised markers from the JSON state or the repo plan does not turn the
+  job back into an unmediated one; registration is read from service-owned
+  storage.
+- **A substituted store fails closed.** Registration detection always consults
+  the authority-validated service-owned store (the service principal's home, or
+  the root-owned `/var/lib` directory), never the invoking user's home. Setting
+  `OPSX_SUPERVISOR_STATE_FILE` to a missing or empty external path does not
+  hide a registered job: it fails closed with `BrokerUnavailableError` instead
+  of falling back to legacy JSON. Batch and phase selection
+  (`approve --all`, `approve P<N>`, `accept --all`, `reset --failed`) resolve
+  membership, order, phases, and `review_created` from the protected snapshot,
+  so editing the repo plan cannot redirect an approval.
+- **Dispatch authorization is not an environment variable.** A worker cannot
+  self-authorize by exporting `OPSX_SUPERVISED_EXECUTION=1`, by writing a
+  `.opsx-plan` fencing file, or by importing/assigning any in-process
+  supervision helper (the control plane exposes no local dispatch flag). A
+  registered job dispatches only inside the supervised execution the trusted
+  service started, proven from the job's service-owned ledger fencing record
+  (live boot identity and process start time, not released or fenced) plus
+  real process ancestry. Anything less is refused with
+  `BrokerMediationError`.
+- **Legacy jobs are unchanged.** An unregistered worktree takes the legacy
+  JSON path byte-identically and needs no broker, ledger, or backend.
+
 ### Created-change acceptance: `review_created`
 
 When `review_created = true` (default), changes created by the orchestrator
@@ -1290,7 +1355,14 @@ to `opencode`).
 opsx-plan approve [plan.toml] <change-id> [<change-id>...]
 opsx-plan approve --all
 ```
-Approve `pause_before` changes. Accepts phase prefixes (e.g. `P3`).
+Approve `pause_before` changes. Accepts phase prefixes (e.g. `P3`), which
+resolve against the protected manifest snapshot in a registered job. In a
+registered supervised job this is broker mediated: an operator approval is
+recorded as a durable receipt through the OS-authenticated operator path, a
+delegated gate is refused (release it through the scoped service action), and a
+worker-domain or unauthenticated attempt fails with `BrokerMediationError`. An
+unreachable or substituted broker path fails closed with
+`BrokerUnavailableError`. An unregistered legacy job behaves exactly as before.
 
 ### `opsx-plan accept`
 
@@ -1299,7 +1371,9 @@ opsx-plan accept [plan.toml] <change-id> [<change-id>...]
 opsx-plan accept --all
 ```
 Accept orchestrator-created changes for driving. Re-verifies created artifacts
-before accepting.
+before accepting. In a registered supervised job acceptance is broker mediated
+(operator authority); the projected acceptance state follows the recorded
+receipt.
 
 ### `opsx-plan reset`
 
@@ -1307,7 +1381,10 @@ before accepting.
 opsx-plan reset [plan.toml] <change-id> [<change-id>...]
 opsx-plan reset --failed
 ```
-Reset failed changes to pending. Accepts phase prefixes.
+Reset failed changes to pending. Accepts phase prefixes. In a registered
+supervised job a reset is a durable broker transaction through the operator
+path; a worker-domain reset is refused with `BrokerMediationError` and resets
+nothing. A broker reset never takes the worktree execution lock.
 
 ### `opsx-plan logs`
 
@@ -1403,6 +1480,14 @@ Equivalent to `opsx-plan run-one`.
 | `--all` | `approve` | Approve all changes awaiting approval |
 | `--all` | `accept` | Accept all changes awaiting acceptance |
 | `--failed` | `reset` | Reset all failed changes to pending |
+
+### Broker refusal errors
+
+| Error | Raised when |
+|---|---|
+| `BrokerMediationError` | A worker-domain or unauthenticated process attempts an approval-family or reset mutation, a dispatch outside the supervised execution, or a delegated/human-only gate through the wrong authority |
+| `BrokerUnavailableError` | The job is registered but the broker path cannot be reached; the command fails closed rather than falling back to JSON authority |
+| `StaleMaterialError` | A relied-upon receipt no longer matches the current material revision (an explicit plan/policy revision re-armed the gate), or a supervised dispatch is attempted with an unresolved gate |
 
 ### `opsx-run` flags
 
