@@ -405,3 +405,45 @@ routing belongs to the later dispatch and lifecycle changes.
 
 - **WHEN** `supervised_author` is configured and a non-supervised compile runs
 - **THEN** the compile dispatches with the model resolved for `controller`, exactly as if `supervised_author` were unset
+
+### Requirement: Supervised budget pricing binds each role to its pinned model identity
+
+For a registered supervised job, cost estimation for budget purposes SHALL
+price each dispatch using the exact model identifier pinned for that
+dispatch's role in the job policy's `model_selection`, resolved through the
+existing per-adapter, per-role precedence. There SHALL be no cross-role
+fallback: a dispatch for one role SHALL NOT be priced using another role's
+resolved or configured model, and an ambient or default model SHALL NOT be
+substituted for the pin.
+
+The `supervisor` role SHALL be priced by the same binding: its exemption
+from the inexpensive allowlist does not exempt it from pricing or budget
+counting. This is a pricing and reservation contract for the role pin; it does
+not require this change to own a production supervisor-primary invocation. The
+supervisor primary's call site is wired by `add-opencode-session-bridge`, which
+routes its usage through this change's reserve/reconcile boundary.
+
+A role whose pinned identifier cannot be resolved to a price SHALL block
+budgeted dispatch with a named unknown-pricing error rather than falling
+back to any other identity or an assumed cost, as required by the budget
+policy's unknown-pricing rule.
+
+#### Scenario: Pricing uses the exact role pin
+
+- **WHEN** a reservation estimate is computed for a supervised dispatch
+- **THEN** the price lookup uses the exact model identifier pinned for that
+  dispatch's role in the job policy, resolved through the existing precedence
+
+#### Scenario: No cross-role pricing fallback
+
+- **WHEN** a supervised dispatch's role pin cannot be priced but another
+  role's resolved model can be
+- **THEN** the dispatch is not priced from the other role's identity; it is
+  blocked with the named unknown-pricing error
+
+#### Scenario: The allowlist-exempt supervisor is still priced
+
+- **WHEN** a reservation estimate is computed for the `supervisor` role
+- **THEN** its pinned frontier model is looked up in the pricing catalog and
+  budget-counted like any other role, and an unpriceable supervisor pin
+  blocks dispatch with the named unknown-pricing error

@@ -107,6 +107,20 @@ class BoundedAttemptsExceededError(BudgetError):
     """An identical incident attempt reached the policy's bounded limit."""
 
 
+def _check_required_keys(payload: Mapping[str, Any], required: Iterable[str], field: str) -> None:
+    """Require every declared key to be physically present before normalization.
+
+    The spec defines the payload *shape*: an omitted declared key is not the
+    same as an explicit null, so a partial object is rejected rather than
+    silently normalized with nulls.
+    """
+    missing = sorted(set(required) - set(payload))
+    if missing:
+        raise BudgetShapeError(
+            f"{field} payload is missing declared key(s): {', '.join(missing)}"
+        )
+
+
 def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
@@ -157,9 +171,14 @@ def _check_unknown_keys(value: Mapping[str, Any], allowed: Iterable[str], field:
 def validate_budgets(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Validate and normalize a versioned ``budgets`` payload.
 
-    Raises :class:`BudgetShapeError` on a malformed payload or an all-null set
-    of limits, and :class:`BudgetVersionError` on a newer-than-supported
-    version. New writes are strict: an unversioned payload is rejected.
+    Raises :class:`BudgetShapeError` on a payload missing a declared key, a
+    malformed value, or an all-null set of limits; :class:`BudgetVersionError`
+    on a newer-than-supported version. New writes are strict: an unversioned
+    payload is rejected.
+
+    Every declared key SHALL be present. The all-null rule spans every budget
+    bound, including ``max_incident_attempts``, so an incident-attempt-only
+    policy is a valid enforceable limit.
     """
     if not isinstance(payload, Mapping):
         raise BudgetShapeError(
@@ -167,17 +186,18 @@ def validate_budgets(payload: Mapping[str, Any]) -> dict[str, Any]:
         )
     _check_version(payload, "budgets")
     _check_unknown_keys(payload, BUDGET_FIELDS, "budgets")
+    _check_required_keys(payload, BUDGET_FIELDS, "budgets")
 
     normalized: dict[str, Any] = {"version": BUDGET_SCHEMA_VERSION}
     for field in BUDGET_LIMIT_FIELDS:
-        value = payload.get(field)
+        value = payload[field]
         if value is not None and not _is_non_negative_number(value):
             raise BudgetShapeError(
                 f"budgets '{field}' must be a non-negative number or null, got {value!r}"
             )
         normalized[field] = value
 
-    attempts = payload.get(MAX_INCIDENT_ATTEMPTS_FIELD)
+    attempts = payload[MAX_INCIDENT_ATTEMPTS_FIELD]
     if attempts is not None and not _is_non_negative_int(attempts):
         raise BudgetShapeError(
             f"budgets '{MAX_INCIDENT_ATTEMPTS_FIELD}' must be a non-negative "
@@ -185,10 +205,10 @@ def validate_budgets(payload: Mapping[str, Any]) -> dict[str, Any]:
         )
     normalized[MAX_INCIDENT_ATTEMPTS_FIELD] = attempts
 
-    if all(normalized[field] is None for field in BUDGET_LIMIT_FIELDS):
+    if all(normalized[field] is None for field in BUDGET_FIELDS):
         raise BudgetShapeError(
             "budgets payload has no enforceable limit: at least one of "
-            f"{', '.join(BUDGET_LIMIT_FIELDS)} must be non-null"
+            f"{', '.join(BUDGET_FIELDS)} must be non-null"
         )
     return normalized
 
@@ -219,8 +239,9 @@ def decode_budgets(value: Any) -> dict[str, Any]:
 def validate_deadlines(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Validate and normalize a versioned ``deadlines`` payload.
 
-    ``deadlines`` carries only :data:`DEADLINE_LIMIT_FIELDS`; a null deadline
-    disables it. Human-wait duration never appears here.
+    ``deadlines`` carries only :data:`DEADLINE_LIMIT_FIELDS`; every declared
+    key SHALL be present and a null deadline disables it. Human-wait duration
+    never appears here.
     """
     if not isinstance(payload, Mapping):
         raise BudgetShapeError(
@@ -228,10 +249,11 @@ def validate_deadlines(payload: Mapping[str, Any]) -> dict[str, Any]:
         )
     _check_version(payload, "deadlines")
     _check_unknown_keys(payload, DEADLINE_FIELDS, "deadlines")
+    _check_required_keys(payload, DEADLINE_FIELDS, "deadlines")
 
     normalized: dict[str, Any] = {"version": BUDGET_SCHEMA_VERSION}
     for field in DEADLINE_LIMIT_FIELDS:
-        value = payload.get(field)
+        value = payload[field]
         if value is not None and not _is_non_negative_number(value):
             raise BudgetShapeError(
                 f"deadlines '{field}' must be a non-negative number or null, got {value!r}"

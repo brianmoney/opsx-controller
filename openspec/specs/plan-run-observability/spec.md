@@ -2,6 +2,7 @@
 
 ## Purpose
 TBD - created by archiving change 2026-07-05-define-plan-run-telemetry-schema. Update Purpose after archive.
+
 ## Requirements
 
 ### Requirement: Report and dashboard can target a single-change run by change id
@@ -1551,3 +1552,105 @@ result or detecting worker/provider failure markers.
   marker and the worker returns valid JSON
 - **THEN** the controller does not treat the metadata text as a provider
   failure
+
+### Requirement: Telemetry records carry an additive role dimension while preserving the legacy schema
+
+Telemetry records SHALL carry an optional top-level `role` field naming the
+model role whose usage the record represents (for example `supervisor`,
+`implementer`, `reviewer`, `archiver`, `supervised_author`,
+`acceptance_reviewer`, `fixer`, `verifier`, or `implementer_escalation`).
+The field SHALL be additive: every pre-existing telemetry field SHALL keep
+its current name, type, and semantics, and the telemetry schema version
+SHALL remain readable by existing consumers without migration.
+
+A record without a `role` field SHALL remain valid and SHALL be interpreted
+by new consumers exactly as before; writing a `role` field SHALL NOT change
+how existing consumers read the record.
+
+The role dimension SHALL be recorded for supervised dispatches, including
+create-stage, retry, and escalation calls, so budget accounting and
+per-role telemetry can attribute every supervised model call to its role.
+
+#### Scenario: A supervised dispatch records its role
+
+- **WHEN** a telemetry record is written for a supervised dispatch,
+  including a `supervised_author` create, a retry, or an
+  `implementer_escalation` dispatch
+- **THEN** the record carries the dispatching role in the `role` field
+  alongside the unchanged legacy fields
+
+#### Scenario: A legacy record without a role remains valid
+
+- **WHEN** a consumer reads a telemetry record written before the role
+  dimension existed
+- **THEN** the record is accepted and interpreted exactly as before, with the
+  role treated as absent rather than an error
+
+#### Scenario: Existing consumers are unaffected
+
+- **WHEN** an existing consumer that predates the `role` field reads a record
+  that carries one
+- **THEN** every legacy field is present with unchanged semantics and the
+  consumer's behavior is unchanged
+
+### Requirement: Core metrics are collected before report aggregation
+
+An explicit core-metrics collection step SHALL exist that assembles the
+budget-relevant metric set — per-role token usage, estimated cost, and
+execution duration, plus job-level totals — from telemetry and supervisor
+ledger records. Report and dashboard aggregation SHALL consume collected
+core metrics rather than re-deriving budget-relevant figures independently.
+
+Collection SHALL be read-only: it SHALL NOT mutate telemetry records,
+execution state, or ledger records. Collection SHALL run before report or
+dashboard aggregation so the reported figures and the budget accounting
+reflect the same underlying records.
+
+#### Scenario: Collection precedes report aggregation
+
+- **WHEN** a report or dashboard is produced for a plan with supervised
+  activity
+- **THEN** the core-metrics collection step has assembled the per-role and
+  job-level metric set first, and the aggregation consumes that collected
+  set
+
+#### Scenario: Collection is read-only
+
+- **WHEN** core metrics are collected
+- **THEN** no telemetry record, execution state, or ledger record is created,
+  modified, or deleted
+
+### Requirement: Supervisor-family role usage is excluded from the legacy model leaderboard projection
+
+Records whose `role` names a supervisor-family role — `supervisor`,
+`supervised_author`, `acceptance_reviewer`, `fixer`, or `verifier` — SHALL
+be excluded from the legacy per-change model leaderboard projection. The
+exclusion SHALL be applied to the leaderboard's input stream and SHALL NOT
+change the leaderboard's grouping, attribution, or placeholder semantics,
+which remain governed by their existing requirements.
+
+Supervisor-family usage SHALL remain visible in per-role telemetry and core
+metrics; only the legacy model leaderboard projection excludes it.
+
+The exclusion SHALL NOT alter leaderboard entries for changes with no
+supervisor-family records: their model-combination triples and aggregate
+values SHALL be computed exactly as before.
+
+#### Scenario: Supervisor-role usage does not pollute the leaderboard
+
+- **WHEN** a run's telemetry includes records with supervisor-family roles
+- **THEN** those records do not contribute model identities, tokens, cost, or
+  change counts to any legacy model leaderboard entry
+
+#### Scenario: Legacy leaderboard entries are unchanged
+
+- **WHEN** the leaderboard is computed for changes whose telemetry contains
+  no supervisor-family roles
+- **THEN** their model-combination triples and aggregate values are identical
+  to the pre-existing computation
+
+#### Scenario: Excluded usage remains visible elsewhere
+
+- **WHEN** supervisor-family records are excluded from the leaderboard input
+- **THEN** the same records still appear in per-role telemetry views and in
+  the collected core metrics

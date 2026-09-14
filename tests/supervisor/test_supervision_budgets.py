@@ -107,6 +107,23 @@ class PayloadValidationTests(unittest.TestCase):
         with self.assertRaises(budgets.BudgetShapeError):
             budgets.validate_budgets({"total_cost_usd": 1.0})
 
+    def test_budgets_rejects_missing_declared_keys(self) -> None:
+        full = _budget_payload(total_cost_usd=1.0)
+        for field in budgets.BUDGET_FIELDS:
+            partial = {key: value for key, value in full.items() if key != field}
+            with self.assertRaises(budgets.BudgetShapeError) as ctx:
+                budgets.validate_budgets(partial)
+            self.assertIn(field, str(ctx.exception))
+
+    def test_budgets_accepts_attempt_only_policy(self) -> None:
+        payload = _budget_payload(max_incident_attempts=2)
+        self.assertEqual(budgets.validate_budgets(payload), payload)
+
+    def test_deadlines_rejects_missing_declared_keys(self) -> None:
+        with self.assertRaises(budgets.BudgetShapeError) as ctx:
+            budgets.validate_deadlines({"version": budgets.BUDGET_SCHEMA_VERSION})
+        self.assertIn("execution_deadline_minutes", str(ctx.exception))
+
     def test_budgets_rejects_newer_version(self) -> None:
         with self.assertRaises(budgets.BudgetVersionError):
             budgets.validate_budgets(_budget_payload(version=2))

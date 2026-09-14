@@ -973,3 +973,333 @@ proceeding or waiting.
   runs an ordinary mutating command in the same worktree
 - **THEN** the command fails with a documented named error stating the
   worktree is owned by a supervised execution
+
+### Requirement: The job policy carries a versioned budgets and deadlines payload
+
+The protected job policy's `budgets` and `deadlines` fields SHALL each be a
+JSON-compatible object carrying a `version` key. Both payloads SHALL share
+one budget schema version, `BUDGET_SCHEMA_VERSION = 1`, independent of the
+outer ledger `policy_version` column and of `MODEL_POLICY_VERSION`. A nested
+payload version newer than the code supports SHALL be rejected with a named
+error rather than silently interpreted (forward-only).
+
+`budgets` SHALL be a JSON-compatible object of the shape `{"version": <int>,
+"total_cost_usd": <number|null>, "per_action_cost_usd": <number|null>,
+"total_elapsed_minutes": <number|null>, "per_action_elapsed_minutes":
+<number|null>, "max_incident_attempts": <integer|null>}`. A null value
+disables that limit; at least one limit SHALL be non-null for a supervised
+job. `max_incident_attempts` bounds how many times one incident attempt
+signature may recur before further identical attempts are refused.
+
+`deadlines` SHALL be a JSON-compatible object of the shape `{"version":
+<int>, "execution_deadline_minutes": <number|null>}`, carrying only
+execution-time limits; human-wait duration is governed by the separate
+deadline-separation requirement below and SHALL NOT appear here as a wait
+budget.
+
+Budget and deadline values SHALL be supervision policy data. They SHALL NOT
+be expressed as new plan manifest keys: the manifest stays the plan's change
+graph, and budget policy lives in the protected job policy, which changes
+only through an explicit operator revision.
+
+The ledger SHALL validate both payloads on write and decode them through the
+same budget functions on read. A payload that is not a JSON object of the
+defined shape SHALL be rejected with a named budget error. A payload stored
+before this schema existed (a JSON value with no `version` key) SHALL remain
+readable as `legacy_unversioned`: no migration is performed, it SHALL NOT be
+reinterpreted as a current payload, and a consumer SHALL treat it as carrying
+no enforceable limits and fail closed for supervised dispatch rather than
+defaulting to unlimited. Replacing a legacy payload requires an explicit
+operator revision recording a versioned payload.
+
+#### Scenario: Registration persists the budget policy
+
+- **WHEN** a supervised job is registered with total and per-action cost and
+  elapsed limits and an execution deadline
+- **THEN** its policy record persists those values as versioned `budgets`
+  and `deadlines` payloads at `BUDGET_SCHEMA_VERSION`, at operator revision 1
+
+#### Scenario: A policy with no limits is rejected
+
+- **WHEN** a write supplies a `budgets` payload in which every limit is null
+- **THEN** the write is rejected with a named budget error and the stored
+  policy is unchanged
+
+#### Scenario: A newer budget schema version is rejected
+
+- **WHEN** a job policy records a budget payload version newer than
+  `BUDGET_SCHEMA_VERSION`
+- **THEN** reading the budget policy fails with a named budget version error
+  rather than silently interpreting the unknown fields
+
+#### Scenario: A pre-schema payload fails closed for supervised dispatch
+
+- **WHEN** a policy row written before this schema (a JSON value with no
+  `version` key) is read
+- **THEN** it is classified `legacy_unversioned` and returned unmodified, and
+  supervised dispatch is blocked until an explicit operator revision records
+  a versioned payload, rather than defaulting to unlimited spend
+
+### Requirement: Every dispatched supervised model call is budget-counted against per-action and total limits
+
+Under a supervised job's policy, every model call the plan orchestrator
+dispatches SHALL be accounted against the job's budgets: `implementer`,
+`reviewer`, and `archiver` workers, the `supervised_author` create stage,
+`acceptance_reviewer`, `fixer`, and `verifier` auxiliary calls, every retry,
+and `implementer_escalation` dispatches.
+
+Each dispatch SHALL be checked against both the per-action limits and the
+job-total limits before it proceeds. A dispatch that would exceed a
+per-action limit, or that arrives when a total limit is already exhausted,
+SHALL be blocked with a named budget-exhaustion state rather than dispatched.
+
+Budget enforcement SHALL apply only to registered supervised jobs. A legacy
+unregistered run SHALL keep its existing `--budget-minutes` / `--budget-usd`
+behavior with no durable budget layer.
+
+Scope boundary: the frontier `supervisor` primary session is not a stage the
+plan orchestrator dispatches, so this change wires no production
+supervisor-primary call site. The supervisor role's pricing and reservation
+behavior is defined and tested here as a boundary primitive; when
+`add-opencode-session-bridge` invokes the supervisor primary, it routes that
+usage through this change's reserve/reconcile boundary rather than introducing
+a separate accounting path.
+
+#### Scenario: Create, retry, and escalation calls are budget-counted
+
+- **WHEN** a supervised job performs a `supervised_author` create dispatch,
+  re-dispatches a stage as a retry, or dispatches through
+  `implementer_escalation`
+- **THEN** each call is reserved and reconciled against the job's budgets as
+  its own action, with no call class running unaccounted
+
+#### Scenario: A per-action limit blocks an oversized dispatch
+
+- **WHEN** a dispatch's reserved estimate exceeds `per_action_cost_usd` or
+  `per_action_elapsed_minutes`
+- **THEN** the dispatch is blocked with a named budget-exhaustion state and
+  no side effect is dispatched
+
+#### Scenario: An exhausted total limit blocks further dispatch
+
+- **WHEN** the job's reconciled plus retained consumption has reached a total
+  limit
+- **THEN** any further dispatch under that job is blocked with a named
+  budget-exhaustion state
+
+#### Scenario: A legacy unregistered run is not budget-gated
+
+- **WHEN** a plan runs without a registered supervised job
+- **THEN** the durable budget layer performs no reservation, blocking, or
+  accounting for that run, and the legacy budget flags behave as before
+
+### Requirement: Budget is reserved before dispatch and reconciled afterward without double billing
+
+A supervised dispatch SHALL reserve budget before any side effect: the
+reservation record SHALL be durably written in the supervisor ledger with the
+action identity, role, requested model, and the estimated cost and elapsed
+amounts before the dispatch proceeds. A reservation that cannot be durably
+recorded SHALL block the dispatch rather than run unaccounted.
+
+After the dispatch completes, observed usage SHALL be reconciled against the
+same reservation record, replacing the estimate with the observed amounts.
+Reconciliation SHALL NOT create a second charge: the reservation and its
+reconciliation are one accounting entry per action.
+
+Duplicate results delivered for the same action — a repeated completion, a
+re-observed usage record, or a retried delivery — SHALL be deduplicated
+against the action's existing reservation and SHALL NOT be billed twice.
+
+The reservation estimate SHALL be computed from the pricing catalog using the
+role's pinned model identity and SHALL include the provider token caps and a
+stated headroom margin, so the reserve conservatively bounds the expected
+charge.
+
+#### Scenario: Reservation is durable before dispatch
+
+- **WHEN** a supervised dispatch is prepared
+- **THEN** its reservation record exists in the ledger with the action
+  identity, role, requested model, and estimated amounts before the dispatch
+  side effect begins, and a dispatch whose reservation write fails is blocked
+
+#### Scenario: Reconciliation replaces the estimate without a second charge
+
+- **WHEN** observed usage arrives for a dispatched action
+- **THEN** it is recorded against that action's reservation, the job's
+  consumption reflects the observed amounts exactly once, and no separate
+  additional charge is created
+
+#### Scenario: A duplicate result is not billed twice
+
+- **WHEN** a second completion or usage record arrives for an action that
+  already has a reconciled reservation
+- **THEN** it is deduplicated against the existing reservation and the job's
+  accounted consumption is unchanged
+
+### Requirement: Unknown or interrupted usage is retained and unpriceable dispatch is blocked
+
+A reservation whose observed usage is unknown or whose dispatch was
+interrupted SHALL be classified `retained` rather than released, using the
+dispatch identity record's `observation_state` and `reservation_state`
+vocabulary: unresolved consumption SHALL continue to count against the job's
+budgets at its reserved estimate and SHALL NOT be treated as free.
+
+A dispatch whose pinned model cannot be priced — the pricing catalog resolves
+it to an unresolved result, or the model identity is unavailable — SHALL be
+blocked before any side effect with a named unknown-pricing error. An
+unpriceable dispatch SHALL NOT proceed on a zero or assumed cost.
+
+#### Scenario: An unknown-outcome reservation is retained
+
+- **WHEN** a dispatched action's outcome cannot be observed and its
+  observation state is `unknown`
+- **THEN** its reservation is classified `retained`, its reserved estimate
+  continues to count against the job's budgets, and the amount is not
+  released back to the job
+
+#### Scenario: An interrupted reservation is retained
+
+- **WHEN** a dispatched action is interrupted before reconciliation and its
+  observation state is `interrupted`
+- **THEN** its reservation is classified `retained` rather than released
+
+#### Scenario: Unknown pricing blocks dispatch with a named error
+
+- **WHEN** a supervised dispatch is prepared for a role whose pinned model
+  the pricing catalog cannot resolve to a price
+- **THEN** the dispatch is blocked with a named unknown-pricing error before
+  any side effect, and no reservation at zero or assumed cost is created
+
+### Requirement: Budget and incident-attempt accounting survives plan reset
+
+All budget state — reservations, reconciled consumption, and exhaustion
+state — SHALL live in the durable supervisor ledger in trusted external
+storage, never in the worktree JSON execution state. An `opsx-plan reset`
+SHALL NOT erase, reduce, or refresh a supervised job's accounted consumption.
+
+Each incident under a supervised job SHALL be recorded with a durable attempt
+signature identifying its failure class and material identity, together with
+an attempt count. Attempt signatures and counts SHALL persist across
+`opsx-plan reset`. When an incident's attempt count reaches the job's bounded
+limit, further identical attempts SHALL be refused with a named
+bounded-attempts state rather than looping, and the refusal SHALL survive
+subsequent resets.
+
+#### Scenario: Consumption survives reset
+
+- **WHEN** `opsx-plan reset` runs on a plan whose supervised job has
+  reconciled and retained consumption
+- **THEN** the job's accounted consumption after the reset is exactly what it
+  was before, and subsequent dispatches remain bound by the same totals
+
+#### Scenario: Identical incidents cannot loop without bound across resets
+
+- **WHEN** the same incident signature recurs and each recurrence is followed
+  by an `opsx-plan reset`
+- **THEN** the attempt count accumulates across the resets, and once the
+  bounded limit is reached any further identical attempt is refused with a
+  named bounded-attempts state
+
+### Requirement: Execution deadlines exclude expected human waits
+
+Deadline accounting SHALL track execution elapsed time separately from
+human-wait duration. Only time in which the job is actively executing —
+actions dispatched or in progress — SHALL consume `execution_deadline_minutes`
+and the elapsed budgets. An expected human wait, such as a held human-only
+approval gate, SHALL be persisted as normal durable state and SHALL consume
+no execution deadline or elapsed budget while it lasts.
+
+When execution resumes after a human wait, deadline and elapsed accounting
+SHALL continue from the pre-wait accumulated values, excluding the wait
+duration.
+
+#### Scenario: A human wait consumes no execution deadline
+
+- **WHEN** a supervised job waits on a human-only approval for a period
+  longer than the remaining execution deadline
+- **THEN** the job is not failed on the execution deadline for that period,
+  and the wait is recorded as durable human-wait state
+
+#### Scenario: Elapsed accounting resumes excluding the wait
+
+- **WHEN** execution resumes after a recorded human wait
+- **THEN** accumulated execution elapsed time continues from its pre-wait
+  value with the wait duration excluded
+
+### Requirement: Budget increases are explicit operator policy revisions
+
+Budget and deadline values SHALL change only through an explicit operator
+revision of the protected job policy, under the ledger's existing
+revision-increment rule. No worker, agent, or supervised dispatch path SHALL
+increase a budget, and no automated process — including `opsx-plan reset`,
+incident recovery, or a budget-exhaustion response — SHALL raise, clear, or
+re-baseline a limit.
+
+A budget increase SHALL take effect only for subsequent reservations; it
+SHALL NOT rewrite previously reconciled or retained consumption.
+
+#### Scenario: An operator revision raises a limit
+
+- **WHEN** an operator records a policy revision with a higher
+  `total_cost_usd` at the next revision number
+- **THEN** subsequent reservations are evaluated against the new limit while
+  previously accounted consumption is unchanged
+
+#### Scenario: A worker-path increase is refused
+
+- **WHEN** any non-operator path attempts to raise, clear, or re-baseline a
+  budget — including as part of a reset or an exhaustion response
+- **THEN** the attempt is refused and the stored budget policy is unchanged
+
+### Requirement: Hard cost limits are enforced with stated headroom rather than false precision
+
+Hard USD limits SHALL be enforced through the reserve-before-dispatch model:
+because observed usage is known only after dispatch, enforcement SHALL
+incorporate the provider token caps and a stated headroom margin into each
+reservation so that the expected overshoot beyond a hard limit is bounded by
+at most one in-flight action's headroom.
+
+The supervision contract documentation SHALL state this semantics explicitly:
+a hard limit bounds total overshoot and SHALL NOT be described as an exact,
+immediately enforced ceiling.
+
+#### Scenario: Reservations include headroom
+
+- **WHEN** a reservation estimate is computed for a dispatch
+- **THEN** the estimate is derived from the pricing catalog with the provider
+  token caps and the stated headroom margin applied, and the recorded
+  reservation reflects that bounded worst case
+
+#### Scenario: Enforcement is documented as bounded, not exact
+
+- **WHEN** the supervision contract describes hard cost limits
+- **THEN** it states that enforcement bounds overshoot to at most one
+  in-flight action's headroom and makes no claim of an exact real-time
+  ceiling
+
+### Requirement: Transient budget failures use bounded backoff and human blockers are actionable state
+
+A transient failure in budget-gated dispatch — such as a temporarily
+unwritable ledger or a retryable pricing-catalog load failure — SHALL be
+retried with bounded backoff: a limited attempt count and capped delay,
+recorded in the ledger. When the bound is reached, the failure SHALL surface
+as a blocked state with its named reason rather than retrying indefinitely.
+
+A genuine human blocker — an exhausted budget awaiting an operator increase,
+or a bounded-attempts refusal — SHALL be surfaced as actionable state
+identifying the required operator action, and SHALL NOT be retried or
+recovered automatically.
+
+#### Scenario: Transient failures back off within a bound
+
+- **WHEN** a budget-gated dispatch fails transiently
+- **THEN** it is retried with bounded backoff, each retry is recorded, and
+  exceeding the bound surfaces a blocked state with the named reason instead
+  of further retries
+
+#### Scenario: An exhausted budget surfaces as an actionable human blocker
+
+- **WHEN** a job's budget is exhausted and further dispatch is blocked
+- **THEN** the job surfaces an actionable blocked state identifying the
+  required operator budget increase, and no automatic retry, recovery, or
+  self-increase is attempted
