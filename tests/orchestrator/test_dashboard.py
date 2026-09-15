@@ -62,6 +62,7 @@ def git(repo: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True)
 
 from lib.orchestrator import dashboard
+from lib.orchestrator import cost as cost_mod
 
 
 class DashboardCommandTests(unittest.TestCase):
@@ -79,6 +80,8 @@ class DashboardCommandTests(unittest.TestCase):
         )
         self.plan_name = "test-plan"
         self._set_up_plan_toml()
+        # Force the shipped pricing catalog so reprice tests are hermetic.
+        cost_mod._cost_catalog = None
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -181,6 +184,7 @@ class DashboardCommandTests(unittest.TestCase):
             output=kwargs.get("output", None),
             run_id=kwargs.get("run_id", None),
             change=kwargs.get("change", None),
+            reprice=kwargs.get("reprice", False),
         )
         out = io.StringIO()
         with mock.patch("sys.stdout", out):
@@ -975,5 +979,47 @@ class DashboardCommandTests(unittest.TestCase):
             "Plan-summary Total Cost must render missing cost with gray "
             ".cost-missing span",
         )
+
+    # -- --reprice (read-time cost reprice) -----------------------------------
+
+    def test_dashboard_reprice_names_catalog_version(self) -> None:
+        records = [
+            self._make_telemetry_record(
+                "add-thing", "implement", 1,
+                input_tokens=100000, output_tokens=50000, total_tokens=150000,
+                cost_status="unresolved", estimated_cost=None,
+            ),
+        ]
+        self._write_telemetry(records)
+        self._write_state({
+            "plan": self.plan_name,
+            "changes": {"add-thing": {"status": "done", "round": 1}},
+        })
+
+        jsonl = self.repo / ".opsx-plan" / "telemetry" / f"{self.plan_name}.jsonl"
+        before = jsonl.read_bytes()
+        stdout, rc = self._run_dashboard(reprice=True)
+        self.assertEqual(rc, 0)
+        html = self._read_output()
+        self.assertIn('<p class="reprice-notice">', html)
+        self.assertIn("pricing catalog v", html)
+        # Telemetry is untouched.
+        self.assertEqual(jsonl.read_bytes(), before)
+
+    def test_dashboard_default_has_no_reprice_notice(self) -> None:
+        records = [
+            self._make_telemetry_record("add-thing", "implement", 1),
+        ]
+        self._write_telemetry(records)
+        self._write_state({
+            "plan": self.plan_name,
+            "changes": {"add-thing": {"status": "done", "round": 1}},
+        })
+
+        stdout, rc = self._run_dashboard()
+        self.assertEqual(rc, 0)
+        html = self._read_output()
+        self.assertNotIn('<p class="reprice-notice">', html)
+
 
 

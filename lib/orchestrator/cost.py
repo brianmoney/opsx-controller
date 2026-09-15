@@ -233,3 +233,20 @@ def estimate_stage_cost(usage, model,
             )
 
     return result
+
+
+def reprice_record(record, repo: Path | None = None):
+    """Return a shallow copy of *record* with ``cost`` recomputed.
+
+    The recomputation uses :func:`estimate_stage_cost` against the currently
+    loaded pricing catalog, from the record's stored ``usage`` and ``model``
+    fields. The input record is not modified, and no file is read or written
+    beyond the catalog already loaded by the estimator.
+    """
+    updated = dict(record)
+    updated["cost"] = estimate_stage_cost(
+        record.get("usage") or {},
+        record.get("model") or {},
+        repo=repo,
+    )
+    return updated

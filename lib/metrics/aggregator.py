@@ -11,7 +11,7 @@ import os
 import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -1167,6 +1167,7 @@ def aggregate(
     repo_root: str | Path,
     plan_name: str,
     run_id: Optional[str] = None,
+    record_transform: Optional[Callable[[dict], dict]] = None,
 ) -> AggregationResult:
     """Run the full aggregation pipeline.
 
@@ -1175,6 +1176,11 @@ def aggregate(
         plan_name: Plan name used for telemetry and state file lookup.
         run_id: Optional specific run to aggregate. When ``None``, the
             latest run is selected automatically.
+        record_transform: Optional pure callable applied to each selected
+            record before any metric is computed. It must return a new
+            record and MUST NOT mutate its argument or any file. Used by
+            ``report``/``dashboard`` for read-time cost reprice; the
+            aggregator itself performs no pricing or I/O for it.
 
     Returns:
         An ``AggregationResult`` with plan metrics, per-change metrics,
@@ -1198,6 +1204,11 @@ def aggregate(
         records, run_id
     )
     all_warnings.extend(run_warnings)
+
+    # 2a. Optional read-time transform (e.g. cost reprice). Applied before any
+    # consumer so change, plan, stage, leaderboard, and core metrics agree.
+    if record_transform is not None:
+        selected_records = [record_transform(r) for r in selected_records]
 
     # 2b. Collect the budget-relevant core metrics before aggregation so report
     # and dashboard consume the same collected set. Read-only.

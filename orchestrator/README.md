@@ -429,3 +429,6 @@ doctor` reports such an installation as stale.
 See [`core/model-efficiency-workflow.md`](../core/model-efficiency-workflow.md)
 for the operator workflow that uses `opsx-plan compile`, `opsx-plan run`,
 `opsx-plan report`, and `opsx-plan dashboard` to benchmark model choices.
+`opsx-plan report` and `opsx-plan dashboard` accept `--reprice` to recompute
+costs from stored usage against the current pricing catalog in memory, leaving
+telemetry and state unchanged.

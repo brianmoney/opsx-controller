@@ -4,6 +4,7 @@ extraction.
 """
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -586,5 +587,123 @@ class CostEstimationTests(unittest.TestCase):
         # = 0.25 + 0.50 = 0.75
         self.assertEqual(result["estimated_cost"], 0.75)
         self.assertIsNotNone(result["price_snapshot"])
+
+
+class RepriceRecordTests(unittest.TestCase):
+    """Unit tests for cost.reprice_record (read-time cost reprice helper)."""
+
+    def setUp(self) -> None:
+        cost._cost_catalog = None
+
+    def tearDown(self) -> None:
+        cost._cost_catalog = None
+
+    @staticmethod
+    def _set_catalog(content: str) -> None:
+        from lib.pricing import PricingCatalog, UnresolvedPrice
+
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".toml", delete=False, encoding="utf-8",
+        )
+        tmp.write(content)
+        tmp.close()
+        cost._cost_catalog = (
+            PricingCatalog(catalog_path=Path(tmp.name)),
+            UnresolvedPrice,
+        )
+
+    def _catalog(self) -> None:
+        self._set_catalog(
+            """\
+            [catalog]
+            version = "9.9.9"
+            updated = "2026-01-01"
+
+            [[entries]]
+            provider = "deepseek"
+            model_id = "deepseek-v4.1-flash"
+            display_name = "DeepSeek V4.1 Flash"
+            billing_mode = "per_token"
+            currency = "USD"
+            input_price_per_mtok = 1.0
+            output_price_per_mtok = 2.0
+            effective_date = "2026-01-01"
+            """
+        )
+
+    def _record(self, provider="commandcode", model_id="deepseek-v4.1-flash"):
+        return {
+            "uid": "u1",
+            "change_id": "change-a",
+            "stage": "implement",
+            "model": {"provider": provider, "model_id": model_id},
+            "usage": {
+                "usage_available": True,
+                "input_tokens": 1_000_000,
+                "output_tokens": 1_000_000,
+                "cached_input_tokens": None,
+                "reasoning_tokens": None,
+                "total_tokens": 2_000_000,
+            },
+            "cost": {
+                "status": "unresolved",
+                "pricing_catalog_version": None,
+                "price_snapshot": None,
+                "unresolved_reason": "unknown provider",
+                "estimated_cost": None,
+            },
+        }
+
+    def test_reprice_resolves_previously_unresolved_record(self) -> None:
+        self._catalog()
+        record = self._record()
+        updated = cost.reprice_record(record)
+        self.assertEqual(updated["cost"]["status"], "estimated")
+        # 1M input at 1.0 + 1M output at 2.0
+        self.assertEqual(updated["cost"]["estimated_cost"], 3.0)
+        self.assertEqual(updated["cost"]["pricing_catalog_version"], "9.9.9")
+
+    def test_reprice_does_not_mutate_input_record(self) -> None:
+        self._catalog()
+        record = self._record()
+        before = json.loads(json.dumps(record))
+        cost.reprice_record(record)
+        self.assertEqual(record, before)
+
+    def test_reprice_leaves_still_unpriced_record_unresolved(self) -> None:
+        self._catalog()
+        record = self._record(provider="openai", model_id="no-such-model")
+        updated = cost.reprice_record(record)
+        self.assertEqual(updated["cost"]["status"], "unresolved")
+        self.assertIsNone(updated["cost"]["estimated_cost"])
+        self.assertIsNotNone(updated["cost"]["unresolved_reason"])
+
+
+class RepriceRecordRepoArgTests(unittest.TestCase):
+    """reprice_record forwards ``repo`` to the installed-path catalog loader."""
+
+    def setUp(self) -> None:
+        cost._cost_catalog = None
+
+    def tearDown(self) -> None:
+        cost._cost_catalog = None
+
+    def test_reprice_record_accepts_repo_without_error(self) -> None:
+        repo = Path(__file__).resolve().parents[2]
+        updated = cost.reprice_record(
+            {
+                "model": {"provider": "openai", "model_id": "gpt-5.6-terra"},
+                "usage": {
+                    "usage_available": True,
+                    "input_tokens": 1000,
+                    "output_tokens": 100,
+                    "cached_input_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "total_tokens": 1100,
+                },
+            },
+            repo=repo,
+        )
+        self.assertEqual(updated["cost"]["status"], "estimated")
 
 

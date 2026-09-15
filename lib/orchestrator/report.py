@@ -10,7 +10,7 @@ import json
 import sys
 from pathlib import Path
 
-from lib.orchestrator import base, planref
+from lib.orchestrator import base, cost as cost_mod, planref
 
 def _fmt_duration(ms: int | float | None) -> str:
     """Format milliseconds as human-readable duration, e.g. '1m30s' or '—'."""
@@ -327,7 +327,8 @@ def _dataclass_to_dict(obj) -> dict:
 
 
 def _print_report_json(result, plan_name: str, run_id: str,
-                       filters: dict, warnings: list[str]) -> None:
+                       filters: dict, warnings: list[str],
+                       reprice_info: dict | None = None) -> None:
     """Emit a single JSON object to stdout."""
     import dataclasses
 
@@ -347,6 +348,9 @@ def _print_report_json(result, plan_name: str, run_id: str,
         ],
         "warnings": warnings,
     }
+    if reprice_info is not None:
+        output["repriced"] = True
+        output["repricing_catalog_version"] = reprice_info.get("version")
     # Deterministic: sort keys, ensure_ascii=True for byte-identical output
     print(json.dumps(output, sort_keys=True, ensure_ascii=True))
 
@@ -389,7 +393,7 @@ def _resolve_for_change_plan(
 
 def cmd_report(args: argparse.Namespace) -> int:
     """opsx-plan report <plan> [--json] [--change <id>] [--run-id <id>]
-       [--stage <stage>] [--model <substr>] [--for-change <id>]"""
+       [--stage <stage>] [--model <substr>] [--for-change <id>] [--reprice]"""
     repo = Path(args.repo).resolve()
     for_change_plan = _resolve_for_change_plan(
         repo, getattr(args, "for_change", None), args.plan,
@@ -420,6 +424,22 @@ def cmd_report(args: argparse.Namespace) -> int:
         plan_name = cfg["name"]
     run_id = args.run_id if args.run_id else None
 
+    # Optional read-time cost reprice: recompute each selected record's cost
+    # from its stored usage/model against the current catalog, in memory.
+    reprice_requested = bool(getattr(args, "reprice", False))
+    reprice_info: dict | None = None
+    record_transform = None
+    if reprice_requested:
+        reprice_info = {"version": None}
+
+        def record_transform(record):
+            updated = cost_mod.reprice_record(record, repo=repo)
+            if reprice_info["version"] is None:
+                reprice_info["version"] = (
+                    updated.get("cost", {}).get("pricing_catalog_version")
+                )
+            return updated
+
     # Validate --stage early
     if args.stage and args.stage not in {"implement", "review", "archive"}:
         print(
@@ -430,7 +450,8 @@ def cmd_report(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        result = aggregate(repo, plan_name, run_id)
+        result = aggregate(repo, plan_name, run_id,
+                           record_transform=record_transform)
     except AggregationError as exc:
         print(f"report error: {exc}", file=sys.stderr)
         return 2
@@ -448,6 +469,8 @@ def cmd_report(args: argparse.Namespace) -> int:
         # Rebuild leaderboard scoped to just this change
         records, _ = _read_telemetry(repo, plan_name)
         selected_records, _, _ = _select_run(records, run_id)
+        if record_transform is not None:
+            selected_records = [record_transform(r) for r in selected_records]
         change_records = [
             r for r in selected_records
             if r.get("change_id") == args.change
@@ -486,13 +509,20 @@ def cmd_report(args: argparse.Namespace) -> int:
 
     if args.json:
         _print_report_json(result, plan_name, selected_run_id, filters,
-                           all_warnings)
+                           all_warnings, reprice_info)
     else:
         # Show active filter header
         active = {k: v for k, v in filters.items() if v}
         if active:
             parts = [f"{k}={v}" for k, v in active.items()]
             print(f"[Filters: {', '.join(parts)}]")
+
+        if reprice_info is not None:
+            version = reprice_info.get("version") or "unknown"
+            print(
+                "[Repriced: costs recomputed from telemetry usage against "
+                f"pricing catalog v{version}]"
+            )
 
         _print_plan_summary(result.plan_metrics, plan_name, selected_run_id,
                             filters)

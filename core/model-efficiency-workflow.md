@@ -625,6 +625,14 @@ will differ. The catalog version recorded in telemetry
 (`cost.pricing_catalog_version`) identifies which catalog was current when the
 estimate was computed.
 
+Because telemetry is append-only, that recomputation is offered as a read-time
+view rather than a rewrite: `opsx-plan report --reprice` and
+`opsx-plan dashboard --reprice` recompute each selected record's cost from its
+stored `usage` and `model` against the current catalog, in memory, and name the
+catalog version used. Telemetry and state files are not modified, and records
+whose model still has no catalog entry remain `unresolved`. Run without
+`--reprice`, both commands report the stored values.
+
 ---
 
 ## Reference

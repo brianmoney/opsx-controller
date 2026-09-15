@@ -3911,6 +3911,12 @@ def main() -> int:
         help="target the derived single-change manifest instead of a plan "
              "path (mutually exclusive with positional plan)",
     )
+    p_report.add_argument(
+        "--reprice", action="store_true",
+        help="recompute each record's cost in memory from stored usage "
+             "against the current pricing catalog (read-only; telemetry and "
+             "state are not modified)",
+    )
     p_report.set_defaults(fn=report.cmd_report)
 
     p_dashboard = sub.add_parser(
@@ -3938,6 +3944,12 @@ def main() -> int:
         "--for-change", default=None,
         help="target the derived single-change manifest instead of a plan "
              "path (mutually exclusive with positional plan)",
+    )
+    p_dashboard.add_argument(
+        "--reprice", action="store_true",
+        help="recompute each record's cost in memory from stored usage "
+             "against the current pricing catalog (read-only; telemetry and "
+             "state are not modified)",
     )
     p_dashboard.set_defaults(fn=dashboard.cmd_dashboard)
 

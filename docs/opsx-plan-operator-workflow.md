@@ -772,6 +772,9 @@ opsx-plan report plan.toml --model gpt-4o
 
 # Target a single-change run's derived manifest
 opsx-plan report --for-change add-feature-a
+
+# Recompute costs from stored usage against the current pricing catalog
+opsx-plan report plan.toml --reprice
 ```
 
 The report includes:
@@ -779,6 +782,17 @@ The report includes:
 - **Per-Change Metrics**: status, rounds, duration, tokens, cost per change
 - **Stage Aggregates**: average durations, review failure rate, cost per change
 - **Model Leaderboard**: grouped by `(implementer, reviewer, archiver)` tuple
+
+#### Repricing historical costs
+
+Telemetry is append-only and each record keeps the pricing snapshot it was
+estimated with, so a record that was `unresolved` (or priced from an older
+catalog) stays that way on disk. `--reprice` shows what the recorded usage
+would cost under the **current** catalog: each selected record's `cost` is
+recomputed in memory from its stored `usage` and `model`, using the same
+estimation routine as dispatch. Telemetry and state are not modified, records
+that still have no catalog entry stay `unresolved`, and the output names the
+catalog version used. Without the flag, stored values are reported unchanged.
 
 #### Usage source provenance
 
@@ -825,12 +839,17 @@ opsx-plan dashboard plan.toml --run-id <run-id>
 
 # Target a single-change run's derived manifest
 opsx-plan dashboard --for-change add-feature-a
+
+# Recompute costs from stored usage against the current pricing catalog
+opsx-plan dashboard plan.toml --reprice
 ```
 
 The dashboard is a self-contained HTML file with no external dependencies. It
 includes seven sections: plan summary header, model leaderboard, per-change
 table, failure breakdown, cost breakdown bar chart, rounds histogram, and stage
-timeline.
+timeline. `--reprice` recomputes costs the same way as
+`opsx-plan report --reprice` and adds a notice naming the catalog version used;
+telemetry and state are never modified.
 
 ---
 

@@ -62,6 +62,7 @@ def git(repo: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True)
 
 from lib.orchestrator import report
+from lib.orchestrator import cost as cost_mod
 
 
 class ReportCommandTests(unittest.TestCase):
@@ -71,6 +72,8 @@ class ReportCommandTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.repo = Path(self.tmp.name)
+        # Force the shipped pricing catalog so reprice tests are hermetic.
+        cost_mod._cost_catalog = None
         git(self.repo, "init")
         git(
             self.repo,
@@ -191,6 +194,7 @@ class ReportCommandTests(unittest.TestCase):
             run_id=kw.get("run_id"),
             stage=kw.get("stage"),
             model=kw.get("model"),
+            reprice=kw.get("reprice", False),
         )
 
     def _run_report(self, **kw) -> tuple[int, str, str]:
@@ -1506,5 +1510,81 @@ class ReportCommandTests(unittest.TestCase):
                           entry.get("reviewer_model"),
                           entry.get("archiver_model")):
                 self.assertIsNotNone(model)
+
+    # -- --reprice (read-time cost reprice) -----------------------------------
+
+    def _reprice_fixture(self):
+        plan_name = "reprice-plan"
+        cid = "ch-reprice"
+        plan_path = self._write_plan_toml(plan_name, [cid])
+        records = [
+            self._build_record(
+                stage="implement", change_id=cid, plan_name=plan_name,
+                input_tokens=100000, output_tokens=50000,
+                cost_status="unresolved", estimated_cost=None,
+            ),
+        ]
+        self._write_telemetry(plan_name, records)
+        self._write_state(plan_name, {
+            "plan": plan_name, "approvals": [],
+            "changes": {cid: {"status": "done", "round": 1, "phase": "done"}},
+        })
+        return plan_path, plan_name
+
+    def test_reprice_recomputes_unresolved_cost(self) -> None:
+        plan_path, _ = self._reprice_fixture()
+        jsonl = self.repo / ".opsx-plan" / "telemetry" / "reprice-plan.jsonl"
+        before = jsonl.read_bytes()
+
+        rc, stdout, _ = self._run_report(plan_path=plan_path, reprice=True)
+        self.assertEqual(rc, 0)
+        self.assertIn("[Repriced:", stdout)
+        # openai/gpt-4o: 100k input * 2.50/mtok + 50k output * 10.00/mtok
+        #                 = 0.25 + 0.50 = 0.75
+        self.assertIn("$0.75", stdout)
+        # Telemetry is untouched by a repriced report.
+        self.assertEqual(jsonl.read_bytes(), before)
+
+    def test_reprice_json_adds_reprice_fields(self) -> None:
+        plan_path, _ = self._reprice_fixture()
+        rc, stdout, _ = self._run_report(
+            plan_path=plan_path, json=True, reprice=True,
+        )
+        self.assertEqual(rc, 0)
+        data = json.loads(stdout)
+        self.assertTrue(data["repriced"])
+        self.assertIsNotNone(data["repricing_catalog_version"])
+        self.assertEqual(data["plan_metrics"]["total_estimated_cost"], 0.75)
+
+    def test_default_json_has_no_reprice_fields(self) -> None:
+        plan_path, _ = self._reprice_fixture()
+        rc, stdout, _ = self._run_report(plan_path=plan_path, json=True)
+        self.assertEqual(rc, 0)
+        data = json.loads(stdout)
+        self.assertNotIn("repriced", data)
+        self.assertNotIn("repricing_catalog_version", data)
+        # Stored (unresolved) value is used when not repricing.
+        self.assertIsNone(data["plan_metrics"]["total_estimated_cost"])
+
+    def test_reprice_preserves_still_unpriced_records(self) -> None:
+        plan_name = "reprice-unknown-plan"
+        cid = "ch-unknown"
+        plan_path = self._write_plan_toml(plan_name, [cid])
+        records = [
+            self._build_record(
+                stage="implement", change_id=cid, plan_name=plan_name,
+                cost_status="unresolved", estimated_cost=None,
+                provider="openai", model_id="no-such-model",
+            ),
+        ]
+        self._write_telemetry(plan_name, records)
+        self._write_state(plan_name, {
+            "plan": plan_name, "approvals": [],
+            "changes": {cid: {"status": "done", "round": 1, "phase": "done"}},
+        })
+        rc, stdout, _ = self._run_report(plan_path=plan_path, reprice=True)
+        self.assertEqual(rc, 0)
+        self.assertIn("unresolved", stdout)
+
 
 

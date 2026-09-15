@@ -11,7 +11,7 @@ import os
 import sys
 from pathlib import Path
 
-from lib.orchestrator import base, planref, report
+from lib.orchestrator import base, cost as cost_mod, planref, report
 
 def _html_escape(s: str) -> str:
     """Escape text for safe HTML embedding."""
@@ -158,6 +158,12 @@ header h1 {
     font-size: 0.85rem;
     color: var(--blue);
     margin-top: 4px;
+}
+
+.reprice-notice {
+    font-size: 0.85rem;
+    color: var(--blue);
+    margin-bottom: 16px;
 }
 
 main {
@@ -793,6 +799,7 @@ def _render_dashboard_html(
     change_id: str | None = None,
     timeline_records: list[dict] | None = None,
     filters: dict | None = None,
+    reprice_info: dict | None = None,
 ) -> str:
     """Render the complete HTML dashboard as a self-contained document."""
     if filters is None:
@@ -819,6 +826,13 @@ def _render_dashboard_html(
         f"<header><h1>opsx-plan Dashboard: "
         f"{_html_escape(plan_name)}</h1></header>"
     )
+    if reprice_info is not None:
+        version = _html_escape(str(reprice_info.get("version") or "unknown"))
+        parts.append(
+            '<p class="reprice-notice">Repriced: costs recomputed from '
+            "telemetry usage against pricing catalog "
+            f"v{version}</p>"
+        )
     parts.append("<main>")
 
     # 1. Plan Summary Header
@@ -855,7 +869,7 @@ def _render_dashboard_html(
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
     """opsx-plan dashboard <plan> [--output <path>] [--run-id <id>]
-       [--change <id>] [--for-change <id>]"""
+       [--change <id>] [--for-change <id>] [--reprice]"""
     repo = Path(args.repo).resolve()
     for_change_plan = report._resolve_for_change_plan(
         repo, getattr(args, "for_change", None), args.plan,
@@ -881,8 +895,23 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         plan_name = cfg["name"]
     run_id = args.run_id if args.run_id else None
 
+    reprice_requested = bool(getattr(args, "reprice", False))
+    reprice_info: dict | None = None
+    record_transform = None
+    if reprice_requested:
+        reprice_info = {"version": None}
+
+        def record_transform(record):
+            updated = cost_mod.reprice_record(record, repo=repo)
+            if reprice_info["version"] is None:
+                reprice_info["version"] = (
+                    updated.get("cost", {}).get("pricing_catalog_version")
+                )
+            return updated
+
     try:
-        result = aggregate(repo, plan_name, run_id)
+        result = aggregate(repo, plan_name, run_id,
+                           record_transform=record_transform)
     except AggregationError as exc:
         print(f"dashboard error: {exc}", file=sys.stderr)
         return 2
@@ -905,6 +934,8 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     # -- Gather timeline records ----------------------------------------------
     records, _ = _read_telemetry(repo, plan_name)
     selected_records, selected_run, _ = _select_run(records, run_id)
+    if record_transform is not None:
+        selected_records = [record_transform(r) for r in selected_records]
 
     # -- Apply --change filter ------------------------------------------------
     if args.change:
@@ -941,6 +972,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         change_id=args.change,
         timeline_records=timeline_records,
         filters=filters,
+        reprice_info=reprice_info,
     )
 
     # Atomic write
