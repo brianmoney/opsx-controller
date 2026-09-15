@@ -1554,27 +1554,23 @@ class Ledger:
     def record_evidence(
         self, action_id: int, *, kind: str, payload: Mapping[str, Any] | str | None = None
     ) -> int:
-        """Record evidence; reconcile an uncertain action in the same transaction."""
+        """Append one evidence row for *action_id*.
+
+        Evidence is an append-only observation log: recording it never changes
+        the action's journal state. An ``uncertain`` action stays uncertain
+        until a caller explicitly invokes :meth:`reconcile_action` after
+        classifying decisive evidence, so usage, session-binding, unknown, or
+        unconfirmed evidence cannot silently unblock an action.
+        """
         encoded = payload if isinstance(payload, str) or payload is None else json.dumps(payload)
         now = _utcnow()
         with self._transaction():
-            action = self.get_action(action_id)
-            state = action["state"]
+            self.get_action(action_id)
             cursor = self._conn.execute(
                 "INSERT INTO evidence (action_id, kind, payload, recorded_at) VALUES (?, ?, ?, ?)",
                 (action_id, kind, encoded, now),
             )
             evidence_id = int(cursor.lastrowid)
-            if state == "uncertain":
-                result = self._conn.execute(
-                    "UPDATE actions SET state = 'reconciled', updated_at = ? "
-                    "WHERE id = ? AND state = 'uncertain'",
-                    (now, action_id),
-                )
-                if result.rowcount != 1:
-                    raise JournalStateError(
-                        f"action {action_id} changed state while reconciling; retry"
-                    )
         return evidence_id
 
     def list_evidence(self, action_id: int) -> list[sqlite3.Row]:
@@ -1583,6 +1579,105 @@ class Ledger:
                 "SELECT * FROM evidence WHERE action_id = ? ORDER BY id", (action_id,)
             )
         )
+
+    def reconcile_action(self, action_id: int) -> None:
+        """Transition an ``uncertain`` action to ``reconciled``.
+
+        Reconciliation is explicit and separate from evidence recording:
+        :meth:`record_evidence` only appends observations, so a caller
+        reconciles only after classifying decisive evidence (a confirmed
+        terminal worker result). The transition is guarded inside one
+        ``BEGIN IMMEDIATE`` transaction; an action that is not ``uncertain``
+        raises :class:`JournalStateError` rather than being silently advanced,
+        and a concurrent state change raises it instead of succeeding.
+        """
+        now = _utcnow()
+        with self._transaction():
+            action = self.get_action(action_id)
+            state = action["state"]
+            if state != "uncertain":
+                raise JournalStateError(
+                    f"action {action_id} is {state}; only an uncertain action is "
+                    "reconciled"
+                )
+            result = self._conn.execute(
+                "UPDATE actions SET state = 'reconciled', updated_at = ? "
+                "WHERE id = ? AND state = 'uncertain'",
+                (now, action_id),
+            )
+            if result.rowcount != 1:
+                raise JournalStateError(
+                    f"action {action_id} changed state while reconciling; retry"
+                )
+
+    def list_uncertain_actions(self, job_id: int) -> list[sqlite3.Row]:
+        """Return *job_id*'s unreconciled ``uncertain`` actions in id order.
+
+        An uncertain action is blocking state: it must be reconciled from
+        recorded evidence before the run completes, fails, or replays it.
+        """
+        return list(
+            self._conn.execute(
+                "SELECT * FROM actions WHERE job_id = ? AND state = 'uncertain' "
+                "ORDER BY id",
+                (job_id,),
+            )
+        )
+
+    def list_dispatches(self, action_id: int) -> list[sqlite3.Row]:
+        """Return *action_id*'s dispatch rows in insertion order."""
+        return list(
+            self._conn.execute(
+                "SELECT * FROM dispatches WHERE action_id = ? ORDER BY id",
+                (action_id,),
+            )
+        )
+
+    def latest_dispatch(self, action_id: int) -> sqlite3.Row | None:
+        """Return *action_id*'s most recent dispatch row, or ``None``."""
+        return self._conn.execute(
+            "SELECT * FROM dispatches WHERE action_id = ? ORDER BY id DESC LIMIT 1",
+            (action_id,),
+        ).fetchone()
+
+    def bind_dispatch_identity(
+        self,
+        action_id: int,
+        *,
+        session_id: str | None = None,
+        process_id: str | None = None,
+    ) -> None:
+        """Bind session/process identity onto *action_id*'s latest dispatch row.
+
+        The identity is normally recorded at dispatch time, but the native Task
+        path learns its session identity only after the worker reports it
+        through the endpoint. This additive accessor fills that column on the
+        already-inserted dispatch row without a schema change; an absent
+        dispatch row raises :class:`UnknownRecordError`. The row is read and
+        updated inside one transaction so a concurrent dispatch cannot be
+        bound to a stale row.
+        """
+        assignments: list[str] = []
+        values: list[Any] = []
+        if session_id is not None:
+            assignments.append("session_id = ?")
+            values.append(session_id)
+        if process_id is not None:
+            assignments.append("process_id = ?")
+            values.append(process_id)
+        if not assignments:
+            return
+        with self._transaction():
+            row = self.latest_dispatch(action_id)
+            if row is None:
+                raise UnknownRecordError(
+                    f"action {action_id} has no dispatch row to bind identity to"
+                )
+            values.append(int(row["id"]))
+            self._conn.execute(
+                f"UPDATE dispatches SET {', '.join(assignments)} WHERE id = ?",
+                tuple(values),
+            )
 
     def complete_action(self, action_id: int) -> None:
         """Mark an action complete. Uncertain actions need reconciliation first."""

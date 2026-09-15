@@ -132,9 +132,9 @@ class SupervisedGateTestCase(unittest.TestCase):
         self.cfg = {
             "name": self.plan_name,
             "adapter": "opencode",
-            "implement_invoke": "opencode run --agent opsx-implementer",
-            "review_invoke": "opencode run --agent opsx-reviewer",
-            "archive_invoke": "opencode run --agent opsx-archiver",
+            "implement_invoke": "opencode run --agent opsx-implementer --model $OPSX_IMPLEMENTER_MODEL",
+            "review_invoke": "opencode run --agent opsx-reviewer --model $OPSX_REVIEWER_MODEL",
+            "archive_invoke": "opencode run --agent opsx-archiver --model $OPSX_ARCHIVER_MODEL",
             "state_file": ".opencode/opsx-controller/{change}.json",
             "timeout_minutes": 1,
             "max_rounds": 2,
@@ -159,6 +159,23 @@ class SupervisedGateTestCase(unittest.TestCase):
             "plan_doc": "",
             "create_timeout_minutes": 1,
         }
+        self.manifest_path = self.repo / "registered-plan.toml"
+        self.manifest_path.write_text(self._manifest_content(), encoding="utf-8")
+        self.cfg["_manifest_path"] = str(self.manifest_path)
+        model_env = {
+            "OPSX_IMPLEMENTER_MODEL": "openai/gpt-4o",
+            "OPSX_REVIEWER_MODEL": "openai/gpt-4o",
+            "OPSX_ARCHIVER_MODEL": "openai/gpt-4o",
+            "OPSX_IMPLEMENTER_ESCALATION_MODEL": "openai/gpt-4o",
+            "OPSX_SUPERVISED_AUTHOR_MODEL": "openai/gpt-4o",
+        }
+        model_patcher = mock.patch.dict(os.environ, model_env)
+        model_patcher.start()
+        self.addCleanup(model_patcher.stop)
+        integration = sys.modules.get("lib.orchestrator.journal_dispatch")
+        if integration is not None:
+            integration.end_active_dispatch()
+            self.addCleanup(integration.end_active_dispatch)
         self.state = {"plan": self.plan_name, "approvals": [], "changes": {}}
         self._saved_invoke = self.opsx_plan.invoke_direct_stage
 
@@ -236,6 +253,13 @@ class SupervisedGateTestCase(unittest.TestCase):
         outcome_list = list(outcomes or [])
 
         def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+            integration = self.opsx_plan.journal_dispatch
+            if integration is not None and integration.active_dispatch() is not None:
+                context = integration.active_dispatch()
+                integration.record_session_binding(
+                    context["ledger"], context["action_id"],
+                    f"fake-{stage}-{round_num}",
+                )
             if payloads:
                 payload = payloads.pop(0)
                 self.assertEqual(stage, payload["stage"])
@@ -682,13 +706,352 @@ class ReservationWiringTests(SupervisedGateTestCase):
         self.assertEqual(rec.get("last_result"), "supervision_gate_unavailable")
 
 
+class DispatchPolicyRegressionTests(SupervisedGateTestCase):
+    def test_missing_actual_model_blocks_before_spawn(self) -> None:
+        self.write_authored_change()
+        self.register_job()
+        self.enable_gate_env()
+        self.cfg["implement_invoke"] = "python3 worker.py"
+        os.environ.pop("OPSX_IMPLEMENTER_MODEL", None)
+        invoked: list[str] = []
+        self.opsx_plan.invoke_direct_stage = lambda *a, **k: invoked.append("called")
+        self.assertEqual(self.run_change(), "budget")
+        self.assertEqual(invoked, [])
+        self.assertIn(
+            "unresolved", self.opsx_plan.state_mod.rec(self.state, self.cid)["reason"]
+        )
+
+    def test_mismatched_actual_model_blocks_before_spawn(self) -> None:
+        self.write_authored_change()
+        policy = _policy()
+        policy["inexpensive_allowlist"]["models"].append("openai/other")
+        self.register_job(policy=policy)
+        self.enable_gate_env()
+        self.cfg["implement_invoke"] = "worker --model openai/other"
+        invoked: list[str] = []
+        self.opsx_plan.invoke_direct_stage = lambda *a, **k: invoked.append("called")
+        self.assertEqual(self.run_change(), "budget")
+        self.assertEqual(invoked, [])
+        self.assertIn(
+            "differs", self.opsx_plan.state_mod.rec(self.state, self.cid)["reason"]
+        )
+
+    def test_create_controller_model_mismatch_blocks_before_spawn(self) -> None:
+        policy = _policy()
+        policy["inexpensive_allowlist"]["models"].append("openai/controller")
+        self.register_job(policy=policy)
+        self.enable_gate_env()
+        self.cfg["create_invoke"] = "worker --model openai/controller"
+        self.cfg["changes"][self.cid]["create_invoke"] = self.cfg["create_invoke"]
+        invoked: list[str] = []
+        self.opsx_plan.run_stage = lambda *a, **k: invoked.append("called")
+        with self.supervised_execution():
+            result = self.opsx_plan.dispatch_create_stage(
+                self.repo, self.cfg, self.state, self.cid, 1,
+                self.cfg["create_invoke"], {"escalation": {"active": False}},
+                "run-1",
+            )
+        self.assertIsInstance(result, dict)
+        self.assertIn("differs", result["blocked"])
+        self.assertEqual(invoked, [])
+
+    def test_create_without_verified_artifacts_is_failed_not_completed(self) -> None:
+        self.register_job()
+        self.enable_gate_env()
+        self.cfg["create_invoke"] = "worker --model openai/gpt-4o"
+        self.cfg["changes"][self.cid]["create_invoke"] = self.cfg["create_invoke"]
+
+        def fake(repo, cfg, cid, stage, invoke_tpl, timeout_minutes, attempt):
+            integration = self.opsx_plan.journal_dispatch
+            context = integration.active_dispatch()
+            integration.record_session_binding(
+                context["ledger"], context["action_id"], "create-no-artifacts"
+            )
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, attempt)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text('{"status":"created"}\n', encoding="utf-8")
+            return "exited", log_path
+
+        self.opsx_plan.run_stage = fake
+        with self.supervised_execution():
+            result = self.opsx_plan.dispatch_create_stage(
+                self.repo, self.cfg, self.state, self.cid, 1,
+                self.cfg["create_invoke"], {"escalation": {"active": False}},
+                "run-1",
+            )
+        self.assertIsInstance(result, tuple)
+        actions = self.ledger.list_actions(self.job_id)
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]["state"], "failed")
+
+    def test_create_retry_cannot_bypass_unreconciled_uncertainty(self) -> None:
+        self.register_job()
+        self.enable_gate_env()
+        self.cfg["create_invoke"] = "worker --model openai/gpt-4o"
+        self.cfg["changes"][self.cid]["create_invoke"] = self.cfg["create_invoke"]
+        calls: list[int] = []
+
+        def fake(repo, cfg, cid, stage, invoke_tpl, timeout_minutes, attempt):
+            calls.append(attempt)
+            integration = self.opsx_plan.journal_dispatch
+            context = integration.active_dispatch()
+            integration.record_session_binding(
+                context["ledger"], context["action_id"], "unfenceable-task"
+            )
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, attempt)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text("timed out\n", encoding="utf-8")
+            return "timeout", log_path
+
+        self.opsx_plan.run_stage = fake
+        with self.supervised_execution():
+            first = self.opsx_plan.dispatch_create_stage(
+                self.repo, self.cfg, self.state, self.cid, 1,
+                self.cfg["create_invoke"], {"escalation": {"active": False}},
+                "run-1",
+            )
+            second = self.opsx_plan.dispatch_create_stage(
+                self.repo, self.cfg, self.state, self.cid, 2,
+                self.cfg["create_invoke"], {"escalation": {"active": False}},
+                "run-1",
+            )
+        self.assertIsInstance(first, tuple)
+        self.assertIsInstance(second, dict)
+        self.assertEqual(second["last_result"], "uncertain_action_pending")
+        self.assertEqual(calls, [1])
+        self.assertEqual(len(self.ledger.list_actions(self.job_id)), 1)
+
+    def test_resume_recovery_invokes_fenced_budgeted_replay(self) -> None:
+        self.write_authored_change()
+        (
+            self.opsx_plan.groundtruth.change_dir(self.repo, self.cid) / "tasks.md"
+        ).write_text(
+            "## 1. Tasks\n\n- [ ] 1.1 Example task\n", encoding="utf-8"
+        )
+        self.register_job()
+        self.enable_gate_env()
+        integration = self.opsx_plan._load_journal_dispatch()
+        with self.supervised_execution():
+            gate = self.opsx_plan.open_supervised_gate(
+                self.repo, self.cfg["_manifest_path"]
+            )
+            entry = integration.gated_dispatch(
+                self.repo, self.cfg, gate, self.cid, "implement", 1,
+                {"escalation": {"active": False}}, "run-1",
+                resolved_model="openai/gpt-4o",
+            )
+            gate["ledger"].bind_dispatch_identity(
+                entry["action_id"], process_id=json.dumps({
+                    "pid": 99999999, "process_start": 1.0,
+                    "boot_id": lock_mod.boot_identity(),
+                })
+            )
+            integration.resolve_dispatch(
+                gate, action_id=entry["action_id"],
+                reservation_id=entry["reservation_id"],
+                outcome="invalid_output", record=None,
+            )
+            self.opsx_plan.close_supervised_gate(gate)
+
+        self.stage_runner([{
+            "stage": "implement",
+            "result": {
+                "status": "implemented", "change": self.cid, "round": 1,
+                "progress_made": True, "completed_tasks": ["1.1"],
+                "remaining_tasks": [], "task_counts": {"complete": 1, "total": 1},
+                "files_touched": [], "known_change_files": [], "summary": "done",
+            },
+        }])
+        with mock.patch.object(
+            integration, "replay_uncertain", wraps=integration.replay_uncertain
+        ) as replay:
+            self.run_change()
+        self.assertGreaterEqual(replay.call_count, 1)
+        reservations = self.ledger.reservations_for_job(self.job_id)
+        self.assertGreaterEqual(len(reservations), 2)
+        self.assertEqual(self.ledger.list_actions(self.job_id)[0]["state"], "failed")
+
+    def test_completed_recovery_skips_duplicate_stage_dispatch(self) -> None:
+        self.write_authored_change()
+        self.register_job()
+        self.enable_gate_env()
+        integration = self.opsx_plan._load_journal_dispatch()
+        with self.supervised_execution():
+            gate = self.opsx_plan.open_supervised_gate(
+                self.repo, self.cfg["_manifest_path"]
+            )
+            entry = integration.gated_dispatch(
+                self.repo, self.cfg, gate, self.cid, "implement", 1,
+                {"escalation": {"active": False}}, "run-1",
+                resolved_model="openai/gpt-4o",
+            )
+            integration.record_session_binding(
+                gate["ledger"], entry["action_id"], "completed-worker"
+            )
+            integration.resolve_dispatch(
+                gate, action_id=entry["action_id"],
+                reservation_id=entry["reservation_id"],
+                outcome="invalid_output", record=None,
+            )
+            gate["ledger"].record_evidence(
+                entry["action_id"], kind="stage_result",
+                payload={"confirmed": True, "outcome": "completed"},
+            )
+            self.opsx_plan.close_supervised_gate(gate)
+
+        r = self.opsx_plan.state_mod.rec(self.state, self.cid)
+        r["phase"] = "review"
+        records = self.stage_runner([{
+            "stage": "review",
+            "result": {
+                "status": "passed", "change": self.cid, "round": 1,
+                "findings": [], "summary": "clean",
+            },
+        }])
+
+        self.run_change()
+
+        self.assertTrue(records)
+        self.assertEqual(records[0]["stage"], "review")
+        implement_actions = [
+            row for row in self.ledger.list_actions(self.job_id)
+            if row["kind"] == "implement"
+        ]
+        self.assertEqual(len(implement_actions), 1)
+        self.assertEqual(implement_actions[0]["state"], "completed")
+
+    def test_same_stage_completion_uses_repository_evidence(self) -> None:
+        self.write_authored_change()
+        tasks_path = self.opsx_plan.groundtruth.change_dir(
+            self.repo, self.cid
+        ) / "tasks.md"
+        tasks_path.write_text(
+            "## 1. Tasks\n\n- [ ] 1.1 Example task\n", encoding="utf-8"
+        )
+        self.register_job()
+        self.enable_gate_env()
+        integration = self.opsx_plan._load_journal_dispatch()
+        with self.supervised_execution():
+            gate = self.opsx_plan.open_supervised_gate(
+                self.repo, self.cfg["_manifest_path"]
+            )
+            entry = integration.gated_dispatch(
+                self.repo, self.cfg, gate, self.cid, "implement", 1,
+                {"escalation": {"active": False}}, "run-1",
+                resolved_model="openai/gpt-4o",
+            )
+            integration.resolve_dispatch(
+                gate, action_id=entry["action_id"],
+                reservation_id=entry["reservation_id"],
+                outcome="invalid_output", record=None,
+            )
+            self.opsx_plan.close_supervised_gate(gate)
+        tasks_path.write_text(
+            "## 1. Tasks\n\n- [x] 1.1 Example task\n", encoding="utf-8"
+        )
+
+        records = self.stage_runner([{
+            "stage": "review",
+            "result": {
+                "status": "reviewed", "change": self.cid, "round": 1,
+                "verdict": "pass",
+                "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                "findings": [], "summary": "clean", "fix_prompt": "",
+            },
+        }])
+
+        self.run_change()
+
+        self.assertTrue(records)
+        self.assertEqual(records[0]["stage"], "review")
+        actions = self.ledger.list_actions(self.job_id)
+        self.assertEqual([row["kind"] for row in actions[:2]], ["implement", "review"])
+        self.assertEqual(actions[0]["state"], "completed")
+
+    def test_same_stage_decisive_result_fails_closed_without_state_evidence(self) -> None:
+        self.write_authored_change()
+        self.register_job()
+        self.enable_gate_env()
+        integration = self.opsx_plan._load_journal_dispatch()
+        with self.supervised_execution():
+            gate = self.opsx_plan.open_supervised_gate(
+                self.repo, self.cfg["_manifest_path"]
+            )
+            entry = integration.gated_dispatch(
+                self.repo, self.cfg, gate, self.cid, "review", 1,
+                {"escalation": {"active": False}}, "run-1",
+                resolved_model="openai/gpt-4o",
+            )
+            integration.record_session_binding(
+                gate["ledger"], entry["action_id"], "completed-reviewer"
+            )
+            integration.resolve_dispatch(
+                gate, action_id=entry["action_id"],
+                reservation_id=entry["reservation_id"],
+                outcome="invalid_output", record=None,
+            )
+            gate["ledger"].record_evidence(
+                entry["action_id"], kind="stage_result",
+                payload={"confirmed": True, "outcome": "completed"},
+            )
+            self.opsx_plan.close_supervised_gate(gate)
+
+        r = self.opsx_plan.state_mod.rec(self.state, self.cid)
+        r["phase"] = "review"
+        records = self.stage_runner([])
+
+        self.assertEqual(self.run_change(), "failed")
+        self.assertEqual(records, [])
+        self.assertEqual(r["status"], self.opsx_plan.base.FAILED)
+        self.assertEqual(r["last_result"], "recovered_action_state_mismatch")
+        self.assertEqual(self.run_change(), "failed")
+        self.assertEqual(len(self.ledger.list_actions(self.job_id)), 1)
+
+    def test_same_stage_archive_recovery_finishes_without_redispatch(self) -> None:
+        self.write_authored_change()
+        self.register_job()
+        self.enable_gate_env()
+        integration = self.opsx_plan._load_journal_dispatch()
+        with self.supervised_execution():
+            gate = self.opsx_plan.open_supervised_gate(
+                self.repo, self.cfg["_manifest_path"]
+            )
+            entry = integration.gated_dispatch(
+                self.repo, self.cfg, gate, self.cid, "archive", 1,
+                {"escalation": {"active": False}}, "run-1",
+                resolved_model="openai/gpt-4o",
+            )
+            integration.resolve_dispatch(
+                gate, action_id=entry["action_id"],
+                reservation_id=entry["reservation_id"],
+                outcome="invalid_output", record=None,
+            )
+            self.opsx_plan.close_supervised_gate(gate)
+
+        archive_dir = (
+            self.repo / "openspec" / "changes" / "archive"
+            / f"2026-09-15-{self.cid}"
+        )
+        archive_dir.parent.mkdir(parents=True, exist_ok=True)
+        self.opsx_plan.groundtruth.change_dir(self.repo, self.cid).rename(archive_dir)
+        r = self.opsx_plan.state_mod.rec(self.state, self.cid)
+        r["phase"] = "archive"
+        records = self.stage_runner([])
+
+        self.assertEqual(self.run_change(), self.opsx_plan.base.DONE)
+        self.assertEqual(records, [])
+        self.assertEqual(r["phase"], "done")
+        self.assertEqual(r["status"], self.opsx_plan.base.DONE)
+        self.assertEqual(len(self.ledger.list_actions(self.job_id)), 1)
+
+
 class CreateStageTelemetryTests(SupervisedGateTestCase):
     """End-to-end create-dispatch telemetry and reconciliation (fix round 2)."""
 
     def setUp(self) -> None:
         super().setUp()
         self.cfg["create_invoke"] = (
-            f"python3 -c \"import json,sys; "
+            f"python3 --model openai/gpt-4o -c \"import json,sys; "
             f"print(json.dumps({{'status':'created','usage':"
             f"{{'input_tokens':50,'output_tokens':25}}}}))\""
         )
@@ -703,6 +1066,13 @@ class CreateStageTelemetryTests(SupervisedGateTestCase):
 
     def _fake_run_stage(self, usage: dict | None, outcome: str = "exited"):
         def fake(repo, cfg, cid, stage, invoke_tpl, timeout_minutes, attempt):
+            integration = self.opsx_plan.journal_dispatch
+            if integration is not None and integration.active_dispatch() is not None:
+                context = integration.active_dispatch()
+                integration.record_session_binding(
+                    context["ledger"], context["action_id"],
+                    f"fake-{stage}-{attempt}",
+                )
             log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, attempt)
             log_path.parent.mkdir(parents=True, exist_ok=True)
             body = "create output\n"
@@ -729,16 +1099,22 @@ class CreateStageTelemetryTests(SupervisedGateTestCase):
         self.assertEqual(len(create), 1)
         return create[0]
 
+    def _dispatch_create(self):
+        # The dispatch boundary requires the trusted supervised execution (the
+        # live ledger fence) exactly as the production cmd_run path provides.
+        with self.supervised_execution():
+            return self.opsx_plan.dispatch_create_stage(
+                self.repo, self.cfg, self.state, self.cid, 1,
+                self.cfg["create_invoke"],
+                {"escalation": {"active": False}}, "run-1",
+            )
+
     def test_successful_create_emits_role_telemetry_and_reconciles(self) -> None:
         self.register_job()
         self.enable_gate_env()
         self._fake_run_stage(usage={"input_tokens": 50, "output_tokens": 25})
         # Capture the reservation state right after the create dispatch.
-        result = self.opsx_plan.dispatch_create_stage(
-            self.repo, self.cfg, self.state, self.cid, 1,
-            self.cfg["create_invoke"],
-            {"escalation": {"active": False}}, "run-1",
-        )
+        result = self._dispatch_create()
         self.assertIsInstance(result, tuple)
         reservation = self._create_reservation()
         self.assertEqual(reservation["role"], "supervised_author")
@@ -764,11 +1140,7 @@ class CreateStageTelemetryTests(SupervisedGateTestCase):
         # A create with no parseable usage: the reservation must be retained at
         # its reserved estimate, never reconciled as free.
         self._fake_run_stage(usage=None)
-        self.opsx_plan.dispatch_create_stage(
-            self.repo, self.cfg, self.state, self.cid, 1,
-            self.cfg["create_invoke"],
-            {"escalation": {"active": False}}, "run-1",
-        )
+        self._dispatch_create()
         reservation = self._create_reservation()
         self.assertEqual(reservation["state"], "retained")
         consumption = self.ledger.consumption_for_job(1)
@@ -791,11 +1163,7 @@ class CreateStageTelemetryTests(SupervisedGateTestCase):
         keys = self._sidecar_env_keys()
         for key in keys:
             os.environ.pop(key, None)
-        self.opsx_plan.dispatch_create_stage(
-            self.repo, self.cfg, self.state, self.cid, 1,
-            self.cfg["create_invoke"],
-            {"escalation": {"active": False}}, "run-1",
-        )
+        self._dispatch_create()
         for key in keys:
             self.assertNotIn(
                 key, os.environ,
@@ -818,11 +1186,7 @@ class CreateStageTelemetryTests(SupervisedGateTestCase):
         patcher = mock.patch.dict(os.environ, prior)
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.opsx_plan.dispatch_create_stage(
-            self.repo, self.cfg, self.state, self.cid, 1,
-            self.cfg["create_invoke"],
-            {"escalation": {"active": False}}, "run-1",
-        )
+        self._dispatch_create()
         for key, value in prior.items():
             self.assertEqual(os.environ.get(key), value)
 
@@ -838,11 +1202,7 @@ class CreateStageTelemetryTests(SupervisedGateTestCase):
         )
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.opsx_plan.dispatch_create_stage(
-            self.repo, self.cfg, self.state, self.cid, 1,
-            self.cfg["create_invoke"],
-            {"escalation": {"active": False}}, "run-1",
-        )
+        self._dispatch_create()
         self.assertEqual(os.environ.get("OPSX_STAGE"), "prior-stage")
         self.assertEqual(os.environ.get("OPSX_ROUND"), "9")
         for key in ("OPSX_USAGE_PATH", "OPSX_PLAN_NAME", "OPSX_RUN_ID",
@@ -877,13 +1237,20 @@ class CreateRunLoopEndToEndTests(SupervisedGateTestCase):
             "\n"
             "[[changes]]\n"
             f'id = "{self.cid}"\n'
-            'create_invoke = "python3 --version"\n',
+            'create_invoke = "python3 --model openai/gpt-4o --version"\n',
             encoding="utf-8",
         )
         return plan
 
     def _install_stage(self, usage: dict | None) -> None:
         def fake(repo, cfg, cid, stage, invoke_tpl, timeout_minutes, attempt):
+            integration = self.opsx_plan.journal_dispatch
+            if integration is not None and integration.active_dispatch() is not None:
+                context = integration.active_dispatch()
+                integration.record_session_binding(
+                    context["ledger"], context["action_id"],
+                    f"fake-{stage}-{attempt}",
+                )
             log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, attempt)
             log_path.parent.mkdir(parents=True, exist_ok=True)
             body = "create output\n"
@@ -921,7 +1288,7 @@ class CreateRunLoopEndToEndTests(SupervisedGateTestCase):
         job_id = self.ledger.register_job(
             run_id="run-1", worktree=self.repo, owner="service",
             policy=_policy(), operator="operator",
-            manifest_content="[[changes]]\nid = \"add-gate-test\"\n",
+            manifest_content=plan.read_text(encoding="utf-8"),
         )
         self.enable_gate_env()
         self._install_stage(usage={"input_tokens": 50, "output_tokens": 25})
@@ -947,7 +1314,7 @@ class CreateRunLoopEndToEndTests(SupervisedGateTestCase):
         job_id = self.ledger.register_job(
             run_id="run-1", worktree=self.repo, owner="service",
             policy=_policy(), operator="operator",
-            manifest_content="[[changes]]\nid = \"add-gate-test\"\n",
+            manifest_content=plan.read_text(encoding="utf-8"),
         )
         self.enable_gate_env()
         self._install_stage(usage=None)
@@ -966,7 +1333,7 @@ class CreateRunLoopEndToEndTests(SupervisedGateTestCase):
         self.ledger.register_job(
             run_id="run-1", worktree=self.repo, owner="service",
             policy=_policy(), operator="operator",
-            manifest_content="[[changes]]\nid = \"add-gate-test\"\n",
+            manifest_content=plan.read_text(encoding="utf-8"),
         )
         broken = self.storage / "broken.sqlite3"
         broken.write_bytes(b"not a sqlite database")

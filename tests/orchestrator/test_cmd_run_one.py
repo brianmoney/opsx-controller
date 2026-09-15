@@ -1184,6 +1184,7 @@ class SingleChangeManifestTests(unittest.TestCase):
             self.repo, self.cid
         )
         self.assertTrue(manifest_path.is_file())
+        self.assertEqual(cfg["_manifest_path"], str(manifest_path))
 
         loaded = self.opsx_plan.planref.load_plan(manifest_path, repo=self.repo)
         self.assertEqual(loaded["name"], cfg["name"])
@@ -1226,6 +1227,10 @@ class SingleChangeManifestTests(unittest.TestCase):
 
         def fake_run_dc(repo, cfg, state, cid, budget_usd=0.0):
             self.assertEqual(cid, self.cid)
+            self.assertEqual(
+                cfg["_manifest_path"],
+                str(self.opsx_plan.planref.single_change_manifest_path(repo, cid)),
+            )
             r = self.opsx_plan.state_mod.rec(state, cid)
             r["phase"] = "done"
             self.opsx_plan.state_mod.set_status(state, cid, self.opsx_plan.base.DONE, "done")
@@ -1310,6 +1315,48 @@ class SingleChangeManifestTests(unittest.TestCase):
         after = self.opsx_plan.planref.read_active_plan(self.repo)
         self.assertEqual(after, before,
                           "cmd_run_one must preserve the active-plan pointer")
+
+    def test_registered_run_one_uses_active_protected_manifest(self):
+        self.write_authored_change(self.cid)
+        plans_dir = self.repo / "openspec" / "plans"
+        plans_dir.mkdir(parents=True)
+        source_manifest = plans_dir / "supervised.toml"
+        source_manifest.write_text(
+            '[plan]\nname = "supervised"\nadapter = "opencode"\n\n'
+            f'[[changes]]\nid = "{self.cid}"\n',
+            encoding="utf-8",
+        )
+        self.opsx_plan.write_active_plan(
+            self.repo, "openspec/plans/supervised.toml"
+        )
+        registration = mock.Mock()
+        registration.ledger = mock.Mock()
+        registration.job_id = 1
+        args = argparse.Namespace(repo=str(self.repo), change=self.cid)
+
+        def fake_run_dc(repo, cfg, state, cid, budget_usd=0.0):
+            self.assertEqual(cfg["_manifest_path"], str(source_manifest))
+            r = self.opsx_plan.state_mod.rec(state, cid)
+            r["phase"] = "done"
+            self.opsx_plan.state_mod.set_status(
+                state, cid, self.opsx_plan.base.DONE, "done"
+            )
+            return self.opsx_plan.base.DONE
+
+        with mock.patch.object(
+            self.opsx_plan.cmd_run_one.supervision_mod,
+            "require_supervised_authorization",
+            return_value=registration,
+        ), mock.patch.object(
+            self.opsx_plan.cmd_run_one.broker_mod,
+            "is_dispatchable",
+            return_value=True,
+        ), mock.patch.object(
+            self.opsx_plan, "run_direct_change", side_effect=fake_run_dc
+        ):
+            rc = self.opsx_plan.cmd_run_one.cmd_run_one(args)
+
+        self.assertEqual(rc, 0)
 
     def test_round_trip_with_nonzero_escalation_threshold(self):
         """2.5: non-zero escalate_after_review_fails survives round-trip"""

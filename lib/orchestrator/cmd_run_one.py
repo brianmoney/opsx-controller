@@ -45,6 +45,7 @@ def cmd_run_one(args: argparse.Namespace) -> int:
     """
     repo = Path(args.repo).resolve()
     change_id = args.change
+    registered = False
 
     # `opsx-run` and `opsx-plan run-one` both dispatch here. A registered
     # supervised job permits dispatch only from the supervised execution; an
@@ -58,6 +59,7 @@ def cmd_run_one(args: argparse.Namespace) -> int:
         print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
     if registration is not None:
+        registered = True
         try:
             if not broker_mod.is_dispatchable(
                 registration.ledger, registration.job_id, change_id
@@ -89,6 +91,15 @@ def cmd_run_one(args: argparse.Namespace) -> int:
         return 2
 
     cfg = _entry().build_single_change_config(repo, change_id)
+    if registered:
+        try:
+            plan_path = planref.resolve_plan(repo, None)
+            cfg["_manifest_path"] = str(
+                planref._resolve_plan_path(repo, plan_path)
+            )
+        except base.PlanError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     # Both `opsx-run` and `opsx-plan run-one` dispatch here, so the lock lives
     # in this shared handler; wrapping only one name would leave the other
     # alias unserialized. Acquire after config resolution and before the first

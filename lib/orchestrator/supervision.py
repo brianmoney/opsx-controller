@@ -411,6 +411,23 @@ def in_supervised_execution(repo: Path | None = None) -> bool:
         registration.close()
 
 
+def execution_boundary_reason(ledger: Any, job_id: int, *, pid: int | None = None) -> str | None:
+    """Return why *pid* is not the job's live supervised execution, or ``None``.
+
+    This is the durable, unforgeable execution-lock evidence a dispatch
+    boundary revalidates per action: the service-owned ledger fencing record
+    for *job_id* must name a currently-live supervised execution (matching
+    boot identity and process start time, defeating PID reuse) that was never
+    released or fenced, and the process must be that execution or a descendant
+    of it. The repo-writable ``.opsx-plan`` lock record is never trusted for
+    this decision, so a worker cannot forge a held worktree lock.
+    """
+    registration = Registration(ledger=ledger, job_id=int(job_id), job=None, policy={})
+    return _execution_boundary_reason(
+        registration, pid=os.getpid() if pid is None else int(pid)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Broker calls
 # ---------------------------------------------------------------------------
@@ -1001,6 +1018,7 @@ __all__ = [
     "WORKER_SOCKET_ENV",
     "call_operator",
     "call_worker_actions",
+    "execution_boundary_reason",
     "in_supervised_execution",
     "install_projection_writer",
     "is_registered",

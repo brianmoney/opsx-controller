@@ -28,6 +28,7 @@ Design rules enforced here:
 
 from __future__ import annotations
 
+import json
 import socket
 import struct
 from dataclasses import dataclass, field
@@ -42,6 +43,14 @@ ENDPOINT_WORKER = "worker-actions"
 # This surface never carries operator credential material. Kept as an explicit
 # constant so tests can assert the property rather than infer it from silence.
 USES_TOKEN_MATERIAL = False
+
+# Worker evidence kinds that may be decisive for reconciliation, plus the
+# explicit terminal outcomes that classify a confirmed result. Everything else
+# (usage, session binding, unknown kinds, unconfirmed payloads, or a confirmed
+# payload with no explicit terminal result) is non-decisive and leaves an
+# action's state untouched.
+_DECISIVE_EVIDENCE_KINDS = frozenset({"stage_result", "spawn_loss"})
+_TERMINAL_SUCCESS_OUTCOMES = frozenset({"completed", "exited", "done"})
 
 
 class EndpointError(Exception):
@@ -238,23 +247,204 @@ def _worker_report_status(
     return {"verb": "report_status", "worker_uid": credentials.uid, "status": request.get("status")}
 
 
+def _bound_job_action(ledger: Any, job_id: int, action_id: Any) -> Any:
+    """Return the action *action_id* when it belongs to the bound *job_id*.
+
+    Evidence and action requests are accepted only for actions of the job the
+    worker is bound to; a cross-job reference is refused with the named
+    authorization error rather than recording against another job's action.
+    """
+    try:
+        numeric = int(action_id)
+    except (TypeError, ValueError):
+        raise broker_module.BrokerError("an integer action_id is required")
+    try:
+        action = ledger.get_action(numeric)
+    except Exception as exc:  # noqa: BLE001 - surfaced as a named broker error
+        raise broker_module.BrokerError(f"unknown action {numeric}: {exc}") from exc
+    if int(action["job_id"]) != int(job_id):
+        raise broker_module.BrokerMediationError(
+            f"action {numeric} is owned by job {action['job_id']}, not the bound "
+            f"job {job_id}; refusing the worker-domain write"
+        )
+    return action
+
+
+def _require_bound_identity(
+    request: Mapping[str, Any], ledger: Any, job_id: int
+) -> None:
+    """Refuse a worker-domain write from outside the job's registered identity."""
+    identity = request.get("service_identity")
+    if identity is None:
+        return
+    job = ledger.get_job(int(job_id))
+    registered = job["owner_principal"]
+    if not registered or identity != registered:
+        raise broker_module.BrokerMediationError(
+            f"requesting identity {identity!r} is not the job's registered "
+            f"service identity {registered!r}"
+        )
+
+
 def _worker_request_action(
     request: Mapping[str, Any], credentials: PeerCredentials
 ) -> dict[str, Any]:
+    """Answer from journaled job state: the bound job's actionable items.
+
+    The response lists unreconciled uncertain actions (which block silent
+    progress until evidence reconciles them), steering receipts, and delegated
+    gate releases. The richer lifecycle payload shape is deferred to
+    ``add-supervised-plan-lifecycle``; this is the minimal actionable-items
+    answer.
+    """
+    ledger, job_id = _broker_ledger(request)
+    _require_bound_identity(request, ledger, job_id)
+    uncertain = [
+        {
+            "action_id": int(row["id"]),
+            "kind": row["kind"],
+            "run_id": row["run_id"],
+            "state": row["state"],
+        }
+        for row in ledger.list_uncertain_actions(job_id)
+    ]
+    try:
+        high_water = int(request.get("high_water", 0))
+    except (TypeError, ValueError):
+        high_water = 0
+    steering: list[dict[str, Any]] = []
+    delegated_releases: list[dict[str, Any]] = []
+    for row in ledger.receipts_after(job_id, high_water):
+        item = {
+            "receipt_id": int(row["id"]),
+            "change_id": row["change_id"],
+            "kind": row["kind"],
+            "authority": row["authority"],
+        }
+        if row["kind"] == "steer":
+            steering.append(item)
+        if row["authority"] == "delegated":
+            delegated_releases.append(item)
     return {
         "verb": "request_action",
         "worker_uid": credentials.uid,
-        "action": request.get("action"),
+        "job_id": int(job_id),
+        "uncertain_actions": uncertain,
+        "steering_receipts": steering,
+        "delegated_releases": delegated_releases,
     }
+
+
+def _evidence_payload_mapping(payload: Any) -> Mapping[str, Any]:
+    """Return *payload* as a mapping, decoding a JSON object string if needed."""
+    if isinstance(payload, Mapping):
+        return payload
+    if isinstance(payload, str) and payload:
+        try:
+            decoded = json.loads(payload)
+        except (TypeError, ValueError):
+            return {}
+        if isinstance(decoded, Mapping):
+            return decoded
+    return {}
+
+
+def _classify_worker_evidence(kind: str, payload: Any) -> str | None:
+    """Classify decisive worker evidence as ``completed``/``failed`` or ``None``.
+
+    Only a confirmed ``stage_result`` or ``spawn_loss`` with an explicit
+    terminal result is decisive. A success is an ``outcome`` of
+    ``completed``/``exited``/``done`` or ``completed: true``; a failure is an
+    ``outcome`` of ``failed``, a ``spawn_loss``, or ``completed: false``.
+    Unconfirmed payloads, other kinds, and confirmed payloads with no explicit
+    terminal result are non-decisive and leave the action's state untouched.
+    """
+    if kind not in _DECISIVE_EVIDENCE_KINDS:
+        return None
+    decoded = _evidence_payload_mapping(payload)
+    if not decoded.get("confirmed"):
+        return None
+    outcome = str(decoded.get("outcome", "") or "").strip().lower()
+    completed = decoded.get("completed")
+    if outcome in _TERMINAL_SUCCESS_OUTCOMES or completed is True:
+        return "completed"
+    if outcome == "failed" or kind == "spawn_loss" or completed is False:
+        return "failed"
+    return None
 
 
 def _worker_record_evidence(
     request: Mapping[str, Any], credentials: PeerCredentials
 ) -> dict[str, Any]:
+    """Persist worker-reported evidence against one of the bound job's actions.
+
+    The caller is validated inside the worker domain (kernel-checked peer uid
+    at accept, plus the bound job's registered identity when asserted) and the
+    referenced action must belong to the bound job. A reported native Task
+    ``session_id`` is bound to the action's dispatch row before any evidence is
+    accepted, and a binding failure is surfaced rather than swallowed. Evidence
+    never reconciles on its own: only decisive evidence (a confirmed
+    ``stage_result``/``spawn_loss`` with an explicit terminal result) against an
+    ``uncertain`` action drives the explicit reconcile-then-terminal lifecycle,
+    so the returned state is ``completed``/``failed`` for a decisive report and
+    unchanged otherwise.
+    """
+    ledger, job_id = _broker_ledger(request)
+    _require_bound_identity(request, ledger, job_id)
+    action_id = request.get("action_id")
+    if action_id is None:
+        raise broker_module.BrokerError("record_evidence requires an action_id")
+    action = _bound_job_action(ledger, job_id, action_id)
+    evidence = request.get("evidence")
+    kind = request.get("kind")
+    payload = request.get("payload")
+    if isinstance(evidence, Mapping):
+        if kind is None:
+            kind = evidence.get("kind")
+        if payload is None:
+            payload = evidence.get("payload", evidence)
+    if not isinstance(kind, str) or not kind:
+        kind = "stage_result"
+
+    session_id = request.get("session_id")
+    bound_session: str | None = None
+    if session_id is not None and str(session_id):
+        bound_session = str(session_id)
+        # Bind before evidence is accepted; a binding failure (for example a
+        # missing dispatch row) is surfaced so the worker learns its report was
+        # not journaled.
+        ledger.bind_dispatch_identity(int(action_id), session_id=bound_session)
+        ledger.record_evidence(
+            int(action_id),
+            kind="session_binding",
+            payload={"session_id": bound_session},
+        )
+
+    prior_state = str(action["state"])
+    evidence_id = ledger.record_evidence(
+        int(action_id), kind=str(kind), payload=payload
+    )
+    decision = _classify_worker_evidence(str(kind), payload)
+    if decision is not None and prior_state == "uncertain":
+        # Decisive evidence is the recorded basis for reconciliation; the
+        # transition is explicit and precedes the terminal state.
+        ledger.reconcile_action(int(action_id))
+        if decision == "completed":
+            ledger.complete_action(int(action_id))
+        else:
+            ledger.fail_action(int(action_id), detail="reconciled worker failure")
+    try:
+        state = str(ledger.get_action(int(action_id))["state"])
+    except Exception:
+        state = prior_state
     return {
         "verb": "record_evidence",
         "worker_uid": credentials.uid,
-        "evidence": request.get("evidence"),
+        "action_id": int(action_id),
+        "evidence_id": int(evidence_id),
+        "kind": str(kind),
+        "state": state,
+        "session_id": bound_session,
     }
 
 

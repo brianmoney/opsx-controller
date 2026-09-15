@@ -634,6 +634,9 @@ class JournalTests(LedgerTestCase):
             handle.replay_action(action_id)
 
         handle.record_evidence(action_id, kind="probe", payload={"effect": False})
+        # Recording evidence only appends; an explicit reconcile is required.
+        self.assertEqual(handle.get_action(action_id)["state"], "uncertain")
+        handle.reconcile_action(action_id)
         self.assertEqual(handle.get_action(action_id)["state"], "reconciled")
         # Only after reconciling evidence may it be completed or replayed.
         handle.complete_action(action_id)
@@ -646,6 +649,7 @@ class JournalTests(LedgerTestCase):
         handle.dispatch_action(action_id)
         handle.mark_uncertain(action_id)
         handle.record_evidence(action_id, kind="probe", payload={"observed": True})
+        handle.reconcile_action(action_id)
 
         handle.replay_action(action_id, session_id="session-2")
         rows = handle.connection.execute(
@@ -692,6 +696,8 @@ class JournalTests(LedgerTestCase):
         # Reconciling evidence is the only path out of uncertainty. Once
         # reconciled, the observed failure may be recorded as terminal.
         handle.record_evidence(action_id, kind="probe", payload={"effect": True})
+        self.assertEqual(handle.get_action(action_id)["state"], "uncertain")
+        handle.reconcile_action(action_id)
         self.assertEqual(handle.get_action(action_id)["state"], "reconciled")
         handle.fail_action(action_id, detail="observed failure")
         self.assertEqual(handle.get_action(action_id)["state"], "failed")
@@ -751,6 +757,51 @@ class JournalTests(LedgerTestCase):
             ).fetchone()[0],
             dispatches_before,
         )
+
+    def test_record_evidence_only_appends_and_never_reconciles(self) -> None:
+        """Only an explicit ``reconcile_action`` transitions an uncertain action,
+        no matter how much non-decisive evidence is appended."""
+        handle = self.open()
+        job_id = self.register(handle)
+        action_id = handle.begin_action(job_id, kind="implement", run_id="run-1")
+        handle.dispatch_action(action_id)
+        handle.mark_uncertain(action_id, detail="no confirmation")
+
+        for kind, payload in (
+            ("usage", {"confirmed": True, "outcome": "completed"}),
+            ("session_binding", {"session_id": "task-1"}),
+            ("unknown", {"confirmed": True, "outcome": "completed"}),
+            ("stage_result", {"confirmed": False, "outcome": "completed"}),
+            ("stage_result", {"confirmed": True}),  # no explicit terminal result
+        ):
+            with self.subTest(kind=kind):
+                handle.record_evidence(action_id, kind=kind, payload=payload)
+                self.assertEqual(
+                    handle.get_action(action_id)["state"], "uncertain"
+                )
+
+        self.assertEqual(len(handle.list_evidence(action_id)), 5)
+        handle.reconcile_action(action_id)
+        self.assertEqual(handle.get_action(action_id)["state"], "reconciled")
+
+    def test_reconcile_action_refuses_non_uncertain_states(self) -> None:
+        handle = self.open()
+        job_id = self.register(handle)
+        action_id = handle.begin_action(job_id, kind="implement", run_id="run-1")
+
+        # An intent is not uncertain.
+        with self.assertRaises(ledger.JournalStateError):
+            handle.reconcile_action(action_id)
+
+        handle.dispatch_action(action_id)
+        with self.assertRaises(ledger.JournalStateError):
+            handle.reconcile_action(action_id)
+        self.assertEqual(handle.get_action(action_id)["state"], "dispatched")
+
+        handle.complete_action(action_id)
+        with self.assertRaises(ledger.JournalStateError):
+            handle.reconcile_action(action_id)
+        self.assertEqual(handle.get_action(action_id)["state"], "completed")
 
 
 class _FakeClock:

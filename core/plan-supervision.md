@@ -393,13 +393,13 @@ than claiming exactly-once external effects.
    explicitly `uncertain`. Uncertainty is a first-class state, not a silence.
    Uncertainty is resolved only by evidence: an `uncertain` action cannot be
    marked complete or failed, replayed, or dispatched until a reconciling
-   evidence row has been recorded. Declaring an unconfirmed action `failed`
-   is not a substitute for reconciliation.
-4. **Evidence reconciliation.** Evidence rows are recorded against an action.
-   Recording evidence for an `uncertain` action reconciles it in the same
-   transaction, moving it to `reconciled`. Only then is the observed outcome
-   applied: the action may be completed or failed according to what the
-   evidence shows.
+   evidence row has been recorded and explicitly reconciled. Declaring an
+   unconfirmed action `failed` is not a substitute for reconciliation.
+4. **Evidence reconciliation.** Evidence rows are appended against an action
+   without changing its state. After classifying decisive evidence, the caller
+   explicitly reconciles an `uncertain` action, moving it to `reconciled`.
+   Only then is the observed outcome applied: the action may be completed or
+   failed according to what the evidence shows.
 5. **Terminal states.** `completed` and `failed` are terminal. A terminal
    action is never dispatched or replayed, and it cannot transition again.
    Retries happen through a fresh action, not by resurrecting a terminal one.
@@ -408,6 +408,87 @@ than claiming exactly-once external effects.
    observable dispatch; its effects must be deduplicated and re-observed
    rather than assumed absent. A lease-style claim was rejected because a
    lease cannot prove an external effect did not happen.
+
+## Engine dispatch contract
+
+The run engine's inner stage dispatch — create, implement, review, and archive,
+including stage retries and `implementer_escalation` — is wrapped by one
+concern-named dispatch boundary in `lib/orchestrator/journal_dispatch.py`. The
+boundary reuses the existing run engine and stage invocation; it introduces no
+new DAG or stage machine. An unregistered legacy run never enters the module.
+
+### Pre-dispatch gate order
+
+Every supervised action evaluates one boundary before any side effect, in a
+fixed order. Each refusal raises a named gate error identifying the failing
+gate:
+
+1. **Execution lock.** The worktree execution lock is held by the dispatching
+   process. The durable proof is the service-owned supervised-execution fence
+   in the ledger (matching boot identity and process start time, so PID reuse
+   cannot impersonate it) naming this process or an ancestor; a repo-writable
+   lock record is consulted only to fail closed on a foreign live holder.
+2. **Broker authority.** The broker's authority state permits the dispatch:
+   relied-upon receipts are revalidated against the current material revision
+   per action, not only at run start.
+3. **Plan/policy freshness.** The manifest-snapshot hash and policy operator
+   revision recorded when the gate opened are rechecked before each action. A
+   changed policy revision or re-registered snapshot blocks with a named
+   stale-material error; the job is never silently re-bound to new material.
+   Only the material gate inputs are compared, so unrelated repository edits do
+   not invalidate.
+4. **Model policy.** `lib/supervisor/model_policy.py::check_dispatch` must
+   allow the action's role against the job policy's pinned identity. A
+   missing, unallowlisted, or identity-mismatched role blocks with its named
+   reason; there is no cross-role fallback or inheritance.
+5. **Budget reservation.** The action intent is committed, the reservation is
+   written durably, and the dispatch record is inserted as the last step before
+   the worker is spawned, so an undispatched action never accrues
+   execution-elapsed time.
+
+### Journal lifecycle and evidence
+
+For each dispatch the boundary commits the action intent before any side
+effect, writes a transactional dispatch record carrying the action id, owning
+job, and worker identity, and then resolves the action to a terminal or
+explicitly uncertain state. The fixed evidence-kind vocabulary is
+`stage_result`, `usage`, `spawn_loss`, and `session_binding`; unknown kinds are
+stored but never decisive.
+
+A confirmed outcome records outcome and usage evidence and completes or fails
+the action. An outcome that cannot be confirmed — a worker lost after spawn, a
+timeout after dispatch, an ambiguous kill, or missing result evidence — marks
+the action `uncertain` with whatever evidence exists. After decisive evidence
+is recorded and classified, the caller explicitly reconciles the uncertain
+action to `reconciled`; only then may it transition to a terminal state. A run
+that resumes with an unreconciled
+uncertain action surfaces it as blocking state instead of dispatching the next
+action as though the uncertain one had succeeded or never happened. A stale
+`dispatched` row found on resume is first classified as `uncertain` and enters
+the same reconciliation path.
+
+### Deduplicating, re-observant replay
+
+Replay never assumes a prior attempt had no effect and never claims exactly-once
+external effects. Before replaying an uncertain action the engine deduplicates:
+a delivered result already recorded against the action reconciles it instead of
+replaying. Otherwise it re-observes the external state the prior attempt may
+have affected and replays only when that observation shows the work incomplete.
+The recorded worker process identity is fenced before replay, so a recycled PID
+or a still-live prior worker blocks a double spawn.
+
+### Dual worker identity tracking
+
+Both worker dispatch paths write to the same journal with the same lifecycle
+and gating. The subprocess path records the spawned worker's process identity
+(pid, process start time, and boot identity) on the dispatch record at spawn.
+The native Task path records the session identity the worker reports through
+the worker-actions endpoint, and journals a `session_binding` evidence entry.
+A supervised dispatch therefore never has a null identity regardless of which
+path carried it. The worker endpoint's `record_evidence` and `request_action`
+verbs are backed by the ledger, remain inside the worker-domain authorization
+boundary, and accept evidence only for actions of the job the worker is bound
+to.
 
 ## Single supervised job per worktree
 
