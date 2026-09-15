@@ -4013,6 +4013,31 @@ def main() -> int:
     )
     p_supervise_probe.set_defaults(fn=cmd_supervise.cmd_supervise_probe)
 
+    p_supervise_serve = supervise_sub.add_parser(
+        "serve",
+        help="host the trusted broker endpoint surface (installs the projection writer)",
+    )
+    p_supervise_serve.add_argument(
+        "plan", nargs="?", default=None, help="path to the plan TOML"
+    )
+    p_supervise_serve.add_argument(
+        "--store", default=None,
+        help="explicit service-owned supervision store path",
+    )
+    p_supervise_serve.add_argument(
+        "--job-id", type=int, default=None, dest="job_id",
+        help="explicit supervised job id (default: the worktree's active job)",
+    )
+    p_supervise_serve.add_argument(
+        "--once", action="store_true",
+        help="accept and dispatch at most one request, then exit",
+    )
+    p_supervise_serve.add_argument(
+        "--timeout", type=float, default=30.0,
+        help="seconds to wait for a request with --once (default: 30)",
+    )
+    p_supervise_serve.set_defaults(fn=cmd_supervise.cmd_supervise_serve)
+
     p_logs = sub.add_parser(
         "logs", help="inspect the latest or filtered stage log for a resolved plan",
         description=(

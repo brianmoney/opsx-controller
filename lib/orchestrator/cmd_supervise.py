@@ -1,8 +1,13 @@
-"""``opsx-plan supervise`` namespace (status / probe).
+"""``opsx-plan supervise`` namespace (status / probe / serve).
 
-Owns the operator-facing surface of the authority boundary. Both subcommands
-are read-only diagnostics over :mod:`lib.supervisor.authority`; neither
-provisions accounts, installs units, or writes the authority store.
+Owns the operator-facing surface of the authority boundary. ``status`` and
+``probe`` are read-only diagnostics over :mod:`lib.supervisor.authority`; they
+neither provision accounts, install units, nor write the authority store.
+``serve`` is the trusted service-side endpoint host: it boots the supervised
+broker session (opening the service-owned ledger and installing the projection
+writer the broker requires) before accepting any operator or worker endpoint
+request, so live receipt transactions always record and regenerate the JSON
+projection.
 
 - ``supervise status`` reports the capability of the host and always exits 0,
   because a report about an unsupported host is still a successful report.
@@ -10,6 +15,10 @@ provisions accounts, installs units, or writes the authority store.
   unprovisioned host it exits non-zero naming ``UnsupportedHostError``; on an
   available host it runs the mandatory activation probe and exits non-zero
   naming ``ActivationProbeError`` when the boundary does not hold.
+- ``supervise serve`` boots that trusted session and dispatches authenticated
+  endpoint requests; it fails closed with ``BrokerUnavailableError`` when the
+  service store, the registered job, the principals, or the endpoint sockets
+  are not provisioned.
 """
 
 from __future__ import annotations
@@ -17,8 +26,12 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
+from lib.orchestrator import planref
+from lib.orchestrator import supervision as supervision_mod
 from lib.supervisor import authority
+from lib.supervisor import broker as broker_mod
 
 
 def cmd_supervise_status(args: argparse.Namespace) -> int:
@@ -61,4 +74,65 @@ def cmd_supervise_probe(args: argparse.Namespace) -> int:
         f"domain is denied write access to the authority store "
         f"({report.state_path})"
     )
+    return 0
+
+
+def cmd_supervise_serve(args: argparse.Namespace) -> int:
+    """opsx-plan supervise serve — host the trusted broker endpoint surface.
+
+    Boots the service session (which installs and retains the trusted
+    projection writer) and the operator/worker endpoint sockets before
+    accepting any request, then dispatches authenticated requests until
+    stopped. A provisioning failure — missing service store, unregistered
+    worktree, unresolvable allowed principal, or a socket that cannot be
+    bound — fails closed with the named broker error rather than serving
+    unauthenticated or unprojected requests.
+    """
+    repo = Path(args.repo).resolve()
+    try:
+        plan_src = planref.resolve_plan(repo, getattr(args, "plan", None))
+        cfg = planref.load_plan(
+            planref._resolve_plan_path(repo, plan_src), repo=repo
+        )
+        store_path = (
+            Path(args.store).resolve() if getattr(args, "store", None) else None
+        )
+        job_id = getattr(args, "job_id", None)
+        host = supervision_mod.open_service_host(
+            repo, cfg, store_path=store_path, job_id=job_id
+        )
+    except broker_mod.BrokerError as exc:
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001 - provisioning failure, fail closed
+        print(f"error: BrokerUnavailableError: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        host.bind()
+    except broker_mod.BrokerError as exc:
+        # An unbindable endpoint is a named fail-closed provisioning error: the
+        # host has already torn the session down, and the CLI reports
+        # BrokerUnavailableError instead of letting a raw OSError escape.
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        host.close()
+        return 1
+    except Exception as exc:  # noqa: BLE001 - provisioning failure, fail closed
+        print(f"error: BrokerUnavailableError: {exc}", file=sys.stderr)
+        host.close()
+        return 1
+
+    try:
+        print(
+            f"supervise serve: session for job {host.session.job_id} is live; "
+            f"operator={host.operator_socket} worker={host.worker_socket}"
+        )
+        if getattr(args, "once", False):
+            host.poll(timeout=float(getattr(args, "timeout", 30.0)))
+        else:
+            host.serve_forever(timeout=1.0)
+    except KeyboardInterrupt:  # pragma: no cover - interactive shutdown
+        pass
+    finally:
+        host.close()
     return 0

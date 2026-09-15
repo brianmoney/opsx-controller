@@ -656,6 +656,31 @@ per-job receipt high-water id and, on boot or wake, scans `id > high_water`
 immediate scan for liveness, but the scan is the authority, so a restart never
 loses a receipt. No receipt path acquires or waits for the execution lock.
 
+### Service projection writer is installed before requests are served
+
+Every broker receipt transaction must regenerate the JSON projection from
+broker and ledger state, so the trusted service installs exactly one
+projection writer
+(`lib.orchestrator.supervision.install_projection_writer`) at boot, before it
+accepts any operator or worker endpoint request. The production call site is
+the service-side endpoint host (`opsx-plan supervise serve`), which boots the
+broker session — opening the service-owned ledger, identifying the worktree's
+active nonterminal registration, and installing and retaining the writer — and
+only then binds the endpoint sockets. Every session is bound to that
+registration: an explicit `--job-id` is accepted only when it *is* the
+worktree's active job, so a foreign (another worktree's) or terminal job id is
+rejected as a registration mismatch before the writer is installed. There is
+deliberately no per-request or per-call callback: the broker consults the
+installed writer itself, and a missing writer fails closed with
+`BrokerUnavailableError` recording nothing, so a recorded receipt can never
+silently leave the projection stale. A provisioning failure (missing store,
+unregistered worktree, unresolvable principal, foreign or terminal explicit job
+id, or an unbindable socket) fails the service closed before any socket is bound
+rather than serving authority records whose projection cannot be regenerated;
+socket provisioning failures are translated to the named `BrokerUnavailableError`
+and tear the partially booted session down instead of escaping as a raw socket
+error.
+
 
 ## Separation from execution state
 

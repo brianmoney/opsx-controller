@@ -19,6 +19,9 @@ Design rules enforced here:
 - Human-only gates release only through an operator receipt; delegated gates
   release only through the scoped service action. A worker-domain attempt is
   refused with :class:`BrokerMediationError` and records nothing.
+- Every committed receipt transaction regenerates the JSON projection through
+  the installed service writer, so endpoint-recorded receipts cannot leave the
+  projection stale.
 - No receipt path acquires or waits for the worktree execution lock.
 """
 
@@ -166,11 +169,15 @@ def _normalize_depends_on(value: Any) -> list[str]:
 def gate_fields(snapshot: Mapping[str, Any], change_id: str) -> dict[str, Any]:
     """Return the gate-relevant subset for *change_id* from the protected snapshot.
 
-    Resolves ``pause_before_human_only`` the same way the manifest loader does:
-    absent on a gated change resolves human-only; explicit ``false`` delegates;
-    an ungated change carries no authority. Only these fields participate in
-    the material revision, so an unrelated manifest edit cannot invalidate a
-    receipt.
+    Resolves ``pause_before_human_only`` with the *same* strict validation the
+    manifest loader applies (``lib.orchestrator.planref``): absent on a gated
+    change resolves human-only; explicit ``false`` delegates; an ungated change
+    carries no authority. A non-boolean value, or ``true`` on a change that is
+    not gated with ``pause_before = true``, is invalid — such a protected
+    snapshot fails closed with a named :class:`BrokerError` rather than being
+    normalized into an ungated (and therefore trivially dispatchable) change.
+    Only these fields participate in the material revision, so an unrelated
+    manifest edit cannot invalidate a receipt.
     """
     changes = snapshot.get("changes", {}) if isinstance(snapshot, Mapping) else {}
     if change_id not in changes:
@@ -185,14 +192,23 @@ def gate_fields(snapshot: Mapping[str, Any], change_id: str) -> dict[str, Any]:
         )
     pause_before = raw_gate
     raw_human = entry.get("pause_before_human_only")
-    if not pause_before:
-        human_only = False
-    elif raw_human is None:
-        human_only = True
-    elif not isinstance(raw_human, bool):
+    # Apply the manifest loader's strict validation to the protected snapshot:
+    # a non-boolean value, and ``true`` on a change that is not gated, are
+    # invalid. Fail closed with a named BrokerError rather than normalizing an
+    # invalid protected snapshot into a different authority.
+    if raw_human is not None and not isinstance(raw_human, bool):
         raise BrokerError(
             f"change {change_id!r} pause_before_human_only must be a boolean"
         )
+    if not pause_before:
+        if raw_human is True:
+            raise BrokerError(
+                f"change {change_id!r} pause_before_human_only = true requires "
+                "pause_before = true on the same change"
+            )
+        human_only = False
+    elif raw_human is None:
+        human_only = True
     else:
         human_only = raw_human
     plan = snapshot.get("plan", {}) if isinstance(snapshot, Mapping) else {}
@@ -424,11 +440,64 @@ def material_state(conn: Any, job_id: int, change_id: str) -> MaterialState:
 # Recording receipts
 # ---------------------------------------------------------------------------
 
+# The trusted-service projection writer. The service installs exactly one
+# writer at boot (``lib.orchestrator.supervision.install_projection_writer``)
+# that regenerates the JSON projection (approvals, acceptance flags, change
+# records) from broker and ledger state; every receipt transaction invokes it
+# automatically. There is no optional per-call callback, so a recorded receipt
+# can never silently leave the projection stale.
+ProjectionWriter = Callable[[Any, int], None]
 
-def _projection_call(receipts: Sequence[Mapping[str, Any]], projection: Callable[[Sequence[Mapping[str, Any]]], None] | None) -> None:
-    if projection is None:
-        return
-    projection(receipts)
+_PROJECTION_WRITER: ProjectionWriter | None = None
+
+
+def set_projection_writer(writer: ProjectionWriter | None) -> ProjectionWriter | None:
+    """Install the trusted-service projection writer, returning the previous one.
+
+    ``None`` clears it. The writer is called as ``writer(ledger, job_id)`` after
+    each committed receipt transaction.
+    """
+    global _PROJECTION_WRITER
+    previous = _PROJECTION_WRITER
+    _PROJECTION_WRITER = writer
+    return previous
+
+
+def projection_writer() -> ProjectionWriter | None:
+    """Return the installed trusted-service projection writer, or ``None``."""
+    return _PROJECTION_WRITER
+
+
+def require_projection_writer() -> ProjectionWriter:
+    """Return the installed service projection writer, or fail closed.
+
+    Every committed receipt transaction must be followed by a projection
+    regeneration, so a missing writer is a service misconfiguration rather than
+    a reason to skip projecting: a registered job with a reachable broker but no
+    projection writer would otherwise record authority records the legacy read
+    paths can never observe. Raising :class:`BrokerUnavailableError` keeps the
+    mediated path fail-closed.
+    """
+    writer = _PROJECTION_WRITER
+    if writer is None:
+        raise BrokerUnavailableError(
+            "no service projection writer is installed; the trusted service must "
+            "install one before recording broker receipts so the JSON projection "
+            "cannot be left stale"
+        )
+    return writer
+
+
+def regenerate_projection(conn: Any, job_id: int) -> None:
+    """Regenerate the JSON projection from broker state after a transaction.
+
+    The trusted service installs exactly one writer at boot (see
+    :func:`set_projection_writer`); every committed receipt transaction invokes
+    it here. There is no optional per-call callback: when no writer is installed
+    the broker fails closed with :class:`BrokerUnavailableError` instead of
+    committing an authority record whose projection would silently stay stale.
+    """
+    require_projection_writer()(conn, job_id)
 
 
 @dataclass(frozen=True)
@@ -460,7 +529,6 @@ def record_approval(
     principal: BrokerPrincipal,
     change_ids: Iterable[str],
     kind: str = APPROVAL,
-    projection: Callable[[Sequence[Mapping[str, Any]]], None] | None = None,
     detail: str | None = None,
 ) -> list[RecordedReceipt]:
     """Record approval/acceptance receipts for *change_ids* in one transaction.
@@ -468,7 +536,8 @@ def record_approval(
     Only the operator principal may release an approval/acceptance gate. Each
     affected change must resolve to human-only authority (a delegated gate is
     released through the scoped service action, not by an operator receipt) and
-    must currently await the gate. The whole batch is one durable transaction.
+    must currently await the gate. The whole batch is one durable transaction,
+    after which the JSON projection is regenerated from broker state.
     """
     if principal.role != OPERATOR:
         raise BrokerMediationError(
@@ -519,6 +588,9 @@ def record_approval(
         )
     if not rows:
         return []
+    # Fail closed *before* committing: a receipt must never be recorded without
+    # a projection writer to regenerate the JSON projection from broker state.
+    require_projection_writer()
     receipt_ids = conn.record_receipts(job_id, rows)
     recorded = [
         RecordedReceipt(
@@ -531,7 +603,7 @@ def record_approval(
         )
         for receipt_id, item in zip(receipt_ids, pending)
     ]
-    _projection_call([item.as_dict() for item in recorded], projection)
+    regenerate_projection(conn, job_id)
     return recorded
 
 
@@ -541,12 +613,13 @@ def record_acceptance(
     *,
     principal: BrokerPrincipal,
     change_ids: Iterable[str],
-    projection: Callable[[Sequence[Mapping[str, Any]]], None] | None = None,
 ) -> list[RecordedReceipt]:
     """Record acceptance receipts (operator authority) in one transaction.
 
     Acceptance is not a ``pause_before`` gate, so no human-only/delegated
-    authority resolution applies; only the operator principal may accept.
+    authority resolution applies; only the operator principal may accept. The
+    batch is one durable transaction, after which the JSON projection is
+    regenerated from broker state.
     """
     if principal.role != OPERATOR:
         raise BrokerMediationError(
@@ -585,6 +658,8 @@ def record_acceptance(
         )
     if not rows:
         return []
+    # Fail closed *before* committing (see :func:`record_approval`).
+    require_projection_writer()
     receipt_ids = conn.record_receipts(job_id, rows)
     recorded = [
         RecordedReceipt(
@@ -594,7 +669,7 @@ def record_acceptance(
         )
         for receipt_id, item in zip(receipt_ids, pending)
     ]
-    _projection_call([item.as_dict() for item in recorded], projection)
+    regenerate_projection(conn, job_id)
     return recorded
 
 
@@ -604,13 +679,13 @@ def release_delegated_gate(
     *,
     principal: BrokerPrincipal,
     change_id: str,
-    projection: Callable[[Sequence[Mapping[str, Any]]], None] | None = None,
 ) -> RecordedReceipt:
     """Record a delegated approval receipt through the scoped service action.
 
     Accepted only when the change's resolved authority is delegated and the
     requesting principal is the scoped service identity. A worker principal is
-    refused with :class:`BrokerMediationError` and records nothing.
+    refused with :class:`BrokerMediationError` and records nothing. A committed
+    receipt regenerates the JSON projection from broker state.
     """
     if principal.role != SERVICE:
         raise BrokerMediationError(
@@ -628,6 +703,8 @@ def release_delegated_gate(
     digest = material_hash(
         change_id, state.fields, state.snapshot_hash, state.policy_revision
     )
+    # Fail closed *before* committing (see :func:`record_approval`).
+    require_projection_writer()
     receipt_id = conn.record_receipt(
         job_id,
         change_id=change_id,
@@ -642,7 +719,7 @@ def release_delegated_gate(
         receipt_id=receipt_id, change_id=change_id, kind=APPROVAL,
         checkpoint=checkpoint, material_hash=digest, authority=SERVICE,
     )
-    _projection_call([recorded.as_dict()], projection)
+    regenerate_projection(conn, job_id)
     return recorded
 
 
@@ -653,14 +730,14 @@ def reset_change(
     principal: BrokerPrincipal,
     change_id: str,
     policy_bound: Mapping[str, Any] | None = None,
-    projection: Callable[[Sequence[Mapping[str, Any]]], None] | None = None,
 ) -> RecordedReceipt:
     """Record a bounded reset receipt through an authorized path.
 
     An operator reset is always authorized. A service reset requires an
     explicit policy bound (:data:`SERVICE_RESET_BOUND_KEY`) and is refused once
     the bound is reached. A worker-domain reset is refused with
-    :class:`BrokerMediationError` and records nothing.
+    :class:`BrokerMediationError` and records nothing. A committed receipt
+    regenerates the JSON projection from broker state.
     """
     if principal.role == WORKER:
         raise BrokerMediationError(
@@ -701,6 +778,8 @@ def reset_change(
     digest = material_hash(
         change_id, state.fields, state.snapshot_hash, state.policy_revision
     )
+    # Fail closed *before* committing (see :func:`record_approval`).
+    require_projection_writer()
     receipt_id = conn.record_receipt(
         job_id,
         change_id=change_id,
@@ -715,7 +794,7 @@ def reset_change(
         receipt_id=receipt_id, change_id=change_id, kind=RESET,
         checkpoint=checkpoint, material_hash=digest, authority=authority,
     )
-    _projection_call([recorded.as_dict()], projection)
+    regenerate_projection(conn, job_id)
     return recorded
 
 
@@ -726,14 +805,14 @@ def record_pause_or_steer(
     principal: BrokerPrincipal,
     change_id: str,
     kind: str,
-    projection: Callable[[Sequence[Mapping[str, Any]]], None] | None = None,
     detail: str | None = None,
 ) -> RecordedReceipt:
     """Record a durable ``pause`` or ``steer`` receipt bound to the change.
 
     A worker principal is refused with :class:`BrokerMediationError` and records
     nothing; only the operator or the scoped service identity may record one.
-    The receipt path never acquires the execution lock.
+    The receipt path never acquires the execution lock. A committed receipt
+    regenerates the JSON projection from broker state.
     """
     if kind not in (PAUSE, STEER):
         raise BrokerError(f"unknown pause/steer kind: {kind}")
@@ -752,6 +831,8 @@ def record_pause_or_steer(
     digest = material_hash(
         change_id, state.fields, state.snapshot_hash, state.policy_revision
     )
+    # Fail closed *before* committing (see :func:`record_approval`).
+    require_projection_writer()
     receipt_id = conn.record_receipt(
         job_id,
         change_id=change_id,
@@ -766,7 +847,7 @@ def record_pause_or_steer(
         receipt_id=receipt_id, change_id=change_id, kind=kind,
         checkpoint=checkpoint, material_hash=digest, authority=principal.role,
     )
-    _projection_call([recorded.as_dict()], projection)
+    regenerate_projection(conn, job_id)
     return recorded
 
 
@@ -996,6 +1077,7 @@ __all__ = [
     "OPERATOR",
     "PAUSE",
     "PRINCIPAL_ROLES",
+    "ProjectionWriter",
     "ReceiptWakeTracker",
     "RecordedReceipt",
     "RESET",
@@ -1014,16 +1096,20 @@ __all__ = [
     "material_state",
     "parse_snapshot",
     "pending_receipts",
+    "projection_writer",
     "record_acceptance",
     "record_approval",
     "record_pause_or_steer",
+    "regenerate_projection",
     "release_delegated_gate",
+    "require_projection_writer",
     "relied_upon_receipts",
     "reset_change",
     "resolve_gate",
     "resolved_authority",
     "revalidate_receipts",
     "selected_snapshot_changes",
+    "set_projection_writer",
     "snapshot_change_gate",
     "snapshot_change_ids",
     "snapshot_change_order",

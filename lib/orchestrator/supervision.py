@@ -23,6 +23,8 @@ Design rules enforced here:
 from __future__ import annotations
 
 import os
+import selectors
+import socket
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -543,18 +545,473 @@ def persist_projection(repo: Path, cfg: dict, state: dict, ledger: Any, job_id: 
     state_mod.save_state(repo, cfg["name"], state)
 
 
+def install_projection_writer(repo: Path, cfg: dict) -> Any:
+    """Install the trusted-service projection writer into the broker.
+
+    The supervised service calls this once at boot so every committed broker
+    transaction regenerates the JSON projection from broker and ledger state.
+    The writer reloads state from disk, projects it, and saves it, so the
+    projection reflects the freshly recorded receipts. Returns the previously
+    installed writer so a caller can restore it.
+
+    This is deliberately not a per-call callback: the broker consults the
+    installed writer itself, so an endpoint-recorded receipt cannot silently
+    leave the projection stale.
+    """
+    def writer(ledger: Any, job_id: int) -> None:
+        state = state_mod.load_state(repo, cfg["name"])
+        persist_projection(repo, cfg, state, ledger, job_id)
+
+    return broker_mod.set_projection_writer(writer)
+
+
+@dataclass
+class ServiceSession:
+    """The trusted service-side broker session (production bootstrap).
+
+    A session is the one production route through which endpoint requests are
+    accepted. It owns the service-owned ledger handle, the identified job, and
+    the trusted projection writer the service installed at boot, so every
+    committed receipt transaction regenerates the JSON projection before the
+    request completes. Closing the session restores the previously installed
+    writer and closes the ledger.
+    """
+
+    repo: Path
+    cfg: dict
+    job_id: int
+    ledger: Any
+    previous_writer: Any
+
+    def serve(
+        self,
+        endpoint: Any,
+        conn: Any,
+        *,
+        ledger_resolver: Any = None,
+    ) -> dict[str, Any]:
+        """Accept and dispatch exactly one broker request on *conn*.
+
+        The request never carries the service-owned ledger: the session
+        injects its own ledger handle and job id, exactly as the supervised
+        service does, so a worker cannot substitute the ledger over the wire.
+        """
+        resolver = ledger_resolver or (
+            lambda _request: (self.ledger, self.job_id)
+        )
+        return broker_client.serve_one(endpoint, conn, ledger_resolver=resolver)
+
+    def close(self) -> None:
+        try:
+            broker_mod.set_projection_writer(self.previous_writer)
+        finally:
+            try:
+                self.ledger.close()
+            except Exception:
+                pass
+
+    def __enter__(self) -> "ServiceSession":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+
+def open_service_session(
+    repo: Path,
+    cfg: dict,
+    *,
+    job_id: int | None = None,
+    store_path: Path | None = None,
+) -> ServiceSession:
+    """Boot the trusted service-side broker session for *repo*.
+
+    This is the production bootstrap the supervised service runs before
+    accepting any operator or worker endpoint request:
+
+    1. open the service-owned ledger (never the repo-writable state),
+    2. identify this worktree's active nonterminal registration and bind the
+       session to it — an explicit *job_id* is only accepted when it *is* that
+       registration, so a foreign job id is rejected rather than served,
+    3. install and retain the trusted projection writer via
+       :func:`install_projection_writer`, so every receipt transaction
+       regenerates the JSON projection from broker and ledger state.
+
+    A missing, corrupt, or otherwise unopenable service store, a worktree with
+    no active job, or an explicit *job_id* that does not match the worktree's
+    active registration fails closed with
+    :class:`broker_mod.BrokerUnavailableError` before the writer is installed,
+    rather than starting a session that could record authority for a foreign
+    job with no projection or leak a raw ledger/database error. The returned
+    session is a context manager; the caller owns it.
+    """
+    path = Path(store_path) if store_path is not None else ledger_path(repo)
+    if path is None:
+        raise broker_mod.BrokerUnavailableError(
+            "no service-owned supervision store is configured; the supervised "
+            "service cannot accept broker requests"
+        )
+    if not path.exists():
+        raise broker_mod.BrokerUnavailableError(
+            f"the service-owned supervision store {path} does not exist; the "
+            "supervised service must be provisioned before accepting broker "
+            "requests"
+        )
+    try:
+        # An existing but unopenable store (corrupt file, unsupported schema,
+        # untrusted location) is an unavailable service store like any other:
+        # it must fail closed as the named broker error, never leak a raw
+        # ``sqlite3.DatabaseError``/``LedgerError`` out of the bootstrap. The
+        # open precedes writer installation, so a failed open leaves no
+        # session, no writer, and nothing recorded or projected.
+        handle = ledger_mod.open_ledger(path, repository_root=repo, create=False)
+    except broker_mod.BrokerUnavailableError:
+        raise
+    except Exception as exc:
+        raise broker_mod.BrokerUnavailableError(
+            f"the service-owned supervision store {path} exists but could not be "
+            f"opened; the supervised service is unavailable and must be "
+            f"reprovisioned before accepting broker requests: {exc}"
+        ) from exc
+    try:
+        # Every session, including an explicit ``--job-id``, is bound to *this*
+        # worktree's active nonterminal registration before anything is
+        # installed or bound. An explicit id that names another worktree's job
+        # (or a terminal job) is a mismatch and is rejected here: otherwise the
+        # service would record receipts for a foreign job while projecting into
+        # the current repo.
+        active = handle.find_job_by_worktree(repo, repository_root=repo)
+        if active is None or active["state"] in ledger_mod.TERMINAL_JOB_STATES:
+            raise broker_mod.BrokerUnavailableError(
+                f"worktree {repo} has no active supervised job; refusing to "
+                "open a broker session for an unregistered worktree"
+            )
+        active_id = int(active["id"])
+        if job_id is None:
+            job_id = active_id
+        elif int(job_id) != active_id:
+            raise broker_mod.BrokerUnavailableError(
+                f"job {job_id} is not the active supervised job {active_id} "
+                f"registered for worktree {repo}; refusing to serve a job that "
+                "belongs to another worktree"
+            )
+        previous = install_projection_writer(repo, cfg)
+    except Exception:
+        handle.close()
+        raise
+    return ServiceSession(
+        repo=repo,
+        cfg=cfg,
+        job_id=job_id,
+        ledger=handle,
+        previous_writer=previous,
+    )
+
+
+OPERATOR_SOCKET_ENV = broker_client.OPERATOR_SOCKET_ENV
+WORKER_SOCKET_ENV = broker_client.WORKER_SOCKET_ENV
+
+
+def service_socket_path(kind: str, store_path: Path) -> Path:
+    """Return the service-owned endpoint socket path for *kind*.
+
+    An explicit socket env override wins (that is the provisioning/test
+    contract the CLI client reads too); otherwise the socket lives beside the
+    service-owned store so a worker cannot repoint it. The result is
+    canonicalized alongside the store.
+    """
+    configured = broker_client.endpoint_socket_path(kind)
+    if configured is not None:
+        return configured
+    name = "operator.sock" if kind == endpoints_mod.ENDPOINT_OPERATOR else "worker.sock"
+    return store_path.parent / name
+
+
+def _allowed_uids_for(role: str, *, principal: Any = None) -> frozenset[int]:
+    """Return the kernel uids the *role* endpoint accepts.
+
+    The authenticated principal is resolved through
+    :mod:`lib.supervisor.authority` (never a worker-selectable name); a
+    missing, unresolvable principal fails closed with
+    :class:`broker_mod.BrokerUnavailableError`, because an endpoint that
+    cannot name its allowed peer must not accept one.
+    """
+    if principal is not None and principal.uid is not None:
+        return frozenset({int(principal.uid)})
+    name = (
+        authority_mod.DEFAULT_SERVICE_PRINCIPAL
+        if role == "service"
+        else None
+    )
+    if name is None:
+        raise broker_mod.BrokerUnavailableError(
+            f"no principal is provisioned for the {role} endpoint; refusing to "
+            "accept unauthenticated broker requests"
+        )
+    try:
+        resolved = authority_mod.resolve_principal(role, name)
+    except Exception as exc:  # pragma: no cover - authority lookup failure
+        raise broker_mod.BrokerUnavailableError(
+            f"the {role} principal could not be resolved: {exc}"
+        ) from exc
+    if resolved.uid is None:
+        raise broker_mod.BrokerUnavailableError(
+            f"the {role} principal {name!r} is not provisioned on this host; "
+            "refusing to accept unauthenticated broker requests"
+        )
+    return frozenset({int(resolved.uid)})
+
+
+@dataclass
+class ServiceEndpointHost:
+    """Production host that serves authenticated broker endpoint requests.
+
+    The host is created from a booted :class:`ServiceSession` (which has
+    already installed and retained the trusted projection writer), binds the
+    operator and worker-actions Unix sockets with service-derived allowed
+    peer uids, and dispatches each accepted connection through the session.
+    Because the session installs the writer before any request is accepted,
+    a live endpoint receipt transaction always records *and* regenerates the
+    JSON projection.
+    """
+
+    session: ServiceSession
+    store_path: Path
+    operator_allowed_uids: frozenset[int]
+    service_allowed_uids: frozenset[int]
+    operator_socket: Path
+    worker_socket: Path
+    _listeners: dict[str, Any] = None  # type: ignore[assignment]
+    _stopped: bool = False
+
+    def __post_init__(self) -> None:
+        if self._listeners is None:
+            self._listeners = {}
+
+    def _endpoint(self, kind: str) -> Any:
+        endpoints_map = {
+            endpoints_mod.ENDPOINT_OPERATOR: (
+                self.operator_allowed_uids, self.operator_socket
+            ),
+            endpoints_mod.ENDPOINT_WORKER: (
+                self.service_allowed_uids, self.worker_socket
+            ),
+        }
+        allowed, _path = endpoints_map[kind]
+        return endpoints_mod.Endpoint(kind, allowed)
+
+    def bind(self) -> "ServiceEndpointHost":
+        """Bind and listen on both endpoint sockets.
+
+        A stale socket file is removed first; the socket is created with
+        restrictive permissions (owner-only) so a worker cannot connect by
+        filesystem permission even before its uid is rejected.
+
+        Every socket provisioning failure (creating, preparing, binding, or
+        listening) is translated to
+        :class:`broker_mod.BrokerUnavailableError`, the named fail-closed error
+        the ``supervise serve`` contract promises: an unbindable endpoint must
+        not escape as a raw ``OSError``. On failure the partially bound sockets
+        are closed and the session (including the projection writer it
+        installed) is torn down before the error propagates, so a failed boot
+        leaves no half-installed authority surface behind.
+        """
+        for kind, path in (
+            (endpoints_mod.ENDPOINT_OPERATOR, self.operator_socket),
+            (endpoints_mod.ENDPOINT_WORKER, self.worker_socket),
+        ):
+            path = Path(path)
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if path.exists():
+                    path.unlink()
+            except OSError as exc:
+                self.close()
+                raise broker_mod.BrokerUnavailableError(
+                    f"the {kind} endpoint socket {path} could not be prepared; "
+                    f"refusing to serve broker requests: {exc}"
+                ) from exc
+            try:
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            except OSError as exc:  # pragma: no cover - platform dependent
+                self.close()
+                raise broker_mod.BrokerUnavailableError(
+                    f"the {kind} endpoint socket could not be created; refusing "
+                    f"to serve broker requests: {exc}"
+                ) from exc
+            try:
+                listener.bind(str(path))
+                try:
+                    os.chmod(path, 0o600)
+                except OSError:  # pragma: no cover - platform dependent
+                    pass
+                listener.listen(8)
+            except OSError as exc:
+                try:
+                    listener.close()
+                except OSError:  # pragma: no cover - best-effort close
+                    pass
+                try:
+                    if path.exists() and path.is_socket():
+                        path.unlink()
+                except OSError:  # pragma: no cover - best-effort cleanup
+                    pass
+                self.close()
+                raise broker_mod.BrokerUnavailableError(
+                    f"the {kind} endpoint socket {path} could not be bound; "
+                    f"refusing to serve broker requests: {exc}"
+                ) from exc
+            self._listeners[kind] = (listener, path)
+        return self
+
+    def poll(self, timeout: float | None = None) -> dict[str, Any] | None:
+        """Accept and dispatch at most one request, returning its result.
+
+        Blocks up to *timeout* seconds for a connection; a timeout returns
+        ``None`` with nothing dispatched.
+        """
+        if not self._listeners:
+            raise broker_mod.BrokerUnavailableError(
+                "the service endpoint host is not bound; call bind() first"
+            )
+        listener_map = {
+            listener: kind for kind, (listener, _p) in self._listeners.items()
+        }
+        selector = selectors.DefaultSelector()
+        try:
+            for listener, _path in self._listeners.values():
+                selector.register(listener, selectors.EVENT_READ)
+            events = selector.select(timeout)
+        finally:
+            selector.close()
+        for key, _mask in events:
+            listener = key.fileobj
+            kind = listener_map[listener]
+            conn, _addr = listener.accept()
+            try:
+                return self.session.serve(self._endpoint(kind), conn)
+            except endpoints_mod.PeerCredentialError as exc:
+                # A rejected peer is closed by the endpoint; surface it so the
+                # caller can decide whether the refusal is fatal.
+                return {"ok": False, "error": "PeerCredentialError", "message": str(exc)}
+        return None
+
+    def serve_forever(self, *, timeout: float = 1.0) -> None:
+        """Poll for and dispatch endpoint requests until :meth:`stop`."""
+        while not self._stopped:
+            self.poll(timeout)
+
+    def stop(self) -> None:
+        self._stopped = True
+
+    def close(self) -> None:
+        for listener, path in self._listeners.values():
+            try:
+                listener.close()
+            except OSError:  # pragma: no cover - best-effort close
+                pass
+            try:
+                if isinstance(path, Path) and path.exists():
+                    path.unlink()
+            except OSError:  # pragma: no cover - best-effort cleanup
+                pass
+        self._listeners = {}
+        try:
+            self.session.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "ServiceEndpointHost":
+        return self.bind()
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+
+def open_service_host(
+    repo: Path,
+    cfg: dict,
+    *,
+    store_path: Path | None = None,
+    job_id: int | None = None,
+    operator_principal: Any = None,
+    service_principal: Any = None,
+) -> ServiceEndpointHost:
+    """Boot the production service host: session + projection writer + sockets.
+
+    This is the single production call site for
+    :func:`install_projection_writer`: the writer is installed by the session
+    before the host binds, so every endpoint request served by the host
+    records its receipt and regenerates the JSON projection. A missing store,
+    an unregistered worktree, or an unresolvable allowed principal fails
+    closed before any socket is bound.
+
+    *operator_principal* / *service_principal* are test seams that override
+    the authority layer's resolved endpoints; production omits them and
+    resolves the operator and service principals from the OS.
+    """
+    session = open_service_session(repo, cfg, store_path=store_path, job_id=job_id)
+    try:
+        effective_store = Path(store_path) if store_path is not None else ledger_path(repo)
+        if effective_store is None:
+            raise broker_mod.BrokerUnavailableError(
+                "no service-owned supervision store is configured"
+            )
+        operator_allowed = (
+            _allowed_uids_for("operator", principal=operator_principal)
+            if operator_principal is not None
+            else _operator_allowed_uids()
+        )
+        service_allowed = _allowed_uids_for("service", principal=service_principal)
+        return ServiceEndpointHost(
+            session=session,
+            store_path=effective_store,
+            operator_allowed_uids=operator_allowed,
+            service_allowed_uids=service_allowed,
+            operator_socket=service_socket_path(
+                endpoints_mod.ENDPOINT_OPERATOR, effective_store
+            ),
+            worker_socket=service_socket_path(
+                endpoints_mod.ENDPOINT_WORKER, effective_store
+            ),
+        )
+    except Exception:
+        session.close()
+        raise
+
+
+def _operator_allowed_uids() -> frozenset[int]:
+    """Return the operator principal's uid resolved from the OS authority layer."""
+    report = authority_mod.detect_backend()
+    principals = report.principals
+    if principals is None or principals.operator.uid is None:
+        raise broker_mod.BrokerUnavailableError(
+            "the operator principal is not provisioned on this host; refusing "
+            "to accept unauthenticated broker requests"
+        )
+    return frozenset({int(principals.operator.uid)})
+
+
 __all__ = [
     "ENV_STATE_FILE",
+    "OPERATOR_SOCKET_ENV",
     "Registration",
+    "ServiceEndpointHost",
+    "ServiceSession",
+    "WORKER_SOCKET_ENV",
     "call_operator",
     "call_worker_actions",
     "in_supervised_execution",
+    "install_projection_writer",
     "is_registered",
     "ledger_path",
     "open_registration",
+    "open_service_host",
+    "open_service_session",
     "persist_projection",
     "project_broker_state",
     "require_supervised_authorization",
+    "service_socket_path",
     "set_transport",
     "state_file_configured",
 ]

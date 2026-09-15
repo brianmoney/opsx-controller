@@ -558,6 +558,25 @@ protected snapshot, plus the snapshot identity and explicit policy revision).
   opsx-plan accept add-new-capability              # acceptance is operator-only too
   opsx-plan reset add-security-hardening           # an operator reset is a durable receipt
   ```
+  The operator endpoint is hosted by the trusted service, which boots the
+  broker session and **installs the projection writer** before accepting any
+  request:
+  ```bash
+  # The trusted service runs this (once the host is provisioned)
+  opsx-plan supervise serve <plan.toml>            # host the endpoint surface
+  # A single request then exit, useful for smoke checks:
+  opsx-plan supervise serve <plan.toml> --once
+  ```
+  Because the writer is installed at boot, every receipt the service records
+  regenerates the JSON projection from broker and ledger state, so a live
+  approval updates legacy `status`/`report` views. The session serves only the
+  current worktree's active registration: an explicit `--job-id` naming another
+  worktree's job (or a terminal one) is refused as a mismatch, so the service
+  can never record receipts for a foreign job while projecting into this repo.
+  A missing service store, a worktree with no active job, an unprovisioned
+  principal, or an unbindable socket fails the command closed with
+  `BrokerUnavailableError` before any request is served, tearing the partially
+  booted session down rather than leaking a raw socket error.
 - **Delegated gates** (`pause_before_human_only = false`) are released only by
   the job's scoped service action, never by an operator approval. Asking the
   operator path to approve a delegated gate is refused.
@@ -1288,6 +1307,7 @@ Reconcile state against the repository and print per-change status.
 ```
 opsx-plan supervise status [--json]
 opsx-plan supervise probe
+opsx-plan supervise serve [plan.toml] [--store PATH] [--job-id N] [--once]
 ```
 
 Inspect and gate the operator authority boundary. `supervise status` is a
@@ -1334,6 +1354,25 @@ Neither subcommand provisions anything, and there is no silent downgrade to a
 weaker isolation posture: provisioning accounts and the service is a manual
 operator step. See `core/plan-supervision.md` ("Operator authority boundary")
 for the trust model and provisioning guidance.
+
+`supervise serve` is the trusted service-side endpoint host, and the **single
+production call site** that installs and retains the broker projection writer.
+Before it accepts any operator or worker endpoint request it opens the
+service-owned ledger, identifies the worktree's active nonterminal registration,
+and installs the writer through which every committed receipt transaction
+regenerates the JSON projection (approvals, acceptance flags, change records)
+from broker and ledger state. Every session is bound to that registration: an
+explicit `--job-id` is accepted only when it *is* the worktree's active job, so
+a foreign (another worktree's) or terminal job id is refused as a mismatch
+before the writer is installed. It then binds the operator and worker-actions
+Unix sockets with allow-lists derived from the OS authority layer (never a
+worker-selectable name), owner-only modes, and dispatches authenticated requests
+until stopped; `--once` serves at most one request and exits, which is useful for
+smoke checks. A missing store, an unregistered worktree, an unprovisioned
+operator/service principal, or an unbindable socket fails closed with
+`BrokerUnavailableError` before any socket is bound, tearing the partially
+booted session down rather than leaking a raw socket error, so the service can
+never record a durable receipt whose projection it cannot regenerate.
 
 `doctor`, `status`, `logs`, and `report` acquire no boundary dependency and
 keep working unchanged on hosts where the boundary is unavailable.

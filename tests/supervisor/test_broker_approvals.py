@@ -40,6 +40,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+from lib.orchestrator import state as state_mod
+from lib.orchestrator import supervision
 from lib.supervisor import authority, broker, broker_client, endpoints, ledger, lock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -170,6 +172,26 @@ class BrokerTestCase(unittest.TestCase):
             "order": ["gated-human", "gated-delegated", "open-change"],
         }
         self.state = {"plan": "broker-test", "approvals": [], "changes": {}}
+        # The trusted service installs the projection writer at boot. Most
+        # tests exercise the broker directly, so install the same writer the
+        # service would; tests that assert the fail-closed path clear it.
+        self._projection_calls: list[tuple[Any, int]] = []
+        self._install_recording_projection_writer()
+
+    def _install_recording_projection_writer(self) -> None:
+        """Install the service projection writer, recording each invocation.
+
+        This mirrors what the supervised service does at boot via
+        ``supervision.install_projection_writer``, with the extra bookkeeping
+        the regressions assert.
+        """
+        def writer(conn: Any, job_id: int) -> None:
+            self._projection_calls.append((conn, job_id))
+            state = state_mod.load_state(self.repo, self.cfg["name"])
+            supervision.persist_projection(self.repo, self.cfg, state, conn, job_id)
+
+        self.addCleanup(broker.set_projection_writer, broker.projection_writer())
+        broker.set_projection_writer(writer)
 
     # -- fixtures ---------------------------------------------------------
 
@@ -331,6 +353,38 @@ class BrokerAuthorityTests(BrokerTestCase):
             broker.is_dispatchable(self.ledger, job_id, "gated-delegated")
         )
 
+    def test_invalid_protected_snapshot_flag_fails_closed(self) -> None:
+        """A protected snapshot with human-only but no gate is rejected.
+
+        ``gate_fields`` must apply the manifest loader's strict check to the
+        protected snapshot, so the invalid combination is a named refusal rather
+        than a normalization into an ungated change. It must fail closed on
+        every path that reads the snapshot, including the gate resolver.
+        """
+        job_id = self.register(content=_manifest(
+            '[[changes]]\nid = "gated-human"\nphase = 1\n'
+            "pause_before = false\npause_before_human_only = true\n"
+        ))
+        snapshot = broker.load_protected_snapshot(self.ledger, job_id)
+        with self.assertRaises(broker.BrokerError):
+            broker.gate_fields(snapshot, "gated-human")
+        with self.assertRaises(broker.BrokerError):
+            broker.material_state(self.ledger, job_id, "gated-human")
+        with self.assertRaises(broker.BrokerError):
+            broker.resolve_gate(self.ledger, job_id, "gated-human")
+        # The refusal records nothing: no receipt, no projection change.
+        self.assertEqual(self.ledger.receipt_high_water(job_id), 0)
+        self.assertEqual(self._projection_calls, [])
+
+    def test_non_boolean_protected_snapshot_flag_fails_closed(self) -> None:
+        job_id = self.register(content=_manifest(
+            '[[changes]]\nid = "gated-human"\nphase = 1\n'
+            "pause_before = true\npause_before_human_only = 1\n"
+        ))
+        snapshot = broker.load_protected_snapshot(self.ledger, job_id)
+        with self.assertRaises(broker.BrokerError):
+            broker.gate_fields(snapshot, "gated-human")
+
     def test_release_delegated_gate_registered_identity_is_enforced(self) -> None:
         job_id = self.register(owner_principal="opsx-supervisor")
         result = self._call_over_socketpair(
@@ -405,6 +459,705 @@ class BrokerAuthorityTests(BrokerTestCase):
         job_id = self.register()
         with self.assertRaises(broker.BrokerError):
             broker.resolve_gate(self.ledger, job_id, "not-in-snapshot")
+
+
+# ---------------------------------------------------------------------------
+# Review regression: endpoint-recorded receipts regenerate the projection
+# ---------------------------------------------------------------------------
+
+
+class EndpointProjectionTests(BrokerTestCase):
+    """Endpoint receipts must regenerate the JSON projection themselves.
+
+    The trusted service installs the projection writer; endpoint handlers must
+    not depend on callers supplying an optional callback, so driving the
+    operator/worker verbs over the real socketpair surface updates the JSON
+    projection as a side effect of the broker transaction.
+    """
+
+    def _json_approvals(self) -> list[str]:
+        return state_mod.load_state(self.repo, self.cfg["name"])["approvals"]
+
+    def _serve(self, job_id: int, request: dict, *, endpoint_kind: str) -> tuple[bool, str]:
+        import threading
+
+        server, client = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(server.close)
+        self.addCleanup(client.close)
+        real = endpoints.peer_credentials(server)
+        endpoint = endpoints.Endpoint(endpoint_kind, frozenset({real.uid}))
+        outcome: dict = {}
+
+        def client_call() -> None:
+            try:
+                outcome["result"] = broker_client.call(
+                    request, kind=endpoint_kind, connector=lambda: client
+                )
+            except broker.BrokerError as exc:
+                outcome["error"] = type(exc).__name__
+
+        thread = threading.Thread(target=client_call)
+        thread.start()
+        try:
+            broker_client.serve_one(
+                endpoint, server,
+                ledger_resolver=lambda _req: (self.ledger, job_id),
+            )
+        finally:
+            thread.join(timeout=10)
+        self.assertFalse(thread.is_alive(), "client half did not finish")
+        if "error" in outcome:
+            return False, outcome["error"]
+        return True, "ok"
+
+    def test_operator_endpoint_approve_regenerates_projection(self) -> None:
+        job_id = self.register()
+        ok, detail = self._serve(
+            job_id,
+            {"verb": "approve", "change_ids": ["gated-human"]},
+            endpoint_kind=endpoints.ENDPOINT_OPERATOR,
+        )
+        self.assertTrue(ok, detail)
+        self.assertEqual(self.ledger.receipt_high_water(job_id), 1)
+        # The projection followed broker state without any caller callback.
+        self.assertEqual(self._json_approvals(), ["gated-human"])
+        self.assertEqual(self._projection_calls, [(self.ledger, job_id)])
+
+    def test_worker_endpoint_delegated_release_regenerates_projection(self) -> None:
+        job_id = self.register(owner_principal="opsx-supervisor")
+        ok, detail = self._serve(
+            job_id,
+            {
+                "verb": "release_delegated_gate",
+                "change_id": "gated-delegated",
+                "service_identity": "opsx-supervisor",
+            },
+            endpoint_kind=endpoints.ENDPOINT_WORKER,
+        )
+        self.assertTrue(ok, detail)
+        self.assertEqual(self.ledger.receipt_high_water(job_id), 1)
+        # The delegated gate appears in the projection after the transaction.
+        self.assertEqual(self._json_approvals(), ["gated-delegated"])
+        self.assertEqual(self._projection_calls, [(self.ledger, job_id)])
+
+    def test_operator_endpoint_reset_regenerates_projection(self) -> None:
+        job_id = self.register()
+        ok, detail = self._serve(
+            job_id,
+            {"verb": "reset_change", "change_ids": ["gated-human"]},
+            endpoint_kind=endpoints.ENDPOINT_OPERATOR,
+        )
+        self.assertTrue(ok, detail)
+        self.assertEqual(
+            [row["kind"] for row in self.ledger.receipts_for_change(
+                job_id, "gated-human")],
+            ["reset"],
+        )
+        # The projection was regenerated from broker state after the reset.
+        self.assertEqual(self._projection_calls, [(self.ledger, job_id)])
+        # And it is internally consistent with the broker resolver.
+        for cid in ("gated-human", "gated-delegated", "open-change"):
+            in_projection = cid in self._json_approvals()
+            resolution = broker.resolve_gate(self.ledger, job_id, cid)
+            self.assertEqual(
+                in_projection,
+                resolution.authority is not None and resolution.dispatchable,
+                f"projection disagrees with broker state for {cid}",
+            )
+
+    def test_endpoint_receipt_without_writer_fails_closed_and_records_nothing(self) -> None:
+        job_id = self.register()
+        broker.set_projection_writer(None)
+        ok, detail = self._serve(
+            job_id,
+            {"verb": "approve", "change_ids": ["gated-human"]},
+            endpoint_kind=endpoints.ENDPOINT_OPERATOR,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(detail, "BrokerUnavailableError")
+        self.assertEqual(
+            self.ledger.receipt_high_water(job_id), 0,
+            "a receipt must not commit without a projection writer",
+        )
+
+    def test_service_boot_writer_regenerates_projection(self) -> None:
+        """The service's own boot-time writer regenerates the projection."""
+        job_id = self.register()
+        # Replace the test's recording writer with the service installer.
+        broker.set_projection_writer(None)
+        previous = supervision.install_projection_writer(self.repo, self.cfg)
+        self.addCleanup(broker.set_projection_writer, previous)
+        ok, detail = self._serve(
+            job_id,
+            {"verb": "approve", "change_ids": ["gated-human"]},
+            endpoint_kind=endpoints.ENDPOINT_OPERATOR,
+        )
+        self.assertTrue(ok, detail)
+        self.assertEqual(
+            state_mod.load_state(self.repo, self.cfg["name"])["approvals"],
+            ["gated-human"],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Production bootstrap: the live service installs the writer before serving
+# ---------------------------------------------------------------------------
+
+
+class ProductionServiceBootstrapTests(BrokerTestCase):
+    """The production service path installs the projection writer itself.
+
+    Regression for the review finding that ``install_projection_writer`` had
+    no production call site: only tests installed it, so live endpoint receipt
+    requests failed closed instead of recording and projecting receipts. These
+    tests exercise :func:`supervision.open_service_session` and
+    :func:`supervision.open_service_host` — the real service bootstrap — with
+    the test's convenience writer cleared, and assert both the durable receipt
+    and the JSON projection updates through the endpoint.
+    """
+
+    def _clear_writer(self) -> None:
+        """Clear the test-installed writer so only production code installs one."""
+        broker.set_projection_writer(None)
+
+    def _register_foreign_job(self) -> int:
+        """Register a second active job for a *different* worktree in this store.
+
+        The job belongs to another worktree under the same repository root, so
+        an explicit ``--job-id`` naming it is a foreign job for ``self.repo``.
+        """
+        foreign = self.repo / "foreign-worktree"
+        foreign.mkdir(exist_ok=True)
+        return self.ledger.register_job(
+            run_id="run-foreign",
+            worktree=foreign,
+            owner="service",
+            policy=_policy(),
+            operator="operator",
+            manifest_content=_manifest(HUMAN_GATED, DELEGATED_GATED, UNGATED),
+        )
+
+    def setUp(self) -> None:
+        # Save the writer the shared fixture installed, then clear it so a
+        # passing test proves production code installed the writer itself.
+        super().setUp()
+        self._saved_writer = broker.projection_writer()
+        broker.set_projection_writer(None)
+        self.addCleanup(broker.set_projection_writer, self._saved_writer)
+
+    def _serve_with_session(
+        self, session, job_id: int, request: dict, *, endpoint_kind: str
+    ) -> tuple[bool, str]:
+        import threading
+
+        server, client = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(server.close)
+        self.addCleanup(client.close)
+        real = endpoints.peer_credentials(server)
+        endpoint = endpoints.Endpoint(endpoint_kind, frozenset({real.uid}))
+        outcome: dict = {}
+
+        def client_call() -> None:
+            try:
+                outcome["result"] = broker_client.call(
+                    request, kind=endpoint_kind, connector=lambda: client
+                )
+            except broker.BrokerError as exc:
+                outcome["error"] = type(exc).__name__
+
+        thread = threading.Thread(target=client_call)
+        thread.start()
+        try:
+            session.serve(endpoint, server)
+        finally:
+            thread.join(timeout=10)
+        self.assertFalse(thread.is_alive(), "client half did not finish")
+        if "error" in outcome:
+            return False, outcome["error"]
+        return True, "ok"
+
+    def test_service_session_installs_writer_and_projects_operator_receipt(self) -> None:
+        """Booting the service session alone makes approvals record and project."""
+        self.assertIsNone(
+            broker.projection_writer(),
+            "the production bootstrap must be the thing that installs the writer",
+        )
+        job_id = self.register()
+        with supervision.open_service_session(
+            self.repo, self.cfg, store_path=self.db_path
+        ) as session:
+            self.assertIsNotNone(
+                broker.projection_writer(),
+                "open_service_session must install the trusted projection writer",
+            )
+            ok, detail = self._serve_with_session(
+                session, job_id,
+                {"verb": "approve", "change_ids": ["gated-human"]},
+                endpoint_kind=endpoints.ENDPOINT_OPERATOR,
+            )
+        self.assertTrue(ok, detail)
+        self.assertEqual(self.ledger.receipt_high_water(job_id), 1)
+        self.assertEqual(
+            state_mod.load_state(self.repo, self.cfg["name"])["approvals"],
+            ["gated-human"],
+        )
+        # Closing the session restores the previous (cleared) writer.
+        self.assertIsNone(broker.projection_writer())
+
+    def test_service_session_projects_delegated_release(self) -> None:
+        """The worker scoped action also records and projects via the session."""
+        job_id = self.register(owner_principal="opsx-supervisor")
+        with supervision.open_service_session(
+            self.repo, self.cfg, store_path=self.db_path
+        ) as session:
+            ok, detail = self._serve_with_session(
+                session, job_id,
+                {
+                    "verb": "release_delegated_gate",
+                    "change_id": "gated-delegated",
+                    "service_identity": "opsx-supervisor",
+                },
+                endpoint_kind=endpoints.ENDPOINT_WORKER,
+            )
+        self.assertTrue(ok, detail)
+        self.assertEqual(self.ledger.receipt_high_water(job_id), 1)
+        self.assertEqual(
+            state_mod.load_state(self.repo, self.cfg["name"])["approvals"],
+            ["gated-delegated"],
+        )
+
+    def test_service_session_without_registered_job_fails_closed(self) -> None:
+        """A worktree with no active job cannot open a broker session."""
+        self._clear_writer()
+        with self.assertRaises(broker.BrokerUnavailableError):
+            supervision.open_service_session(
+                self.repo, self.cfg, store_path=self.db_path
+            )
+
+    def test_service_session_rejects_foreign_explicit_job_id(self) -> None:
+        """An explicit --job-id for another worktree is refused before serving.
+
+        Regression for the review finding that ``open_service_session`` accepted
+        any existing ledger job: a foreign job id must be rejected as a
+        worktree/registration mismatch before the projection writer is
+        installed, so no receipt or projection change can occur for it.
+        """
+        self._clear_writer()
+        own_job = self.register()
+        foreign_job = self._register_foreign_job()
+        self.assertNotEqual(own_job, foreign_job)
+        state = state_mod.load_state(self.repo, self.cfg["name"])
+        before = json.dumps(state, sort_keys=True)
+
+        with self.assertRaises(broker.BrokerUnavailableError) as ctx:
+            supervision.open_service_session(
+                self.repo, self.cfg, store_path=self.db_path, job_id=foreign_job
+            )
+        self.assertIn("not the active supervised job", str(ctx.exception))
+        # Nothing was installed or served: the writer is still absent, neither
+        # job recorded a receipt, and the JSON projection is unchanged.
+        self.assertIsNone(broker.projection_writer())
+        self.assertEqual(self.ledger.receipt_high_water(foreign_job), 0)
+        self.assertEqual(self.ledger.receipt_high_water(own_job), 0)
+        after = json.dumps(
+            state_mod.load_state(self.repo, self.cfg["name"]), sort_keys=True
+        )
+        self.assertEqual(before, after)
+
+    def test_service_session_accepts_matching_explicit_job_id(self) -> None:
+        """An explicit job id equal to the worktree's active job is accepted."""
+        self._clear_writer()
+        own_job = self.register()
+        with supervision.open_service_session(
+            self.repo, self.cfg, store_path=self.db_path, job_id=own_job
+        ) as session:
+            self.assertEqual(session.job_id, own_job)
+            self.assertIsNotNone(broker.projection_writer())
+        self.assertIsNone(broker.projection_writer())
+
+    def test_service_session_rejects_terminal_explicit_job_id(self) -> None:
+        """A terminal job id cannot be selected even if it exists."""
+        self._clear_writer()
+        own_job = self.register()
+        self.ledger.set_job_state(own_job, "completed")
+        with self.assertRaises(broker.BrokerUnavailableError):
+            supervision.open_service_session(
+                self.repo, self.cfg, store_path=self.db_path, job_id=own_job
+            )
+        self.assertIsNone(broker.projection_writer())
+
+    def test_service_session_corrupt_store_fails_closed(self) -> None:
+        """An existing but corrupt store fails closed as BrokerUnavailableError.
+
+        Regression for the review finding that ``open_service_session`` let
+        ``ledger_mod.open_ledger`` raise a raw ``sqlite3.DatabaseError`` for an
+        unopenable existing store: every unavailable service-store provisioning
+        failure must surface as the named broker error *before* a session or
+        writer is installed, so a corrupt store can neither leak a raw database
+        error nor record or project anything.
+        """
+        self._clear_writer()
+        job_id = self.register()
+        corrupt = self.storage / "corrupt.sqlite3"
+        # A non-sqlite file at the configured store path is an *existing*
+        # but unopenable store (``open_ledger`` fails while reading the
+        # recorded schema version), distinct from a missing store.
+        corrupt.write_bytes(b"this is not a sqlite database at all\n")
+        state = state_mod.load_state(self.repo, self.cfg["name"])
+        before = json.dumps(state, sort_keys=True)
+
+        with self.assertRaises(broker.BrokerUnavailableError) as ctx:
+            supervision.open_service_session(
+                self.repo, self.cfg, store_path=corrupt
+            )
+        self.assertIn("could not be opened", str(ctx.exception))
+        # No session or writer was installed, no receipt was recorded, and the
+        # JSON projection is untouched.
+        self.assertIsNone(broker.projection_writer())
+        self.assertEqual(self.ledger.receipt_high_water(job_id), 0)
+        after = json.dumps(
+            state_mod.load_state(self.repo, self.cfg["name"]), sort_keys=True
+        )
+        self.assertEqual(before, after)
+
+    def test_service_session_unsupported_schema_fails_closed(self) -> None:
+        """An existing store with an unsupported schema fails closed too.
+
+        The raw ``ledger.LedgerVersionError`` is a ``LedgerError``, not a
+        broker error; the bootstrap must translate it like any other
+        unavailable-store failure and leave no writer or projection behind.
+        """
+        import sqlite3
+
+        self._clear_writer()
+        job_id = self.register()
+        newer = self.storage / "newer.sqlite3"
+        conn = sqlite3.connect(str(newer))
+        try:
+            conn.execute("PRAGMA user_version = 999")
+            conn.commit()
+        finally:
+            conn.close()
+        state = state_mod.load_state(self.repo, self.cfg["name"])
+        before = json.dumps(state, sort_keys=True)
+
+        with self.assertRaises(broker.BrokerUnavailableError) as ctx:
+            supervision.open_service_session(
+                self.repo, self.cfg, store_path=newer
+            )
+        self.assertIn("could not be opened", str(ctx.exception))
+        self.assertIsNone(broker.projection_writer())
+        self.assertEqual(self.ledger.receipt_high_water(job_id), 0)
+        after = json.dumps(
+            state_mod.load_state(self.repo, self.cfg["name"]), sort_keys=True
+        )
+        self.assertEqual(before, after)
+
+    def test_service_host_unbindable_socket_fails_closed(self) -> None:
+        """An unbindable endpoint socket fails closed as BrokerUnavailableError.
+
+        Regression for the review finding that ``bind`` leaked a raw ``OSError``
+        out of the CLI: the endpoint host must translate socket provisioning
+        failures to the named broker error, tear the session (and its installed
+        writer) down, and serve nothing.
+        """
+        from types import SimpleNamespace
+
+        self._clear_writer()
+        job_id = self.register()
+        # A plain file where the operator socket's parent directory must be:
+        # creating the socket directory cannot succeed, so binding is
+        # impossible.
+        blocker = self.root / "blocker"
+        blocker.write_text("not a directory\n", encoding="utf-8")
+        socket_env = mock.patch.dict(
+            os.environ,
+            {
+                supervision.OPERATOR_SOCKET_ENV: str(blocker / "operator.sock"),
+                supervision.WORKER_SOCKET_ENV: str(self.root / "worker.sock"),
+            },
+        )
+        socket_env.start()
+        self.addCleanup(socket_env.stop)
+        host = supervision.open_service_host(
+            self.repo, self.cfg,
+            store_path=self.db_path,
+            operator_principal=SimpleNamespace(uid=os.getuid()),
+            service_principal=SimpleNamespace(uid=os.getuid()),
+        )
+        try:
+            self.assertIsNotNone(broker.projection_writer())
+            with self.assertRaises(broker.BrokerUnavailableError) as ctx:
+                host.bind()
+            self.assertIn("could not be prepared", str(ctx.exception))
+        finally:
+            host.close()
+        # The failed boot cleaned up: the writer is restored and nothing was
+        # bound or served, so no receipt was recorded.
+        self.assertIsNone(broker.projection_writer())
+        self.assertEqual(self.ledger.receipt_high_water(job_id), 0)
+        self.assertFalse(host.operator_socket.exists())
+
+    def test_service_host_worker_socket_failure_cleans_up_operator_socket(self) -> None:
+        """A worker-socket failure after the operator bound tears both down."""
+        from types import SimpleNamespace
+
+        self._clear_writer()
+        job_id = self.register()
+        blocker = self.root / "blocker"
+        blocker.write_text("not a directory\n", encoding="utf-8")
+        operator_sock = self.root / "operator-ok.sock"
+        socket_env = mock.patch.dict(
+            os.environ,
+            {
+                supervision.OPERATOR_SOCKET_ENV: str(operator_sock),
+                supervision.WORKER_SOCKET_ENV: str(blocker / "worker.sock"),
+            },
+        )
+        socket_env.start()
+        self.addCleanup(socket_env.stop)
+        host = supervision.open_service_host(
+            self.repo, self.cfg,
+            store_path=self.db_path,
+            operator_principal=SimpleNamespace(uid=os.getuid()),
+            service_principal=SimpleNamespace(uid=os.getuid()),
+        )
+        try:
+            with self.assertRaises(broker.BrokerUnavailableError):
+                host.bind()
+        finally:
+            host.close()
+        # The operator socket that did bind was cleaned up along with the
+        # session, and nothing was served or recorded.
+        self.assertFalse(operator_sock.exists())
+        self.assertIsNone(broker.projection_writer())
+        self.assertEqual(self.ledger.receipt_high_water(job_id), 0)
+
+    def test_supervise_serve_cli_unbindable_socket_fails_closed(self) -> None:
+        """``supervise serve`` reports BrokerUnavailableError for a bad socket."""
+        from lib.orchestrator import cmd_supervise
+
+        self._clear_writer()
+        job_id = self.register()
+        plan = self._write_plan()
+        blocker = self.root / "blocker"
+        blocker.write_text("not a directory\n", encoding="utf-8")
+        socket_env = mock.patch.dict(
+            os.environ,
+            {
+                supervision.OPERATOR_SOCKET_ENV: str(blocker / "operator.sock"),
+                supervision.WORKER_SOCKET_ENV: str(self.root / "worker.sock"),
+            },
+        )
+        socket_env.start()
+        self.addCleanup(socket_env.stop)
+        allowed_patch = mock.patch.object(
+            supervision, "_allowed_uids_for", return_value=frozenset({os.getuid()})
+        )
+        allowed_patch.start()
+        self.addCleanup(allowed_patch.stop)
+        operator_patch = mock.patch.object(
+            supervision, "_operator_allowed_uids",
+            return_value=frozenset({os.getuid()}),
+        )
+        operator_patch.start()
+        self.addCleanup(operator_patch.stop)
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            plan=str(plan.relative_to(self.repo)),
+            store=str(self.db_path),
+            job_id=None,
+            once=True,
+            timeout=1.0,
+        )
+        with redirect_stderr(io.StringIO()) as err:
+            code = cmd_supervise.cmd_supervise_serve(args)
+        self.assertEqual(code, 1)
+        self.assertIn("BrokerUnavailableError", err.getvalue())
+        # No request was served and the writer the session installed was
+        # restored by the fail-closed path.
+        self.assertIsNone(broker.projection_writer())
+        self.assertEqual(self.ledger.receipt_high_water(job_id), 0)
+
+    def test_service_host_binds_and_projects_operator_release(self) -> None:
+        """The production host binds sockets and projects a live endpoint receipt."""
+        from types import SimpleNamespace
+
+        job_id = self.register()
+        socket_env = mock.patch.dict(
+            os.environ,
+            {
+                supervision.OPERATOR_SOCKET_ENV: str(self.root / "operator.sock"),
+                supervision.WORKER_SOCKET_ENV: str(self.root / "worker.sock"),
+            },
+        )
+        socket_env.start()
+        self.addCleanup(socket_env.stop)
+        host = supervision.open_service_host(
+            self.repo, self.cfg,
+            store_path=self.db_path,
+            operator_principal=SimpleNamespace(uid=os.getuid()),
+            service_principal=SimpleNamespace(uid=os.getuid()),
+        )
+        self.addCleanup(host.close)
+        self.assertIsNotNone(broker.projection_writer())
+        host.bind()
+        self.assertTrue(host.operator_socket.exists())
+
+        import threading
+
+        outcome: dict = {}
+
+        def client_call() -> None:
+            try:
+                outcome["result"] = broker_client.call(
+                    {"verb": "approve", "change_ids": ["gated-human"]},
+                    kind=endpoints.ENDPOINT_OPERATOR,
+                    socket_path=host.operator_socket,
+                )
+            except broker.BrokerError as exc:
+                outcome["error"] = type(exc).__name__
+
+        thread = threading.Thread(target=client_call)
+        thread.start()
+        result = host.poll(timeout=10)
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn("error", outcome, outcome.get("error"))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.ledger.receipt_high_water(job_id), 1)
+        self.assertEqual(
+            state_mod.load_state(self.repo, self.cfg["name"])["approvals"],
+            ["gated-human"],
+        )
+
+    def test_supervise_serve_cli_boots_writer_and_projects_receipt(self) -> None:
+        """The ``supervise serve`` command itself installs the writer and serves.
+
+        End-to-end through the CLI handler: the command boots the production
+        bootstrap (installing the projection writer), binds the endpoint
+        sockets, and dispatches a live operator approval that records a durable
+        receipt and regenerates the JSON projection.
+        """
+        import threading
+        import time
+
+        from lib.orchestrator import cmd_supervise
+
+        job_id = self.register()
+        plan = self._write_plan()
+        operator_sock = self.root / "serve-operator.sock"
+        worker_sock = self.root / "serve-worker.sock"
+        socket_env = mock.patch.dict(
+            os.environ,
+            {
+                supervision.OPERATOR_SOCKET_ENV: str(operator_sock),
+                supervision.WORKER_SOCKET_ENV: str(worker_sock),
+            },
+        )
+        socket_env.start()
+        self.addCleanup(socket_env.stop)
+        # The test host provisions no distinct principals, so resolve the
+        # endpoint accept set to this process's uid. Production resolves the
+        # real operator/service principals and fails closed otherwise.
+        principal_patch = mock.patch.object(
+            supervision, "_operator_allowed_uids", return_value=frozenset({os.getuid()})
+        )
+        principal_patch.start()
+        self.addCleanup(principal_patch.stop)
+        allowed_patch = mock.patch.object(
+            supervision, "_allowed_uids_for", return_value=frozenset({os.getuid()})
+        )
+        allowed_patch.start()
+        self.addCleanup(allowed_patch.stop)
+
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            plan=str(plan.relative_to(self.repo)),
+            store=str(self.db_path),
+            job_id=None,
+            once=True,
+            timeout=15.0,
+        )
+        serve_result: dict = {}
+
+        def run_serve() -> None:
+            serve_result["rc"] = cmd_supervise.cmd_supervise_serve(args)
+
+        thread = threading.Thread(target=run_serve)
+        thread.start()
+        try:
+            deadline = time.time() + 10
+            while not operator_sock.exists() and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(operator_sock.exists(), "serve did not bind the socket")
+            self.assertEqual(
+                broker_client.call(
+                    {"verb": "approve", "change_ids": ["gated-human"]},
+                    kind=endpoints.ENDPOINT_OPERATOR,
+                    socket_path=operator_sock,
+                )["approved"],
+                ["gated-human"],
+            )
+        finally:
+            thread.join(timeout=15)
+        self.assertFalse(thread.is_alive(), "serve did not exit after --once")
+        self.assertEqual(serve_result.get("rc"), 0, serve_result)
+        self.assertEqual(self.ledger.receipt_high_water(job_id), 1)
+        self.assertEqual(
+            state_mod.load_state(self.repo, self.cfg["name"])["approvals"],
+            ["gated-human"],
+        )
+
+    def test_supervise_serve_cli_fails_closed_without_store(self) -> None:
+        """A missing service store is refused before any socket is bound."""
+        from lib.orchestrator import cmd_supervise
+
+        self._clear_writer()
+        self.register()
+        plan = self._write_plan()
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            plan=str(plan.relative_to(self.repo)),
+            store=str(self.root / "missing" / "supervisor.sqlite3"),
+            job_id=None,
+            once=True,
+            timeout=1.0,
+        )
+        with redirect_stderr(io.StringIO()) as err:
+            code = cmd_supervise.cmd_supervise_serve(args)
+        self.assertEqual(code, 1)
+        self.assertIn("BrokerUnavailableError", err.getvalue())
+        self.assertIsNone(broker.projection_writer())
+
+    def test_supervise_serve_cli_corrupt_store_fails_closed(self) -> None:
+        """A corrupt existing service store fails closed through the CLI too.
+
+        Regression for the review finding that an unopenable existing store
+        leaked a raw database error: ``supervise serve`` must report the named
+        ``BrokerUnavailableError`` and return 1 without installing a writer.
+        """
+        from lib.orchestrator import cmd_supervise
+
+        self._clear_writer()
+        job_id = self.register()
+        plan = self._write_plan()
+        corrupt = self.storage / "corrupt.sqlite3"
+        corrupt.write_bytes(b"this is not a sqlite database at all\n")
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            plan=str(plan.relative_to(self.repo)),
+            store=str(corrupt),
+            job_id=None,
+            once=True,
+            timeout=1.0,
+        )
+        with redirect_stderr(io.StringIO()) as err:
+            code = cmd_supervise.cmd_supervise_serve(args)
+        self.assertEqual(code, 1)
+        self.assertIn("BrokerUnavailableError", err.getvalue())
+        self.assertIsNone(broker.projection_writer())
+        self.assertEqual(self.ledger.receipt_high_water(job_id), 0)
 
 
 # ---------------------------------------------------------------------------
