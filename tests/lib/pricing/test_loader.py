@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from textwrap import dedent
 
-from lib.pricing.loader import CatalogLoadError, PricingCatalog
+from lib.pricing.loader import PROVIDER_ALIASES, CatalogLoadError, PricingCatalog
 from lib.pricing.types import ResolvedPrice, UnresolvedPrice
 
 
@@ -512,3 +512,86 @@ class Iso4217CurrencyRegressionTests(unittest.TestCase):
         result = catalog.resolve("anthropic", "claude-sonnet-4")
         self.assertIsInstance(result, ResolvedPrice)
         self.assertEqual(result.currency, "SEK")
+
+
+# ---------------------------------------------------------------------------
+# Provider route aliases resolve to the canonical provider entry
+# ---------------------------------------------------------------------------
+
+
+class ProviderAliasTests(unittest.TestCase):
+    def _deepseek_catalog(self) -> Path:
+        return _write_catalog(
+            """\
+            [catalog]
+            version = "1.0.0"
+            updated = "2026-01-01"
+
+            [[entries]]
+            provider = "deepseek"
+            model_id = "deepseek-v4.1-flash"
+            display_name = "DeepSeek V4.1 Flash"
+            billing_mode = "per_token"
+            currency = "USD"
+            input_price_per_mtok = 0.15
+            output_price_per_mtok = 0.60
+            effective_date = "2026-09-10"
+            """
+        )
+
+    def test_alias_map_covers_dispatch_route_prefixes(self) -> None:
+        self.assertEqual(PROVIDER_ALIASES.get("commandcode"), "deepseek")
+        self.assertEqual(PROVIDER_ALIASES.get("opencode-go"), "deepseek")
+
+    def test_route_prefix_resolves_canonical_entry(self) -> None:
+        catalog = PricingCatalog(catalog_path=self._deepseek_catalog())
+        result = catalog.resolve("commandcode", "deepseek-v4.1-flash")
+        self.assertIsInstance(result, ResolvedPrice)
+        self.assertEqual(result.provider, "deepseek")
+        self.assertEqual(result.model_id, "deepseek-v4.1-flash")
+        self.assertEqual(result.input_price_per_mtok, 0.15)
+
+    def test_aliased_provider_with_unknown_model_reports_unknown_model(self) -> None:
+        catalog = PricingCatalog(catalog_path=self._deepseek_catalog())
+        result = catalog.resolve("opencode-go", "no-such-model")
+        self.assertIsInstance(result, UnresolvedPrice)
+        self.assertIn("unknown model", result.reason)
+
+    def test_unaliased_unknown_provider_still_reports_unknown_provider(self) -> None:
+        catalog = PricingCatalog(catalog_path=self._deepseek_catalog())
+        result = catalog.resolve("nonexistent", "deepseek-v4.1-flash")
+        self.assertIsInstance(result, UnresolvedPrice)
+        self.assertIn("unknown provider", result.reason)
+
+
+# ---------------------------------------------------------------------------
+# Shipped catalog covers the pinned route models (2026-09-15 coverage)
+# ---------------------------------------------------------------------------
+
+
+class ShippedCatalogCoverageTests(unittest.TestCase):
+    def test_pinned_route_models_resolve(self) -> None:
+        catalog = PricingCatalog()
+        for provider, model_id in [
+            ("commandcode", "deepseek-v4.1-flash"),
+            ("opencode-go", "deepseek-v4.1-flash"),
+            ("moonshotai", "kimi-k3"),
+            ("openai", "gpt-5.6-terra"),
+            ("openai", "gpt-5.6-luna"),
+        ]:
+            with self.subTest(provider=provider, model_id=model_id):
+                result = catalog.resolve(provider, model_id)
+                self.assertIsInstance(result, ResolvedPrice)
+
+    def test_pinned_models_carry_a_reasoning_rate(self) -> None:
+        catalog = PricingCatalog()
+        for provider, model_id in [
+            ("commandcode", "deepseek-v4.1-flash"),
+            ("moonshotai", "kimi-k3"),
+            ("openai", "gpt-5.6-terra"),
+            ("openai", "gpt-5.6-luna"),
+        ]:
+            with self.subTest(provider=provider, model_id=model_id):
+                result = catalog.resolve(provider, model_id)
+                self.assertIsInstance(result, ResolvedPrice)
+                self.assertIsNotNone(result.reasoning_price_per_mtok)

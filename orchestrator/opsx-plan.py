@@ -2946,6 +2946,7 @@ def run_doctor_checks(repo: Path, plan_src: str | None,
     checks.append(doctor._check_model_resolution(repo, adapter))
     checks.append(doctor._check_model_identifier_syntax(repo, adapter))
     checks.append(doctor._check_supervised_models(repo, adapter))
+    checks.append(doctor._check_model_pricing_resolution(repo, adapter))
     checks.append(doctor._check_openspec_on_path(repo))
     checks.append(doctor._check_openspec_initialized(repo))
     checks.append(doctor._check_adapter_client_on_path(adapter))
@@ -2970,6 +2971,8 @@ def run_doctor_checks(repo: Path, plan_src: str | None,
             doctor._print_model_resolution_detail(repo, adapter)
         if label == "Supervised model configuration is reported":
             doctor._print_supervised_model_detail(repo, adapter)
+        if label == "Model pricing resolves for configured roles":
+            doctor._print_model_pricing_detail(repo, adapter)
 
     return failures
 
@@ -2983,6 +2986,7 @@ def run_preflight_warnings(repo: Path, plan_src: str | None,
     checks.append(doctor._check_model_resolution(repo, adapter))
     checks.append(doctor._check_model_identifier_syntax(repo, adapter))
     checks.append(doctor._check_supervised_models(repo, adapter))
+    checks.append(doctor._check_model_pricing_resolution(repo, adapter))
     checks.append(doctor._check_openspec_on_path(repo))
     checks.append(doctor._check_openspec_initialized(repo))
     checks.append(doctor._check_adapter_client_on_path(adapter))

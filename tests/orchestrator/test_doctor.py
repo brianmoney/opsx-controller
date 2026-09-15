@@ -211,6 +211,67 @@ class DoctorPreflightTests(unittest.TestCase):
                 elif v in os.environ:
                     del os.environ[v]
 
+    def _set_required_models(self, mapping: dict[str, str]) -> None:
+        saved: dict[str, str | None] = {}
+        for role, value in mapping.items():
+            var = f"OPSX_{role.upper()}_MODEL"
+            saved[var] = os.environ.get(var)
+            os.environ[var] = value
+
+        def restore() -> None:
+            for var, val in saved.items():
+                if val is not None:
+                    os.environ[var] = val
+                elif var in os.environ:
+                    del os.environ[var]
+
+        self.addCleanup(restore)
+
+    def test_check_model_pricing_resolution_passes_for_catalog_models(self) -> None:
+        """Configured roles with catalog coverage pass the pricing check."""
+        self._set_required_models(
+            {
+                "controller": "moonshotai/kimi-k3",
+                "implementer": "commandcode/deepseek-v4.1-flash",
+                "reviewer": "openai/gpt-5.6-terra",
+                "archiver": "opencode-go/deepseek-v4.1-flash",
+            }
+        )
+        passed, label, remediation = doctor_mod._check_model_pricing_resolution(
+            self.repo, "opencode"
+        )
+        self.assertTrue(passed, f"check failed: {remediation}")
+
+    def test_check_model_pricing_resolution_fails_for_unknown_model(self) -> None:
+        """A configured role without a catalog entry fails with the role named."""
+        self._set_required_models(
+            {
+                "controller": "openai/no-such-model",
+                "implementer": "openai/no-such-model",
+                "reviewer": "openai/no-such-model",
+                "archiver": "openai/no-such-model",
+            }
+        )
+        passed, label, remediation = doctor_mod._check_model_pricing_resolution(
+            self.repo, "opencode"
+        )
+        self.assertFalse(passed)
+        self.assertIn("no pricing for", remediation)
+        self.assertIn("controller", remediation)
+
+    def test_split_model_identifier_uses_adapter_default_for_bare_ids(self) -> None:
+        self.assertEqual(
+            doctor_mod._split_model_identifier("claude-opus-5", "claude-code"),
+            ("anthropic", "claude-opus-5"),
+        )
+        self.assertIsNone(
+            doctor_mod._split_model_identifier("claude-opus-5", "opencode")
+        )
+        self.assertEqual(
+            doctor_mod._split_model_identifier("openai/gpt-5.6-terra", "opencode"),
+            ("openai", "gpt-5.6-terra"),
+        )
+
     def test_check_tracked_bytecode_no_false_positives_on_clean_tree(self) -> None:
         """A clean tree without bytecode should pass."""
         passed, label, remediation = doctor_mod._check_tracked_bytecode(self.repo)

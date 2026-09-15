@@ -139,6 +139,97 @@ def _check_supervised_models(repo: Path, adapter: str) -> tuple[bool, str, str]:
     return (True, label, "; ".join(lines))
 
 
+_DEFAULT_PROVIDER_BY_ADAPTER: dict[str, str] = {"claude-code": "anthropic"}
+
+
+def _split_model_identifier(model: str, adapter: str) -> tuple[str, str] | None:
+    """Return ``(provider, model_id)`` for a pricing lookup, or ``None``.
+
+    Provider-prefixed identifiers are split on the first ``/``. A bare
+    identifier is paired with the adapter's default provider when one is
+    known, so the claude-code adapter's unprefixed roles can be looked up.
+    """
+    value = model.strip()
+    if not value:
+        return None
+    if "/" in value:
+        provider, model_id = value.split("/", 1)
+        provider = provider.strip()
+        model_id = model_id.strip()
+        if provider and model_id:
+            return provider, model_id
+        return None
+    default_provider = _DEFAULT_PROVIDER_BY_ADAPTER.get(adapter)
+    if default_provider:
+        return default_provider, value
+    return None
+
+
+def _pricing_rows(repo: Path, adapter: str) -> list[tuple[str, str, bool]]:
+    """Return ``(role, model, resolves)`` rows for every configured role.
+
+    A ``ModelConfigError`` from role resolution propagates unchanged so the
+    caller can treat it as already reported by the model-resolution check.
+    """
+    from lib.models.resolver import resolve as resolve_models
+    from lib.models.types import ALL_ROLES
+    from lib.pricing import PricingCatalog, UnresolvedPrice
+
+    resolved = resolve_models(adapter, repo=repo)
+    catalog = PricingCatalog()
+    rows: list[tuple[str, str, bool]] = []
+    for role in ALL_ROLES:
+        entry = resolved.get(role)
+        if entry is None or not entry.model:
+            continue
+        parsed = _split_model_identifier(entry.model, adapter)
+        if parsed is None:
+            rows.append((role, entry.model, False))
+            continue
+        provider, model_id = parsed
+        result = catalog.resolve(provider, model_id)
+        rows.append((role, entry.model, not isinstance(result, UnresolvedPrice)))
+    return rows
+
+
+def _check_model_pricing_resolution(repo: Path, adapter: str) -> tuple[bool, str, str]:
+    """Check that every configured role model resolves in the pricing catalog."""
+    label = "Model pricing resolves for configured roles"
+    try:
+        from lib.models.resolver import ModelConfigError
+    except Exception as exc:  # pragma: no cover - deployment failure path
+        return (False, label, f"model resolver module unavailable: {exc}")
+    try:
+        rows = _pricing_rows(repo, adapter)
+    except ModelConfigError:
+        return (True, label, "")
+    except Exception as exc:
+        return (False, label, f"pricing resolution failed: {exc}")
+    unresolved = [f"{role} '{model}'" for role, model, resolves in rows if not resolves]
+    if unresolved:
+        return (
+            False,
+            label,
+            "no pricing for " + "; ".join(unresolved)
+            + "; add real entries to lib/pricing/catalog.toml",
+        )
+    return (True, label, "")
+
+
+def _print_model_pricing_detail(repo: Path, adapter: str) -> None:
+    """Print each configured role's pricing coverage under its check line."""
+    try:
+        rows = _pricing_rows(repo, adapter)
+    except Exception:
+        return
+    if not rows:
+        print("      (no configured roles)")
+        return
+    for role, model, resolves in rows:
+        status = "resolved" if resolves else "UNRESOLVED"
+        print(f"      {role:<24} {status:<10} {model}")
+
+
 def _print_supervised_model_detail(repo: Path, adapter: str) -> None:
     """Print the supervised-model section under its doctor check line."""
     try:

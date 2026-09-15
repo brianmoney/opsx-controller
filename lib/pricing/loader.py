@@ -51,6 +51,16 @@ _VALID_CURRENCY_CODES: frozenset[str] = frozenset(
 _VALID_BILLING_MODES: frozenset[str] = frozenset({"per_token", "subscription"})
 _VALID_SUBSCRIPTION_PERIODS: frozenset[str] = frozenset({"monthly", "yearly"})
 
+# Adapter route prefixes -> canonical provider that owns the catalog entries.
+# A route prefix (e.g. ``commandcode``, ``opencode-go``) names the client-side
+# reseller/route; pricing is keyed by the underlying model provider.
+PROVIDER_ALIASES: dict[str, str] = {
+    "commandcode": "deepseek",
+    "opencode-go": "deepseek",
+    "claude": "anthropic",
+    "codex": "openai",
+}
+
 
 class CatalogLoadError(Exception):
     """Raised when the catalog file contains one or more invalid entries.
@@ -108,16 +118,20 @@ class PricingCatalog:
         multiple entries share the same ``(provider, model_id)`` pair the
         entry with the latest ``effective_date`` is returned.
 
+        ``provider`` is folded through :data:`PROVIDER_ALIASES` first, so a
+        client route prefix resolves to the canonical provider's entry.
+
         Returns an ``UnresolvedPrice`` when no entry matches, with a
         ``reason`` describing why resolution failed.
         """
         if not self._entries:
             return UnresolvedPrice(provider=provider, model_id=model_id, reason="empty catalog")
 
-        key = (provider, model_id)
+        canonical_provider = PROVIDER_ALIASES.get(provider, provider)
+        key = (canonical_provider, model_id)
         entries = self._by_provider_model.get(key)
         if entries is None:
-            provider_exists = any(k[0] == provider for k in self._by_provider_model)
+            provider_exists = any(k[0] == canonical_provider for k in self._by_provider_model)
             reason = "unknown model" if provider_exists else "unknown provider"
             return UnresolvedPrice(provider=provider, model_id=model_id, reason=reason)
 
