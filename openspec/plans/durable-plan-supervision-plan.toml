@@ -1,8 +1,14 @@
 [plan]
 name = "durable-plan-supervision"
 adapter = "opencode"
-timeout_minutes = 90
-max_rounds = 5
+# 150m, not the 90m default: every change here is a trust-boundary contract
+# whose verification reruns the full suite (~2.2 min) many times, and 90m
+# killed enforce-supervised-agent-contracts' round 2 mid-progress.
+timeout_minutes = 150
+# 8 rounds, not 5: these are adversarial contracts. The hardest
+# knowledge-forge plan (email-handoff-routing-safety) ran 17 review-failure
+# rounds at max_rounds = 8 and still completed; 5 exhausted here.
+max_rounds = 8
 no_progress_limit = 2
 require_clean_tracked = true
 plan_doc = "openspec/plans/durable-plan-supervision-plan.md"
@@ -11,8 +17,18 @@ create_timeout_minutes = 30
 create_max_attempts = 2
 created_check = "openspec validate {change} --strict"
 review_created = true
+# Escalate the implementer to the configured implementer_escalation model
+# (openai/gpt-5.6-terra) after two failed reviews. Without this the
+# inexpensive implementer patches one finding at a time while the frontier
+# reviewer finds the next; the two 5-round changes burned out exactly so.
+escalate_after_review_fails = 2
+# fast_checks run post-archive; 20m gives the suite margin. Running the real
+# suites makes the controller verify the workers' "green" claim independently.
+check_timeout_minutes = 20
 fast_checks = [
   "openspec validate --all",
+  "python3 -m unittest discover -t . -s tests",
+  "node tests/opencode/test-opsx-usage-emitter.js",
 ]
 
 # Phase 1: Contracts and Configuration Foundations
@@ -84,9 +100,8 @@ depends_on = ["add-action-journal-dispatch"]
 [[changes]]
 id = "enforce-supervised-agent-contracts"
 phase = 4
-# Larger than the plan default (90m): this change carries five critical
-# trust-boundary findings plus a broad 1647-test suite, and round 2 was
-# killed by the wall-clock timeout mid-work rather than by any failure.
+# Above the 150m plan default: this change carries the largest file/test
+# surface and its round 2 was killed mid-progress by the old 90m cap.
 timeout_minutes = 180
 depends_on = [
   "register-supervised-model-roles",
@@ -99,6 +114,7 @@ depends_on = [
 [[changes]]
 id = "add-supervised-plan-lifecycle"
 phase = 5
+pause_before = true # trust/contract gate (matches the kf pattern): execution ownership and durable lifecycle decisions; approves the P5 approach on top of P4 before it is built on
 depends_on = [
   "add-action-journal-dispatch",
   "enforce-broker-mediated-approvals",
@@ -117,6 +133,7 @@ depends_on = [
 [[changes]]
 id = "add-bounded-incident-recovery"
 phase = 5
+pause_before = true # trust/contract gate: bounded recovery mutates durable supervision state and can reconstitute work; human accepts the incident/recovery policy before it runs unattended
 depends_on = [
   "add-supervised-plan-lifecycle",
   "enforce-supervised-agent-contracts",
@@ -125,6 +142,7 @@ depends_on = [
 [[changes]]
 id = "add-watchdog-reconstitution"
 phase = 5
+pause_before = true # trust/contract gate: the watchdog can restart/reconstitute a plan run; human accepts the reconstitution policy before unattended operation
 depends_on = [
   "add-supervised-plan-lifecycle",
   "add-acceptance-review-stage",
