@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import re
 import secrets
 import socket
@@ -49,6 +50,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
+from lib.supervisor import agent_contracts as agent_contracts_mod
 from lib.supervisor import broker as broker_mod
 from lib.supervisor import budgets as budget_mod
 from lib.supervisor import clock as clock_mod
@@ -1214,6 +1216,7 @@ class JournaledSessionBridge:
         policy: Mapping[str, Any] | None = None,
         process_id: str | None = None,
         change_id: str | None = None,
+        server_identity: str | None = None,
         now: Callable[[], str] = clock_mod.utcnow,
     ) -> None:
         self.bridge = bridge
@@ -1223,6 +1226,11 @@ class JournaledSessionBridge:
         self.policy = policy
         self.process_id = process_id
         self.change_id = change_id
+        # The launched service-owned session server's fenceable identity. It
+        # defaults to the dispatched server process identity; it is what binds
+        # the isolated-transport decision to the launched server rather than to
+        # a bare loopback hostname.
+        self.server_identity = server_identity
         self._now = now
 
     # -- journal queries -------------------------------------------------
@@ -1255,6 +1263,94 @@ class JournaledSessionBridge:
             return None
         return _decode_detail(row["detail"]).get("request_id")
 
+    # -- agent contract enforcement --------------------------------------
+
+    def create_session(
+        self,
+        *,
+        title: str | None = None,
+        role: str = model_policy_mod.SUPERVISOR_ROLE,
+        model: Mapping[str, Any] | None = None,
+        requested_permissions: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        """Create a session bound to *role*'s concrete agent, contract-checked.
+
+        The bridge asserts the agent it binds is the role's registered agent
+        before any session request: a session cannot run under a different
+        agent than its registered role, and a mismatch is refused with a
+        recorded ``policy_violation`` incident rather than created. A
+        caller-supplied *model* must equal the role's exact policy pin; an
+        override is refused, never substituted. Stage workers keep the existing
+        direct-dispatch path, so this method is only used for supervised
+        sessions.
+        """
+        bound_agent = agent_contracts_mod.role_agent(role)
+        agent_contracts_mod.enforce_session_contract(
+            self.ledger,
+            self.job_id,
+            policy=self.policy,
+            role=role,
+            observed_agent=bound_agent,
+            requested_permissions=requested_permissions,
+            requested_model=agent_contracts_mod.model_identity_string(model),
+            run_id=self.run_id,
+        )
+        return self.bridge.create_session(
+            title=title, agent=bound_agent, model=model
+        )
+
+    def enforce_prompt_contract(
+        self,
+        action_id: int,
+        *,
+        role: str,
+        observed_agent: str | None,
+        requested_permissions: Sequence[str] | None = None,
+        requested_model: Any = None,
+        transport_config: Mapping[str, Any] | None = None,
+        environ: Mapping[str, str] | None = None,
+    ) -> agent_contracts_mod.TransportDecision:
+        """Run the session contract and the pre-prompt transport gate.
+
+        Order is deliberate: the identity/capability/model-pin contract first
+        (a spoof, escalation, or unpinned model override is a
+        ``policy_violation`` and must never reach the transport step), then the
+        fail-closed egress gate, whose decision is recorded as action evidence
+        **before** the caller writes the dispatch record. On a refusal nothing
+        further is written and no prompt is issued.
+
+        The isolated-transport case requires the *launched* service-owned
+        session server's own fenceable identity, not merely a loopback
+        address: the bridge supplies its recorded server process identity and
+        the server's reported address, so an arbitrary loopback target cannot
+        qualify.
+        """
+        agent_contracts_mod.enforce_session_contract(
+            self.ledger,
+            self.job_id,
+            policy=self.policy,
+            role=role,
+            observed_agent=observed_agent,
+            requested_permissions=requested_permissions,
+            requested_model=requested_model,
+            run_id=self.run_id,
+        )
+        config: dict[str, Any] = dict(transport_config or {})
+        address = getattr(self.bridge.transport, "address", None)
+        if "target" not in config:
+            config["target"] = address
+        if "server_address" not in config:
+            config["server_address"] = address
+        if "server_identity" not in config:
+            config["server_identity"] = self.process_id
+        environment = os.environ if environ is None else environ
+        return agent_contracts_mod.assert_pre_prompt_transport(
+            self.ledger,
+            action_id,
+            environ=environment,
+            config=config,
+        )
+
     # -- prompt lifecycle ------------------------------------------------
 
     def prompt(
@@ -1270,12 +1366,24 @@ class JournaledSessionBridge:
         reserved_cost_usd: float | None = None,
         reserved_elapsed_minutes: float = 0.0,
         pricing_catalog_version: str | None = None,
+        requested_permissions: Sequence[str] | None = None,
+        transport_config: Mapping[str, Any] | None = None,
+        environ: Mapping[str, str] | None = None,
     ) -> PromptIdentity:
         """Journal identity, reserve budget, dispatch, then prompt.
 
         At most one prompt per session is in flight: an existing in-flight (or
         unreconciled uncertain) prompt raises :class:`PromptInFlightError`
         before anything is written.
+
+        Two fail-closed contracts run inside the intent window, before any
+        server request: the session contract (the concrete agent the prompt
+        runs under must be the role's registered agent, and no requested
+        capability may exceed the role's allowlist) and the pre-prompt
+        transport gate (model traffic must flow through the trusted gateway or
+        an equivalently enforced isolated transport). Both fail the action —
+        with the gate reason and, for the session contract, a recorded
+        ``policy_violation`` incident — and issue no prompt.
         """
         existing = self.in_flight_prompt(session_id)
         if existing is not None:
@@ -1283,6 +1391,7 @@ class JournaledSessionBridge:
                 f"action {existing['id']} is already in flight for session "
                 f"{session_id!r}; reconcile it before prompting again"
             )
+        bound_agent = agent or agent_contracts_mod.role_agent(role)
         request_id = new_request_id()
         detail = {
             "change_id": self.change_id,
@@ -1291,6 +1400,7 @@ class JournaledSessionBridge:
             "role": role,
             "session_id": session_id,
             "request_id": request_id,
+            "agent": bound_agent,
         }
         action_id = int(
             self.ledger.begin_action(
@@ -1300,6 +1410,24 @@ class JournaledSessionBridge:
                 detail=json.dumps(detail, sort_keys=True),
             )
         )
+        try:
+            self.enforce_prompt_contract(
+                action_id,
+                role=role,
+                observed_agent=bound_agent,
+                requested_permissions=requested_permissions,
+                requested_model=agent_contracts_mod.model_identity_string(model),
+                transport_config=transport_config,
+                environ=environ,
+            )
+        except agent_contracts_mod.AgentContractError as exc:
+            # The contract refused before any server request: the action is
+            # failed with the gate reason (the policy_violation incident is
+            # already recorded) and no prompt is issued.
+            self.ledger.fail_action(
+                action_id, detail=f"{type(exc).__name__}: {exc}"
+            )
+            raise
         reservation_id: int | None = None
         if self.policy is not None and reserved_cost_usd is not None:
             reservation_id = int(
@@ -1334,7 +1462,11 @@ class JournaledSessionBridge:
         )
         try:
             self.bridge.prompt_async(
-                session_id, text=text, marker=request_id, model=model, agent=agent
+                session_id,
+                text=text,
+                marker=request_id,
+                model=model,
+                agent=bound_agent,
             )
         except SessionBridgeError as exc:
             # The acknowledgement was lost or the request failed after the

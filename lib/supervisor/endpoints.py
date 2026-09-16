@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping
 
+from lib.supervisor import agent_contracts as agent_contracts_module
 from lib.supervisor import broker as broker_module
 
 ENDPOINT_OPERATOR = "operator"
@@ -184,6 +185,17 @@ def _operator_reset_change(
     ledger, job_id = _broker_ledger(request)
     principal = _principal_for(credentials, broker_module.OPERATOR)
     change_ids = _requested_change_ids(request)
+    # A reset is a repair-consuming transition: an authorized reset that would
+    # discard a supervised repair is refused until an independent verifier
+    # verdict consumes it. A change with no recorded repair passes unchanged.
+    for change_id in change_ids:
+        _gate_repair_consumption(
+            ledger,
+            job_id,
+            change_id=change_id,
+            transition="reset",
+            request=request,
+        )
     recorded = [
         broker_module.reset_change(
             ledger, job_id, principal=principal, change_id=change_id
@@ -198,22 +210,49 @@ def _operator_reset_change(
     }
 
 
+def _gate_repair_consumption(
+    ledger: Any,
+    job_id: int,
+    *,
+    change_id: str,
+    transition: str,
+    request: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Run the repair-consumption gate for one change, naming the transition."""
+    return agent_contracts_module.assert_repair_consumable(
+        ledger,
+        int(job_id),
+        transition=transition,
+        change_id=str(change_id),
+        fixer_report=request.get("fixer_report"),
+        verifier_verdict=request.get("verifier_verdict"),
+        fixer_session_id=request.get("fixer_session_id"),
+        verifier_session_id=request.get("verifier_session_id"),
+        action_id=request.get("action_id"),
+    )
+
+
 def _worker_release_delegated_gate(
     request: Mapping[str, Any], credentials: PeerCredentials
 ) -> dict[str, Any]:
     ledger, job_id = _broker_ledger(request)
+    _require_worker_contract(request, ledger, job_id)
     identity = request.get("service_identity")
-    job = ledger.get_job(job_id)
-    registered = job["owner_principal"]
-    if not registered or identity != registered:
-        raise broker_module.BrokerMediationError(
-            f"requesting identity {identity!r} is not the job's registered "
-            f"service identity {registered!r}"
-        )
     principal = _principal_for(credentials, broker_module.SERVICE, identity)
     change_id = request.get("change_id")
     if not change_id:
         raise broker_module.BrokerError("release_delegated_gate requires a change_id")
+    agent_contracts_module.assert_repair_consumable(
+        ledger,
+        int(job_id),
+        transition="release_delegated_gate",
+        change_id=str(change_id),
+        fixer_report=request.get("fixer_report"),
+        verifier_verdict=request.get("verifier_verdict"),
+        fixer_session_id=request.get("fixer_session_id"),
+        verifier_session_id=request.get("verifier_session_id"),
+        action_id=request.get("action_id"),
+    )
     receipt = broker_module.release_delegated_gate(
         ledger, job_id, principal=principal, change_id=str(change_id)
     )
@@ -244,6 +283,8 @@ def _operator_cancel(request: Mapping[str, Any], credentials: PeerCredentials) -
 def _worker_report_status(
     request: Mapping[str, Any], credentials: PeerCredentials
 ) -> dict[str, Any]:
+    ledger, job_id = _broker_ledger(request)
+    _require_worker_contract(request, ledger, job_id)
     return {"verb": "report_status", "worker_uid": credentials.uid, "status": request.get("status")}
 
 
@@ -270,20 +311,106 @@ def _bound_job_action(ledger: Any, job_id: int, action_id: Any) -> Any:
     return action
 
 
-def _require_bound_identity(
+def _require_worker_contract(
     request: Mapping[str, Any], ledger: Any, job_id: int
-) -> None:
-    """Refuse a worker-domain write from outside the job's registered identity."""
-    identity = request.get("service_identity")
-    if identity is None:
-        return
+) -> dict[str, Any]:
+    """Refuse a supervised worker request whose identity or contract drifts.
+
+    Every worker-domain request is a *supervised* request: it must carry its
+    role, its observed concrete agent, and the job's registered service
+    identity. A missing field, a spoofed identity, a mismatched agent, an
+    unpinned role, a model override, and a requested capability outside the
+    role allowlist are each *never* defaulted: the violation is recorded as a
+    durable ``policy_violation`` incident against the job and the request is
+    refused with :class:`broker_module.BrokerMediationError`. There is no
+    unauthenticated legacy worker path on this endpoint.
+    """
     job = ledger.get_job(int(job_id))
-    registered = job["owner_principal"]
-    if not registered or identity != registered:
-        raise broker_module.BrokerMediationError(
-            f"requesting identity {identity!r} is not the job's registered "
-            f"service identity {registered!r}"
+    identity_check = agent_contracts_module.check_worker_identity(request, job)
+    if not identity_check["allowed"]:
+        incident_id = agent_contracts_module.record_policy_violation(
+            ledger,
+            int(job_id),
+            role=request.get("role"),
+            observed_agent=request.get("observed_agent"),
+            reason=str(identity_check["reason"]),
+            detail={
+                "violations": [v["kind"] for v in identity_check["violations"]]
+            },
         )
+        raise broker_module.BrokerMediationError(
+            f"worker request refused: {identity_check['reason']} "
+            f"(policy_violation incident {incident_id} recorded against job {job_id})"
+        )
+
+    role = request.get("role")
+    try:
+        policy = ledger.current_policy(int(job_id))
+    except Exception:  # noqa: BLE001 - absent policy is durable-state absence
+        policy = None
+    observed = request.get("observed_agent")
+    requested = request.get("requested_permissions")
+    if isinstance(requested, (str, bytes)) or (
+        requested is not None and not isinstance(requested, Iterable)
+    ):
+        raise broker_module.BrokerError(
+            "requested_permissions must be an iterable of capability names"
+        )
+    requested_model = request.get("requested_model")
+    check = agent_contracts_module.check_session_contract(
+        policy,
+        role,
+        observed,
+        list(requested) if requested is not None else None,
+        requested_model=requested_model,
+    )
+    if check["allowed"]:
+        return check
+    incident_id = agent_contracts_module.record_policy_violation(
+        ledger,
+        int(job_id),
+        role=check.get("role") or role,
+        observed_agent=check.get("observed_agent"),
+        expected_agent=check.get("expected_agent"),
+        reason=str(check.get("reason") or "session contract violated"),
+        detail={"violations": [v["kind"] for v in check["violations"]]},
+    )
+    raise broker_module.BrokerMediationError(
+        f"worker request refused: {check['reason']} "
+        f"(policy_violation incident {incident_id} recorded against job {job_id})"
+    )
+
+
+def _worker_report_violation(
+    request: Mapping[str, Any], credentials: PeerCredentials
+) -> dict[str, Any]:
+    """Record a worker-detected policy violation durably against the job.
+
+    This is how an executable-level shell-bypass attempt is surfaced rather
+    than merely printed: the worker's tracked shell wrapper reports the
+    attempted command, and the durable ``policy_violation`` incident is
+    recorded in the same incident surface a spoof or escalation uses. The
+    request is held to the worker identity contract first, so a violation
+    report cannot be forged from outside the job.
+    """
+    ledger, job_id = _broker_ledger(request)
+    _require_worker_contract(request, ledger, job_id)
+    detail = request.get("detail", request.get("command"))
+    if isinstance(detail, (Mapping, list, tuple)):
+        detail = json.dumps(detail, sort_keys=True, default=str)
+    incident_id = agent_contracts_module.record_policy_violation(
+        ledger,
+        int(job_id),
+        role=request.get("role"),
+        observed_agent=request.get("observed_agent"),
+        reason=str(request.get("reason") or "worker-reported policy violation"),
+        detail={"reported_command": str(detail) if detail else ""},
+    )
+    return {
+        "verb": "report_violation",
+        "worker_uid": credentials.uid,
+        "incident_id": incident_id,
+    }
 
 
 def _worker_request_action(
@@ -298,7 +425,7 @@ def _worker_request_action(
     answer.
     """
     ledger, job_id = _broker_ledger(request)
-    _require_bound_identity(request, ledger, job_id)
+    _require_worker_contract(request, ledger, job_id)
     uncertain = [
         {
             "action_id": int(row["id"]),
@@ -390,7 +517,7 @@ def _worker_record_evidence(
     unchanged otherwise.
     """
     ledger, job_id = _broker_ledger(request)
-    _require_bound_identity(request, ledger, job_id)
+    _require_worker_contract(request, ledger, job_id)
     action_id = request.get("action_id")
     if action_id is None:
         raise broker_module.BrokerError("record_evidence requires an action_id")
@@ -418,6 +545,27 @@ def _worker_record_evidence(
             int(action_id),
             kind="session_binding",
             payload={"session_id": bound_session},
+        )
+
+    # Worker-initiated subprocess delegation: a reported process identity is
+    # bound to the owning action's dispatch row in the same journal the
+    # orchestrator uses, so the delegation is tracked with the same lifecycle.
+    process_identity = request.get("process_identity", request.get("process_id"))
+    bound_process: str | None = None
+    if process_identity is not None and process_identity != "":
+        if isinstance(process_identity, Mapping):
+            bound_process = json.dumps(dict(process_identity), sort_keys=True)
+        elif isinstance(process_identity, str):
+            bound_process = process_identity
+        else:
+            raise broker_module.BrokerError(
+                "process_identity must be a serialized identity string or object"
+            )
+        ledger.bind_dispatch_identity(int(action_id), process_id=bound_process)
+        ledger.record_evidence(
+            int(action_id),
+            kind="session_binding",
+            payload={"process_identity": bound_process},
         )
 
     prior_state = str(action["state"])
@@ -451,6 +599,8 @@ def _worker_record_evidence(
 def _worker_heartbeat(
     request: Mapping[str, Any], credentials: PeerCredentials
 ) -> dict[str, Any]:
+    ledger, job_id = _broker_ledger(request)
+    _require_worker_contract(request, ledger, job_id)
     return {"verb": "heartbeat", "worker_uid": credentials.uid}
 
 
@@ -471,6 +621,7 @@ WORKER_HANDLERS: Mapping[str, Callable[..., Any]] = MappingProxyType(
         "record_evidence": _worker_record_evidence,
         "heartbeat": _worker_heartbeat,
         "release_delegated_gate": _worker_release_delegated_gate,
+        "report_violation": _worker_report_violation,
     }
 )
 

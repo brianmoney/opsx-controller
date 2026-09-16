@@ -393,6 +393,8 @@ class BrokerAuthorityTests(BrokerTestCase):
                 "verb": "release_delegated_gate",
                 "change_id": "gated-delegated",
                 "service_identity": "someone-else",
+                "role": "implementer",
+                "observed_agent": "opsx-implementer",
             },
             endpoint_kind=endpoints.ENDPOINT_WORKER,
         )
@@ -531,6 +533,8 @@ class EndpointProjectionTests(BrokerTestCase):
                 "verb": "release_delegated_gate",
                 "change_id": "gated-delegated",
                 "service_identity": "opsx-supervisor",
+                "role": "implementer",
+                "observed_agent": "opsx-implementer",
             },
             endpoint_kind=endpoints.ENDPOINT_WORKER,
         )
@@ -716,6 +720,8 @@ class ProductionServiceBootstrapTests(BrokerTestCase):
                     "verb": "release_delegated_gate",
                     "change_id": "gated-delegated",
                     "service_identity": "opsx-supervisor",
+                    "role": "implementer",
+                    "observed_agent": "opsx-implementer",
                 },
                 endpoint_kind=endpoints.ENDPOINT_WORKER,
             )

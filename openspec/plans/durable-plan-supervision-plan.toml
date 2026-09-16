@@ -1,0 +1,169 @@
+[plan]
+name = "durable-plan-supervision"
+adapter = "opencode"
+timeout_minutes = 90
+max_rounds = 5
+no_progress_limit = 2
+require_clean_tracked = true
+plan_doc = "openspec/plans/durable-plan-supervision-plan.md"
+create_invoke = "opencode run --model {controller_model} \"/opsx-propose Please review @{plan_doc} and create a change for {change}\""
+create_timeout_minutes = 30
+create_max_attempts = 2
+created_check = "openspec validate {change} --strict"
+review_created = true
+fast_checks = [
+  "openspec validate --all",
+]
+
+# Phase 1: Contracts and Configuration Foundations
+
+[[changes]]
+id = "define-supervision-ledger-contract"
+phase = 1
+pause_before = true # first change in proposed `durable-plan-supervision` capability — human accepts the storage/policy contract before anything builds on it
+
+[[changes]]
+id = "add-human-only-pause-flag"
+phase = 1
+depends_on = ["define-supervision-ledger-contract"]
+
+[[changes]]
+id = "register-supervised-model-roles"
+phase = 1
+depends_on = ["define-supervision-ledger-contract"]
+
+# Phase 2: Authority Boundary and Human-Only Enforcement
+
+[[changes]]
+id = "establish-operator-authority-boundary"
+phase = 2
+depends_on = ["define-supervision-ledger-contract"]
+pause_before = true # suggested manual gate — first trust-boundary change; operator confirms the isolation backend, endpoint split, and fail-closed behavior
+
+[[changes]]
+id = "enforce-broker-mediated-approvals"
+phase = 2
+depends_on = [
+  "establish-operator-authority-boundary",
+  "add-human-only-pause-flag",
+  # schema coupling: add-supervision-budgets owns ledger v4, so the broker's
+  # v5 migration (_migrate_4_to_5) must land on top of it
+  "add-supervision-budgets",
+]
+pause_before = true # suggested manual gate — alters the approval trust posture; human accepts broker scope and rejected alternatives
+
+# Phase 3: Execution Ownership, Budgets, and Action Journal
+
+[[changes]]
+id = "add-process-singleton-lock"
+phase = 3
+depends_on = ["define-supervision-ledger-contract"]
+
+[[changes]]
+id = "add-supervision-budgets"
+phase = 3
+depends_on = ["define-supervision-ledger-contract"]
+
+[[changes]]
+id = "add-action-journal-dispatch"
+phase = 3
+depends_on = [
+  "add-process-singleton-lock",
+  "add-supervision-budgets",
+  "enforce-broker-mediated-approvals",
+  "register-supervised-model-roles",
+]
+
+# Phase 4: Session Bridge and Agent Contracts
+
+[[changes]]
+id = "add-opencode-session-bridge"
+phase = 4
+depends_on = ["add-action-journal-dispatch"]
+
+[[changes]]
+id = "enforce-supervised-agent-contracts"
+phase = 4
+# Larger than the plan default (90m): this change carries five critical
+# trust-boundary findings plus a broad 1647-test suite, and round 2 was
+# killed by the wall-clock timeout mid-work rather than by any failure.
+timeout_minutes = 180
+depends_on = [
+  "register-supervised-model-roles",
+  "establish-operator-authority-boundary",
+  "add-opencode-session-bridge",
+]
+
+# Phase 5: Lifecycle, Acceptance, Recovery, and Watchdog
+
+[[changes]]
+id = "add-supervised-plan-lifecycle"
+phase = 5
+depends_on = [
+  "add-action-journal-dispatch",
+  "enforce-broker-mediated-approvals",
+  "enforce-supervised-agent-contracts",
+]
+
+[[changes]]
+id = "add-acceptance-review-stage"
+phase = 5
+depends_on = [
+  "add-supervised-plan-lifecycle",
+  "enforce-supervised-agent-contracts",
+  "register-supervised-model-roles",
+]
+
+[[changes]]
+id = "add-bounded-incident-recovery"
+phase = 5
+depends_on = [
+  "add-supervised-plan-lifecycle",
+  "enforce-supervised-agent-contracts",
+]
+
+[[changes]]
+id = "add-watchdog-reconstitution"
+phase = 5
+depends_on = [
+  "add-supervised-plan-lifecycle",
+  "add-acceptance-review-stage",
+  "add-bounded-incident-recovery",
+]
+
+# Phase 6: Observability, Regression, and Packaging
+
+[[changes]]
+id = "add-supervision-observability"
+phase = 6
+depends_on = [
+  "add-action-journal-dispatch",
+  "add-supervision-budgets",
+  "add-bounded-incident-recovery",
+  "add-supervised-plan-lifecycle",
+]
+
+[[changes]]
+id = "add-supervision-fault-injection-tests"
+phase = 6
+depends_on = [
+  "add-action-journal-dispatch",
+  "add-supervision-budgets",
+  "add-supervised-plan-lifecycle",
+  "add-acceptance-review-stage",
+  "add-bounded-incident-recovery",
+  "add-watchdog-reconstitution",
+  "enforce-broker-mediated-approvals",
+]
+
+[[changes]]
+id = "add-supervision-service-packaging"
+phase = 6
+depends_on = [
+  "add-supervision-fault-injection-tests",
+  "establish-operator-authority-boundary",
+  "enforce-broker-mediated-approvals",
+  "add-supervision-budgets",
+  "add-supervision-observability",
+]
+pause_before = true # suggested manual gate — unattended activation must be a deliberate operator decision after all foundations are green

@@ -70,10 +70,32 @@ install_agents() {
   # Remove stale nested controller agent from previous installations
   rm -f "$dest_dir/opsx-controller.md"
 
+  # The four supervised agent definitions are optional-role artifacts: they
+  # carry OPSX_<SUPERVISED_ROLE>_{MODEL,VARIANT} placeholders, so they are
+  # installed (and verified) through the supervised-role path and reported as
+  # unconfigured on a machine that registers no supervised roles. The legacy
+  # worker agents install exactly as before.
   local file
   for file in "$ROOT_DIR"/adapters/opencode/agents/*.md; do
-    install_agent "$file" "$dest_dir/$(basename "$file")"
+    local agent
+    agent="$(basename "$file" .md)"
+    if opsx_supervised_role_for_agent "$agent" >/dev/null 2>&1; then
+      continue
+    fi
+    install_agent "$file" "$dest_dir/$agent.md"
   done
+  install_supervised_agents "$ROOT_DIR/adapters/opencode/agents" "$dest_dir"
+}
+
+install_supervise_shim() {
+  local dest_bin="$1"
+  mkdir -p "$dest_bin"
+  install -m 0755 \
+    "$ROOT_DIR/adapters/opencode/bin/opsx-supervise" \
+    "$dest_bin/opsx-supervise"
+  install -m 0755 \
+    "$ROOT_DIR/adapters/opencode/bin/opsx-worker-exec" \
+    "$dest_bin/opsx-worker-exec"
 }
 
 install_support_readme() {
@@ -195,6 +217,7 @@ install_global() {
   install_plugins "$config_root/plugins"
   install_support_readme "$config_root/opsx-controller"
   install_plan_authoring_reference "$config_root/opsx-controller"
+  install_supervise_shim "$HOME/.local/bin"
   install_orchestrator --global
   printf '%s\n' \
     "Installed skills to $config_root/skills" \
@@ -203,6 +226,8 @@ install_global() {
     "Installed plugins to $config_root/plugins" \
     "Installed support files to $config_root/opsx-controller" \
     "Installed plan-authoring reference to $config_root/opsx-controller/plan-authoring.md" \
+    "Installed supervised service tool to $HOME/.local/bin/opsx-supervise" \
+    "Installed supervised worker shell wrapper to $HOME/.local/bin/opsx-worker-exec" \
     "Installed opsx-plan runtime libraries to $HOME/.local/lib/opsx-controller" \
     "Installed opsx-plan to $HOME/.local/bin/opsx-plan" \
     "Installed opsx-run to $HOME/.local/bin/opsx-run" \
@@ -210,6 +235,8 @@ install_global() {
   do_verify
   verify_plugin_deployed "$config_root/plugins"
   verify_plan_authoring_reference "$config_root/opsx-controller"
+  verify_supervised_agents_and_skill \
+    "$config_root/agents" "$config_root/skills" "$ROOT_DIR" "$HOME/.local/bin"
 }
 
 install_project() {
@@ -227,6 +254,7 @@ install_project() {
   install_plugins "$project_dir/.opencode/plugins"
   install_support_readme "$project_dir/.opencode/opsx-controller"
   install_plan_authoring_reference "$project_dir/.opencode/opsx-controller"
+  install_supervise_shim "$project_dir/.opsx-controller/bin"
   ensure_project_gitignore "$project_dir"
   ensure_project_config "$project_dir"
   install_orchestrator --project "$project_dir"
@@ -238,6 +266,8 @@ install_project() {
     "Installed plugins to $project_dir/.opencode/plugins" \
     "Installed support files to $project_dir/.opencode/opsx-controller" \
     "Installed plan-authoring reference to $project_dir/.opencode/opsx-controller/plan-authoring.md" \
+    "Installed supervised service tool to $project_dir/.opsx-controller/bin/opsx-supervise" \
+    "Installed supervised worker shell wrapper to $project_dir/.opsx-controller/bin/opsx-worker-exec" \
     "Installed opsx-plan runtime libraries to $project_dir/.opsx-controller/lib" \
     "Installed opsx-plan to $project_dir/.opsx-controller/bin/opsx-plan" \
     "Installed opsx-run to $project_dir/.opsx-controller/bin/opsx-run" \
@@ -246,6 +276,8 @@ install_project() {
   do_verify
   verify_plugin_deployed "$project_dir/.opencode/plugins"
   verify_plan_authoring_reference "$project_dir/.opencode/opsx-controller"
+  verify_supervised_agents_and_skill \
+    "$project_dir/.opencode/agents" "$project_dir/.opencode/skills" "$ROOT_DIR" "$project_dir/.opsx-controller/bin"
 }
 
 if [[ $# -eq 0 ]]; then

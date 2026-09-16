@@ -1248,6 +1248,11 @@ def open_primary_session(
     reconciled after the terminal result. The bounded full/rebrief briefing is
     dispatched through that same bridge before the runtime is returned, so the
     managed session is actually briefed rather than merely describing one.
+
+    The primary session is bound to its concrete `opsx-supervisor` agent
+    through the journaled bridge, which runs the session contract first: a
+    caller-supplied *agent* that is not the supervisor role's registered agent
+    is refused with a recorded `policy_violation` rather than run.
     """
     ledger = session.ledger
     job_id = int(session.job_id)
@@ -1320,7 +1325,21 @@ def open_primary_session(
         transport = transport_factory(server.address)
         bridge = session_bridge_mod.SessionBridge(transport)
         bridge.check_capability()
-        created = bridge.create_session(title=title, agent=agent, model=model)
+        journaled = _journaled_session_bridge(
+            ledger, job_id, run_id, bridge,
+            policy=policy,
+            process_id=server.process_identity,
+            change_id=change_id,
+        )
+        # The primary session is bound to its registered concrete agent through
+        # the journaled bridge, so the session contract is checked (and a
+        # spoil/escalation recorded as a policy_violation) before the session
+        # exists, rather than trusting a caller-supplied agent.
+        created = journaled.create_session(
+            title=title,
+            role=model_policy_mod.SUPERVISOR_ROLE,
+            model=model,
+        )
         session_id = str(created["id"])
     except Exception:
         try:
@@ -1346,12 +1365,7 @@ def open_primary_session(
         adopted=False,
         briefing=briefing,
         linkage=linkage,
-        journaled=_journaled_session_bridge(
-            ledger, job_id, run_id, bridge,
-            policy=policy,
-            process_id=server.process_identity,
-            change_id=change_id,
-        ),
+        journaled=journaled,
         prompt_plan=prompt_plan,
         server=server,
     )
@@ -1382,7 +1396,14 @@ def _journaled_session_bridge(
     process_id: str | None,
     change_id: str | None,
 ) -> Any:
-    """Build the journaled bridge that owns every primary prompt lifecycle."""
+    """Build the journaled bridge that owns every primary prompt lifecycle.
+
+    The launched server's fenceable process identity is passed both as the
+    dispatch process identity and as the isolated-transport ``server_identity``,
+    so the pre-prompt egress gate can bind the transport target to the
+    service-owned session server the service actually launched rather than to a
+    bare loopback address.
+    """
     return session_bridge_mod.JournaledSessionBridge(
         bridge,
         ledger,
@@ -1390,6 +1411,7 @@ def _journaled_session_bridge(
         run_id=str(run_id),
         policy=policy,
         process_id=process_id,
+        server_identity=process_id,
         change_id=change_id,
     )
 

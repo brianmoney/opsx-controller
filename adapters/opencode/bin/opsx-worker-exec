@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""opsx-worker-exec: the supervised worker's tracked shell wrapper.
+
+Every supervised worker's `bash` permission allows exactly one shell command:
+this wrapper, invoked as ``opsx-worker-exec <command...>``. It is the
+executable layer of the agent contract, layered under the per-role permission
+block:
+
+- a check, build, or read-only inspection runs and returns its real exit code,
+  so supervised workers keep their verification reach;
+- an unjournaled model client, an agent runner, a nested shell, or a shell
+  indirection is **never executed** — the attempt is classified as a policy
+  violation, reported to the worker-actions endpoint through the tracked
+  ``report_violation`` verb, and returns non-zero.
+
+It resolves the installed ``lib/supervisor`` runtime from its own location
+(never from a repository checkout) and delegates to
+:func:`lib.supervisor.worker_exec.main`.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_SCRIPT_ROOT = Path(__file__).resolve().parents[1]
+_RUNTIME_ROOTS = (
+    _SCRIPT_ROOT,
+    _SCRIPT_ROOT / "lib" / "opsx-controller",
+    _SCRIPT_ROOT / ".opsx-controller",
+)
+
+
+def _ensure_runtime_modules() -> None:
+    for runtime_root in _RUNTIME_ROOTS:
+        if (runtime_root / "lib" / "supervisor").is_dir():
+            runtime_root_str = str(runtime_root)
+            if runtime_root_str not in sys.path:
+                sys.path.insert(0, runtime_root_str)
+            return
+
+
+def main() -> int:
+    _ensure_runtime_modules()
+    try:
+        from lib.supervisor import worker_exec
+    except ModuleNotFoundError:
+        sys.stderr.write(
+            "opsx-worker-exec: the installed supervision runtime is missing; "
+            "reinstall the adapter (bash adapters/opencode/install.sh --global)\n"
+        )
+        return 4
+    return int(worker_exec.main())
+
+
+if __name__ == "__main__":
+    sys.exit(main())

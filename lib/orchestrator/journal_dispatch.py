@@ -30,6 +30,7 @@ from lib.orchestrator import cost as cost_mod
 from lib.orchestrator import state as state_mod
 from lib.orchestrator import supervision as supervision_mod
 from lib.orchestrator import telemetry as telemetry_mod
+from lib.supervisor import agent_contracts as agent_contracts_mod
 from lib.supervisor import broker as broker_mod
 from lib.supervisor import budgets as budget_mod
 from lib.supervisor import ledger as ledger_mod
@@ -102,6 +103,43 @@ class ModelPolicyGateError(DispatchGateError):
 
 class BudgetGateError(DispatchGateError):
     gate = GATE_BUDGET
+
+
+# The named pre-prompt egress gate for supervised stage-worker spawns. It is
+# deliberately both a dispatch gate (so the run loop's existing conversion to a
+# durable blocked state catches it) and the agent-contract
+# :class:`EgressEnforcementError` (so a caller can catch the named enforcement
+# failure exactly as it does at the session-bridge choke point).
+class EgressGateError(DispatchGateError, agent_contracts_mod.EgressEnforcementError):
+    gate = "egress"
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        decision: "agent_contracts_mod.TransportDecision | None" = None,
+        last_result: str | None = None,
+    ) -> None:
+        DispatchGateError.__init__(self, reason, last_result=last_result)
+        self.decision = decision
+
+
+# The named repair-consumption gate. It is both a dispatch gate (so the run
+# loop reports a durable blocked state) and the agent-contract
+# :class:`RepairConsumptionError` (so a caller can catch the named refusal).
+# Every repair-consuming transition — resume and dispatch alike — runs it.
+class RepairGateError(DispatchGateError, agent_contracts_mod.RepairConsumptionError):
+    gate = "repair"
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        decision: Mapping[str, Any] | None = None,
+        last_result: str | None = None,
+    ) -> None:
+        DispatchGateError.__init__(self, reason, last_result=last_result)
+        self.decision = dict(decision or {})
 
 
 # The pricing boundary lives in :mod:`lib.orchestrator.cost` (the low layer that
@@ -285,14 +323,19 @@ def evaluate_gates(
     stage: str,
     role: str,
     resolved_model: str | None = None,
-) -> None:
+    environ: Mapping[str, str] | None = None,
+) -> agent_contracts_mod.TransportDecision:
     """Evaluate the fixed gate order, raising the named gate error on refusal.
 
     Order: execution lock held, broker authority revalidated per action,
     immutable plan/policy freshness against the registration anchors, model
-    policy for the stage role. The budget reservation gate is the reserve
+    policy for the stage role, the repair-consumption gate, then the named
+    pre-prompt egress enforcement. The budget reservation gate is the reserve
     mechanics that run immediately after, so a caller that has not yet reserved
     has not passed the boundary.
+
+    Returns the enforced transport decision so the caller can journal it as
+    action evidence before the dispatch record.
     """
     ledger = gate["ledger"]
     job_id = int(gate["job_id"])
@@ -301,6 +344,41 @@ def evaluate_gates(
     assert_authority_gate(ledger, job_id, cid)
     assert_material_freshness(ledger, job_id, gate)
     assert_model_policy_gate(policy, role, resolved_model=resolved_model)
+    assert_repair_gate(ledger, job_id, cid, transition="dispatch")
+    return assert_egress_gate(ledger, job_id, environ=environ)
+
+
+def assert_repair_gate(
+    ledger: Any,
+    job_id: int,
+    cid: str,
+    *,
+    transition: str = "dispatch",
+    fixer_report: Mapping[str, Any] | None = None,
+    verifier_verdict: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Require any recorded repair to be independently verified before it is consumed.
+
+    A resume or dispatch that consumes a repair reads the change's latest
+    recorded fixer report and verifier verdict from the journal (unless the
+    caller presents them) and refuses with the named :class:`RepairGateError`
+    — recording a durable ``policy_violation`` — when the repair is not
+    independently verified. A change with no recorded repair passes: the gate
+    refuses non-independent repairs, not ordinary transitions.
+    """
+    try:
+        return agent_contracts_mod.assert_repair_consumable(
+            ledger,
+            int(job_id),
+            transition=transition,
+            change_id=cid,
+            fixer_report=fixer_report,
+            verifier_verdict=verifier_verdict,
+        )
+    except agent_contracts_mod.RepairConsumptionError as exc:
+        raise RepairGateError(
+            str(exc), decision=getattr(exc, "decision", None)
+        ) from exc
 
 
 def assert_lock_gate(repo: Path, ledger: Any, job_id: int) -> None:
@@ -329,7 +407,13 @@ def assert_lock_gate(repo: Path, ledger: Any, job_id: int) -> None:
 
 
 def assert_authority_gate(ledger: Any, job_id: int, cid: str) -> None:
-    """Require the broker's authority state to permit this dispatch."""
+    """Require the broker's authority state to permit this dispatch.
+
+    This is also the resume-revalidation gate: a run that resumes after a
+    restart re-enters through here, so it runs the repair-consumption gate
+    explicitly (a recorded repair is refused unless an independent verifier
+    reviewed the real diff) before the dispatch gate runs it again.
+    """
     try:
         broker_mod.assert_resume_clear(ledger, job_id, change_ids=[cid])
     except broker_mod.StaleMaterialError as exc:
@@ -340,6 +424,7 @@ def assert_authority_gate(ledger: Any, job_id: int, cid: str) -> None:
         broker_mod.assert_dispatchable(ledger, job_id, cid)
     except broker_mod.BrokerError as exc:
         raise AuthorityGateError(str(exc)) from exc
+    assert_repair_gate(ledger, job_id, cid, transition="resume")
 
 
 def assert_material_freshness(ledger: Any, job_id: int, gate: Mapping[str, Any]) -> None:
@@ -407,6 +492,40 @@ def assert_model_policy_gate(
         )
 
 
+def assert_egress_gate(
+    ledger: Any,
+    job_id: int,
+    *,
+    environ: Mapping[str, str] | None = None,
+    config: Mapping[str, Any] | None = None,
+) -> agent_contracts_mod.TransportDecision:
+    """Require enforced model transport before a supervised worker is spawned.
+
+    This is the same named, fail-closed step the session bridge runs before a
+    prompt: model traffic must flow through the trusted gateway or an
+    equivalently enforced isolated transport, and a worker environment must
+    carry no reusable provider credential. A supervised stage-worker dispatch
+    is a service-owned spawn inside the isolated worker domain, so the
+    isolated-transport path holds for a credential-free environment; a leak or
+    an unenforced target blocks with the named error before any spawn exists.
+    """
+    environment = os.environ if environ is None else environ
+    options: dict[str, Any] = dict(config or {})
+    options.setdefault("worker_domain_spawn", True)
+    try:
+        return agent_contracts_mod.assert_pre_prompt_transport(
+            None,
+            None,
+            environ=environment,
+            config=options,
+            record=False,
+        )
+    except agent_contracts_mod.EgressEnforcementError as exc:
+        raise EgressGateError(
+            str(exc), decision=getattr(exc, "decision", None)
+        ) from exc
+
+
 # ---------------------------------------------------------------------------
 # Reservation mechanics (intent -> reserve -> dispatch record)
 # ---------------------------------------------------------------------------
@@ -423,6 +542,7 @@ def reserve_for_dispatch(
     run_id: str,
     *,
     resolved_model: str | None = None,
+    transport_decision: "agent_contracts_mod.TransportDecision | None" = None,
 ) -> dict:
     """Reserve budget for one supervised dispatch, blocking on any failure.
 
@@ -430,6 +550,11 @@ def reserve_for_dispatch(
     or ``{"blocked": reason, "last_result": <state>}`` when the dispatch must
     not proceed. Raises nothing: every budget failure becomes an actionable
     blocked state so the run loop can surface it.
+
+    *transport_decision*, when supplied, is the already-evaluated pre-prompt
+    egress decision: it is recorded as action evidence inside the intent window
+    and **before** the dispatch record, so the journal shows enforcement before
+    the side effect rather than a usage observation afterward.
     """
     ledger = gate["ledger"]
     job_id = int(gate["job_id"])
@@ -491,6 +616,9 @@ def reserve_for_dispatch(
         "reservation_id": None,
         "dispatch_id": None,
     }
+    # Guard so a bounded-backoff retry never records the transport decision
+    # twice against the same action.
+    transport_state: dict[str, bool] = {"recorded": False}
 
     def _fail_orphan_intent(reason: str) -> None:
         action_id = dispatch_state["action_id"]
@@ -541,6 +669,16 @@ def reserve_for_dispatch(
                 pricing_catalog_version=estimate_state["catalog_version"],
             )
             dispatch_state["reservation_id"] = int(reservation_id)
+        if transport_decision is not None and not transport_state["recorded"]:
+            # Enforcement before the side effect: the decision is evidence on
+            # the action, written before the dispatch record that authorizes
+            # the spawn.
+            ledger.record_evidence(
+                action_id,
+                kind=agent_contracts_mod.EVIDENCE_TRANSPORT_DECISION,
+                payload=transport_decision.as_dict(),
+            )
+            transport_state["recorded"] = True
         if dispatch_state["dispatch_id"] is None:
             begin_active_dispatch(ledger, job_id, action_id)
             try:
@@ -641,24 +779,30 @@ def gated_dispatch(
     run_id: str,
     *,
     resolved_model: str | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> dict:
     """Run the whole boundary: gates, then intent, reserve, and dispatch record.
 
     Raises a named :class:`DispatchGateError` for every gate failure and for a
     refused budget reservation, before any side effect of the action. On
     success the action is journaled as dispatched and the worker identity is
-    bound when the caller spawns it.
+    bound when the caller spawns it. The pre-prompt egress enforcement runs as
+    a named gate after the model-policy gate and before the reserve/spawn, and
+    its decision is recorded as action evidence before the dispatch record.
     """
     escalation_active = bool(r.get("escalation", {}).get("active"))
     role = telemetry_mod.resolve_stage_role(stage, escalation_active=escalation_active)
+    transport_decision: "agent_contracts_mod.TransportDecision | None" = None
     if role is not None:
-        evaluate_gates(
+        transport_decision = evaluate_gates(
             repo, gate,
             cid=cid, stage=stage, role=role, resolved_model=resolved_model,
+            environ=environ,
         )
     result = reserve_for_dispatch(
         repo, cfg, gate, cid, stage, round_num, r, run_id,
         resolved_model=resolved_model,
+        transport_decision=transport_decision,
     )
     if isinstance(result, dict) and result.get("blocked"):
         raise BudgetGateError(
@@ -1097,13 +1241,16 @@ __all__ = [
     "JournalDispatchError",
     "LockGateError",
     "ModelPolicyGateError",
+    "RepairGateError",
     "RetryableCatalogLoadError",
     "StaleMaterialGateError",
     "active_dispatch",
     "assert_authority_gate",
+    "assert_egress_gate",
     "assert_lock_gate",
     "assert_material_freshness",
     "assert_model_policy_gate",
+    "assert_repair_gate",
     "begin_active_dispatch",
     "end_active_dispatch",
     "evaluate_gates",

@@ -138,10 +138,12 @@ class ActionJournalTestCase(unittest.TestCase):
     def register(
         self, *, policy: dict | None = None, manifest_content: str = MANIFEST
     ) -> int:
+        self.principal = "opsx-service"
         return self.ledger.register_job(
             run_id="run-1",
             worktree=self.repo,
             owner="service",
+            owner_principal=self.principal,
             policy=policy if policy is not None else _policy(),
             operator="operator",
             manifest_content=manifest_content,
@@ -585,7 +587,14 @@ class DispatchPathTests(ActionJournalTestCase):
         credentials = endpoints_mod.PeerCredentials(pid=os.getpid(), uid=os.getuid(), gid=os.getgid())
         with self.assertRaises(broker_mod.BrokerMediationError):
             endpoints_mod._worker_record_evidence(
-                {"ledger": self.ledger, "job_id": job1, "action_id": foreign_action},
+                {
+                    "ledger": self.ledger,
+                    "job_id": job1,
+                    "action_id": foreign_action,
+                    "role": "implementer",
+                    "observed_agent": "opsx-implementer",
+                    "service_identity": self.principal,
+                },
                 credentials,
             )
         self.assertEqual(self.ledger.list_evidence(foreign_action), [])
@@ -601,6 +610,9 @@ class DispatchPathTests(ActionJournalTestCase):
                 "ledger": self.ledger,
                 "job_id": job_id,
                 "action_id": action_id,
+                "role": "implementer",
+                "observed_agent": "opsx-implementer",
+                "service_identity": self.principal,
                 "evidence": {
                     "kind": "stage_result",
                     "payload": {"confirmed": True, "outcome": "completed"},
@@ -629,6 +641,9 @@ class DispatchPathTests(ActionJournalTestCase):
                 "ledger": self.ledger, "job_id": job_id,
                 "action_id": action_id, "kind": "usage",
                 "payload": {"tokens": 10},
+                "role": "implementer",
+                "observed_agent": "opsx-implementer",
+                "service_identity": self.principal,
             },
             credentials,
         )

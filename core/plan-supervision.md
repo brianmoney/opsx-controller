@@ -1022,6 +1022,132 @@ guard. A mutating request is issued
 at most once: the transport never blind-retries a prompt, because a duplicate
 prompt is exactly the failure the request identity exists to prevent.
 
+### Agent contracts and the pre-prompt transport gate
+
+Two fail-closed contracts run inside the intent window — after the action
+intent is committed and **before** the dispatch record and any server request —
+in `lib/supervisor/agent_contracts.py` (stdlib only; it imports only
+`ledger`/`clock`-level modules, never `session_bridge` or `endpoints`, so the
+package's acyclic graph holds).
+
+**The session contract.** Each supervised policy role maps to exactly one
+concrete installed agent, and each agent carries a least-privilege capability
+allowlist:
+
+| Role | Concrete agent | Capabilities |
+| --- | --- | --- |
+| `supervisor` | `opsx-supervisor` | `read`, `glob`, `grep`, plus the tracked service tool |
+| `implementer` / `supervised_author` / escalation | `opsx-implementer` | `read`, `glob`, `grep`, `edit`, `bash` |
+| `reviewer` | `opsx-reviewer` | `read`, `glob`, `grep`, `bash` |
+| `archiver` | `opsx-archiver` | `read`, `glob`, `grep`, `edit`, `bash` |
+| `acceptance_reviewer` | `opsx-acceptance-reviewer` | `read`, `glob`, `grep`, `bash` |
+| `fixer` | `opsx-fixer` | `read`, `glob`, `grep`, `edit`, `bash` |
+| `verifier` | `opsx-verifier` | `read`, `glob`, `grep`, `bash` |
+
+`check_session_contract` is the pure predicate: an unregistered role, a
+session whose observed agent is not the role's concrete agent (an unbound
+agent counts as not matching), a role with no pin in the job policy, a
+`requested_model` that is not the role's **exact** pin, or any requested
+capability outside the role's allowlist is a violation — never defaulted.
+`enforce_session_contract` adds the durable consequence: a `policy_violation`
+incident is recorded against the job and the dispatch is blocked before any
+side effect.
+
+The contract is **non-optional** on the worker path. Every worker-domain request
+must carry its role, its observed concrete agent, and the job's registered
+service identity; `check_worker_identity` refuses a request that omits any of
+them, and there is no unauthenticated legacy worker path on the endpoint. The
+mandatory fields are wired at four points: the journaled bridge's session
+create and prompt (the agent it binds must be the role's registered agent, and a
+caller-supplied model must equal the role's exact pin), the worker-actions
+endpoint request path (identity plus role contract), `build_request` in the
+tracked service tool (an unidentified request is never framed), and the
+per-role agent permission blocks.
+
+Delegation is non-recursive by construction: `task` is denied on every
+supervised agent. The primary's `bash` allows only the `opsx-supervise *`
+pattern; each worker role's `bash` allows only the tracked shell wrapper
+`opsx-worker-exec *`. A shell attempt to reach a model client or agent runner is
+refused by the executable layer (`lib/supervisor/worker_exec.py`): the known
+model-client/agent-runner binaries, a nested shell, and the shell indirection a
+bypass uses are all classified as a bypass, never executed, and reported to the
+worker endpoint through the `report_violation` verb as a durable
+`policy_violation` incident.
+
+**Worker-initiated delegation is journaled on both paths.** A native Task
+session identity reported through `record_evidence` is bound to the owning
+action's dispatch row as `session_binding` evidence; a worker-reported
+subprocess process identity is bound the same way against the same action in
+the same journal the orchestrator uses. A binding failure is surfaced rather
+than swallowed, and delegation that cannot be journaled does not execute.
+
+**The pre-prompt transport gate.** `evaluate_transport` is the pure decision:
+model traffic is *enforced* when a trusted model gateway endpoint is configured
+(`OPSX_MODEL_GATEWAY_ENDPOINT`), or when an equivalently enforced isolated
+transport holds — the transport target is the **launched service-owned session
+server**, or the dispatch is a service-owned spawn inside the isolated worker
+domain **and** the worker environment is free of any reusable provider
+credential. `check_server_identity` is what binds the isolated path to the
+launched server: a bare loopback hostname is never accepted, because any process
+on the host could bind a loopback port. The presented server identity must be a
+fenceable pid/start-time/boot identity that names a live process on the current
+boot, and the transport target must equal the address the launched server
+reported. A provider credential in the worker environment is never enforced,
+even with a gateway configured, because the credential is itself the bypass. `assert_pre_prompt_transport` raises the
+named `EgressEnforcementError` before any prompt or spawn side effect when the
+decision is unenforced, and records the decision as
+`transport_decision` action evidence **before** the dispatch record when it is
+enforced — so the journal shows enforcement before the side effect rather than a
+usage observation afterward. `transport_decision` is outside the decisive
+evidence vocabulary: recording it can never complete, fail, or reconcile an
+action on its own.
+
+Call sites are the two supervised choke points: `JournaledSessionBridge.prompt`
+(before the dispatch record and the server request) and
+`lib/orchestrator/journal_dispatch.gated_dispatch` for supervised stage-worker
+spawns (the named egress gate, evaluated after the model-policy gate and before
+the reserve/spawn, with the same fail-closed semantics). On failure the action
+is failed with the gate reason and nothing needs unwinding, because no prompt or
+subprocess exists yet.
+
+**Verifier independence.** A `fixer` report never self-certifies completion:
+`repair_consumable` requires an independent `verifier` verdict (`pass`) from a
+*different* session that reviewed the actual diff (`diff_reviewed` and
+`repair_verified` both true). A missing, contradicting, or same-session verdict
+blocks the repair regardless of the fixer's report, and no repair verdict ever
+checks a task or waives the implement/review/archive task-completeness gates.
+
+`repair_consumable` is consumed in production, not merely exported:
+`assert_repair_consumable` gates every repair-consuming transition — `resume`
+and `dispatch` in `journal_dispatch` (`assert_repair_gate`, inside the authority
+and full gate order), the operator `reset_change` endpoint, and the worker
+`release_delegated_gate` endpoint. The gate reads the change's latest recorded
+fixer report and verifier verdict from the journal when the caller does not
+present them, so a caller cannot escape it by omission. The recorded
+`repair_verdict` evidence is non-decisive: it never completes, fails, or
+reconciles an action on its own, and a refused consumption records a durable
+`policy_violation` before the transition's side effect.
+
+### The tracked service tool
+
+The supervised primary's only side-effecting capability is the tracked service
+tool `opsx-supervise` (`lib/supervisor/service_tool.py`, deployed by the
+OpenCode adapter as an executable alongside its other support files). It maps a
+**closed** set of worker-actions verbs — `report_status`, `request_action`,
+`record_evidence`, `heartbeat`, `release_delegated_gate`, `report_violation` —
+one-to-one onto the worker endpoint through `lib/supervisor/broker_client.py`.
+It resolves only the worker endpoint: an operator verb is unreachable through it
+by construction, and journaling is structural rather than voluntary, because
+every verb maps to an endpoint handler that writes the ledger before its effect.
+Every request it frames carries the supervised role, the observed concrete
+agent, and the registered service identity; a payload cannot override those
+fields, and an unidentified request is refused before it is framed. The
+`opsx-supervisor` agent's `bash` permission allows only the `opsx-supervise *`
+invocation pattern, and each worker role's allows only `opsx-worker-exec *`
+(`lib/supervisor/worker_exec.py`), so arbitrary Bash and Task dispatch are
+denied while the single journaled path and the tracked shell wrapper remain
+available.
+
 ### Events-as-hints semantics
 
 The streamed session event channel is **hints only**. No event is ever

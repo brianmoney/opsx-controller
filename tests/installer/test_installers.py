@@ -892,6 +892,217 @@ class AdapterInstallerTests(unittest.TestCase):
                        "Codex opsx-plan skill must state plan-run is unsupported")
 
 
+class SupervisedAgentInstallerTests(unittest.TestCase):
+    """The OpenCode adapter installs and verifies the supervised agents/skill.
+
+    Every test uses a temp HOME so the real environment is untouched. The
+    supervised role models are optional: an install with them resolved must
+    deploy the four concrete agents, the supervision skill, and the
+    ``opsx-supervise`` service-tool shim; an install without them must leave
+    the legacy agents byte-identical and report the supervised agents as
+    unconfigured rather than failing.
+    """
+
+    SUPERVISED_ENV = {
+        "OPSX_SUPERVISOR_MODEL": "test-provider/test-supervisor",
+        "OPSX_ACCEPTANCE_REVIEWER_MODEL": "test-provider/test-acceptance",
+        "OPSX_FIXER_MODEL": "test-provider/test-fixer",
+        "OPSX_VERIFIER_MODEL": "test-provider/test-verifier",
+    }
+    SUPERVISED_AGENTS = (
+        "opsx-supervisor",
+        "opsx-acceptance-reviewer",
+        "opsx-fixer",
+        "opsx-verifier",
+    )
+    LEGACY_AGENTS = ("opsx-implementer", "opsx-reviewer", "opsx-archiver")
+
+    def setUp(self) -> None:
+        self.home = tempfile.TemporaryDirectory()
+        self.env = {**_model_env(), "HOME": self.home.name}
+
+    def tearDown(self) -> None:
+        self.home.cleanup()
+
+    def _agents_dir(self) -> Path:
+        return Path(self.home.name) / ".config" / "opencode" / "agents"
+
+    def _skills_dir(self) -> Path:
+        return Path(self.home.name) / ".config" / "opencode" / "skills"
+
+    def _bin_dir(self) -> Path:
+        return Path(self.home.name) / ".local" / "bin"
+
+    def _run_verify_helper(
+        self, *args: str, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess:
+        """Source the shared helper and invoke a verification function directly.
+
+        This exercises the reporting path without the installer's
+        install-then-verify ordering repairing the corruption first.
+        """
+        script = (
+            'set -euo pipefail\n'
+            f'source {str(_REPO / "lib" / "install-common.sh")!r}\n'
+            "verify_supervised_agents_and_skill "
+            + " ".join(repr(a) for a in args)
+            + "\n"
+        )
+        return subprocess.run(
+            ["bash", "-c", script],
+            cwd=_REPO,
+            env={**os.environ, **(env or self.env)},
+            capture_output=True,
+            text=True,
+        )
+
+    def test_install_deploys_supervised_agents_skill_and_shim(self) -> None:
+        env = {**self.env, **self.SUPERVISED_ENV}
+        _run_installer(_OPENCODE_INSTALLER, Path(self.home.name), env)
+        agents = self._agents_dir()
+        for name in self.SUPERVISED_AGENTS:
+            path = agents / f"{name}.md"
+            self.assertTrue(path.is_file(), f"supervised agent missing: {path}")
+        skill = self._skills_dir() / "opsx-supervision" / "SKILL.md"
+        self.assertTrue(skill.is_file(), f"supervision skill missing: {skill}")
+        shim = self._bin_dir() / "opsx-supervise"
+        self.assertTrue(shim.is_file(), f"service-tool shim missing: {shim}")
+        self.assertTrue(os.access(str(shim), os.X_OK))
+        self.assertEqual(
+            hashlib.sha256(shim.read_bytes()).digest(),
+            hashlib.sha256(
+                (_REPO / "adapters" / "opencode" / "bin" / "opsx-supervise").read_bytes()
+            ).digest(),
+            "installed shim must match the repository copy",
+        )
+        worker_exec = self._bin_dir() / "opsx-worker-exec"
+        self.assertTrue(
+            worker_exec.is_file(), f"worker shell wrapper missing: {worker_exec}"
+        )
+        self.assertTrue(os.access(str(worker_exec), os.X_OK))
+        self.assertEqual(
+            hashlib.sha256(worker_exec.read_bytes()).digest(),
+            hashlib.sha256(
+                (
+                    _REPO / "adapters" / "opencode" / "bin" / "opsx-worker-exec"
+                ).read_bytes()
+            ).digest(),
+            "installed worker wrapper must match the repository copy",
+        )
+
+    def test_install_substitutes_supervised_role_models(self) -> None:
+        env = {**self.env, **self.SUPERVISED_ENV}
+        _run_installer(_OPENCODE_INSTALLER, Path(self.home.name), env)
+        agents = self._agents_dir()
+        expected = {
+            "opsx-supervisor": "test-provider/test-supervisor",
+            "opsx-acceptance-reviewer": "test-provider/test-acceptance",
+            "opsx-fixer": "test-provider/test-fixer",
+            "opsx-verifier": "test-provider/test-verifier",
+        }
+        for name, model in expected.items():
+            text = (agents / f"{name}.md").read_text(encoding="utf-8")
+            self.assertIn(f'model: "{model}"', text)
+            self.assertNotIn(
+                "{env:", text, f"unsubstituted placeholder left in {name}"
+            )
+        # The primary's bash allowlist must name the real shim pattern.
+        supervisor = (agents / "opsx-supervisor.md").read_text(encoding="utf-8")
+        self.assertIn('"opsx-supervise *": allow', supervisor)
+        self.assertIn("task: deny", supervisor)
+        self.assertIn("edit: deny", supervisor)
+
+    def test_unconfigured_supervised_roles_leave_legacy_agents_untouched(self) -> None:
+        home = Path(self.home.name)
+        _run_installer(_OPENCODE_INSTALLER, home, self.env)
+        agents = self._agents_dir()
+        for name in self.SUPERVISED_AGENTS:
+            self.assertFalse(
+                (agents / f"{name}.md").exists(),
+                f"unconfigured supervised agent must not be installed: {name}",
+            )
+        for name in self.LEGACY_AGENTS:
+            self.assertTrue(
+                (agents / f"{name}.md").is_file(),
+                f"legacy agent must install unchanged: {name}",
+            )
+
+        # A second temp install with the supervised roles resolved must leave
+        # the legacy agents byte-identical.
+        with tempfile.TemporaryDirectory() as other:
+            env = {**_model_env(), "HOME": other, **self.SUPERVISED_ENV}
+            _run_installer(_OPENCODE_INSTALLER, Path(other), env)
+            other_agents = Path(other) / ".config" / "opencode" / "agents"
+            for name in self.LEGACY_AGENTS:
+                self.assertEqual(
+                    hashlib.sha256((agents / f"{name}.md").read_bytes()).digest(),
+                    hashlib.sha256((other_agents / f"{name}.md").read_bytes()).digest(),
+                    f"supervised install must not modify legacy agent {name}",
+                )
+
+    def test_verify_passes_on_a_clean_install(self) -> None:
+        env = {**self.env, **self.SUPERVISED_ENV}
+        proc = _run_installer_verify(_OPENCODE_INSTALLER, Path(self.home.name), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        output = proc.stdout + proc.stderr
+        for name in self.SUPERVISED_AGENTS:
+            self.assertIn(f"supervised agent {name} deployed and matches source", output)
+        self.assertIn("supervision skill deployed and matches source", output)
+
+    def test_verify_reports_a_stale_or_missing_agent_by_name(self) -> None:
+        env = {**self.env, **self.SUPERVISED_ENV}
+        home = Path(self.home.name)
+        _run_installer(_OPENCODE_INSTALLER, home, env)
+        (self._agents_dir() / "opsx-fixer.md").write_text(
+            "post-install corruption\n", encoding="utf-8"
+        )
+        (self._agents_dir() / "opsx-verifier.md").unlink()
+
+        proc = self._run_verify_helper(
+            str(self._agents_dir()),
+            str(self._skills_dir()),
+            str(_REPO),
+            env={**self.env, **self.SUPERVISED_ENV},
+        )
+        self.assertNotEqual(proc.returncode, 0, "divergence must fail verification")
+        output = proc.stdout + proc.stderr
+        self.assertIn("supervised agent opsx-fixer at", output)
+        self.assertIn("differs from", output)
+        self.assertIn("supervised agent opsx-verifier is MISSING from", output)
+
+    def test_verify_reports_a_stale_worker_shell_wrapper_by_name(self) -> None:
+        env = {**self.env, **self.SUPERVISED_ENV}
+        home = Path(self.home.name)
+        _run_installer(_OPENCODE_INSTALLER, home, env)
+        (self._bin_dir() / "opsx-worker-exec").write_text(
+            "post-install corruption\n", encoding="utf-8"
+        )
+        proc = self._run_verify_helper(
+            str(self._agents_dir()),
+            str(self._skills_dir()),
+            str(_REPO),
+            str(self._bin_dir()),
+            env=env,
+        )
+        self.assertNotEqual(proc.returncode, 0, "divergence must fail verification")
+        output = proc.stdout + proc.stderr
+        self.assertIn("supervised service tool opsx-worker-exec at", output)
+        self.assertIn("differs from", output)
+
+    def test_verify_reports_unconfigured_agents_without_failing(self) -> None:
+        home = Path(self.home.name)
+        _run_installer(_OPENCODE_INSTALLER, home, self.env)
+        proc = self._run_verify_helper(
+            str(self._agents_dir()),
+            str(self._skills_dir()),
+            str(_REPO),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        output = proc.stdout + proc.stderr
+        for name in self.SUPERVISED_AGENTS:
+            self.assertIn(f"supervised agent {name} is unconfigured", output)
+
+
 class ProjectInstallerTests(unittest.TestCase):
     """Verify that project-level installs deploy the plan-authoring reference."""
 

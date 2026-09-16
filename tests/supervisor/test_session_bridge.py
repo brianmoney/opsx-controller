@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
+from lib.supervisor import agent_contracts as agent_contracts_mod
 from lib.supervisor import budgets as budget_mod
 from lib.supervisor import ledger, lock as lock_mod, model_policy
 from lib.supervisor import session_bridge as bridge_mod
@@ -449,6 +450,14 @@ class BridgeTestCase(unittest.TestCase):
 
     def journaled(self, server: FakeOpencodeServer, *, process_id: str | None = None):
         bridge = self.make_bridge(server)
+        # The loopback fake server runs in this process, so this process's
+        # fenceable identity *is* the launched service-server identity the
+        # isolated-transport decision requires. A test that supplies an
+        # explicit process_id overrides it, and a test that wants the
+        # unenforced path uses a non-loopback transport.
+        server_identity = process_id or bridge_mod.serialize_process_identity(os.getpid())
+        if process_id is None:
+            process_id = server_identity
         return bridge_mod.JournaledSessionBridge(
             bridge,
             self.ledger,
@@ -456,6 +465,7 @@ class BridgeTestCase(unittest.TestCase):
             run_id="run-1",
             policy=self.policy,
             process_id=process_id,
+            server_identity=server_identity,
             change_id="add-opencode-session-bridge",
         )
 
@@ -1902,6 +1912,9 @@ class JournalDisciplineTests(BridgeTestCase):
                     bridge_mod.EVIDENCE_USAGE,
                     bridge_mod.EVIDENCE_SPAWN_LOSS,
                     bridge_mod.EVIDENCE_HINT,
+                    # The named pre-prompt transport gate records its decision
+                    # as additive action evidence before the dispatch record.
+                    agent_contracts_mod.EVIDENCE_TRANSPORT_DECISION,
                 }
             )
         )

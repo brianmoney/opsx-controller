@@ -62,10 +62,12 @@ class EndpointEvidenceTests(unittest.TestCase):
             self.storage / "supervisor.sqlite3", repository_root=self.repo
         )
         self.addCleanup(self.ledger.close)
+        self.principal = "opsx-service"
         self.job_id = self.ledger.register_job(
             run_id="run-1",
             worktree=self.worktree,
             owner="service",
+            owner_principal=self.principal,
             policy=_policy(),
             operator="operator",
             manifest_content="[[changes]]\nid = \"change-a\"\n",
@@ -94,6 +96,9 @@ class EndpointEvidenceTests(unittest.TestCase):
             "ledger": self.ledger,
             "job_id": self.job_id,
             "action_id": action_id,
+            "role": "implementer",
+            "observed_agent": "opsx-implementer",
+            "service_identity": self.principal,
         }
         if kind is not None:
             request["evidence"] = {"kind": kind, "payload": payload}
@@ -206,6 +211,9 @@ class EndpointEvidenceTests(unittest.TestCase):
             "ledger": self.ledger,
             "job_id": self.job_id,
             "action_id": foreign_action,
+            "role": "implementer",
+            "observed_agent": "opsx-implementer",
+            "service_identity": self.principal,
             "evidence": {"kind": "stage_result", "payload": {"confirmed": True}},
         }
         with self.assertRaises(broker_module.BrokerMediationError):
