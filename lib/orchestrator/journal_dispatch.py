@@ -104,8 +104,11 @@ class BudgetGateError(DispatchGateError):
     gate = GATE_BUDGET
 
 
-class RetryableCatalogLoadError(budget_mod.BudgetError):
-    """A pricing-catalog load failure the bounded retry may resolve."""
+# The pricing boundary lives in :mod:`lib.orchestrator.cost` (the low layer that
+# owns catalog resolution). The boundary re-exports its named retryable-catalog
+# error so callers keep catching one class, and so this module never becomes a
+# dependency of the pricing layer.
+RetryableCatalogLoadError = cost_mod.RetryableCatalogLoadError
 
 
 # The single in-flight supervised dispatch, if any. The subprocess stage
@@ -227,92 +230,20 @@ def mark_active_uncertain(detail: str = "interrupted") -> bool:
 # ---------------------------------------------------------------------------
 # Pricing / reservation estimate (orchestrator boundary)
 # ---------------------------------------------------------------------------
+#
+# The pricing helpers live in :mod:`lib.orchestrator.cost` — the low layer that
+# already owns catalog resolution — so this module (which the supervision
+# service imports) never has to be imported back by it. These thin re-exports
+# keep the boundary's public surface stable.
 
 
-def pinned_model_for_role(policy: Mapping[str, Any], role: str) -> str | None:
-    """Return the exact model identifier pinned for *role*, or ``None``."""
-    return _pinned_model_for_role(policy, role)
+pinned_model_for_role = cost_mod.pinned_model_for_role
 
 
-def _pinned_model_for_role(policy: Mapping[str, Any], role: str) -> str | None:
-    selection = policy.get("model_selection")
-    if not isinstance(selection, Mapping):
-        return None
-    roles = selection.get("roles")
-    if not isinstance(roles, Mapping):
-        return None
-    pin = roles.get(role)
-    return pin if isinstance(pin, str) and pin.strip() else None
+reservation_estimate_for_dispatch = cost_mod.reservation_estimate_for_dispatch
 
 
-def _split_model_identity(model: str) -> tuple[str, str] | None:
-    if "/" not in model:
-        return None
-    provider, model_id = model.split("/", 1)
-    provider, model_id = provider.strip(), model_id.strip()
-    if not provider or not model_id:
-        return None
-    return provider, model_id
-
-
-def _pinned_rate_and_catalog_version(
-    repo: Path, policy: Mapping[str, Any], role: str
-) -> tuple[float, str | None]:
-    pin = _pinned_model_for_role(policy, role)
-    if pin is None:
-        raise budget_mod.UnknownPricingError(
-            f"role '{role}' has no model_selection pin to price"
-        )
-    identity = _split_model_identity(pin)
-    if identity is None:
-        raise budget_mod.UnknownPricingError(
-            f"role '{role}' pin '{pin}' is not a provider/model identifier"
-        )
-    try:
-        base.ensure_own_root_on_syspath()
-        from lib.pricing import PricingCatalog, UnresolvedPrice  # noqa: F401
-    except Exception as exc:  # pragma: no cover - pricing runtime missing
-        raise RetryableCatalogLoadError(
-            f"pricing runtime unavailable for role '{role}': {exc}"
-        ) from exc
-    catalog_info = cost_mod._get_catalog(repo)
-    if catalog_info is None:
-        cost_mod._cost_catalog = None
-        raise RetryableCatalogLoadError(
-            f"pricing catalog failed to load for role '{role}'"
-        )
-    catalog, UnresolvedPriceCls = catalog_info
-    provider, model_id = identity
-    price = catalog.resolve(provider, model_id)
-    if isinstance(price, UnresolvedPriceCls):
-        raise budget_mod.UnknownPricingError(
-            f"role '{role}' pin '{pin}' is unpriceable: {price.reason}"
-        )
-    if price.billing_mode != "per_token":
-        raise budget_mod.UnknownPricingError(
-            f"role '{role}' pin '{pin}' is {price.billing_mode}; no per-token "
-            "rate is available to bound a reservation"
-        )
-    rates = (
-        price.input_price_per_mtok,
-        price.output_price_per_mtok,
-        price.cached_input_price_per_mtok,
-        price.reasoning_price_per_mtok,
-    )
-    positive = [rate for rate in rates if isinstance(rate, (int, float)) and rate > 0]
-    if not positive:
-        raise budget_mod.UnknownPricingError(
-            f"role '{role}' pin '{pin}' has no positive per-token rate"
-        )
-    return float(max(positive)), catalog.get_catalog_version()
-
-
-def reservation_estimate_for_dispatch(
-    repo: Path, policy: Mapping[str, Any], role: str
-) -> tuple[float, str | None]:
-    """Estimate one dispatch's reserved cost from the pricing catalog."""
-    rate, catalog_version = _pinned_rate_and_catalog_version(repo, policy, role)
-    return budget_mod.reservation_estimate(rate), catalog_version
+RetryableCatalogLoadError = cost_mod.RetryableCatalogLoadError
 
 
 def execution_elapsed_minutes(ledger: Any, job_id: int) -> float:

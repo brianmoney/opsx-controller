@@ -8,6 +8,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from lib.orchestrator import cost
 
@@ -707,3 +708,108 @@ class RepriceRecordRepoArgTests(unittest.TestCase):
         self.assertEqual(updated["cost"]["status"], "estimated")
 
 
+
+
+class PinnedReservationEstimateTests(unittest.TestCase):
+    """The pinned-model reservation estimate now lives in ``cost`` (the layer
+    that owns catalog resolution) so both the journal dispatch boundary and the
+    supervision service resolve their pricing through one low module.
+
+    Regression for the import-cycle fix: the helpers must keep their fail-closed
+    named errors and must not require importing the dispatch boundary.
+    """
+
+    def setUp(self) -> None:
+        cost._cost_catalog = None
+
+    def tearDown(self) -> None:
+        cost._cost_catalog = None
+
+    def _catalog(self) -> None:
+        from lib.pricing import PricingCatalog, UnresolvedPrice
+
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".toml", delete=False, encoding="utf-8",
+        )
+        tmp.write(
+            """\
+            [catalog]
+            version = "9.9.9"
+            updated = "2026-01-01"
+
+            [[entries]]
+            provider = "openai"
+            model_id = "gpt-4o"
+            display_name = "GPT-4o"
+            billing_mode = "per_token"
+            currency = "USD"
+            input_price_per_mtok = 2.5
+            output_price_per_mtok = 10.0
+            effective_date = "2026-01-01"
+            """
+        )
+        tmp.close()
+        cost._cost_catalog = (
+            PricingCatalog(catalog_path=Path(tmp.name)),
+            UnresolvedPrice,
+        )
+
+    @staticmethod
+    def _policy(pin: str | None) -> dict:
+        roles = {} if pin is None else {"supervisor": pin}
+        return {"model_selection": {"roles": roles}}
+
+    def test_pinned_model_for_role_returns_the_exact_pin(self) -> None:
+        self.assertEqual(
+            cost.pinned_model_for_role(self._policy("openai/gpt-4o"), "supervisor"),
+            "openai/gpt-4o",
+        )
+        self.assertIsNone(
+            cost.pinned_model_for_role(self._policy(None), "supervisor")
+        )
+
+    def test_reservation_estimate_uses_the_pinned_rate(self) -> None:
+        self._catalog()
+        repo = Path(__file__).resolve().parents[2]
+        estimate, catalog_version = cost.reservation_estimate_for_dispatch(
+            repo, self._policy("openai/gpt-4o"), "supervisor"
+        )
+        self.assertGreater(estimate, 0.0)
+        self.assertEqual(catalog_version, "9.9.9")
+
+    def test_unpinned_role_raises_named_unknown_pricing(self) -> None:
+        from lib.supervisor import budgets
+
+        self._catalog()
+        repo = Path(__file__).resolve().parents[2]
+        with self.assertRaises(budgets.UnknownPricingError):
+            cost.reservation_estimate_for_dispatch(
+                repo, self._policy(None), "supervisor"
+            )
+
+    def test_unpriceable_pin_raises_named_unknown_pricing(self) -> None:
+        from lib.supervisor import budgets
+
+        self._catalog()
+        repo = Path(__file__).resolve().parents[2]
+        with self.assertRaises(budgets.UnknownPricingError):
+            cost.reservation_estimate_for_dispatch(
+                repo, self._policy("openai/no-such-model"), "supervisor"
+            )
+
+    def test_catalog_load_failure_raises_the_retryable_error(self) -> None:
+        from lib.supervisor import budgets
+
+        cost._cost_catalog = None
+        with mock.patch.object(cost, "_get_catalog", return_value=None):
+            with self.assertRaises(cost.RetryableCatalogLoadError):
+                cost.reservation_estimate_for_dispatch(
+                    Path("."), self._policy("openai/gpt-4o"), "supervisor"
+                )
+            # The retryable error is a budget error the boundary catches.
+            self.assertTrue(issubclass(cost.RetryableCatalogLoadError,
+                                       budgets.BudgetError))
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()

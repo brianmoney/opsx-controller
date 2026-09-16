@@ -127,12 +127,26 @@ def cmd_supervise_serve(args: argparse.Namespace) -> int:
             f"supervise serve: session for job {host.session.job_id} is live; "
             f"operator={host.operator_socket} worker={host.worker_socket}"
         )
+        if getattr(args, "primary_session", False):
+            runtime = host.start_primary_session()
+            print(
+                f"supervise serve: primary session {runtime.session_id} "
+                f"{'adopted' if runtime.adopted else 'started'} at "
+                f"{runtime.server_address} (briefing: {runtime.briefing.mode})"
+            )
         if getattr(args, "once", False):
             host.poll(timeout=float(getattr(args, "timeout", 30.0)))
         else:
             host.serve_forever(timeout=1.0)
     except KeyboardInterrupt:  # pragma: no cover - interactive shutdown
         pass
+    except broker_mod.BrokerError as exc:
+        # A primary session that cannot start or adopt (no restricted-spawn
+        # mechanism, no address, an unsupported server) is a named fail-closed
+        # provisioning error, never a raw OSError out of the serve loop.
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        host.close()
+        return 1
     finally:
         host.close()
     return 0

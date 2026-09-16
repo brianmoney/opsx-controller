@@ -910,3 +910,161 @@ budget layer. When a supervision backend is present but its ledger or policy
 cannot be read, the run fails closed: it blocks before dispatch rather than
 falling back to the unbudgeted legacy path, so a registered job is never
 dispatched without a reservation.
+
+## OpenCode session bridge
+
+The supervised primary session is driven through a documented, versioned
+session bridge implemented in `lib/supervisor/session_bridge.py`. The bridge
+belongs to the `lib/supervisor/` runtime package, so it is standard-library
+only, imports no other runtime package, and is importable without side effects.
+The transport is stdlib `http.client` over **loopback only**: a non-loopback
+server address is refused rather than dialed.
+
+### Documented API subset and result-schema
+
+The bridge depends on exactly five operations against a headless
+`opencode serve` instance and on no other server surface:
+
+| Operation | Server surface |
+| --- | --- |
+| version capability check | `GET /global/health` |
+| create | `POST /session` |
+| prompt | `POST /session/{session_id}/prompt_async` |
+| lookup | `GET /session/{session_id}`, `GET /session/{session_id}/message` |
+| abort | `POST /session/{session_id}/abort` |
+
+The event channel (`GET /event`, `text/event-stream`) is consumed as a hint
+source only. The typed **result-schema** a prompt returns is
+`opencode-session-result` version `1`, derived from polled authoritative
+message state — never from the streamed event channel. Its fields are:
+`version`, `schema`, `session_id`, `marker`, `marker_found` (whether the
+marker's user message was actually discovered — a requested marker is never
+echoed back as if it were observed), `status`
+(`pending`/`completed`/`error`/`aborted`), `terminal`, `message_id`,
+`provider_id`, `model_id`, `text`, `usage` (`usage_available`, `input_tokens`,
+`output_tokens`, `cached_input_tokens`, `reasoning_tokens`), `cost`
+(`status`, `estimated_cost`), `duration_ms`, and `source` (`poll`). The
+`usage`/`cost` shapes are the same ones the dispatch boundary reconciles, so
+supervisor-primary usage crosses the existing budget boundary unchanged.
+
+### Version capability check
+
+Before any session operation the bridge queries `GET /global/health` and
+compares the reported version against the pinned supported range
+**`>=1.18.0 <1.19.0`**. Any mismatch — an older or newer version, an
+unparseable or missing version, an unhealthy report, or an unreachable health
+endpoint — fails closed with the named `UnsupportedVersionError` /
+`UnreachableServerError` and no create, prompt, lookup, or abort request is
+issued. A session operation requested before a successful check raises the
+named `CapabilityNotCheckedError`. The range is pinned at implementation time
+against the operator's installed server; extending it is an explicit,
+verify-then-extend action, never a silent hope that the server matches.
+
+### Service-owned session lifetime
+
+For a registered supervised job the service owns the primary session's
+lifetime. The headless server is launched in the **worker domain** through the
+authenticated restricted-process launcher from the authority boundary, not
+through a new endpoint verb, so the endpoint tables' no-execution contract is
+intact and no model session — including the frontier primary — runs with
+service-identity privileges. The server binds a job-specific loopback address,
+and its process identity (pid, process start time, boot identity) is journaled
+alongside the session identity so the existing fencing machinery can tell a
+live server from a recycled PID.
+
+On service restart the host first performs an **adopt-by-lookup**: it resolves
+the job's recorded session identity through lookup against the recorded
+server, and adopts that live session rather than spawning a replacement. A
+replacement server and session are launched only when lookup shows the session
+is gone. Either way the **primary session linkage** (server address + session
+id + server process identity) is journaled at registration/first use, and an
+operator's interactive chat starts or attaches to the same service-managed
+session through that linkage instead of a divergent private one. The linkage is
+recorded through the existing action-detail and `session_binding` evidence
+surfaces: it is additive and requires no ledger schema migration.
+
+### Identity-before-prompt journaling
+
+Every bridge operation that can cause a model side effect is a journaled
+supervised action, and it reuses the existing lifecycle rather than a parallel
+one:
+
+1. the action intent is committed in its own transaction **before any server
+   request**, carrying a generated **request identity** in its detail;
+2. a budget reservation is committed for the `supervisor` role;
+3. a dispatch record is written carrying the session identity and the headless
+   server's process identity;
+4. the prompt request is issued, with the same request identity embedded in the
+   prompt payload as a single machine-readable marker line
+   (`OPSX-REQUEST-MARKER:<id>`), so the identity stays discoverable through
+   lookup afterward;
+5. a terminal outcome is recorded, or the action is marked explicitly
+   `uncertain` with evidence.
+
+At most one prompt per session is in flight; a second prompt is refused with
+the named `PromptInFlightError` rather than queued or issued.
+
+A **lost launch acknowledgement** is resolved by lookup, never by
+re-prompting: the bridge polls the authoritative message list, matches the
+recorded request marker, and reconciles the existing action — completing it,
+failing it, or re-observing it as still in flight. Terminal reconciliation
+targets that recorded marker: when the marker is absent from authoritative
+state the lookup reports `pending` and selects no assistant reply, so an older,
+unrelated completed turn is never reported as this request's outcome. Only
+authoritative session disappearance is terminal without a matching marker. A
+still-pending poll is an observation, not a resolution: while the prompt's
+outcome is unresolved the action stays in the session's in-flight guard and no
+second prompt may be issued, whether the marker was discovered
+(marker-confirmed in-flight) or not observed at all. An unobservable prompt retains its reservation as unknown
+consumption; a marker-confirmed in-flight prompt keeps its reservation for its
+eventual observed usage. Only a positive terminal observation releases the
+guard. A mutating request is issued
+at most once: the transport never blind-retries a prompt, because a duplicate
+prompt is exactly the failure the request identity exists to prevent.
+
+### Events-as-hints semantics
+
+The streamed session event channel is **hints only**. No event is ever
+recorded as an outcome; a hint at most schedules or accelerates an
+authoritative poll and may be journaled as `session_hint` evidence against the
+action it reconciles. `session_hint` is outside the decisive evidence
+vocabulary, so it is stored but never decisive: it can neither complete, fail,
+nor reconcile an action. An event matching no journaled action is an orphan:
+at most an observation, never an outcome.
+
+The authoritative **poll loop** — bounded-backoff polling of session and
+message state, reusing the budget module's capped exponential backoff and
+bounded attempts — is the sole path to terminal results, usage figures, and the
+typed result-schema. Lost, duplicate, out-of-order, and no-replay event cases
+all converge on that same poll:
+
+- **duplicates and out-of-order arrivals** are recognized by message/part
+  identity before any evidence or usage is recorded, so nothing is
+  double-applied or double-billed;
+- **stream loss and reconnect gaps** converge by polling: the bridge never
+  requests event replay and never assumes the contents of missed events.
+
+### Briefing composition and bounding rule
+
+A reconnect or replacement briefing is composed from durable state only: the
+journaled job record and protected plan snapshot reference, active and
+unreconciled uncertain actions, budget and reservation state, incident history
+including previous failed remedies, and — where a single change is registered —
+the broker's gate resolution. A transcript replay is never the briefing; the
+adopted session's server-side transcript is not trusted as the sole context
+source.
+
+The briefing is explicitly **bounded**. Blocking items — unreconciled uncertain
+actions and pending gates — are always retained **in full** and are rendered as
+blocking state, never summarized away. Overflow is shed from the **oldest
+non-blocking detail first**. An adopted session receives a bounded **re-brief**
+(2000 chars); a replacement session receives the full bounded briefing (6000
+chars).
+
+The composed text is delivered to the managed session through the same
+journaled bridge as any other primary prompt: it is reserved, dispatched with
+the session and server process identity, and reconciled from polled usage, so
+the briefing appears in the action journal as a `supervisor_prompt` action
+tagged with `stage=briefing` rather than bypassing the journal as an
+out-of-band write. A replacement session that cannot be briefed is torn down
+instead of being handed back unbriefed.

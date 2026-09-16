@@ -23,22 +23,30 @@ Design rules enforced here:
 from __future__ import annotations
 
 import os
+import re
 import selectors
+import shlex
 import socket
+import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from lib.orchestrator import base
 from lib.orchestrator import state as state_mod
 from lib.supervisor import authority as authority_mod
 from lib.supervisor import broker as broker_mod
 from lib.supervisor import broker_client
+from lib.supervisor import budgets as budget_mod
 from lib.supervisor import endpoints as endpoints_mod
 from lib.supervisor import ledger as ledger_mod
 from lib.supervisor import lock as lock_mod
+from lib.supervisor import model_policy as model_policy_mod
+from lib.supervisor import session_bridge as session_bridge_mod
 
 ENV_STATE_FILE = "OPSX_SUPERVISOR_STATE_FILE"
+ENV_SERVER_COMMAND = "OPSX_SESSION_SERVER_COMMAND"
 
 
 def state_file_configured() -> bool:
@@ -798,12 +806,41 @@ class ServiceEndpointHost:
     service_allowed_uids: frozenset[int]
     operator_socket: Path
     worker_socket: Path
+    primary_session: "PrimarySessionRuntime | None" = None
     _listeners: dict[str, Any] = None  # type: ignore[assignment]
     _stopped: bool = False
 
     def __post_init__(self) -> None:
         if self._listeners is None:
             self._listeners = {}
+
+    def start_primary_session(
+        self,
+        *,
+        title: str | None = None,
+        agent: str | None = None,
+        model: Mapping[str, Any] | None = None,
+        launcher: Any = None,
+        transport_factory: Any = None,
+    ) -> "PrimarySessionRuntime":
+        """Start or adopt this job's service-managed primary session.
+
+        The host owns the lifetime: it records the linkage, keeps the runtime,
+        and tears it down on :meth:`close`. A second call returns the existing
+        runtime (a service owns one primary session per job).
+        """
+        if self.primary_session is not None:
+            return self.primary_session
+        self.primary_session = open_primary_session(
+            Path(self.session.repo),
+            self.session,
+            title=title,
+            agent=agent,
+            model=model,
+            launcher=launcher,
+            transport_factory=transport_factory,
+        )
+        return self.primary_session
 
     def _endpoint(self, kind: str) -> Any:
         endpoints_map = {
@@ -922,6 +959,12 @@ class ServiceEndpointHost:
         self._stopped = True
 
     def close(self) -> None:
+        if self.primary_session is not None:
+            try:
+                self.primary_session.close()
+            except Exception:  # pragma: no cover - best-effort teardown
+                pass
+            self.primary_session = None
         for listener, path in self._listeners.values():
             try:
                 listener.close()
@@ -1009,12 +1052,534 @@ def _operator_allowed_uids() -> frozenset[int]:
     return frozenset({int(principals.operator.uid)})
 
 
+# ---------------------------------------------------------------------------
+# Service-owned primary session lifetime
+# ---------------------------------------------------------------------------
+
+
+def session_server_command(job_id: int | None = None) -> list[str]:
+    """Return the worker-domain headless session server command.
+
+    The service launches the headless server through this argv in the worker
+    domain; the restricted-process launcher (not a new endpoint verb) carries
+    the identity switch, keeping the endpoint tables' no-execution contract
+    intact. An operator may pin the argv explicitly through
+    ``OPSX_SESSION_SERVER_COMMAND``; otherwise the documented ``opencode
+    serve`` invocation runs, bound to a **job-specific loopback port** derived
+    deterministically from the job id so the job's server and session are
+    identifiable and adoptable after a restart.
+    """
+    configured = (os.environ.get(ENV_SERVER_COMMAND) or "").strip()
+    if configured:
+        return shlex.split(configured)
+    return [
+        "opencode", "serve", "--hostname", "127.0.0.1",
+        "--port", str(job_loopback_port(job_id)),
+    ]
+
+
+# The job-specific loopback port range: a deterministic, per-job binding in an
+# otherwise-unassigned high range, so a job's server address is reproducible
+# across service restarts (which adopt-by-lookup needs).
+LOOPBACK_PORT_BASE = 41000
+LOOPBACK_PORT_SPAN = 2000
+
+
+def job_loopback_port(job_id: int | None) -> int:
+    """Return the deterministic job-specific loopback port for *job_id*."""
+    if job_id is None:
+        return 0  # ephemeral: the server reports its own address
+    return LOOPBACK_PORT_BASE + (int(job_id) % LOOPBACK_PORT_SPAN)
+
+
+def _server_address_from_line(line: str) -> str | None:
+    """Extract a loopback ``host:port`` from a server startup line, or ``None``.
+
+    The headless server prints its bound address (``opencode server listening
+    on http://127.0.0.1:PORT``); a non-loopback or portless line is refused so
+    the bridge can never be pointed off-loopback.
+    """
+    match = re.search(r"(127\.0\.0\.1|\[::1\]|localhost):(\d+)", line or "")
+    if match is None:
+        return None
+    host, port = match.group(1), match.group(2)
+    return f"{host.strip('[]')}:{port}"
+
+
+def launch_session_server(
+    *,
+    job_id: int | None = None,
+    switch: Sequence[str] | None = None,
+    command: Sequence[str] | None = None,
+    popen_factory: Any = None,
+    boot_timeout: float = 20.0,
+    env: Mapping[str, str] | None = None,
+) -> "SessionServerProcess":
+    """Launch the job's headless session server in the worker domain.
+
+    The server runs under the worker principal exactly like any other model
+    session: the argv is prefixed with the authenticated restricted-process
+    launcher from the authority boundary, never with service-identity
+    privileges. Its process identity is journaled by the caller through the
+    normal dispatch/identity surface, so the existing fencing machinery can
+    tell a live server from a recycled PID. *job_id* selects the deterministic
+    job-specific loopback port; *popen_factory* is a test seam.
+    """
+    argv = (
+        list(command)
+        if command is not None
+        else session_server_command(job_id)
+    )
+    mechanism = list(switch) if switch is not None else authority_mod.discover_switch_mechanism(
+        authority_mod.DEFAULT_WORKER_PRINCIPAL, env=env
+    )
+    if not mechanism:
+        raise broker_mod.BrokerUnavailableError(
+            "no restricted-spawn mechanism is available to launch the headless "
+            f"session server under the worker principal "
+            f"'{authority_mod.DEFAULT_WORKER_PRINCIPAL}'; refusing to run a "
+            "model session with service-identity privileges"
+        )
+    mechanism = authority_mod.canonical_switch_mechanism(mechanism)
+    full_argv = mechanism + argv
+    factory = popen_factory or subprocess.Popen
+
+    def spawner(argv: Sequence[str]) -> Any:
+        return factory(
+            list(argv), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+
+    try:
+        process = spawner(full_argv)
+    except Exception as exc:  # noqa: BLE001 - every spawn failure is named
+        raise broker_mod.BrokerUnavailableError(
+            f"the headless session server could not be started in the worker "
+            f"domain: {exc}"
+        ) from exc
+    server = SessionServerProcess(
+        process=process, command=tuple(full_argv), worker_command=tuple(argv)
+    )
+    try:
+        server.await_address(timeout=boot_timeout)
+    except Exception:
+        server.terminate()
+        raise
+    return server
+
+
+@dataclass
+class SessionServerProcess:
+    """A service-owned headless session server running in the worker domain."""
+
+    process: Any
+    command: tuple[str, ...]
+    worker_command: tuple[str, ...]
+    address: str | None = None
+    _reader: Any = None
+
+    @property
+    def pid(self) -> int:
+        return int(self.process.pid)
+
+    @property
+    def process_identity(self) -> str:
+        """The fenceable pid + start time + boot identity of the server."""
+        return session_bridge_mod.serialize_process_identity(self.pid)
+
+    def await_address(self, *, timeout: float = 20.0) -> str:
+        """Read the server's bound loopback address, or fail closed."""
+        if self.address is not None:
+            return self.address
+        stream = getattr(self.process, "stdout", None)
+        if stream is None:
+            raise broker_mod.BrokerUnavailableError(
+                "the headless session server exposes no startup stream; its "
+                "loopback address cannot be established"
+            )
+        deadline = time.monotonic() + float(timeout)
+        while time.monotonic() < deadline:
+            line = stream.readline()
+            if not line:
+                break
+            address = _server_address_from_line(line)
+            if address is not None:
+                self.address = address
+                return address
+        raise broker_mod.BrokerUnavailableError(
+            "the headless session server did not report a loopback address "
+            "before the startup timeout; refusing to adopt an unaddressed session"
+        )
+
+    def terminate(self) -> None:
+        try:
+            self.process.terminate()
+        except Exception:  # pragma: no cover - best-effort termination
+            pass
+
+
+def open_primary_session(
+    repo: Path,
+    session: "ServiceSession",
+    *,
+    title: str | None = None,
+    agent: str | None = None,
+    model: Mapping[str, Any] | None = None,
+    launcher: Any = None,
+    transport_factory: Any = None,
+    deliver_briefing: bool = True,
+    briefing_max_attempts: int = budget_mod.BACKOFF_MAX_ATTEMPTS,
+) -> "PrimarySessionRuntime":
+    """Start or adopt the job's service-managed primary session.
+
+    Adopt-by-lookup runs first: when the job's recorded primary session linkage
+    resolves through lookup on the recorded server, the live session is adopted
+    (and receives a bounded re-brief) instead of a replacement being launched.
+    Only when lookup shows the session is gone does a replacement server and
+    session get created from a full bounded briefing. Either way the linkage is
+    journaled, so an operator's interactive chat starts or attaches to the same
+    service-managed session.
+
+    The returned runtime drives every primary prompt through a
+    :class:`~lib.supervisor.session_bridge.JournaledSessionBridge` built from
+    the recorded policy and the headless server's process identity: the prompt
+    intent (with its request identity) is journaled before the server request,
+    a supervisor-role budget reservation is committed first, a dispatch record
+    binds the session and server process identity, and observed usage is
+    reconciled after the terminal result. The bounded full/rebrief briefing is
+    dispatched through that same bridge before the runtime is returned, so the
+    managed session is actually briefed rather than merely describing one.
+    """
+    ledger = session.ledger
+    job_id = int(session.job_id)
+    change_id = session_change_id(session)
+    try:
+        run_id = str(ledger.get_job(job_id)["run_id"])
+    except Exception:  # noqa: BLE001 - a missing job row is durable-state absence
+        run_id = str(job_id)
+    try:
+        policy = ledger.current_policy(job_id)
+    except Exception:  # noqa: BLE001 - absent policy is durable-state absence
+        policy = None
+    prompt_plan = _supervisor_prompt_plan(repo, policy)
+    transport_factory = transport_factory or session_bridge_mod.LoopbackTransport.from_address
+    if linkage := session_bridge_mod.primary_session_linkage(ledger, job_id):
+        transport = None
+        try:
+            transport = transport_factory(linkage.server_address)
+            bridge = session_bridge_mod.SessionBridge(transport)
+            bridge.check_capability()
+            live = bridge.lookup_session(linkage.session_id)
+        except session_bridge_mod.SessionBridgeError:
+            live = None
+        if live is not None:
+            briefing = session_bridge_mod.compose_briefing(
+                ledger, job_id, mode="rebrief",
+                change_id=change_id,
+            )
+            runtime = PrimarySessionRuntime(
+                bridge=bridge,
+                session_id=linkage.session_id,
+                server_address=linkage.server_address,
+                adopted=True,
+                briefing=briefing,
+                linkage=linkage,
+                journaled=_journaled_session_bridge(
+                    ledger, job_id, run_id, bridge,
+                    policy=policy,
+                    process_id=linkage.process_id,
+                    change_id=change_id,
+                ),
+                prompt_plan=prompt_plan,
+            )
+            try:
+                _apply_briefing(
+                    runtime,
+                    model=model,
+                    agent=agent,
+                    max_attempts=briefing_max_attempts,
+                    enabled=deliver_briefing,
+                )
+            except Exception:
+                # An adopted session that cannot receive its re-brief is not
+                # handed back half-briefed; its probe connection is released.
+                runtime.close()
+                raise
+            return runtime
+        # Lookup showed the session is gone: the probe connection is not the
+        # adopted runtime, so it is released before a replacement is launched.
+        if transport is not None:
+            try:
+                transport.close()
+            except Exception:  # pragma: no cover - best-effort close
+                pass
+    server_launcher = launcher or (
+        lambda: launch_session_server(job_id=job_id)
+    )
+    server = server_launcher()
+    try:
+        transport = transport_factory(server.address)
+        bridge = session_bridge_mod.SessionBridge(transport)
+        bridge.check_capability()
+        created = bridge.create_session(title=title, agent=agent, model=model)
+        session_id = str(created["id"])
+    except Exception:
+        try:
+            server.terminate()
+        except Exception:  # pragma: no cover - best-effort cleanup
+            pass
+        raise
+    briefing = session_bridge_mod.compose_briefing(
+        ledger, job_id, mode="full", change_id=change_id
+    )
+    linkage = session_bridge_mod.record_primary_session_linkage(
+        ledger,
+        job_id,
+        run_id=run_id,
+        server_address=str(server.address),
+        session_id=session_id,
+        process_id=server.process_identity,
+    )
+    runtime = PrimarySessionRuntime(
+        bridge=bridge,
+        session_id=session_id,
+        server_address=str(server.address),
+        adopted=False,
+        briefing=briefing,
+        linkage=linkage,
+        journaled=_journaled_session_bridge(
+            ledger, job_id, run_id, bridge,
+            policy=policy,
+            process_id=server.process_identity,
+            change_id=change_id,
+        ),
+        prompt_plan=prompt_plan,
+        server=server,
+    )
+    try:
+        _apply_briefing(
+            runtime,
+            model=model,
+            agent=agent,
+            max_attempts=briefing_max_attempts,
+            enabled=deliver_briefing,
+        )
+    except Exception:
+        # A replacement whose briefing cannot be dispatched is not a usable
+        # primary: tear the server down rather than returning a session that
+        # was never briefed (and would leak a headless server).
+        runtime.close()
+        raise
+    return runtime
+
+
+def _journaled_session_bridge(
+    ledger: Any,
+    job_id: int,
+    run_id: str,
+    bridge: Any,
+    *,
+    policy: Mapping[str, Any] | None,
+    process_id: str | None,
+    change_id: str | None,
+) -> Any:
+    """Build the journaled bridge that owns every primary prompt lifecycle."""
+    return session_bridge_mod.JournaledSessionBridge(
+        bridge,
+        ledger,
+        job_id=int(job_id),
+        run_id=str(run_id),
+        policy=policy,
+        process_id=process_id,
+        change_id=change_id,
+    )
+
+
+def _supervisor_prompt_plan(
+    repo: Path, policy: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    """Return the supervisor-primary reserve/dispatch plan, or an empty plan.
+
+    With a recorded policy the plan carries the reserved cost estimate and the
+    pricing-catalog version (computed exactly as the dispatch boundary does,
+    through the pricing catalog), plus the pinned supervisor model translated
+    to the server's ``{providerID, modelID}`` shape. A policy whose supervisor
+    pin cannot be priced blocks the session rather than prompting unbudgeted.
+    Without a recorded policy there is nothing to reserve against, so the plan
+    is empty and no reservation is written.
+    """
+    if not isinstance(policy, Mapping):
+        return {}
+    try:
+        from lib.orchestrator import cost as cost_mod
+
+        estimate, catalog_version = cost_mod.reservation_estimate_for_dispatch(
+            Path(repo), policy, model_policy_mod.SUPERVISOR_ROLE
+        )
+        pinned = cost_mod.pinned_model_for_role(
+            policy, model_policy_mod.SUPERVISOR_ROLE
+        )
+    except Exception as exc:  # noqa: BLE001 - every failure is a named blocker
+        raise broker_mod.BrokerUnavailableError(
+            "the supervisor-primary prompt cannot be budgeted before dispatch: "
+            f"{type(exc).__name__}: {exc}; operator action required: qualify the "
+            "supervisor role's pinned model in the pricing catalog, then record "
+            "an updated policy revision"
+        ) from exc
+    return {
+        "reserved_cost_usd": float(estimate),
+        "reserved_elapsed_minutes": 0.0,
+        "pricing_catalog_version": catalog_version,
+        "model": session_bridge_mod.parse_model_identity(pinned) if pinned else None,
+    }
+
+
+def _apply_briefing(
+    runtime: "PrimarySessionRuntime",
+    *,
+    model: Mapping[str, Any] | None,
+    agent: str | None,
+    max_attempts: int,
+    enabled: bool,
+) -> Any:
+    """Dispatch the bounded full/rebrief text to the managed session.
+
+    The briefing is a supervised primary prompt like any other: it is
+    journaled (identity before the server request), reserved, dispatched with
+    the session/process identity, and reconciled from polled usage.
+    """
+    if not enabled or runtime.journaled is None:
+        return None
+    return runtime.dispatch_prompt(
+        runtime.briefing.render(),
+        stage="briefing",
+        model=model,
+        agent=agent,
+        max_attempts=max_attempts,
+    )
+
+
+def session_change_id(session: "ServiceSession") -> str | None:
+    """Return the single registered change id for the job, or ``None``.
+
+    A job's protected snapshot membership is the authority; when exactly one
+    change is registered its gate state belongs in the briefing. Multiple or
+    unreadable membership yields ``None`` (no gate line) rather than guessing.
+    """
+    try:
+        snapshot = broker_mod.load_protected_snapshot(session.ledger, session.job_id)
+        change_ids = broker_mod.snapshot_change_ids(snapshot)
+    except Exception:  # noqa: BLE001 - absent snapshot is durable-state absence
+        return None
+    return change_ids[0] if len(change_ids) == 1 else None
+
+
+@dataclass
+class PrimarySessionRuntime:
+    """The service-managed primary session: bridge, identity, and briefing."""
+
+    bridge: Any
+    session_id: str
+    server_address: str
+    adopted: bool
+    briefing: Any
+    linkage: Any
+    server: Any = None
+    journaled: Any = None
+    prompt_plan: dict[str, Any] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.prompt_plan is None:
+            self.prompt_plan = {}
+
+    def dispatch_prompt(
+        self,
+        text: str,
+        *,
+        stage: str = "primary",
+        round_num: int | None = None,
+        model: Mapping[str, Any] | None = None,
+        agent: str | None = None,
+        max_attempts: int = budget_mod.BACKOFF_MAX_ATTEMPTS,
+        sleep: Any = None,
+    ) -> dict[str, Any]:
+        """Dispatch one primary prompt through the journaled bridge.
+
+        Every side effect goes through the journal lane: the intent carrying
+        the request identity is committed before the server request, the
+        supervisor-role reservation is committed first, the dispatch record
+        binds the session and server process identity, and the observed usage
+        is reconciled from the polled terminal result. A lost acknowledgement
+        is recovered by lookup, never by re-prompting.
+        """
+        if self.journaled is None:
+            raise broker_mod.BrokerUnavailableError(
+                "the primary session has no journaled session bridge; refusing "
+                "to prompt a supervised primary outside the action journal"
+            )
+        plan = self.prompt_plan or {}
+        reserved_cost = plan.get("reserved_cost_usd")
+        identity = self.journaled.prompt(
+            self.session_id,
+            text=text,
+            stage=stage,
+            round_num=round_num,
+            role=model_policy_mod.SUPERVISOR_ROLE,
+            model=model if model is not None else plan.get("model"),
+            agent=agent,
+            reserved_cost_usd=reserved_cost,
+            reserved_elapsed_minutes=float(
+                plan.get("reserved_elapsed_minutes") or 0.0
+            ),
+            pricing_catalog_version=plan.get("pricing_catalog_version"),
+        )
+        kwargs: dict[str, Any] = {"max_attempts": max_attempts}
+        if sleep is not None:
+            kwargs["sleep"] = sleep
+        if not identity.acknowledged:
+            recovery = self.journaled.recover_lost_ack(identity, **kwargs)
+            return {
+                "identity": identity,
+                "result": recovery["result"],
+                "reconciled": recovery["reconciled"],
+                "terminal": recovery.get("terminal", recovery["reconciled"]),
+                "duplicate_prompt_issued": recovery["duplicate_prompt_issued"],
+            }
+        result = session_bridge_mod.poll_until_terminal(
+            self.bridge, self.session_id, marker=identity.request_id, **kwargs
+        )
+        outcome = self.journaled.resolve(identity, result=result)
+        return {
+            "identity": identity,
+            "result": result,
+            "outcome": outcome,
+            "reconciled": outcome != "uncertain",
+            "duplicate_prompt_issued": False,
+        }
+
+    def close(self) -> None:
+        try:
+            self.bridge.transport.close()
+        except Exception:  # pragma: no cover - best-effort close
+            pass
+        if self.server is not None:
+            self.server.terminate()
+
+    def __enter__(self) -> "PrimarySessionRuntime":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+
 __all__ = [
+    "ENV_SERVER_COMMAND",
     "ENV_STATE_FILE",
     "OPERATOR_SOCKET_ENV",
+    "PrimarySessionRuntime",
     "Registration",
     "ServiceEndpointHost",
     "ServiceSession",
+    "SessionServerProcess",
     "WORKER_SOCKET_ENV",
     "call_operator",
     "call_worker_actions",
@@ -1022,7 +1587,9 @@ __all__ = [
     "in_supervised_execution",
     "install_projection_writer",
     "is_registered",
+    "launch_session_server",
     "ledger_path",
+    "open_primary_session",
     "open_registration",
     "open_service_host",
     "open_service_session",
@@ -1030,6 +1597,8 @@ __all__ = [
     "project_broker_state",
     "require_supervised_authorization",
     "service_socket_path",
+    "session_change_id",
+    "session_server_command",
     "set_transport",
     "state_file_configured",
 ]

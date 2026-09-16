@@ -374,7 +374,11 @@ importable `lib/orchestrator/` package alongside the existing `lib/metrics`,
   `resolve_plan`, and the rest of the plan-resolution closure). Depends on
   `base`.
 - `lib/orchestrator/cost.py` — `estimate_stage_cost` and its pricing-catalog
-  helpers. Depends on `base`.
+  helpers, plus the pre-dispatch reservation estimate derived from a role's
+  pinned model (`pinned_model_for_role`, `reservation_estimate_for_dispatch`)
+  that both the journal dispatch boundary and the supervision service resolve
+  through. Depends on `base` and the supervisor budget primitive
+  (`lib.supervisor.budgets`, for the pure `reservation_estimate`).
 - `lib/orchestrator/groundtruth.py` — `git`, `change_dir`, archive-locating
   helpers, `verify_change_*`, `run_fast_checks`, and tracked-worktree helpers.
   Depends on `base`.

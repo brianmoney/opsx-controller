@@ -322,3 +322,33 @@ If validation fails, the command SHALL exit with a clear error and SHALL NOT rep
 #### Scenario: Invalid generated TOML is rejected
 - **WHEN** the selected client returns malformed TOML or a manifest with invalid dependency references
 - **THEN** `opsx-plan compile` exits with a validation error and does not report the manifest as compiled
+
+### Requirement: Supervised primary sessions are driven through the service-managed session bridge
+
+For a registered supervised job executing under the OpenCode adapter, the
+frontier primary session SHALL be created, prompted, looked up, and aborted
+through the service-managed session bridge against the job's headless session
+server; the primary SHALL NOT be executed as a one-shot `opencode run`
+subprocess. Stage workers — implement, review, archive, and create — SHALL
+continue to use the existing direct-dispatch path under the action journal.
+
+#### Scenario: The primary uses the bridge while stages keep direct dispatch
+
+- **WHEN** a supervised OpenCode job engages its primary session and then
+  dispatches a stage worker
+- **THEN** the primary session is a service-managed headless session driven
+  through the session bridge, and the stage worker is dispatched through the
+  existing direct path with no change to its invocation
+
+### Requirement: Non-supervised OpenCode runs keep direct dispatch
+
+An unregistered, non-supervised OpenCode run SHALL behave exactly as before:
+one-shot direct dispatch for every stage, with no headless session server
+started, no session bridge traffic, and no new runtime dependency.
+
+#### Scenario: A legacy run is unchanged with the bridge installed
+
+- **WHEN** an ordinary, unregistered plan run executes in a repository where
+  the session bridge is installed
+- **THEN** every stage dispatches exactly as before and no headless session
+  server is started for the run

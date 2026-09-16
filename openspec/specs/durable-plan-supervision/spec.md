@@ -1729,3 +1729,207 @@ worker is bound to.
   different job
 - **THEN** the write is refused with a named authorization error and the
   target action is unchanged
+
+### Requirement: The session bridge exposes a documented, version-checked session API
+
+The supervision service SHALL drive the supervised primary session through a
+documented, versioned session bridge API with five operations — create,
+prompt, result-schema, lookup, and abort — backed by a headless session
+server. Before any session operation, the bridge SHALL perform a version
+capability check against the server's reported version and SHALL fail closed
+with a named unsupported-version error when the server does not satisfy the
+documented supported range. No session operation SHALL be attempted against an
+unchecked or unsupported server, and the bridge SHALL NOT depend on any server
+surface outside the documented subset.
+
+The typed result returned by a prompt SHALL be defined by the documented
+result-schema and SHALL be derived from authoritative session state, never
+from the streamed event channel.
+
+#### Scenario: The version capability check gates first use
+
+- **WHEN** the bridge connects to a session server whose reported version is
+  outside the documented supported range
+- **THEN** the bridge refuses with a named unsupported-version error and
+  issues no create, prompt, lookup, or abort request
+
+#### Scenario: An unchecked server is never used
+
+- **WHEN** any bridge operation is requested before the version capability
+  check has succeeded
+- **THEN** the operation is refused with a named error and no server request
+  is issued
+
+#### Scenario: Prompt results follow the documented result-schema
+
+- **WHEN** a prompted session reaches a terminal state
+- **THEN** the bridge returns the typed result defined by the documented
+  result-schema, derived from polled authoritative session state
+
+### Requirement: The service owns supervised primary session lifetime
+
+For a registered supervised job, the service SHALL own the primary session's
+lifetime: it SHALL launch the headless session in the worker domain, record
+the session identity against the job, and on restart SHALL attempt to adopt
+the existing session through lookup before creating a new one. An operator's
+interactive chat SHALL start or attach to the same service-managed session via
+the primary session linkage recorded at registration, so the human and the
+supervised job share one authoritative conversation.
+
+The headless session process SHALL run in the worker domain: the service owns,
+observes, and re-briefs the session, but no model session — including the
+frontier primary — runs with service-identity privileges.
+
+#### Scenario: A restart adopts the live session by lookup
+
+- **WHEN** the service restarts while a job's headless session is still live
+- **THEN** it resolves the job's recorded session identity through lookup and
+  adopts that session rather than spawning a replacement
+
+#### Scenario: An interactive chat attaches to the managed session
+
+- **WHEN** an operator opens an interactive chat for a supervised job
+- **THEN** the chat starts or attaches to the service-managed primary session
+  via the recorded primary session linkage rather than a divergent private
+  session
+
+#### Scenario: The headless session is confined to the worker domain
+
+- **WHEN** the headless session process executes under supervision
+- **THEN** it runs under the worker identity with no service-identity
+  privileges, exactly like any other model session
+
+### Requirement: The session bridge operates over the action journal
+
+Every bridge operation that can cause a model side effect SHALL be a journaled
+supervised action: action intent committed in its own transaction before any
+server request, a dispatch record carrying the session identity and the
+headless server's process identity, and a terminal outcome or an explicit
+uncertain mark with recorded evidence. Session events SHALL be reconciled
+against the journal: an event is never recorded as an outcome without a
+journaled action it reconciles.
+
+For an unregistered legacy run, the bridge SHALL create no journal records and
+introduce no ledger dependency.
+
+#### Scenario: A prompt is journaled end to end
+
+- **WHEN** the bridge prompts the supervised primary session
+- **THEN** the ledger holds the intent committed before the server request, a
+  dispatch record bound to the session identity and the server process
+  identity, and a terminal or explicitly uncertain outcome with evidence once
+  the prompt resolves
+
+#### Scenario: An orphan event is never an outcome
+
+- **WHEN** a session event arrives that matches no journaled action
+- **THEN** it is treated as a hint and recorded at most as evidence, never as
+  an action outcome
+
+#### Scenario: A legacy run creates no bridge records
+
+- **WHEN** an ordinary, unregistered plan run executes with the bridge
+  installed
+- **THEN** its execution is unchanged and the supervisor ledger contains no
+  bridge actions for that run
+
+### Requirement: Request and action identities are journaled before prompt side effects
+
+Before issuing a prompt, the bridge SHALL record the action identity and a
+discoverable request identity in the journal, and SHALL carry the request
+identity into the session so it remains discoverable through the lookup
+operation afterward. A lost launch acknowledgement SHALL be resolved by
+lookup against the recorded request identity — recovering the real prompt's
+state — rather than by blindly re-prompting, and a recovered prompt SHALL
+reconcile the existing action instead of creating a duplicate dispatch.
+
+#### Scenario: Identities are durable before the side effect
+
+- **WHEN** the process is interrupted after the identities are recorded but
+  before the prompt request completes
+- **THEN** the reopened ledger contains the action identity and the request
+  identity for that prompt
+
+#### Scenario: A lost acknowledgement is recovered by lookup
+
+- **WHEN** a prompt's acknowledgement is lost after the server accepted the
+  prompt
+- **THEN** the bridge discovers the in-flight prompt through lookup using the
+  recorded request identity and reconciles the existing action rather than
+  issuing a second prompt
+
+### Requirement: Streamed session events are hints reconciled against authoritative session state
+
+The bridge SHALL treat the streamed session event channel as hints only: no
+event SHALL be trusted as an outcome, and every hint SHALL be confirmed by
+polling authoritative session state. The bridge SHALL tolerate lost,
+duplicate, and out-of-order events and SHALL NOT depend on event replay: when
+the stream is disconnected, delivers duplicates, or cannot supply events
+missed during a gap, the bridge SHALL converge on the same authoritative state
+by polling.
+
+#### Scenario: A duplicate event is applied once
+
+- **WHEN** the same session event is delivered more than once
+- **THEN** the duplicate is recognized and no duplicate outcome, evidence, or
+  billing is recorded
+
+#### Scenario: A lost stream falls back to polling
+
+- **WHEN** the event stream disconnects while a prompt is in flight
+- **THEN** the bridge determines the prompt's outcome by polling authoritative
+  session state
+
+#### Scenario: Missed events are never replayed or assumed
+
+- **WHEN** a reconnected stream cannot supply the events missed during the
+  disconnection
+- **THEN** the bridge polls authoritative session state rather than requesting
+  replay or assuming the missed events' contents
+
+### Requirement: Reconnect briefing is composed from the authority store and the ledger
+
+When the service reconnects to an adopted session or starts a new bounded
+briefing, the briefing content SHALL be derived from the authority store, the
+ledger, active and uncertain actions, budget state, and previous failed
+remedies — not from transcript-only replay. The briefing SHALL be explicitly
+bounded, and an unreconciled uncertain action SHALL be presented as blocking
+state rather than summarized away.
+
+#### Scenario: A restarted session is briefed from durable state
+
+- **WHEN** a primary session is briefed after a service restart
+- **THEN** the briefing content is composed from journaled job, action,
+  incident, budget, and authority records rather than a transcript replay
+
+#### Scenario: The briefing stays within its bound
+
+- **WHEN** the derived briefing context exceeds the documented bound
+- **THEN** the briefing is reduced according to the documented bounding rule
+  rather than growing without limit
+
+#### Scenario: An uncertain action blocks in the briefing
+
+- **WHEN** an unreconciled uncertain action exists at briefing time
+- **THEN** the briefing presents it as blocking state
+
+### Requirement: Supervisor primary usage flows through the budget reserve and reconcile boundary
+
+Every supervisor-primary prompt SHALL reserve budget through the existing
+reservation boundary before the prompt side effect and SHALL reconcile
+observed usage afterward through the same boundary as any other supervised
+model call. An interrupted or unknown-usage prompt SHALL retain its
+reservation rather than releasing it. The bridge SHALL introduce no separate
+accounting path for the primary session.
+
+#### Scenario: A reservation exists before the prompt side effect
+
+- **WHEN** a supervisor-primary prompt is dispatched
+- **THEN** a budget reservation for the supervisor role is committed before
+  the server request is issued
+
+#### Scenario: An interrupted prompt retains its reservation
+
+- **WHEN** a prompt's usage cannot be observed after an interruption
+- **THEN** the reservation is retained as unknown or interrupted usage per the
+  budget contract rather than released

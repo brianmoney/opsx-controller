@@ -4076,6 +4076,13 @@ def main() -> int:
         "--timeout", type=float, default=30.0,
         help="seconds to wait for a request with --once (default: 30)",
     )
+    p_supervise_serve.add_argument(
+        "--primary-session", action="store_true", dest="primary_session",
+        help=(
+            "start or adopt the job's service-managed primary session (headless "
+            "server in the worker domain, adopt-by-lookup on restart)"
+        ),
+    )
     p_supervise_serve.set_defaults(fn=cmd_supervise.cmd_supervise_serve)
 
     p_logs = sub.add_parser(
