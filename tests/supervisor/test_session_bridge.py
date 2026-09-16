@@ -417,6 +417,19 @@ def _policy(*, total_cost_usd: float = 100.0) -> dict:
     }
 
 
+# The exact pin every role carries in `_selection()`, in the server's
+# {providerID, modelID} shape. Every supervised prompt must carry it: the
+# model-pin refusals themselves are covered in test_agent_contracts, while
+# these lifecycle tests supply the pin so the prompt can dispatch.
+_PINNED_MODEL = {"providerID": "openai", "modelID": "gpt-4o"}
+
+
+def _pinned_prompt(journaled,*args, **kwargs):
+    """Prompt the journaled bridge with the role's exact pinned model."""
+    kwargs.setdefault("model", _PINNED_MODEL)
+    return journaled.prompt(*args, **kwargs)
+
+
 class BridgeTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -704,7 +717,7 @@ class IdentityBeforePromptTests(BridgeTestCase):
                 return original(session_id, **kwargs)
 
             journaled.bridge.prompt_async = spy
-            identity = journaled.prompt(session["id"], text="hello")
+            identity = _pinned_prompt(journaled,session["id"], text="hello")
         request_id, state = seen[0]
         self.assertEqual(request_id, identity.request_id)
         self.assertEqual(state, "dispatched")
@@ -720,7 +733,7 @@ class IdentityBeforePromptTests(BridgeTestCase):
             server.state.drop_ack_once = True
             journaled = self.journaled(server)
             session = journaled.bridge.create_session(title="lost")
-            identity = journaled.prompt(
+            identity = _pinned_prompt(journaled,
                 session["id"], text="lost-ack",
                 reserved_cost_usd=1.0, reserved_elapsed_minutes=0.5,
             )
@@ -747,7 +760,7 @@ class IdentityBeforePromptTests(BridgeTestCase):
                 server.state.drop_ack_once = True
                 journaled = self.journaled(server)
                 session = journaled.bridge.create_session(title="confirmed-pending")
-                identity = journaled.prompt(
+                identity = _pinned_prompt(journaled,
                     session["id"], text="still running",
                     reserved_cost_usd=1.0, reserved_elapsed_minutes=0.5,
                 )
@@ -767,7 +780,7 @@ class IdentityBeforePromptTests(BridgeTestCase):
                     "a pending poll must not reconcile the action out of the guard",
                 )
                 with self.assertRaises(bridge_mod.PromptInFlightError):
-                    journaled.prompt(session["id"], text="second")
+                    _pinned_prompt(journaled,session["id"], text="second")
                 self.assertEqual(
                     len(server.state.prompt_calls), 1,
                     "no second prompt may be issued while the first is unresolved",
@@ -819,7 +832,7 @@ class IdentityBeforePromptTests(BridgeTestCase):
             # the acknowledgement is dropped, so its marker is undiscoverable.
             server.state.drop_ack_once = True
             server.state.hold_prompt_record = True
-            identity = journaled.prompt(
+            identity = _pinned_prompt(journaled,
                 session["id"], text="delayed after prior",
                 reserved_cost_usd=1.0, reserved_elapsed_minutes=0.5,
             )
@@ -843,7 +856,7 @@ class IdentityBeforePromptTests(BridgeTestCase):
                 "an unresolved prompt must stay in the in-flight guard",
             )
             with self.assertRaises(bridge_mod.PromptInFlightError):
-                journaled.prompt(session["id"], text="second")
+                _pinned_prompt(journaled,session["id"], text="second")
             self.assertEqual(
                 len(server.state.prompt_calls), 1,
                 "the undiscoverable prompt must never be re-issued",
@@ -880,7 +893,7 @@ class IdentityBeforePromptTests(BridgeTestCase):
             server.state.hold_prompt_record = True
             journaled = self.journaled(server)
             session = journaled.bridge.create_session(title="undiscoverable")
-            identity = journaled.prompt(
+            identity = _pinned_prompt(journaled,
                 session["id"], text="delayed",
                 reserved_cost_usd=2.0, reserved_elapsed_minutes=0.5,
             )
@@ -898,7 +911,7 @@ class IdentityBeforePromptTests(BridgeTestCase):
                 self.ledger.get_action(identity.action_id)["state"], "uncertain",
             )
             with self.assertRaises(bridge_mod.PromptInFlightError):
-                journaled.prompt(session["id"], text="second")
+                _pinned_prompt(journaled,session["id"], text="second")
             self.assertEqual(len(server.state.prompt_calls), 1)
             reservation = self.ledger.reservation_for_action(identity.action_id)
             self.assertEqual(
@@ -931,10 +944,10 @@ class IdentityBeforePromptTests(BridgeTestCase):
         with FakeOpencodeServer() as server:
             journaled = self.journaled(server)
             session = journaled.bridge.create_session(title="serial")
-            first = journaled.prompt(session["id"], text="one")
+            first = _pinned_prompt(journaled,session["id"], text="one")
             self.assertTrue(first.acknowledged)
             with self.assertRaises(bridge_mod.PromptInFlightError):
-                journaled.prompt(session["id"], text="two")
+                _pinned_prompt(journaled,session["id"], text="two")
         self.assertEqual(len(server.state.prompt_calls), 1)
 
     def test_prompt_dispatch_identity_binds_session_and_process(self) -> None:
@@ -942,7 +955,7 @@ class IdentityBeforePromptTests(BridgeTestCase):
             identity_process = bridge_mod.serialize_process_identity(os.getpid())
             journaled = self.journaled(server, process_id=identity_process)
             session = journaled.bridge.create_session(title="bind")
-            identity = journaled.prompt(session["id"], text="bind me")
+            identity = _pinned_prompt(journaled,session["id"], text="bind me")
         dispatch = self.ledger.latest_dispatch(identity.action_id)
         self.assertEqual(dispatch["session_id"], session["id"])
         self.assertEqual(dispatch["process_id"], identity_process)
@@ -955,7 +968,7 @@ class IdentityBeforePromptTests(BridgeTestCase):
         with FakeOpencodeServer() as server:
             journaled = self.journaled(server)
             session = journaled.bridge.create_session(title="resolve")
-            identity = journaled.prompt(session["id"], text="resolve")
+            identity = _pinned_prompt(journaled,session["id"], text="resolve")
             result = journaled.bridge.result(session["id"], marker=identity.request_id)
             self.assertEqual(journaled.resolve(identity, result=result), "completed")
             self.assertEqual(journaled.resolve(identity, result=result), "completed")
@@ -1684,7 +1697,7 @@ class EventHintTests(BridgeTestCase):
         with FakeOpencodeServer() as server:
             journaled = self.journaled(server)
             session = journaled.bridge.create_session(title="hints")
-            identity = journaled.prompt(session["id"], text="hint me")
+            identity = _pinned_prompt(journaled,session["id"], text="hint me")
             hint = bridge_mod.SessionEventHint(
                 event_id="evt_m", kind="message.updated",
                 session_id=session["id"], message_id="msg_1",
@@ -1719,7 +1732,7 @@ class EventHintTests(BridgeTestCase):
         with FakeOpencodeServer() as server:
             journaled = self.journaled(server)
             session = journaled.bridge.create_session(title="loss")
-            identity = journaled.prompt(session["id"], text="loss")
+            identity = _pinned_prompt(journaled,session["id"], text="loss")
             old = os.environ.get("FAKE_EVENT_SCRIPT")
             os.environ["FAKE_EVENT_SCRIPT"] = json.dumps(
                 [
@@ -1789,7 +1802,7 @@ class BudgetRoutingTests(BridgeTestCase):
                 return original(session_id, **kwargs)
 
             journaled.bridge.prompt_async = spy
-            identity = journaled.prompt(
+            identity = _pinned_prompt(journaled,
                 session["id"], text="budget",
                 reserved_cost_usd=1.0, reserved_elapsed_minutes=0.5,
             )
@@ -1802,7 +1815,7 @@ class BudgetRoutingTests(BridgeTestCase):
         with FakeOpencodeServer() as server:
             journaled = self.journaled(server)
             session = journaled.bridge.create_session(title="reconcile")
-            identity = journaled.prompt(
+            identity = _pinned_prompt(journaled,
                 session["id"], text="reconcile",
                 reserved_cost_usd=1.0, reserved_elapsed_minutes=0.5,
             )
@@ -1820,7 +1833,7 @@ class BudgetRoutingTests(BridgeTestCase):
         with FakeOpencodeServer() as server:
             journaled = self.journaled(server)
             session = journaled.bridge.create_session(title="double")
-            identity = journaled.prompt(
+            identity = _pinned_prompt(journaled,
                 session["id"], text="double",
                 reserved_cost_usd=1.0, reserved_elapsed_minutes=0.5,
             )
@@ -1840,7 +1853,7 @@ class BudgetRoutingTests(BridgeTestCase):
         with FakeOpencodeServer() as server:
             journaled = self.journaled(server)
             session = journaled.bridge.create_session(title="retain")
-            identity = journaled.prompt(
+            identity = _pinned_prompt(journaled,
                 session["id"], text="retain",
                 reserved_cost_usd=2.0, reserved_elapsed_minutes=0.5,
             )
@@ -1858,7 +1871,7 @@ class BudgetRoutingTests(BridgeTestCase):
             bridge = self.make_bridge(server)
             journaled = self.journaled(server)
             session = bridge.create_session(title="unknown")
-            identity = journaled.prompt(
+            identity = _pinned_prompt(journaled,
                 session["id"], text="unknown",
                 reserved_cost_usd=1.5, reserved_elapsed_minutes=0.5,
             )
@@ -1898,7 +1911,7 @@ class JournalDisciplineTests(BridgeTestCase):
         with FakeOpencodeServer() as server:
             journaled = self.journaled(server)
             session = journaled.bridge.create_session(title="vocab")
-            identity = journaled.prompt(session["id"], text="vocab")
+            identity = _pinned_prompt(journaled,session["id"], text="vocab")
             result = journaled.bridge.result(session["id"], marker=identity.request_id)
             journaled.resolve(identity, result=result)
         action = self.ledger.get_action(identity.action_id)
@@ -1923,7 +1936,7 @@ class JournalDisciplineTests(BridgeTestCase):
         with FakeOpencodeServer() as server:
             journaled = self.journaled(server)
             session = journaled.bridge.create_session(title="fail")
-            identity = journaled.prompt(session["id"], text="fail")
+            identity = _pinned_prompt(journaled,session["id"], text="fail")
             # Simulate a lost ack so the action becomes uncertain, then resolve
             # it to a confirmed failure through evidence + reconciliation.
             self.ledger.mark_uncertain(identity.action_id)

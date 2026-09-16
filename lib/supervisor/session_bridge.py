@@ -1231,6 +1231,18 @@ class JournaledSessionBridge:
         # the isolated-transport decision to the launched server rather than to
         # a bare loopback hostname.
         self.server_identity = server_identity
+        # Immutable service-owned transport authority: the launched server's
+        # fenceable identity (captured by the service at launch) plus the
+        # address of the transport the service created. Captured once here and
+        # never rebuilt from caller input, so no prompt caller can substitute a
+        # target, address, or identity.
+        self.server_address = getattr(
+            getattr(bridge, "transport", None), "address", None
+        )
+        self.server_binding = agent_contracts_mod.capture_launched_server_binding(
+            self.server_address,
+            server_identity if server_identity is not None else process_id,
+        )
         self._now = now
 
     # -- journal queries -------------------------------------------------
@@ -1279,10 +1291,10 @@ class JournaledSessionBridge:
         before any session request: a session cannot run under a different
         agent than its registered role, and a mismatch is refused with a
         recorded ``policy_violation`` incident rather than created. A
-        caller-supplied *model* must equal the role's exact policy pin; an
-        override is refused, never substituted. Stage workers keep the existing
-        direct-dispatch path, so this method is only used for supervised
-        sessions.
+        caller-supplied *model* must normalize to the role's exact policy pin;
+        a missing, malformed, or differing model is refused, never substituted.
+        Stage workers keep the existing direct-dispatch path, so this method is
+        only used for supervised sessions.
         """
         bound_agent = agent_contracts_mod.role_agent(role)
         agent_contracts_mod.enforce_session_contract(
@@ -1292,7 +1304,8 @@ class JournaledSessionBridge:
             role=role,
             observed_agent=bound_agent,
             requested_permissions=requested_permissions,
-            requested_model=agent_contracts_mod.model_identity_string(model),
+            requested_model=model,
+            require_model=True,
             run_id=self.run_id,
         )
         return self.bridge.create_session(
@@ -1321,9 +1334,11 @@ class JournaledSessionBridge:
 
         The isolated-transport case requires the *launched* service-owned
         session server's own fenceable identity, not merely a loopback
-        address: the bridge supplies its recorded server process identity and
-        the server's reported address, so an arbitrary loopback target cannot
-        qualify.
+        address. The bridge derives that authority itself: it captures a
+        :class:`LaunchedServerBinding` from the process identity the service
+        launched and the transport the service created, and it refuses any
+        caller-supplied transport override (a ``target``, ``server_address``,
+        ``server_identity``, or ``server_binding``) rather than trusting it.
         """
         agent_contracts_mod.enforce_session_contract(
             self.ledger,
@@ -1333,16 +1348,44 @@ class JournaledSessionBridge:
             observed_agent=observed_agent,
             requested_permissions=requested_permissions,
             requested_model=requested_model,
+            require_model=True,
             run_id=self.run_id,
         )
-        config: dict[str, Any] = dict(transport_config or {})
-        address = getattr(self.bridge.transport, "address", None)
-        if "target" not in config:
-            config["target"] = address
-        if "server_address" not in config:
-            config["server_address"] = address
-        if "server_identity" not in config:
-            config["server_identity"] = self.process_id
+        overrides = sorted(
+            key
+            for key in (transport_config or {})
+            if key in agent_contracts_mod.CALLER_TRANSPORT_OVERRIDE_KEYS
+        )
+        if overrides:
+            # A caller-supplied transport target/address/identity is not
+            # authority: only the service-captured launched-server state may
+            # authorize the isolated path. Refuse before any side effect and
+            # record the refusal as the transport decision.
+            decision = agent_contracts_mod.TransportDecision(
+                enforced=False,
+                path=agent_contracts_mod.TRANSPORT_UNENFORCED,
+                detail=(
+                    "caller-supplied transport override(s) "
+                    f"{', '.join(overrides)} are not authority; the launched "
+                    "service-server identity and address are service-owned and "
+                    "immutable"
+                ),
+            )
+            self.ledger.record_evidence(
+                int(action_id),
+                kind=agent_contracts_mod.EVIDENCE_TRANSPORT_DECISION,
+                payload=decision.as_dict(),
+            )
+            raise agent_contracts_mod.EgressEnforcementError(
+                f"pre-prompt transport enforcement failed: {decision.detail}",
+                decision=decision,
+            )
+        # Service-owned binding, captured once at construction: the launched
+        # server's identity plus the address of the transport the service
+        # created. Neither is caller-overridable.
+        config: dict[str, Any] = {}
+        if self.server_binding is not None:
+            config["server_binding"] = self.server_binding
         environment = os.environ if environ is None else environ
         return agent_contracts_mod.assert_pre_prompt_transport(
             self.ledger,
@@ -1416,7 +1459,7 @@ class JournaledSessionBridge:
                 role=role,
                 observed_agent=bound_agent,
                 requested_permissions=requested_permissions,
-                requested_model=agent_contracts_mod.model_identity_string(model),
+                requested_model=model,
                 transport_config=transport_config,
                 environ=environ,
             )

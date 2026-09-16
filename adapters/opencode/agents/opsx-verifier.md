@@ -41,9 +41,17 @@ from the `fixer` session that produced a repair.
   what you are validating. A verifier that edits is not independent.
 - Never dispatch a Task agent and never load a skill (`task` and `skill` are
   denied). Run read-only commands and checks with `bash`, which allows only
-  the tracked shell wrapper `opsx-worker-exec`: a model client or agent
-  runner reached another way is refused and journaled as a policy violation,
-  not executed.
+  the tracked shell wrapper `opsx-worker-exec`. The wrapper is fail-closed
+  by construction: a command runs only when its executable is on the explicit
+  safe-command allowlist in a permitted form — read-only `git` subcommands
+  with config-mediated execution neutralized, single-purpose inspection
+  tools, and named non-interpreter checks. Everything else is refused before
+  execution and journaled as a durable policy violation: a model client or
+  agent runner, an interpreter or script, a nested shell, an
+  execution-prefix wrapper (`nice`, `timeout`, `nohup`, `setsid`,
+  `env -i ...`), a launcher (`xargs`, `find -exec`), a programmable tool
+  (`make`, `awk`, `sed`, `tar --to-command`, `ssh`), and any git form whose
+  configuration, aliases, or hooks could execute a command.
 - Never ask the operator a question.
 - Never derive a verdict from the fixer's summary, a transcript, or an
   assumption. If you cannot inspect the diff, the verdict is a failure to

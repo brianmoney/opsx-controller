@@ -1047,19 +1047,21 @@ allowlist:
 `check_session_contract` is the pure predicate: an unregistered role, a
 session whose observed agent is not the role's concrete agent (an unbound
 agent counts as not matching), a role with no pin in the job policy, a
-`requested_model` that is not the role's **exact** pin, or any requested
-capability outside the role's allowlist is a violation — never defaulted.
-`enforce_session_contract` adds the durable consequence: a `policy_violation`
-incident is recorded against the job and the dispatch is blocked before any
-side effect.
+`requested_model` that is missing, malformed, or not the role's **exact** pin,
+or any requested capability outside the role's allowlist is a violation —
+never defaulted. `enforce_session_contract` adds the durable consequence: a
+`policy_violation` incident is recorded against the job and the dispatch is
+blocked before any side effect.
 
 The contract is **non-optional** on the worker path. Every worker-domain request
 must carry its role, its observed concrete agent, and the job's registered
 service identity; `check_worker_identity` refuses a request that omits any of
 them, and there is no unauthenticated legacy worker path on the endpoint. The
 mandatory fields are wired at four points: the journaled bridge's session
-create and prompt (the agent it binds must be the role's registered agent, and a
-caller-supplied model must equal the role's exact pin), the worker-actions
+create and prompt (the agent it binds must be the role's registered agent, and
+the model must normalize to the role's exact pin — a missing or malformed model
+is refused, never defaulted, while the service resolves its own pinned identity
+from the policy for a primary session it creates), the worker-actions
 endpoint request path (identity plus role contract), `build_request` in the
 tracked service tool (an unidentified request is never framed), and the
 per-role agent permission blocks.
@@ -1067,12 +1069,52 @@ per-role agent permission blocks.
 Delegation is non-recursive by construction: `task` is denied on every
 supervised agent. The primary's `bash` allows only the `opsx-supervise *`
 pattern; each worker role's `bash` allows only the tracked shell wrapper
-`opsx-worker-exec *`. A shell attempt to reach a model client or agent runner is
-refused by the executable layer (`lib/supervisor/worker_exec.py`): the known
-model-client/agent-runner binaries, a nested shell, and the shell indirection a
-bypass uses are all classified as a bypass, never executed, and reported to the
-worker endpoint through the `report_violation` verb as a durable
-`policy_violation` incident.
+`opsx-worker-exec *`. The executable layer (`lib/supervisor/worker_exec.py`)
+is a **fail-closed allowlist**, not a denylist. A denylist of dangerous
+executables is unbounded — any program with a programmable or
+configuration-mediated execution feature (`git -c alias.x='!cmd'`, a repo
+hook or content filter, `make`, `awk system()`, `sed`'s `e` flag,
+`find -exec`, `tar --to-command`, `ssh`, an execution-prefix wrapper such as
+`nice`/`nohup`/`setsid`/`env -i`) can reach a shell or a model client without
+naming it — so the single rule is the reverse: **a command executes only when
+its leading executable is an explicitly enumerated safe executable AND its
+argv satisfies that executable's form constraints; everything else is refused
+before execution** and reported to the worker endpoint through the
+`report_violation` verb as a durable `policy_violation` incident. The safe
+surface is three shapes:
+
+- **Single-purpose inspection tools** (`ls`, `cat`, `grep`, `head`, `diff`,
+  `wc`, ...) whose argv is data, never a command — plus constrained variants
+  whose exec-capable flags are refused (`find` without `-exec`/`-execdir`,
+  `sort` without `--compress-program`, `rg` without `--pre`/`--hostname-bin`,
+  with `RIPGREP_CONFIG_PATH` scrubbed so its config cannot re-open them).
+- **Named non-interpreter check tools** the roles need (`openspec validate`
+  and its siblings).
+- **git, special-cased** because it is programmable through configuration:
+  only built-in read-only subcommands (`status`, `diff`, `log`, `show`,
+  `rev-parse`, `rev-list`, `ls-files`, `grep`, `shortlog`, `describe`,
+  `show-ref`, `cat-file`) are allowlisted, so an alias or external `git-*`
+  command can never be the subcommand (an alias cannot shadow a builtin) and
+  hooks never run for the allowlisted builtins; worker-supplied global config
+  options (`-c`, `--config-env`, `--exec-path`, `--git-dir`, `-C`, ...) are
+  refused; flags that would re-enable an execution surface are refused
+  (`cat-file --filters`, `--ext-diff`, `--textconv`); the wrapper injects
+  config pins making the pager, external diff, textconv, the fsmonitor hook,
+  credential helpers, SSH, and every signing helper inert; and a preflight
+  refuses the command when the repository's effective config defines any
+  external clean/smudge/process filter the pins do not already neutralize —
+  that is worktree-controlled command execution, and it fails closed, as does
+  a preflight that cannot complete.
+
+Every allowed command runs with a scrubbed environment: inherited `GIT_*`
+variables and interpreter/loader hooks (`NODE_OPTIONS`, `PYTHONPATH`,
+`LD_PRELOAD`, ...) are stripped, and the wrapper pins its own inert values,
+so environment-mediated execution cannot smuggle code into an allowed tool
+either. The residual trust assumptions are stated in the module docstring:
+the allowlist trusts the binaries it names (`openspec` is the project's own
+check tool), and the wrapper's own environment is service-provisioned because
+the permission pattern admits only the literal `opsx-worker-exec *` command
+line.
 
 **Worker-initiated delegation is journaled on both paths.** A native Task
 session identity reported through `record_evidence` is bound to the owning
@@ -1088,11 +1130,17 @@ transport holds — the transport target is the **launched service-owned session
 server**, or the dispatch is a service-owned spawn inside the isolated worker
 domain **and** the worker environment is free of any reusable provider
 credential. `check_server_identity` is what binds the isolated path to the
-launched server: a bare loopback hostname is never accepted, because any process
-on the host could bind a loopback port. The presented server identity must be a
-fenceable pid/start-time/boot identity that names a live process on the current
-boot, and the transport target must equal the address the launched server
-reported. A provider credential in the worker environment is never enforced,
+launched server, and its authority is a `LaunchedServerBinding` the service
+captured at launch (the launched process's fenceable pid/start-time/boot
+identity plus the address of the transport the service created). A bare loopback
+hostname, a caller-supplied address, or a caller-supplied live process identity
+is never accepted — any process on the host could bind a loopback port, and a
+live foreign pid proves nothing. The binding's identity must name a live process
+on the current boot, and any presented transport target must equal the binding's
+reported address. `JournaledSessionBridge.enforce_prompt_contract` derives this
+binding itself and refuses a caller-supplied `target`, `server_address`,
+`server_identity`, or `server_binding` override rather than trusting it. A
+provider credential in the worker environment is never enforced,
 even with a gateway configured, because the credential is itself the bypass. `assert_pre_prompt_transport` raises the
 named `EgressEnforcementError` before any prompt or spawn side effect when the
 decision is unenforced, and records the decision as

@@ -1252,7 +1252,10 @@ def open_primary_session(
     The primary session is bound to its concrete `opsx-supervisor` agent
     through the journaled bridge, which runs the session contract first: a
     caller-supplied *agent* that is not the supervisor role's registered agent
-    is refused with a recorded `policy_violation` rather than run.
+    is refused with a recorded `policy_violation` rather than run. The session
+    is created under the supervisor role's exact pinned model — resolved from
+    the job policy when the caller supplies none — so an unpinned session can
+    never reach the server.
     """
     ledger = session.ledger
     job_id = int(session.job_id)
@@ -1334,11 +1337,19 @@ def open_primary_session(
         # The primary session is bound to its registered concrete agent through
         # the journaled bridge, so the session contract is checked (and a
         # spoil/escalation recorded as a policy_violation) before the session
-        # exists, rather than trusting a caller-supplied agent.
+        # exists, rather than trusting a caller-supplied agent. The session is
+        # created under the supervisor role's exact pin: when the caller does
+        # not supply one, the service resolves its own pinned identity from the
+        # job policy (a caller-supplied model that differs from the pin is still
+        # refused, never substituted).
+        session_model = model
+        if session_model is None:
+            planned = prompt_plan.get("model")
+            session_model = planned if isinstance(planned, Mapping) else None
         created = journaled.create_session(
             title=title,
             role=model_policy_mod.SUPERVISOR_ROLE,
-            model=model,
+            model=session_model,
         )
         session_id = str(created["id"])
     except Exception:

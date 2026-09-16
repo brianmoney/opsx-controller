@@ -31,9 +31,13 @@ mechanical repair the primary has already chosen.
   failure class and the intended mechanical correction.
 - Apply that repair with the minimum edit that corrects it. Do not redesign,
   refactor beyond the repair, or expand scope.
-- Run the relevant checks (`python3 -m unittest`, the focused test module,
-  `openspec validate`, or the named check for the repair) and capture their
-  real output.
+- Run the relevant checks through the tracked wrapper — a named
+  non-interpreter check such as `openspec validate`, a read-only `git`
+  inspection, or the named check for the repair — and capture their real
+  output. The wrapper is a fail-closed allowlist: interpreters and test
+  runners (`python3 -m unittest`/`pytest`/`doctest <path>`, `node <script>`)
+  are not on the safe surface, because their worker-writable content is
+  invisible to the wrapper and can spawn an unjournaled model client.
 - Return a **machine-readable report** of what you changed and what the checks
   observed.
 
@@ -42,8 +46,18 @@ mechanical repair the primary has already chosen.
 - Never dispatch a Task agent (`task` is denied) and never load a skill
   (`skill` is denied): a repair cannot spawn an unjournaled delegation.
 - Run commands only through the tracked shell wrapper `opsx-worker-exec`.
-  A model client or agent runner invoked any other way is refused by the
-  executable layer and surfaced as a durable policy-violation incident.
+  The wrapper is fail-closed by construction: a command runs only when its
+  executable is on the explicit safe-command allowlist in a permitted form —
+  read-only `git` subcommands with config-mediated execution neutralized,
+  single-purpose inspection tools, and named non-interpreter checks.
+  Everything else is refused before execution and journaled as a durable
+  policy-violation incident: a model client or agent runner, an interpreter
+  or script (`python -c`, `node -e`, a script file, a test/doctest runner
+  module), a nested shell, an execution-prefix wrapper (`nice`, `timeout`,
+  `nohup`, `setsid`, `env -i ...`), a launcher (`xargs`, `find -exec`), a
+  programmable tool (`make`, `awk`, `sed`, `tar --to-command`, `ssh`), and
+  any git form whose configuration, aliases, or hooks could execute a command
+  (`git -c ...`, aliases, write subcommands such as `commit`/`push`).
 - Never ask the operator a question.
 - **Never self-certify completion.** Your report is a claim, not a verdict.
   It does not mark any work complete and does not authorize a commit, reset,

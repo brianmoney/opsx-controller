@@ -74,9 +74,10 @@ EVIDENCE_REPAIR = "repair_verdict"
 # The incident kind a spoofed or escalated worker is surfaced as.
 POLICY_VIOLATION_INCIDENT = "policy_violation"
 
-# The identity of the launched service-owned session server, carried by the
-# worker environment (worker-writable, so it is evidence, not authority) and
-# asserted against the running server when the isolated transport is decided.
+# Legacy worker-environment names for the launched-server identity/address.
+# They are worker-writable, so they are evidence and never authority: the
+# isolated transport path consults only a service-captured
+# :class:`LaunchedServerBinding`, never these variables.
 SERVER_IDENTITY_ENV = "OPSX_SUPERVISOR_SERVER_IDENTITY"
 SERVER_ADDRESS_ENV = "OPSX_SUPERVISOR_SERVER_ADDRESS"
 
@@ -84,6 +85,21 @@ SERVER_ADDRESS_ENV = "OPSX_SUPERVISOR_SERVER_ADDRESS"
 TRANSPORT_GATEWAY = "gateway"
 TRANSPORT_ISOLATED = "isolated-transport"
 TRANSPORT_UNENFORCED = "unenforced"
+
+# Transport fields that only service-owned code may supply. A caller (worker
+# session, bridge caller, or config map) that presents any of these is trying
+# to substitute caller-overridable authority for the service-captured
+# launched-server binding, so they are refused rather than trusted.
+CALLER_TRANSPORT_OVERRIDE_KEYS = frozenset(
+    {
+        "target",
+        "server_address",
+        "server_identity",
+        "server_binding",
+        "gateway_endpoint",
+        "worker_domain_spawn",
+    }
+)
 
 # The two supervised roles whose independence is load-bearing: a ``fixer``
 # report is never consumed until a separate ``verifier`` session validates the
@@ -281,6 +297,21 @@ def model_identity_string(model: Mapping[str, Any] | None) -> str | None:
     return None
 
 
+def normalize_model_identity(model: Any) -> str | None:
+    """Normalize a requested model to the ``provider/model`` identity string.
+
+    Accepts either the server's ``{providerID, modelID}`` mapping or an
+    already-normalized string. Anything else — absent, empty, a malformed
+    mapping, or another type — normalizes to ``None`` so the caller can refuse
+    it rather than falling through to an unchecked dispatch.
+    """
+    if isinstance(model, Mapping):
+        return model_identity_string(model)
+    if isinstance(model, str) and model.strip():
+        return model.strip()
+    return None
+
+
 def check_model_pin(
     policy: Mapping[str, Any] | None,
     role: Any,
@@ -353,6 +384,8 @@ def check_session_contract(
     observed_agent: Any,
     requested_permissions: Sequence[str] | None = None,
     requested_model: Any = None,
+    *,
+    require_model: bool = False,
 ) -> dict[str, Any]:
     """Pure predicate: does this session match its registered role contract?
 
@@ -364,9 +397,12 @@ def check_session_contract(
     state or defaults a violation away: an escalation is never silently
     satisfied by a broader permission.
 
-    *requested_model* is optional so a caller that checks the model separately
-    (or has no model to check) does not have to supply it; when it is supplied
-    the exact-pin equality is part of the same contract result.
+    *requested_model* may be the server's ``{providerID, modelID}`` mapping or
+    an already-normalized ``provider/model`` string. A supplied but
+    absent/malformed model, or any dispatch checked with *require_model* true
+    (every supervised ``create_session``/``prompt`` sets it), is a violation:
+    the exact model identity is required and is never substituted, so a
+    normalized-``None`` model can never reach the server unpinned.
     """
     violations: list[dict[str, str]] = []
     role_name = role.strip() if isinstance(role, str) and role.strip() else ""
@@ -413,8 +449,21 @@ def check_session_contract(
                     ),
                 }
             )
-    if requested_model is not None:
-        pin_check = check_model_pin(policy, role_name, requested_model)
+    normalized_model = normalize_model_identity(requested_model)
+    if normalized_model is None and (requested_model is not None or require_model):
+        # A missing or malformed identity is refused, not skipped: the exact
+        # pin is mandatory for every supervised dispatch.
+        violations.append(
+            {
+                "kind": "unbound_model",
+                "detail": (
+                    "the dispatch carries no exact model identity; a supervised "
+                    "session or prompt is never issued without its pinned model"
+                ),
+            }
+        )
+    elif normalized_model is not None:
+        pin_check = check_model_pin(policy, role_name, normalized_model)
         violations.extend(dict(v) for v in pin_check["violations"])
     allowed_capabilities = role_capabilities(role_name)
     for permission in list(requested_permissions or ()):
@@ -434,6 +483,7 @@ def check_session_contract(
         "role": role_name or None,
         "expected_agent": expected_agent,
         "observed_agent": observed,
+        "requested_model": normalized_model,
         "allowlist": sorted(allowed_capabilities),
         "violations": violations,
         "reason": reason,
@@ -489,6 +539,7 @@ def enforce_session_contract(
     observed_agent: Any,
     requested_permissions: Sequence[str] | None = None,
     requested_model: Any = None,
+    require_model: bool = False,
     run_id: str | None = None,
 ) -> dict[str, Any]:
     """Check the contract and refuse with a recorded ``policy_violation``.
@@ -498,7 +549,12 @@ def enforce_session_contract(
     :class:`SessionContractViolation` before any side effect of the dispatch.
     """
     check = check_session_contract(
-        policy, role, observed_agent, requested_permissions, requested_model
+        policy,
+        role,
+        observed_agent,
+        requested_permissions,
+        requested_model,
+        require_model=require_model,
     )
     if check["allowed"]:
         return check
@@ -1049,108 +1105,122 @@ def server_identity_is_live(value: Any) -> bool:
         return False
 
 
-def check_server_identity(
-    options: Mapping[str, Any] | None,
-    environ: Mapping[str, str] | None = None,
-) -> dict[str, Any]:
-    """Pure predicate: is the transport target the *launched* service server?
+@dataclass(frozen=True)
+class LaunchedServerBinding:
+    """The service-captured identity and address of the launched session server.
 
-    A loopback hostname is not by itself proof of isolation: any process on the
-    host could bind a loopback port. The isolated path therefore requires the
-    launched service-owned session server's own identity — its fenceable
-    process identity and the address it reported at launch — to be live and to
-    match the transport target. A bare loopback address with no launched-server
-    identity is not isolated transport and fails closed.
-
-    Config (``server_identity``/``server_address``) wins over the worker
-    environment, because the service captured the launched values while the
-    environment fields are worker-writable evidence.
+    Only service-owned code — the journaled bridge or the orchestrator launcher
+    — constructs a binding, from the process it launched and the transport it
+    created. A worker-writable environment value, a caller-supplied mapping, or
+    a merely live foreign pid can never stand in for it: the isolated transport
+    path accepts this object as its **only** authority, and a caller cannot
+    override the target, address, or identity.
     """
-    environment = os.environ if environ is None else environ
-    options = options if isinstance(options, Mapping) else {}
 
-    target = options.get("target")
-    if target is None:
-        target = environment.get(SERVER_ADDRESS_ENV)
-    target = target.strip() if isinstance(target, str) and target.strip() else None
+    address: str
+    identity: str
 
-    expected_address = options.get("server_address")
-    if expected_address is None:
-        expected_address = environment.get(SERVER_ADDRESS_ENV)
-    expected_address = (
-        str(expected_address).strip() if expected_address else None
+    def as_dict(self) -> dict[str, Any]:
+        return {"address": self.address, "identity": self.identity}
+
+
+def capture_launched_server_binding(
+    address: Any, identity: Any
+) -> LaunchedServerBinding | None:
+    """Build a service-captured binding from *address* and *identity*, or ``None``.
+
+    The address must be a loopback service-server address and the identity must
+    be a fenceable pid/start-time/boot identity. Liveness is checked at decision
+    time, not capture time. A missing or malformed value yields ``None`` — never
+    a placeholder — so the isolated path fails closed.
+    """
+    if not isinstance(address, str) or not address.strip():
+        return None
+    address = address.strip()
+    if not is_loopback_address(address):
+        return None
+    parsed = _fenceable_server_identity(identity)
+    if parsed is None:
+        return None
+    return LaunchedServerBinding(
+        address=address,
+        identity=json.dumps(parsed, sort_keys=True),
     )
 
-    provided_identity = options.get("server_identity")
-    if provided_identity is None:
-        provided_identity = environment.get(SERVER_IDENTITY_ENV)
-    if isinstance(provided_identity, Mapping):
-        provided_identity = json.dumps(
-            {key: provided_identity[key] for key in sorted(provided_identity)},
-            sort_keys=True,
+
+def check_server_identity(
+    binding: Any,
+    *,
+    target: Any = None,
+) -> dict[str, Any]:
+    """Pure predicate: is *binding* the live launched server, and *target* it?
+
+    Authority is the service-captured :class:`LaunchedServerBinding`. A raw
+    caller-supplied identity, address, or loopback target is evidence, never
+    authority: without a binding the isolated path fails closed. When *target*
+    is supplied it must be the binding's own reported address.
+
+    Liveness is checked here (pid + process start time + boot identity) because
+    the binding is service-captured; a caller cannot present a stranger's live
+    pid as the server's identity and have it accepted, since no caller-supplied
+    identity is consulted at all.
+    """
+    if not isinstance(binding, LaunchedServerBinding):
+        reason = (
+            "no service-captured launched-server binding was presented; a "
+            "caller-supplied loopback target, address, or live process identity "
+            "is evidence, never authority"
         )
-    provided_identity = (
-        str(provided_identity).strip() if provided_identity else None
-    )
-
+        return {
+            "allowed": False,
+            "binding": None,
+            "server_address": None,
+            "target": None,
+            "violations": [
+                {"kind": "missing_launched_server_binding", "detail": reason}
+            ],
+            "reason": reason,
+        }
+    server_address = binding.address
     violations: list[dict[str, str]] = []
-    if not provided_identity:
+    if not is_loopback_address(server_address):
         violations.append(
             {
-                "kind": "missing_server_identity",
+                "kind": "non_loopback_server_address",
                 "detail": (
-                    "no launched service-server identity accompanies the "
-                    "transport target; a loopback address alone does not prove "
-                    "the service-owned session server"
+                    f"the launched server address {server_address!r} is not a "
+                    "loopback service-server address"
                 ),
             }
         )
-    elif _fenceable_server_identity(provided_identity) is None:
-        violations.append(
-            {
-                "kind": "unfenceable_server_identity",
-                "detail": (
-                    f"the presented server identity {provided_identity!r} is not "
-                    "a fenceable pid/start-time/boot identity"
-                ),
-            }
-        )
-    elif not server_identity_is_live(provided_identity):
+    if not server_identity_is_live(binding.identity):
         violations.append(
             {
                 "kind": "dead_server_identity",
                 "detail": (
-                    f"the presented server identity {provided_identity!r} does "
+                    f"the launched server identity {binding.identity!r} does "
                     "not name a live process on the current boot; it is not the "
                     "launched service-owned session server"
                 ),
             }
         )
-    if target is None or not is_loopback_address(target):
-        violations.append(
-            {
-                "kind": "non_loopback_target",
-                "detail": (
-                    f"the isolated transport target {target!r} is not a loopback "
-                    "service-server address"
-                ),
-            }
-        )
-    elif expected_address is not None and target != expected_address:
+    candidate = target.strip() if isinstance(target, str) and target.strip() else None
+    if candidate is not None and candidate != server_address:
         violations.append(
             {
                 "kind": "server_address_mismatch",
                 "detail": (
-                    f"the transport target {target!r} is not the launched "
-                    f"service server's reported address {expected_address!r}"
+                    f"the presented transport target {candidate!r} is not the "
+                    f"launched service server's reported address "
+                    f"{server_address!r}"
                 ),
             }
         )
     return {
         "allowed": not violations,
-        "target": target,
-        "server_identity": provided_identity,
-        "expected_address": expected_address,
+        "binding": binding,
+        "server_address": server_address,
+        "target": candidate if candidate is not None else server_address,
         "violations": violations,
         "reason": violations[0]["detail"] if violations else None,
     }
@@ -1162,13 +1232,16 @@ def evaluate_transport(
 ) -> TransportDecision:
     """Pure decision: is model traffic enforced for this prompt/spawn?
 
-    Enforced when a trusted model gateway endpoint is configured, or when the
-    isolated-transport conditions hold: the transport target is loopback to the
-    *launched service-owned session server* (proven by that server's fenceable
-    identity and reported address, not a bare loopback hostname) **and** the
-    worker environment carries no reusable provider credential. A service-owned
-    spawn inside the isolated worker domain has no network egress target of its
-    own and is enforced under the same credential rule.
+    Enforced when a trusted model gateway endpoint is configured, when the
+    dispatch is a service-owned spawn inside the isolated worker domain, or
+    when a **service-captured** :class:`LaunchedServerBinding` names the live
+    launched session server **and** the worker environment carries no reusable
+    provider credential.
+
+    A raw ``target``/``server_address``/``server_identity`` in *config*, or a
+    worker-writable environment identity, is never authority: the isolated path
+    requires the binding the service captured at launch, so an arbitrary
+    loopback target presented with any live (even foreign) pid fails closed.
 
     A worker environment carrying a provider credential is never enforced —
     not even with a gateway configured — because the credential is itself the
@@ -1200,33 +1273,6 @@ def evaluate_transport(
             path=TRANSPORT_GATEWAY,
             detail=f"model traffic is routed through the trusted gateway {gateway!r}",
         )
-    explicit_target = options.get("target")
-    server = check_server_identity(options, environment)
-    if explicit_target is not None:
-        # An explicit transport target must be the launched service-owned
-        # session server, proven by that server's own fenceable identity and
-        # reported address. A bare loopback hostname is not isolation.
-        if server["allowed"]:
-            return TransportDecision(
-                enforced=True,
-                path=TRANSPORT_ISOLATED,
-                detail=(
-                    f"the transport target {server['target']!r} is the launched "
-                    "service-owned session server (identity "
-                    f"{server['server_identity']!r}) and the worker environment "
-                    "carries no provider credential"
-                ),
-            )
-        return TransportDecision(
-            enforced=False,
-            path=TRANSPORT_UNENFORCED,
-            detail=(
-                "an explicit transport target was presented but it is not the "
-                f"launched service-owned session server ({server['reason']}); "
-                "refusing to issue a prompt or spawn that would reach a model "
-                "unenforced"
-            ),
-        )
     if options.get("worker_domain_spawn") is True:
         # A service-owned spawn inside the isolated worker domain has no
         # network egress target of its own; it is enforced under the same
@@ -1240,16 +1286,15 @@ def evaluate_transport(
                 "environment carries no provider credential"
             ),
         )
-    # No explicit target: fall back to the worker-domain environment's
-    # launched-server address and identity, both of which must be consistent.
-    if server["allowed"] and server["target"] is not None:
+    server = check_server_identity(options.get("server_binding"), target=options.get("target"))
+    if server["allowed"]:
         return TransportDecision(
             enforced=True,
             path=TRANSPORT_ISOLATED,
             detail=(
-                f"the worker-domain target {server['target']!r} is the launched "
-                "service-owned session server (identity "
-                f"{server['server_identity']!r}) and the worker environment "
+                f"the transport target {server['server_address']!r} is the "
+                "launched service-owned session server (identity "
+                f"{server['binding'].identity!r}) and the worker environment "
                 "carries no provider credential"
             ),
         )
@@ -1257,11 +1302,10 @@ def evaluate_transport(
         enforced=False,
         path=TRANSPORT_UNENFORCED,
         detail=(
-            "no trusted model gateway is configured and no enforced isolated "
-            "transport is in place ("
-            f"{server['reason'] or 'no explicit target or launched-server '
-            'identity was presented'}); refusing to issue a prompt or spawn "
-            "that would reach a model unenforced"
+            "no trusted model gateway is configured and the isolated transport "
+            "is not authorized by a service-captured launched-server binding ("
+            f"{server['reason']}); refusing to issue a prompt or spawn that "
+            "would reach a model unenforced"
         ),
     )
 
@@ -1299,11 +1343,13 @@ def assert_pre_prompt_transport(
 
 __all__ = [
     "AgentContractError",
+    "CALLER_TRANSPORT_OVERRIDE_KEYS",
     "EVIDENCE_REPAIR",
     "EVIDENCE_TRANSPORT_DECISION",
     "EgressEnforcementError",
     "FIXER_ROLE",
     "GATEWAY_ENDPOINT_ENV",
+    "LaunchedServerBinding",
     "POLICY_VIOLATION_INCIDENT",
     "PRIMARY_SERVICE_TOOL_CAPABILITY",
     "REPAIR_CONSUMING_TRANSITIONS",
@@ -1323,6 +1369,7 @@ __all__ = [
     "WORKER_ROLE_FIELD",
     "assert_pre_prompt_transport",
     "assert_repair_consumable",
+    "capture_launched_server_binding",
     "check_model_pin",
     "check_server_identity",
     "check_session_contract",
@@ -1335,6 +1382,7 @@ __all__ = [
     "is_repair_consuming_transition",
     "missing_worker_identity_fields",
     "model_identity_string",
+    "normalize_model_identity",
     "provider_credentials",
     "record_policy_violation",
     "record_repair_evidence",
