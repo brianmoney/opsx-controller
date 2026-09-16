@@ -34,6 +34,7 @@ from lib.supervisor import agent_contracts as agent_contracts_mod
 from lib.supervisor import broker as broker_mod
 from lib.supervisor import budgets as budget_mod
 from lib.supervisor import ledger as ledger_mod
+from lib.supervisor import lifecycle as lifecycle_mod
 from lib.supervisor import lock as lock_mod
 from lib.supervisor import model_policy as model_policy_mod
 
@@ -56,6 +57,7 @@ GATE_AUTHORITY = "authority"
 GATE_STALE_MATERIAL = "stale_material"
 GATE_MODEL_POLICY = "model_policy"
 GATE_BUDGET = "budget"
+GATE_STOP = "stop"
 
 JOURNAL_TERMINAL_STATES = ("completed", "failed")
 
@@ -103,6 +105,12 @@ class ModelPolicyGateError(DispatchGateError):
 
 class BudgetGateError(DispatchGateError):
     gate = GATE_BUDGET
+
+
+class StopBoundaryGateError(DispatchGateError):
+    """A durable pause/drain stop request forbids any new dispatch."""
+
+    gate = GATE_STOP
 
 
 # The named pre-prompt egress gate for supervised stage-worker spawns. It is
@@ -340,6 +348,7 @@ def evaluate_gates(
     ledger = gate["ledger"]
     job_id = int(gate["job_id"])
     policy = gate["policy"]
+    assert_stop_boundary(ledger, job_id)
     assert_lock_gate(repo, ledger, job_id)
     assert_authority_gate(ledger, job_id, cid)
     assert_material_freshness(ledger, job_id, gate)
@@ -406,6 +415,27 @@ def assert_lock_gate(repo: Path, ledger: Any, job_id: int) -> None:
             )
 
 
+def assert_stop_boundary(ledger: Any, job_id: int) -> None:
+    """Observe a durable pause/drain stop request before any new dispatch.
+
+    The request is ledger state (a job-scoped receipt plus an open ``stop``
+    wait), so a restarted execution observes it here too. A ``drain`` whose
+    in-flight actions are still running reports ``draining`` and no new action
+    begins; once they reach a terminal outcome the job is recorded ``paused``.
+    """
+    try:
+        stop = lifecycle_mod.observe_stop_request(ledger, job_id)
+    except lifecycle_mod.UnknownJobError:
+        return
+    if stop is None or stop.get("dispatch_allowed"):
+        return
+    raise StopBoundaryGateError(
+        "a durable stop request is in effect; no new dispatch begins "
+        f"(disposition: {stop.get('disposition')})",
+        last_result="stop_requested",
+    )
+
+
 def assert_authority_gate(ledger: Any, job_id: int, cid: str) -> None:
     """Require the broker's authority state to permit this dispatch.
 
@@ -413,6 +443,10 @@ def assert_authority_gate(ledger: Any, job_id: int, cid: str) -> None:
     restart re-enters through here, so it runs the repair-consumption gate
     explicitly (a recorded repair is refused unless an independent verifier
     reviewed the real diff) before the dispatch gate runs it again.
+
+    A human-only gate that is not yet satisfied records a durable human wait
+    bound to the gate checkpoint; a gate that has become dispatchable ends it.
+    Neither path polls and neither dispatches a model action.
     """
     try:
         broker_mod.assert_resume_clear(ledger, job_id, change_ids=[cid])
@@ -421,10 +455,52 @@ def assert_authority_gate(ledger: Any, job_id: int, cid: str) -> None:
     except broker_mod.BrokerError as exc:
         raise AuthorityGateError(str(exc)) from exc
     try:
-        broker_mod.assert_dispatchable(ledger, job_id, cid)
+        resolution = broker_mod.resolve_gate(ledger, job_id, cid)
     except broker_mod.BrokerError as exc:
         raise AuthorityGateError(str(exc)) from exc
+    if not resolution.dispatchable:
+        _record_human_wait_gate(ledger, job_id, cid, resolution)
+        raise AuthorityGateError(
+            f"change {cid} is not dispatchable: {resolution.reason}"
+        )
+    lifecycle_mod.end_human_wait(ledger, job_id, change_id=cid)
     assert_repair_gate(ledger, job_id, cid, transition="resume")
+
+
+def _record_human_wait_gate(
+    ledger: Any, job_id: int, cid: str, resolution: Any
+) -> int | None:
+    """Persist the durable human wait for an unsatisfied human-only gate.
+
+    A delegated gate is not a human wait (its scoped service action resolves
+    it), and an already-open wait is not duplicated. A terminal job records
+    nothing.
+    """
+    if str(getattr(resolution, "authority", "") or "") != broker_mod.HUMAN_ONLY:
+        return None
+    if lifecycle_mod.open_human_wait(ledger, job_id, change_id=cid) is not None:
+        return None
+    try:
+        material = broker_mod.material_state(ledger, job_id, cid)
+        digest = broker_mod.material_hash(
+            cid, material.fields, material.snapshot_hash, material.policy_revision
+        )
+    except broker_mod.BrokerError:
+        return None
+    checkpoint = str(
+        getattr(resolution, "checkpoint", None)
+        or broker_mod.checkpoint_for(broker_mod.APPROVAL, cid)
+    )
+    try:
+        return lifecycle_mod.record_human_wait(
+            ledger,
+            job_id,
+            change_id=cid,
+            checkpoint=checkpoint,
+            material_hash=digest,
+        )
+    except lifecycle_mod.TerminalJobError:
+        return None
 
 
 def assert_material_freshness(ledger: Any, job_id: int, gate: Mapping[str, Any]) -> None:
@@ -793,6 +869,9 @@ def gated_dispatch(
     escalation_active = bool(r.get("escalation", {}).get("active"))
     role = telemetry_mod.resolve_stage_role(stage, escalation_active=escalation_active)
     transport_decision: "agent_contracts_mod.TransportDecision | None" = None
+    # The durable stop boundary is observed for every dispatch, including a
+    # stage with no model role, before any side effect of the action.
+    assert_stop_boundary(gate["ledger"], int(gate["job_id"]))
     if role is not None:
         transport_decision = evaluate_gates(
             repo, gate,

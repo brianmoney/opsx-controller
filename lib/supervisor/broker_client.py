@@ -23,18 +23,26 @@ from typing import Any, Mapping
 
 from lib.supervisor import broker as broker_module
 from lib.supervisor import endpoints as endpoints_module
+from lib.supervisor import lifecycle as lifecycle_module
 
 OPERATOR_SOCKET_ENV = "OPSX_SUPERVISOR_OPERATOR_SOCKET"
 WORKER_SOCKET_ENV = "OPSX_SUPERVISOR_WORKER_SOCKET"
 
 DEFAULT_TIMEOUT_SECONDS = 30.0
 
-# Named broker errors that may travel back over the wire.
+# Named broker errors that may travel back over the wire. The supervised
+# lifecycle errors are part of this surface: a mediated ``pause`` / ``drain`` /
+# ``resume`` / ``cancel`` must reach the CLI as its named error, never as a
+# generic broker refusal.
 _ERROR_TYPES: dict[str, type[BaseException]] = {
     "BrokerError": broker_module.BrokerError,
     "BrokerMediationError": broker_module.BrokerMediationError,
     "BrokerUnavailableError": broker_module.BrokerUnavailableError,
     "StaleMaterialError": broker_module.StaleMaterialError,
+    "LifecycleError": lifecycle_module.LifecycleError,
+    "UnknownJobError": lifecycle_module.UnknownJobError,
+    "TerminalJobError": lifecycle_module.TerminalJobError,
+    "IllegalTransitionError": lifecycle_module.IllegalTransitionError,
 }
 
 

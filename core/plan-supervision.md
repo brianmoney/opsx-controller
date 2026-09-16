@@ -497,6 +497,117 @@ supervised job for a worktree that already has an active job is refused with a
 named `DuplicateJobError`, and the existing job is left unchanged. A new
 registration becomes legal only once the prior job reaches a terminal state.
 
+## Supervised job lifecycle
+
+One stdlib-only module (`lib/supervisor/lifecycle.py`) owns the state machine,
+its transition guards, and the named failure family; the operator endpoint
+verbs and the `opsx-plan supervise` CLI handlers are thin adapters over it, so
+the mediated path and the trust-root bootstrap path can never diverge.
+
+### Registration record
+
+Registration (`opsx-plan supervise register`) runs as the trust root, because
+the endpoint host is job-scoped and no endpoint can exist before a job does.
+It validates the isolation backend through the fail-closed authority gate
+(`require_authority_backend`, which includes the mandatory activation probe)
+before writing anything, and then records, in one durable transaction in the
+service-owned ledger:
+
+- the job row: repository root, repository-relative worktree, owner identity;
+- the protected job policy at operator revision 1: the standing permissions
+  (authority configuration), the frozen model selection and inexpensive
+  allowlist, and the budgets and deadlines;
+- the protected manifest snapshot captured from the plan's canonical manifest
+  content, with its hash derived by the ledger from that content; and
+- the primary-session linkage configuration.
+
+Registration fails closed with the named unsupported-host error and records
+nothing on a host without a supported backend. Nothing is written to the
+worktree or to JSON execution state. A second active job for the same worktree
+is refused with `DuplicateJobError`.
+
+### State machine and transition guards
+
+```
+registered -> active -> (paused -> active)* -> completed | failed | cancelled
+```
+
+`completed`, `failed`, and `cancelled` are terminal. Every transition is a
+durable ledger transaction; a refused transition changes nothing.
+
+| Verb | Legal source | Effect |
+| --- | --- | --- |
+| `register` | — | records the job in `registered` |
+| `start` | `registered` | `active`; brings up the service-owned execution and primary session and drives the existing run engine |
+| `resume` | `paused` | `active` only after resume revalidation confirms every relied-upon receipt still matches the current material revision |
+| `pause` | `active` | durable stop request; in-flight actions are marked `uncertain`; `paused` |
+| `drain` | `active` | durable stop request; no new dispatch; in-flight actions reach a terminal outcome, then `paused` |
+| `cancel` | any non-terminal | `cancelled`; terminal effects below |
+| `inspect` | any | read-only projection; no transition |
+
+A target outside the legal set raises the named illegal-transition error; a
+mutating verb against a terminal job raises the named terminal-job error.
+Neither refusal alters the job record, and a terminal job refuses every later
+receipt, stop request, and lifecycle verb.
+
+### Pause and drain: stop boundaries
+
+`pause` and `drain` each record a **durable stop request**: a job-scoped
+receipt (kind `pause` or `drain`) that participates in the existing
+receipt-driven wake-up, plus an open `stop` wait row. Both are written without
+acquiring the worktree execution lock, so a request is legal while the job
+waits on a human-only gate. Because the request is ledger state, a job that
+restarts between the request and its observance still honors it at the
+dispatch boundary before any new action is dispatched.
+
+The boundaries differ only in in-flight disposition. `pause` interrupts
+in-flight actions and marks them `uncertain` for evidence reconciliation, then
+enters `paused`. `drain` forbids new dispatch but lets in-flight actions reach
+a terminal outcome, entering `paused` only afterward. A job that is still
+`active` under a drain hold reports `draining` and refuses dispatch; once the
+in-flight set is terminal, the boundary records `paused`.
+
+### Cancellation
+
+`cancel` records the `cancelled` terminal state in one durable transaction. An
+action that holds only an intent (no side effect) is failed with a cancellation
+reason; a dispatched action whose outcome cannot be confirmed is marked
+`uncertain` for reconciliation; an already-uncertain action is left for
+evidence. Cancellation ends open waits and terminates ownership, so the partial
+unique index frees the worktree for a new registration. No transition out of
+`cancelled` exists.
+
+### Human wait
+
+When the run engine reaches an unsatisfied human-only gate, the wait is
+recorded as normal durable job state: an open `human` wait carrying the
+awaiting checkpoint, the material revision, and the start. The job keeps
+permanent ownership without holding the execution lock. There is no LLM polling
+and no stall recovery for a human wait: the job dispatches no model action
+while the wait lasts, and wake-up is through the durable receipt scan. A gate
+that becomes dispatchable (an approval receipt arrives and still matches the
+material revision) ends the wait; resume after the wait revalidates receipts
+before dispatch. A delegated gate is not a human wait: its scoped service
+action resolves it.
+
+### Completion from evidence
+
+A supervised job reaches `completed` only when every enabled change classifies
+done from the existing ground truth — archive evidence per change
+(`verify_direct_archive_done`), the post-archive fast checks
+(`groundtruth.run_fast_checks`), and post-archive cleanliness
+(`delivery.verify_post_archive_clean`). A worker or primary session's claim of
+done never completes the job; without that evidence the change continues
+through the existing implement/review/archive loop, and a repeated failure is
+bounded by the change's existing round budget. Non-supervised runs determine
+completion exactly as before.
+
+Pending `(manual)` tasks are collected via `state.pending_manual_tasks`,
+attached to the completion record, and shown on the `inspect` surface as the
+operator checklist. They never mark the change, job, or run incomplete or
+failed, and the implement/review/archive task-completeness gates are
+unchanged.
+
 ## Worktree execution lock
 
 Permanent job ownership (the ledger's ownership fields and single-job

@@ -1396,6 +1396,88 @@ never record a durable receipt whose projection it cannot regenerate.
 `doctor`, `status`, `logs`, and `report` acquire no boundary dependency and
 keep working unchanged on hosts where the boundary is unavailable.
 
+### Lifecycle commands
+
+```
+opsx-plan supervise register [plan.toml] [--store PATH] [--budget-usd N]
+                             [--budget-minutes N] [--per-action-usd N]
+                             [--per-action-minutes N] [--deadline-minutes N]
+                             [--max-incident-attempts N] [--primary-session]
+opsx-plan supervise start    [plan.toml] [--store PATH] [--job-id N] [--no-drive]
+opsx-plan supervise inspect  [plan.toml] [--store PATH] [--job-id N] [--json]
+opsx-plan supervise resume   [plan.toml] [--store PATH] [--job-id N] [--no-drive]
+opsx-plan supervise pause    [plan.toml] [--store PATH] [--job-id N]
+opsx-plan supervise drain    [plan.toml] [--store PATH] [--job-id N]
+opsx-plan supervise cancel   [plan.toml] [--store PATH] [--job-id N]
+```
+
+The job state machine is `registered → active → (paused → active)* →
+completed | failed | cancelled`, with the last three terminal. Every command
+except `inspect` is a durable ledger transition; a refused transition records
+nothing.
+
+**`register`** records the complete job: repository root and worktree identity,
+the protected manifest snapshot captured from the plan's canonical manifest
+(with its hash derived from that content), the standing permissions, the frozen
+model selection and inexpensive allowlist, the budgets and deadlines at
+operator revision 1, and the primary-session linkage configuration. It runs as
+the trust root (the endpoint host is job-scoped and cannot exist before a job
+does) and fails closed with `UnsupportedHostError` on a host without a
+supported isolation backend, recording nothing. A second active job for the
+same worktree is refused with `DuplicateJobError`. Nothing is written to the
+worktree or to JSON execution state.
+
+**`start`** transitions `registered → active`, records the live
+service-owned execution fence, and drives the existing run engine — the same
+`opsx-plan run` loop, no new DAG. `--no-drive` performs only the transition.
+
+**`resume`** transitions `paused → active` only after resume revalidation
+confirms that every relied-upon approval and acceptance receipt still matches
+the current material revision. A receipt invalidated by an explicit policy or
+plan revision re-arms its gate and the command fails with `StaleMaterialError`
+(the job stays `paused` and the affected change returns to awaiting its
+approval authority). After the wait clears, the engine is driven as for
+`start`.
+
+**`pause`** and **`drain`** are the two stop boundaries. Both record a durable
+stop request (a job-scoped receipt plus an open `stop` wait) that survives a
+restart and wakes a waiting job through the normal receipt scan; neither
+requires the worktree execution lock. `pause` interrupts in-flight actions and
+marks them `uncertain` for reconciliation, then enters `paused`. `drain` forbids
+new dispatch but lets in-flight actions reach a terminal outcome, entering
+`paused` only afterward. A job that is still `active` under a drain hold refuses
+dispatch with the `stop` gate until the in-flight work is terminal.
+
+**`cancel`** records the `cancelled` terminal state. An action holding only an
+intent is failed with a cancellation reason; a dispatched action whose outcome
+cannot be confirmed is marked `uncertain`; an already-uncertain action is left
+for evidence. Cancellation ends open waits and frees the worktree for a new
+registration. A cancelled job refuses every later receipt, stop request, and
+lifecycle verb with the named terminal-job error.
+
+**`inspect`** is a read-only projection — state, recorded waits, policy
+revision, budget posture, recent actions and incidents, and the pending
+`(manual)` operator checklist. It acquires neither the execution lock nor a live
+service, and fails with the named unknown-job error when no registered job
+exists.
+
+Mutating commands (`start`, `resume`, `pause`, `drain`, `cancel`) for a live job
+are mediated through the operator OS-authenticated endpoint, so a
+worker-domain process cannot invoke them. When no operator socket is
+configured the command acts as the trust root directly against the
+service-owned ledger (the non-live job path); a configured-but-unreachable
+endpoint fails closed with `BrokerUnavailableError` rather than acting
+unmediated. An unregistered worktree fails with `UnknownJobError`; an illegal
+transition fails with `IllegalTransitionError`; a terminal job fails with
+`TerminalJobError`; an unsupported host fails with `UnsupportedHostError`. All
+exit non-zero.
+
+A supervised job reaches `completed` only from plan, archive, and fast-check
+evidence — never from a worker or primary claim. Pending `(manual)` tasks are
+reported on the completion record and the `inspect` output as the operator
+checklist, and never mark the job incomplete or failed. Legacy, unregistered
+runs are unaffected.
+
 ### `opsx-plan doctor`
 
 ```

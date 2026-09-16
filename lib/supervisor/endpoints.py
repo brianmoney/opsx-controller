@@ -37,6 +37,7 @@ from typing import Any, Callable, Iterable, Mapping
 
 from lib.supervisor import agent_contracts as agent_contracts_module
 from lib.supervisor import broker as broker_module
+from lib.supervisor import lifecycle as lifecycle_module
 
 ENDPOINT_OPERATOR = "operator"
 ENDPOINT_WORKER = "worker-actions"
@@ -164,8 +165,26 @@ def _requested_change_ids(request: Mapping[str, Any]) -> list[str]:
     return [str(cid) for cid in change_ids]
 
 
+def _require_mutable_job(ledger: Any, job_id: int) -> Any:
+    """Return the job row, refusing a terminal job with the named error.
+
+    Every mutating operator request re-checks the durable job state, so a
+    cancelled (or otherwise terminal) job refuses all further receipts, stop
+    requests, and lifecycle verbs with the named terminal-job error and records
+    nothing.
+    """
+    job = lifecycle_module.require_job(ledger, job_id)
+    if str(job["state"]) in lifecycle_module.TERMINAL_JOB_STATES:
+        raise lifecycle_module.TerminalJobError(
+            f"job {job_id} is {job['state']}; a terminal job refuses all "
+            "further receipts, stop requests, and lifecycle verbs"
+        )
+    return job
+
+
 def _operator_approve(request: Mapping[str, Any], credentials: PeerCredentials) -> dict[str, Any]:
     ledger, job_id = _broker_ledger(request)
+    _require_mutable_job(ledger, job_id)
     principal = _principal_for(credentials, broker_module.OPERATOR)
     recorded = broker_module.record_approval(
         ledger, job_id, principal=principal,
@@ -183,6 +202,7 @@ def _operator_reset_change(
     request: Mapping[str, Any], credentials: PeerCredentials
 ) -> dict[str, Any]:
     ledger, job_id = _broker_ledger(request)
+    _require_mutable_job(ledger, job_id)
     principal = _principal_for(credentials, broker_module.OPERATOR)
     change_ids = _requested_change_ids(request)
     # A reset is a repair-consuming transition: an authorized reset that would
@@ -237,6 +257,7 @@ def _worker_release_delegated_gate(
 ) -> dict[str, Any]:
     ledger, job_id = _broker_ledger(request)
     _require_worker_contract(request, ledger, job_id)
+    _require_mutable_job(ledger, job_id)
     identity = request.get("service_identity")
     principal = _principal_for(credentials, broker_module.SERVICE, identity)
     change_id = request.get("change_id")
@@ -276,8 +297,55 @@ def _operator_enable(request: Mapping[str, Any], credentials: PeerCredentials) -
     return {"verb": "enable", "operator_uid": credentials.uid}
 
 
+def _lifecycle_result(verb: str, job_id: int, credentials: PeerCredentials, job: Any) -> dict[str, Any]:
+    return {
+        "verb": verb,
+        "operator_uid": credentials.uid,
+        "job_id": int(job_id),
+        "state": str(job["state"]),
+    }
+
+
+def _operator_pause(request: Mapping[str, Any], credentials: PeerCredentials) -> dict[str, Any]:
+    ledger, job_id = _broker_ledger(request)
+    job = lifecycle_module.pause(
+        ledger,
+        job_id,
+        authority=broker_module.OPERATOR,
+        actor_principal=str(credentials.uid),
+        detail=request.get("detail"),
+    )
+    return _lifecycle_result("pause", job_id, credentials, job)
+
+
+def _operator_drain(request: Mapping[str, Any], credentials: PeerCredentials) -> dict[str, Any]:
+    ledger, job_id = _broker_ledger(request)
+    job = lifecycle_module.drain(
+        ledger,
+        job_id,
+        authority=broker_module.OPERATOR,
+        actor_principal=str(credentials.uid),
+        detail=request.get("detail"),
+    )
+    return _lifecycle_result("drain", job_id, credentials, job)
+
+
+def _operator_resume(request: Mapping[str, Any], credentials: PeerCredentials) -> dict[str, Any]:
+    ledger, job_id = _broker_ledger(request)
+    job = lifecycle_module.resume(ledger, job_id)
+    return _lifecycle_result("resume", job_id, credentials, job)
+
+
 def _operator_cancel(request: Mapping[str, Any], credentials: PeerCredentials) -> dict[str, Any]:
-    return {"verb": "cancel", "operator_uid": credentials.uid}
+    ledger, job_id = _broker_ledger(request)
+    job = lifecycle_module.cancel(
+        ledger,
+        job_id,
+        authority=broker_module.OPERATOR,
+        actor_principal=str(credentials.uid),
+        detail=request.get("detail"),
+    )
+    return _lifecycle_result("cancel", job_id, credentials, job)
 
 
 def _worker_report_status(
@@ -611,6 +679,9 @@ OPERATOR_HANDLERS: Mapping[str, Callable[..., Any]] = MappingProxyType(
         "revise_policy": _operator_revise_policy,
         "enable": _operator_enable,
         "cancel": _operator_cancel,
+        "pause": _operator_pause,
+        "drain": _operator_drain,
+        "resume": _operator_resume,
     }
 )
 

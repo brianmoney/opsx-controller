@@ -95,6 +95,7 @@ try:
     from lib.supervisor import broker as broker_mod
     from lib.supervisor import budgets as budget_mod
     from lib.supervisor import ledger as ledger_mod
+    from lib.supervisor import lifecycle as lifecycle_mod
     from lib.supervisor import lock as lock_mod
 except ModuleNotFoundError as exc:  # pragma: no cover
     sys.exit(f"opsx-plan requires the lib.orchestrator runtime package: {exc}")
@@ -1929,6 +1930,96 @@ def supervised_gated_reserve(
         return {"blocked": str(exc), "last_result": exc.last_result}
 
 
+def evaluate_supervised_completion(
+    repo: Path, cfg: dict, ledger: Any, job_id: int
+) -> tuple[bool, list[dict[str, str]], dict[str, list[str]]]:
+    """Return ``(complete, failures, manual_tasks)`` for a supervised job.
+
+    Completion is decided only from the existing ground truth — archive
+    evidence per enabled change (:func:`verify_direct_archive_done`), the
+    post-archive fast checks (:func:`groundtruth.run_fast_checks`), and
+    post-archive cleanliness (:func:`delivery.verify_post_archive_clean`) —
+    never from a worker or primary session's claim of done. Pending
+    ``(manual)`` tasks are collected as the operator checklist and never make
+    the job incomplete.
+    """
+    state = state_mod.load_state(repo, cfg["name"])
+    manual: dict[str, list[str]] = {}
+    failures: list[dict[str, str]] = []
+    for cid in cfg["order"]:
+        change = cfg["changes"].get(cid) or {}
+        if not change.get("enabled", True):
+            continue
+        record = state_mod.rec(state, cid)
+        ok, why = verify_direct_archive_done(repo, cid, record)
+        if not ok:
+            failures.append({"change_id": cid, "reason": why})
+            continue
+        pending = state_mod.pending_manual_tasks(repo, cid)
+        if pending:
+            manual[cid] = pending
+    if failures:
+        return False, failures, manual
+    checks_ok, check_why = groundtruth.run_fast_checks(repo, cfg)
+    if not checks_ok:
+        return False, [{"change_id": "", "reason": f"post-archive {check_why}"}], manual
+    clean_ok, clean_why = delivery.verify_post_archive_clean(repo, cfg)
+    if not clean_ok:
+        return False, [{"change_id": "", "reason": f"post-archive {clean_why}"}], manual
+    return True, [], manual
+
+
+def _finalize_supervised_completion(repo: Path, cfg: dict, registration: Any) -> None:
+    """Verify and record supervised completion at the end of a run.
+
+    Verification reads plan, archive, and fast-check evidence. A verified job
+    transitions to ``completed`` and the pending ``(manual)`` tasks are attached
+    to the completion record and printed as the operator checklist; an
+    unverified job records a durable incident naming the outstanding change and
+    stays non-terminal (the existing loop remains the progression authority).
+    """
+    ledger = registration.ledger
+    job_id = int(registration.job_id)
+    try:
+        complete, failures, manual = evaluate_supervised_completion(
+            repo, cfg, ledger, job_id
+        )
+    except broker_mod.BrokerError as exc:
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return
+    manual_flat = [
+        f"{cid}: {task}" for cid, tasks in manual.items() for task in tasks
+    ]
+    if not complete:
+        reasons = "; ".join(
+            f"{failure['change_id'] or 'plan'}: {failure['reason']}"
+            for failure in failures
+        )
+        try:
+            ledger.record_incident(job_id, kind="completion_blocked", summary=reasons)
+        except Exception:
+            pass
+        print(f"supervised completion not verified: {reasons}", file=sys.stderr)
+        return
+    try:
+        job = lifecycle_mod.complete(ledger, job_id)
+    except broker_mod.BrokerError as exc:
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return
+    summary = "job completed from archive evidence and post-archive checks"
+    if manual_flat:
+        summary += "; pending manual tasks: " + "; ".join(manual_flat)
+    try:
+        ledger.record_incident(job_id, kind="job_completed", summary=summary)
+    except Exception:
+        pass
+    print(f"supervised job {job_id} is {job['state']}")
+    if manual_flat:
+        print("operator checklist (pending manual tasks):")
+        for item in manual_flat:
+            print(f"  - {item}")
+
+
 def supervised_gate_record_incident(
     gate: dict, cid: str, stage: str, *, discriminator: str = "dispatch",
 ) -> None:
@@ -3313,9 +3404,14 @@ def _cmd_run_body(args: argparse.Namespace, repo: Path, plan_src: str, cfg: dict
         else None
     )
     try:
-        return _cmd_run_body_inner(
+        rc = _cmd_run_body_inner(
             args, repo, plan_src, cfg, state, gate_resolver
         )
+        if rc == 0 and run_registration is not None:
+            # A registered job completes only from plan/archive/fast-check
+            # evidence; an ordinary run never reaches this path.
+            _finalize_supervised_completion(repo, cfg, run_registration)
+        return rc
     finally:
         if run_registration is not None:
             run_registration.close()
@@ -4084,6 +4180,101 @@ def main() -> int:
         ),
     )
     p_supervise_serve.set_defaults(fn=cmd_supervise.cmd_supervise_serve)
+
+    p_supervise_register = supervise_sub.add_parser(
+        "register",
+        help="record the supervised job for a plan (trust-root registration)",
+    )
+    p_supervise_register.add_argument(
+        "plan", nargs="?", default=None, help="path to the plan TOML"
+    )
+    p_supervise_register.add_argument(
+        "--store", default=None,
+        help="explicit service-owned supervision store path",
+    )
+    p_supervise_register.add_argument(
+        "--budget-usd", type=float, default=0.0, dest="budget_usd",
+        help="total cost budget for the job",
+    )
+    p_supervise_register.add_argument(
+        "--budget-minutes", type=float, default=None, dest="budget_minutes",
+        help="total elapsed budget for the job",
+    )
+    p_supervise_register.add_argument(
+        "--per-action-usd", type=float, default=None, dest="per_action_usd",
+        help="per-action cost budget for the job",
+    )
+    p_supervise_register.add_argument(
+        "--per-action-minutes", type=float, default=None,
+        dest="per_action_minutes", help="per-action elapsed budget for the job",
+    )
+    p_supervise_register.add_argument(
+        "--deadline-minutes", type=float, default=None, dest="deadline_minutes",
+        help="execution deadline for the job",
+    )
+    p_supervise_register.add_argument(
+        "--max-incident-attempts", type=int, default=None,
+        dest="max_incident_attempts", help="bounded incident attempt count",
+    )
+    p_supervise_register.add_argument(
+        "--primary-session", action="store_true", dest="primary_session",
+        help="record the linkage for a service-managed primary session",
+    )
+    p_supervise_register.add_argument("--json", action="store_true")
+    p_supervise_register.set_defaults(fn=cmd_supervise.cmd_supervise_register)
+
+    p_supervise_start = supervise_sub.add_parser(
+        "start", help="activate a registered job and drive the supervised run engine",
+    )
+    p_supervise_start.add_argument(
+        "plan", nargs="?", default=None, help="path to the plan TOML"
+    )
+    p_supervise_start.add_argument("--store", default=None)
+    p_supervise_start.add_argument("--job-id", type=int, default=None, dest="job_id")
+    p_supervise_start.add_argument(
+        "--no-drive", action="store_true", dest="no_drive",
+        help="transition to active without driving the run engine",
+    )
+    p_supervise_start.set_defaults(fn=cmd_supervise.cmd_supervise_start)
+
+    p_supervise_resume = supervise_sub.add_parser(
+        "resume", help="revalidate and reactivate a paused job",
+    )
+    p_supervise_resume.add_argument(
+        "plan", nargs="?", default=None, help="path to the plan TOML"
+    )
+    p_supervise_resume.add_argument("--store", default=None)
+    p_supervise_resume.add_argument("--job-id", type=int, default=None, dest="job_id")
+    p_supervise_resume.add_argument(
+        "--no-drive", action="store_true", dest="no_drive",
+        help="transition to active without driving the run engine",
+    )
+    p_supervise_resume.set_defaults(fn=cmd_supervise.cmd_supervise_resume)
+
+    p_supervise_inspect = supervise_sub.add_parser(
+        "inspect", help="read-only projection of a supervised job",
+    )
+    p_supervise_inspect.add_argument(
+        "plan", nargs="?", default=None, help="path to the plan TOML"
+    )
+    p_supervise_inspect.add_argument("--store", default=None)
+    p_supervise_inspect.add_argument("--job-id", type=int, default=None, dest="job_id")
+    p_supervise_inspect.add_argument("--json", action="store_true")
+    p_supervise_inspect.set_defaults(fn=cmd_supervise.cmd_supervise_inspect)
+
+    for _verb, _help in (
+        ("pause", "record the pause stop boundary (interrupt in-flight work)"),
+        ("drain", "record the drain stop boundary (let in-flight work finish)"),
+        ("cancel", "record the terminal cancellation for the job"),
+    ):
+        _parser = supervise_sub.add_parser(_verb, help=_help)
+        _parser.add_argument(
+            "plan", nargs="?", default=None, help="path to the plan TOML"
+        )
+        _parser.add_argument("--store", default=None)
+        _parser.add_argument("--job-id", type=int, default=None, dest="job_id")
+        _parser.add_argument("--json", action="store_true")
+        _parser.set_defaults(fn=getattr(cmd_supervise, f"cmd_supervise_{_verb}"))
 
     p_logs = sub.add_parser(
         "logs", help="inspect the latest or filtered stage log for a resolved plan",

@@ -948,11 +948,16 @@ def relied_upon_receipts(conn: Any, job_id: int) -> list[Any]:
 
     The latest receipt per ``(change_id, kind)`` whose checkpoint and material
     hash still match the current revision is "relied upon"; an older receipt
-    superseded by a newer one is not. This is the revalidation input.
+    superseded by a newer one is not. This is the revalidation input. Job-scoped
+    stop requests and ``pause``/``steer``/``reset`` control receipts are not
+    gate receipts and are deliberately excluded: a stop request must not be
+    revalidated as if it were gate authority.
     """
     rows = conn.receipts_after(job_id, 0)
     latest: dict[tuple[str, str], Any] = {}
     for row in rows:
+        if row["kind"] not in (APPROVAL, ACCEPTANCE):
+            continue
         latest[(row["change_id"], row["kind"])] = row
     return list(latest.values())
 

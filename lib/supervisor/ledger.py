@@ -34,14 +34,34 @@ from lib.supervisor import budgets
 from lib.supervisor import clock
 from lib.supervisor import model_policy
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 CURRENT_POLICY_VERSION = 1
 
 # Durable broker receipt kinds and the authorities that may record them. A
 # receipt is an authority record (who released a checkpoint against which
-# material revision), not a dispatched action; it is append-only.
-RECEIPT_KINDS = ("approval", "acceptance", "reset", "pause", "steer")
+# material revision), not a dispatched action; it is append-only. ``drain`` is
+# the second stop-request kind: a job-scoped request to stop at a boundary that
+# waits for in-flight actions to reach a terminal outcome.
+RECEIPT_KINDS = ("approval", "acceptance", "reset", "pause", "steer", "drain")
 RECEIPT_AUTHORITIES = ("operator", "delegated", "service")
+
+# The frozen version-5 receipt vocabulary. Kept as its own literal so the
+# version-5 schema still describes exactly what version-5 code wrote; the
+# forward migration to version 6 rebuilds the CHECK with the live
+# :data:`RECEIPT_KINDS`.
+_RECEIPT_KINDS_V5 = ("approval", "acceptance", "reset", "pause", "steer")
+
+# Durable wait kinds. A ``human`` wait is an expected human-only gate the job
+# waits out; a ``stop`` wait is a recorded stop-boundary hold (pause/drain)
+# that a restarted execution must still observe before dispatching.
+WAIT_KINDS = ("human", "stop")
+WAIT_STATES = ("open", "ended")
+
+# Job-scoped stop requests use a reserved change id and a checkpoint naming the
+# receipt kind, so the job-level request never collides with a per-change
+# receipt.
+STOP_REQUEST_CHANGE_ID = "*"
+STOP_CHECKPOINT_PREFIX = "job-stop:"
 
 # Fencing-record events. A fencing record describes one execution-lock
 # acquisition, release, or takeover for a supervised job; it never reassigns
@@ -433,7 +453,10 @@ def _migrate_3_to_4(conn: sqlite3.Connection) -> None:
 
 
 _RECEIPT_KINDS_SQL = "'" + "','".join(RECEIPT_KINDS) + "'"
+_RECEIPT_KINDS_V5_SQL = "'" + "','".join(_RECEIPT_KINDS_V5) + "'"
 _RECEIPT_AUTHORITIES_SQL = "'" + "','".join(RECEIPT_AUTHORITIES) + "'"
+_WAIT_KINDS_SQL = "'" + "','".join(WAIT_KINDS) + "'"
+_WAIT_STATES_SQL = "'" + "','".join(WAIT_STATES) + "'"
 
 _SCHEMA_V5_STATEMENTS = (
     f"""
@@ -441,7 +464,7 @@ _SCHEMA_V5_STATEMENTS = (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         job_id INTEGER NOT NULL REFERENCES jobs (id),
         change_id TEXT NOT NULL,
-        kind TEXT NOT NULL CHECK (kind IN ({_RECEIPT_KINDS_SQL})),
+        kind TEXT NOT NULL CHECK (kind IN ({_RECEIPT_KINDS_V5_SQL})),
         checkpoint TEXT NOT NULL,
         material_hash TEXT NOT NULL,
         authority TEXT NOT NULL CHECK (authority IN ({_RECEIPT_AUTHORITIES_SQL})),
@@ -479,12 +502,93 @@ def _migrate_4_to_5(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+_SCHEMA_V6_WAITS = (
+    f"""
+    CREATE TABLE IF NOT EXISTS waits (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id INTEGER NOT NULL REFERENCES jobs (id),
+        kind TEXT NOT NULL CHECK (kind IN ({_WAIT_KINDS_SQL})),
+        change_id TEXT,
+        checkpoint TEXT NOT NULL,
+        material_hash TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ({_WAIT_STATES_SQL})),
+        started_at TEXT NOT NULL,
+        ended_at TEXT
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_waits_job_state ON waits (job_id, state)
+    """,
+)
+
+
+def _migrate_5_to_6(conn: sqlite3.Connection) -> None:
+    """Add the durable wait record, the ``drain`` receipt kind, and linkage config.
+
+    Two changes land together because they are one lifecycle contract:
+
+    - ``waits`` records an interval (checkpoint, material revision, wait kind,
+      start/end) — a human-only gate wait or a stop-boundary hold — which a
+      point-in-time receipt cannot express.
+    - ``drain`` joins the receipt vocabulary. SQLite cannot widen an existing
+      ``CHECK`` in place, so the ``receipts`` table is rebuilt inside the same
+      migration transaction with every row preserved.
+    - ``jobs.linkage_config`` records the primary-session linkage configuration
+      captured at registration. Nullable and additive for existing rows.
+
+    Forward-only discipline is unchanged: an older ledger migrates in one
+    transaction; a newer-than-code ledger is refused before any write.
+    """
+    # ``CREATE TABLE ... AS``-style rebuilds are avoided so the exact column
+    # types, constraints, and row ids survive the copy.
+    conn.execute(
+        f"""
+        CREATE TABLE receipts_v6 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER NOT NULL REFERENCES jobs (id),
+            change_id TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ({_RECEIPT_KINDS_SQL})),
+            checkpoint TEXT NOT NULL,
+            material_hash TEXT NOT NULL,
+            authority TEXT NOT NULL CHECK (authority IN ({_RECEIPT_AUTHORITIES_SQL})),
+            actor_principal TEXT,
+            detail TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO receipts_v6 (
+            id, job_id, change_id, kind, checkpoint, material_hash,
+            authority, actor_principal, detail, created_at
+        )
+        SELECT id, job_id, change_id, kind, checkpoint, material_hash,
+               authority, actor_principal, detail, created_at
+        FROM receipts
+        """
+    )
+    conn.execute("DROP TABLE receipts")
+    conn.execute("ALTER TABLE receipts_v6 RENAME TO receipts")
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_receipts_job_change_kind
+            ON receipts (job_id, change_id, kind)
+        """
+    )
+    for statement in _SCHEMA_V6_WAITS:
+        conn.execute(statement)
+    if not _column_exists(conn, "jobs", "linkage_config"):
+        conn.execute("ALTER TABLE jobs ADD COLUMN linkage_config TEXT")
+
+
 MIGRATIONS: dict[int, Any] = {
     1: _migrate_0_to_1,
     2: _migrate_1_to_2,
     3: _migrate_2_to_3,
     4: _migrate_3_to_4,
     5: _migrate_4_to_5,
+    6: _migrate_5_to_6,
 }
 
 
@@ -625,16 +729,18 @@ class Ledger:
         owner_principal: str | None = None,
         owner_host: str | None = None,
         owner_boot_id: str | None = None,
+        linkage_config: Mapping[str, Any] | str | None = None,
         policy_version: int = CURRENT_POLICY_VERSION,
     ) -> int:
         """Register a supervised job with its initial policy revision.
 
-        The job row, policy revision 1, and the protected manifest snapshot are
-        written in a single transaction. A registered job always has protected
-        snapshot content to evaluate gates against, so *manifest_content* is
-        required: a registration without it is invalid. The snapshot's identity
-        hash is computed from the content and recorded on the policy, replacing
-        any caller-supplied ``manifest_snapshot_hash`` so the two can never
+        The job row, policy revision 1, the protected manifest snapshot, and
+        the primary-session linkage configuration are written in a single
+        transaction. A registered job always has protected snapshot content to
+        evaluate gates against, so *manifest_content* is required: a
+        registration without it is invalid. The snapshot's identity hash is
+        computed from the content and recorded on the policy, replacing any
+        caller-supplied ``manifest_snapshot_hash`` so the two can never
         disagree.
 
         A second registration for a worktree that already has an active job
@@ -655,6 +761,10 @@ class Ledger:
         fields = self._validate_policy(policy)
         snapshot_hash = snapshot_digest(manifest_content)
         fields["manifest_snapshot_hash"] = snapshot_hash
+        if linkage_config is None or isinstance(linkage_config, str):
+            encoded_linkage = linkage_config
+        else:
+            encoded_linkage = json.dumps(dict(linkage_config), sort_keys=True)
         now = _utcnow()
 
         existing = self._conn.execute(
@@ -675,12 +785,13 @@ class Ledger:
                 INSERT INTO jobs (
                     run_id, repo_root, worktree_path, state, owner,
                     owner_principal, owner_host, owner_boot_id,
-                    high_water_incident, created_at, updated_at
-                ) VALUES (?, ?, ?, 'registered', ?, ?, ?, ?, 0, ?, ?)
+                    high_water_incident, linkage_config, created_at, updated_at
+                ) VALUES (?, ?, ?, 'registered', ?, ?, ?, ?, 0, ?, ?, ?)
                 """,
                 (
                     run_id, repo_root, worktree_rel, owner,
-                    owner_principal, owner_host, owner_boot_id, now, now,
+                    owner_principal, owner_host, owner_boot_id,
+                    encoded_linkage, now, now,
                 ),
             )
             job_id = int(cursor.lastrowid)
@@ -695,10 +806,9 @@ class Ledger:
                 "(job_id, snapshot_hash, content, created_at) VALUES (?, ?, ?, ?)",
                 (job_id, snapshot_hash, manifest_content, now),
             )
-            _ = self._conn.execute(
-                "UPDATE jobs SET state = 'active', updated_at = ? WHERE id = ?",
-                (now, job_id),
-            )
+            # The job is recorded in the ``registered`` state. Activation is a
+            # separate, explicit lifecycle transition (``start``), so a
+            # registration is durable but never dispatchable on its own.
         except sqlite3.IntegrityError as exc:
             self._conn.execute("ROLLBACK")
             if "idx_jobs_active_worktree" in str(exc) or "UNIQUE" in str(exc):
@@ -726,8 +836,14 @@ class Ledger:
         if root is None:
             raise LedgerError("find_job_by_worktree requires a repository_root")
         worktree_rel = repository_relative(worktree, root)
+        # A worktree may carry several job rows over its lifetime (a terminal
+        # job plus a re-registration). The active, non-terminal row is the
+        # current registration and is preferred; a worktree with only terminal
+        # history still resolves to its most recent terminal job.
         return self._conn.execute(
-            "SELECT * FROM jobs WHERE repo_root = ? AND worktree_path = ?",
+            "SELECT * FROM jobs WHERE repo_root = ? AND worktree_path = ? "
+            "ORDER BY CASE WHEN state IN ('completed', 'failed', 'cancelled') "
+            "THEN 1 ELSE 0 END, id DESC LIMIT 1",
             (str(_canonical(root)), worktree_rel),
         ).fetchone()
 
@@ -918,6 +1034,200 @@ class Ledger:
         """Return the content identified by the current policy's snapshot hash."""
         policy = self.current_policy(job_id)
         return self.manifest_snapshot(job_id, policy["manifest_snapshot_hash"])
+
+    def job_linkage_config(self, job_id: int) -> dict[str, Any] | None:
+        """Return the decoded primary-session linkage configuration, or ``None``.
+
+        The configuration is captured at registration and stored with the job in
+        service-owned storage; a raw non-JSON value is returned under
+        ``{"raw": value}`` rather than being silently dropped.
+        """
+        row = self.get_job(job_id)
+        raw = row["linkage_config"]
+        if raw is None:
+            return None
+        if isinstance(raw, (bytes, bytearray)):  # pragma: no cover - defensive
+            raw = raw.decode("utf-8", "replace")
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, ValueError):
+            return {"raw": raw}
+        return decoded if isinstance(decoded, dict) else {"value": decoded}
+
+    # -- waits and stop requests -------------------------------------------
+
+    def record_wait(
+        self,
+        job_id: int,
+        *,
+        kind: str,
+        checkpoint: str,
+        material_hash: str,
+        change_id: str | None = None,
+    ) -> int:
+        """Open a durable wait interval for *job_id* in one transaction.
+
+        A wait is an interval (checkpoint, material revision, kind,
+        started/ended), not a point-in-time receipt: a human-only gate wait or a
+        stop-boundary hold both need a start and an eventual end. An unknown
+        kind, an empty checkpoint or material hash, or an unknown job is refused
+        and nothing is written.
+        """
+        if kind not in WAIT_KINDS:
+            raise LedgerError(f"unknown wait kind: {kind}")
+        if not checkpoint or not material_hash:
+            raise LedgerError("a wait requires a checkpoint and a material hash")
+        self.get_job(job_id)
+        now = _utcnow()
+        with self._transaction():
+            cursor = self._conn.execute(
+                """
+                INSERT INTO waits (
+                    job_id, kind, change_id, checkpoint, material_hash, state,
+                    started_at, ended_at
+                ) VALUES (?, ?, ?, ?, ?, 'open', ?, NULL)
+                """,
+                (job_id, kind, change_id, checkpoint, material_hash, now),
+            )
+            wait_id = int(cursor.lastrowid)
+        return wait_id
+
+    def get_wait(self, wait_id: int) -> sqlite3.Row:
+        row = self._conn.execute(
+            "SELECT * FROM waits WHERE id = ?", (wait_id,)
+        ).fetchone()
+        if row is None:
+            raise UnknownRecordError(f"no such wait: {wait_id}")
+        return row
+
+    def end_wait(self, wait_id: int) -> None:
+        """Close an open wait. An already-ended wait is left unchanged."""
+        now = _utcnow()
+        with self._transaction():
+            wait = self.get_wait(wait_id)
+            if wait["state"] == "ended":
+                return
+            _ = self._conn.execute(
+                "UPDATE waits SET state = 'ended', ended_at = ? "
+                "WHERE id = ? AND state = 'open'",
+                (now, wait_id),
+            )
+
+    def list_waits(self, job_id: int) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute(
+                "SELECT * FROM waits WHERE job_id = ? ORDER BY id", (job_id,)
+            )
+        )
+
+    def open_waits(self, job_id: int, *, kind: str | None = None) -> list[sqlite3.Row]:
+        """Return *job_id*'s still-open waits, optionally filtered by kind."""
+        if kind is None:
+            return list(
+                self._conn.execute(
+                    "SELECT * FROM waits WHERE job_id = ? AND state = 'open' "
+                    "ORDER BY id",
+                    (job_id,),
+                )
+            )
+        return list(
+            self._conn.execute(
+                "SELECT * FROM waits WHERE job_id = ? AND state = 'open' "
+                "AND kind = ? ORDER BY id",
+                (job_id, kind),
+            )
+        )
+
+    def end_open_waits(self, job_id: int, *, kind: str | None = None) -> int:
+        """Close every open wait for *job_id*, returning how many were closed."""
+        now = _utcnow()
+        with self._transaction():
+            if kind is None:
+                cursor = self._conn.execute(
+                    "UPDATE waits SET state = 'ended', ended_at = ? "
+                    "WHERE job_id = ? AND state = 'open'",
+                    (now, job_id),
+                )
+            else:
+                cursor = self._conn.execute(
+                    "UPDATE waits SET state = 'ended', ended_at = ? "
+                    "WHERE job_id = ? AND state = 'open' AND kind = ?",
+                    (now, job_id, kind),
+                )
+            return int(cursor.rowcount)
+
+    def record_stop_request(
+        self,
+        job_id: int,
+        *,
+        kind: str,
+        authority: str,
+        actor_principal: str | None = None,
+        detail: str | None = None,
+    ) -> int:
+        """Record a durable job-scoped stop request in one transaction.
+
+        A stop request is the pair of a job-level receipt (the durable wake-up
+        record, kind ``pause`` or ``drain``) and an open ``stop`` wait (the
+        boundary hold a restarted execution must still observe). Both are
+        written atomically, never requiring the worktree execution lock. The
+        material hash is derived from the job's current policy revision, so the
+        request is bound to the policy it was recorded against.
+        """
+        stop_kinds = ("pause", "drain")
+        if kind not in stop_kinds:
+            raise LedgerError(f"unknown stop-request kind: {kind}")
+        if authority not in RECEIPT_AUTHORITIES:
+            raise LedgerError(f"unknown receipt authority: {authority}")
+        self.get_job(job_id)
+        policy = self.current_policy(job_id)
+        material_hash = snapshot_digest(
+            f"job-stop:{job_id}:{policy['revision']}"
+        )
+        checkpoint = STOP_CHECKPOINT_PREFIX + kind
+        now = _utcnow()
+        with self._transaction():
+            cursor = self._conn.execute(
+                """
+                INSERT INTO receipts (
+                    job_id, change_id, kind, checkpoint, material_hash,
+                    authority, actor_principal, detail, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id, STOP_REQUEST_CHANGE_ID, kind, checkpoint,
+                    material_hash, authority, actor_principal, detail, now,
+                ),
+            )
+            receipt_id = int(cursor.lastrowid)
+            _ = self._conn.execute(
+                """
+                INSERT INTO waits (
+                    job_id, kind, change_id, checkpoint, material_hash, state,
+                    started_at, ended_at
+                ) VALUES (?, 'stop', NULL, ?, ?, 'open', ?, NULL)
+                """,
+                (job_id, checkpoint, material_hash, now),
+            )
+        return receipt_id
+
+    def stop_receipts(self, job_id: int) -> list[sqlite3.Row]:
+        """Return *job_id*'s job-scoped stop receipts in insertion order."""
+        return list(
+            self._conn.execute(
+                "SELECT * FROM receipts WHERE job_id = ? AND change_id = ? "
+                "AND kind IN ('pause', 'drain') ORDER BY id",
+                (job_id, STOP_REQUEST_CHANGE_ID),
+            )
+        )
+
+    def latest_stop_receipt(self, job_id: int) -> sqlite3.Row | None:
+        """Return the most recent job-scoped stop receipt, or ``None``."""
+        return self._conn.execute(
+            "SELECT * FROM receipts WHERE job_id = ? AND change_id = ? "
+            "AND kind IN ('pause', 'drain') ORDER BY id DESC LIMIT 1",
+            (job_id, STOP_REQUEST_CHANGE_ID),
+        ).fetchone()
 
     # -- policy ------------------------------------------------------------
 
