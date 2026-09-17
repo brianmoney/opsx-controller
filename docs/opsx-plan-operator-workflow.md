@@ -1431,6 +1431,8 @@ Reconcile state against the repository and print per-change status.
 opsx-plan supervise status [--json]
 opsx-plan supervise probe
 opsx-plan supervise serve [plan.toml] [--store PATH] [--job-id N] [--once]
+opsx-plan supervise watchdog [plan.toml] [--store PATH] [--job-id N]
+                              [--once] [--interval SECONDS] [--json]
 ```
 
 Inspect and gate the operator authority boundary. `supervise status` is a
@@ -1497,6 +1499,33 @@ operator/service principal, or an unbindable socket fails closed with
 booted session down rather than leaking a raw socket error, so the service can
 never record a durable receipt whose projection it cannot regenerate.
 
+`supervise serve` also owns the watchdog loop: it performs the boot-scan
+reconciliation for the registered non-terminal jobs before serving and runs a
+periodic watchdog tick from its serve loop. The boot scan attempts to
+reconnect and adopt an existing session before any respawn, and only a
+`dead`, quiesced job that already had a prior execution is reconstituted, under
+the bounded restart backoff.
+
+`supervise watchdog` runs that same deterministic runner directly, without the
+execution lock and without a live service. Every tick evaluates **all**
+registered non-terminal jobs; with `--once` it runs exactly one tick and exits,
+and without it, it ticks every `--interval` seconds until interrupted. An
+explicit `--job-id` does not narrow the tick: it only selects which job's report
+is shown at the top level, while `--json` still lists every assessed job under
+`jobs`/`assessments`. It reports each job's classification (`live`, `quiet`,
+`stalled`, `dead`, or `expected_human_wait`), the three separate liveness,
+progress, and deadline signals, the restart-attempt state, and the recent
+reconstitution events, in human-readable form or as `--json`. A prior owner
+whose fencing record no longer holds the lock but whose recorded identity still
+matches a live process is surfaced as a blocking hazard and is never
+reconstituted. It exits non-zero with the named unknown-job error when the
+worktree has no registered supervised job, and it never mutates anything when
+read-only observation is requested through `status`/`inspect`/`report`. An
+expected human wait is reported as `expected_human_wait` and receives no model,
+recovery, or reconstitution action. See `core/plan-supervision.md` ("Watchdog
+and reconstitution") for the signal, classification, quiescence, and
+bounded-restart contracts.
+
 `doctor`, `status`, `logs`, and `report` acquire no boundary dependency and
 keep working unchanged on hosts where the boundary is unavailable.
 
@@ -1513,6 +1542,8 @@ opsx-plan supervise resume   [plan.toml] [--store PATH] [--job-id N] [--no-drive
 opsx-plan supervise pause    [plan.toml] [--store PATH] [--job-id N]
 opsx-plan supervise drain    [plan.toml] [--store PATH] [--job-id N]
 opsx-plan supervise cancel   [plan.toml] [--store PATH] [--job-id N]
+opsx-plan supervise watchdog [plan.toml] [--store PATH] [--job-id N]
+                             [--once] [--interval SECONDS] [--json]
 ```
 
 The job state machine is `registered → active → (paused → active)* →

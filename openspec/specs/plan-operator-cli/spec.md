@@ -1083,3 +1083,62 @@ change behavior for unregistered plans.
 
 - **WHEN** a steering command is run for a plan with no registered supervised job
 - **THEN** existing behavior is unchanged and no supervision request identity is reported
+
+### Requirement: `opsx-plan supervise` provides the watchdog surface
+
+The `opsx-plan supervise` namespace SHALL provide a `watchdog` command that
+runs the deterministic watchdog loop or, with `--once`, exactly one tick. It
+SHALL report each supervised job's classification and recent reconstitution
+events, in human-readable form and as structured JSON. The command SHALL
+require neither the worktree execution lock nor a live service, and SHALL exit
+non-zero with a named unknown-job error when no registered supervised job
+exists.
+
+`opsx-plan supervise serve` SHALL run the boot-scan reconciliation and the
+periodic watchdog tick as part of the service host, so the service-owned loop
+supervises registered jobs unattended.
+
+The watchdog surface SHALL NOT affect legacy unregistered runs: an operator who
+never registers a supervised job observes no behavior change in any existing
+command.
+
+#### Scenario: A single tick runs from the command line
+
+- **WHEN** an operator runs `opsx-plan supervise watchdog --once` for a
+  registered job
+- **THEN** exactly one tick is evaluated and the job's classification and any
+  reconstitution events are reported
+
+#### Scenario: The watchdog surface fails closed without a registered job
+
+- **WHEN** `opsx-plan supervise watchdog` runs for a worktree with no
+  registered supervised job
+- **THEN** it exits non-zero with a named unknown-job error and records nothing
+
+#### Scenario: Serve supervises unattended
+
+- **WHEN** `opsx-plan supervise serve` runs for a registered job
+- **THEN** it performs the boot-scan reconciliation and periodic watchdog ticks
+  as part of the service host
+
+#### Scenario: Legacy runs are unaffected
+
+- **WHEN** an operator runs any existing `opsx-plan` command for a plan with no
+  registered supervised job
+- **THEN** its behavior is unchanged by the watchdog surface
+
+### Requirement: Operator documentation describes the watchdog and reconstitution behavior
+
+The operator-facing `opsx-plan` documentation SHALL describe the watchdog: the
+service-owned loop with no control-channel dependency, the separate liveness,
+progress, and deadline signals, the job classification vocabulary, boot-scan
+reconciliation with reconnect before respawn, quiescence-gated reconstitution,
+the restart backoff bound, the no-action rule for an expected human wait, and
+the read-only reconstitution-event surface.
+
+#### Scenario: The watchdog surface is documented
+
+- **WHEN** an operator reads the documented `opsx-plan supervise` reference
+- **THEN** it covers the watchdog loop, the signals and classifications, boot
+  reconciliation, quiescence-gated reconstitution, restart bounds, human-wait
+  handling, and the reconstitution-event surface

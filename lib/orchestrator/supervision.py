@@ -44,6 +44,7 @@ from lib.supervisor import ledger as ledger_mod
 from lib.supervisor import lock as lock_mod
 from lib.supervisor import model_policy as model_policy_mod
 from lib.supervisor import session_bridge as session_bridge_mod
+from lib.supervisor import watchdog as watchdog_mod
 
 ENV_STATE_FILE = "OPSX_SUPERVISOR_STATE_FILE"
 ENV_SERVER_COMMAND = "OPSX_SESSION_SERVER_COMMAND"
@@ -505,6 +506,14 @@ def project_job(
         change_ids=change_ids,
         acceptance_reviews=ledger.list_acceptance_reviews(job_id),
     )
+    watchdog_state: dict[str, Any] | None = None
+    try:
+        # Read-only observation: the report computes classification and reads
+        # recent events without mutating the ledger, taking the execution lock,
+        # or requiring a live service.
+        watchdog_state = watchdog_mod.Watchdog(ledger, repo=repo).report(job)
+    except Exception:  # noqa: BLE001 - observation is advisory
+        watchdog_state = None
 
     return {
         "job_id": job_id,
@@ -574,6 +583,7 @@ def project_job(
         ],
         "linkage_config": ledger.job_linkage_config(job_id),
         "pending_manual_tasks": manual,
+        "watchdog": watchdog_state,
         "metrics": {
             "cost_per_correct_completion": metrics,
         },
@@ -1216,10 +1226,49 @@ class ServiceEndpointHost:
     primary_session: "PrimarySessionRuntime | None" = None
     _listeners: dict[str, Any] = None  # type: ignore[assignment]
     _stopped: bool = False
+    watchdog: Any = None
+    watchdog_interval: float = 5.0
+    _watchdog_scanned: bool = False
+    _last_watchdog_tick: float = 0.0
+    watchdog_error: str | None = None
 
     def __post_init__(self) -> None:
         if self._listeners is None:
             self._listeners = {}
+
+    # -- watchdog loop -----------------------------------------------------
+
+    def run_boot_scan(self) -> Any:
+        """Reconcile every non-terminal job before serving.
+
+        The boot scan records each job's classification and attempts reconnect
+        before any respawn. A watchdog failure is contained: the endpoint
+        surface must still serve requests, so the error is recorded on the host
+        rather than escaping the serve loop.
+        """
+        if self.watchdog is None:
+            return None
+        self._watchdog_scanned = True
+        self._last_watchdog_tick = time.monotonic()
+        try:
+            return self.watchdog.boot_scan()
+        except Exception as exc:  # noqa: BLE001 - contained, recorded below
+            self.watchdog_error = str(exc)
+            return None
+
+    def maybe_tick(self) -> Any:
+        """Run a watchdog tick when the configured interval has elapsed."""
+        if self.watchdog is None:
+            return None
+        now = time.monotonic()
+        if now - self._last_watchdog_tick < float(self.watchdog_interval):
+            return None
+        self._last_watchdog_tick = now
+        try:
+            return self.watchdog.tick()
+        except Exception as exc:  # noqa: BLE001 - contained, recorded below
+            self.watchdog_error = str(exc)
+            return None
 
     def start_primary_session(
         self,
@@ -1335,6 +1384,12 @@ class ServiceEndpointHost:
             raise broker_mod.BrokerUnavailableError(
                 "the service endpoint host is not bound; call bind() first"
             )
+        # Boot reconciliation runs before the first request is served; a
+        # periodic tick runs when its interval has elapsed. Both are contained
+        # so the broker endpoint surface keeps serving.
+        if not self._watchdog_scanned:
+            self.run_boot_scan()
+        self.maybe_tick()
         listener_map = {
             listener: kind for kind, (listener, _p) in self._listeners.items()
         }
@@ -1383,6 +1438,7 @@ class ServiceEndpointHost:
             except OSError:  # pragma: no cover - best-effort cleanup
                 pass
         self._listeners = {}
+        self.watchdog = None
         try:
             self.session.close()
         except Exception:
@@ -1395,6 +1451,35 @@ class ServiceEndpointHost:
         self.close()
 
 
+def _watchdog_session_is_live(ledger: Any, job_id: int) -> bool:
+    """Return whether the job's recorded primary session is still adoptable.
+
+    A read-only lookup through the documented session bridge: it probes the
+    recorded server address and asks for the recorded session. A missing
+    linkage, an unreachable server, or an absent session is not live, so the
+    watchdog falls through to the (quiescence-gated) reconstitution path.
+    """
+    linkage = session_bridge_mod.primary_session_linkage(ledger, int(job_id))
+    if linkage is None:
+        return False
+    transport = None
+    try:
+        transport = session_bridge_mod.LoopbackTransport.from_address(
+            linkage.server_address
+        )
+        bridge = session_bridge_mod.SessionBridge(transport)
+        bridge.check_capability()
+        return bridge.lookup_session(linkage.session_id) is not None
+    except Exception:  # noqa: BLE001 - an unreachable probe is simply not live
+        return False
+    finally:
+        if transport is not None:
+            try:
+                transport.close()
+            except Exception:  # pragma: no cover - best-effort close
+                pass
+
+
 def open_service_host(
     repo: Path,
     cfg: dict,
@@ -1403,6 +1488,7 @@ def open_service_host(
     job_id: int | None = None,
     operator_principal: Any = None,
     service_principal: Any = None,
+    watchdog_redrive: Any = None,
 ) -> ServiceEndpointHost:
     """Boot the production service host: session + projection writer + sockets.
 
@@ -1430,6 +1516,12 @@ def open_service_host(
             else _operator_allowed_uids()
         )
         service_allowed = _allowed_uids_for("service", principal=service_principal)
+        watchdog = watchdog_mod.Watchdog(
+            session.ledger,
+            repo=repo,
+            reconnect=_watchdog_session_is_live,
+            redrive=watchdog_redrive,
+        )
         return ServiceEndpointHost(
             session=session,
             store_path=effective_store,
@@ -1441,6 +1533,7 @@ def open_service_host(
             worker_socket=service_socket_path(
                 endpoints_mod.ENDPOINT_WORKER, effective_store
             ),
+            watchdog=watchdog,
         )
     except Exception:
         session.close()

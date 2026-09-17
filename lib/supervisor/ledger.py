@@ -36,7 +36,7 @@ from lib.supervisor import budgets
 from lib.supervisor import clock
 from lib.supervisor import model_policy
 
-CURRENT_SCHEMA_VERSION = 9
+CURRENT_SCHEMA_VERSION = 10
 CURRENT_POLICY_VERSION = 1
 
 # Durable broker receipt kinds and the authorities that may record them. A
@@ -783,6 +783,60 @@ def _migrate_8_to_9(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+# The version-10 migration adds the append-only ``watchdog_events`` table. It is
+# declared separately from every earlier schema literal so the earlier schemas
+# still describe exactly what their version of the code wrote.
+_SCHEMA_V10_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS watchdog_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id INTEGER NOT NULL REFERENCES jobs (id),
+        kind TEXT NOT NULL,
+        classification TEXT,
+        reason TEXT,
+        detail TEXT,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_watchdog_events_job
+        ON watchdog_events (job_id, id)
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS watchdog_events_guard_update
+        BEFORE UPDATE ON watchdog_events
+        FOR EACH ROW
+    BEGIN
+        SELECT RAISE(ABORT, 'watchdog_events rows are append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS watchdog_events_guard_delete
+        BEFORE DELETE ON watchdog_events
+        FOR EACH ROW
+    BEGIN
+        SELECT RAISE(ABORT, 'watchdog_events rows are append-only');
+    END
+    """,
+)
+
+
+def _migrate_9_to_10(conn: sqlite3.Connection) -> None:
+    """Add the append-only ``watchdog_events`` reconstitution-event table.
+
+    Strictly additive and forward-only, in the same single migration
+    transaction as every other step: one row per watchdog classification
+    transition or reconstitution event, carrying the job id, the event kind,
+    the classification, the reason, optional detail, and the timestamp. Two
+    guard triggers refuse every ``UPDATE`` and ``DELETE``, so the table is
+    insert-only and a later tick can only append. No existing table, row, or
+    JSON state is rewritten, and the migration chains on whatever schema head
+    exists when it lands.
+    """
+    for statement in _SCHEMA_V10_STATEMENTS:
+        conn.execute(statement)
+
+
 MIGRATIONS: dict[int, Any] = {
     1: _migrate_0_to_1,
     2: _migrate_1_to_2,
@@ -793,6 +847,7 @@ MIGRATIONS: dict[int, Any] = {
     7: _migrate_6_to_7,
     8: _migrate_7_to_8,
     9: _migrate_8_to_9,
+    10: _migrate_9_to_10,
 }
 
 
@@ -2292,6 +2347,89 @@ class Ledger:
                 (job_id,),
             )
         )
+
+    # -- watchdog reconstitution events ------------------------------------
+
+    def record_watchdog_event(
+        self,
+        job_id: int,
+        *,
+        kind: str,
+        classification: str | None = None,
+        reason: str = "",
+        detail: str | None = None,
+    ) -> int:
+        """Append one watchdog event for *job_id* and return its id.
+
+        The record is insert-only: the ``watchdog_events`` table carries guard
+        triggers that refuse every ``UPDATE`` and ``DELETE``, so a later tick
+        can only append. The row survives a ledger reopen and a process
+        restart. *classification* is the classification the event belongs to
+        and is optional for events that are not classification transitions.
+        """
+        self.get_job(job_id)
+        normalized_kind = str(kind).strip()
+        if not normalized_kind:
+            raise LedgerError("watchdog event kind must not be empty")
+        now = _utcnow()
+        with self._transaction():
+            cursor = self._conn.execute(
+                """
+                INSERT INTO watchdog_events (
+                    job_id, kind, classification, reason, detail, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    normalized_kind,
+                    classification,
+                    str(reason) if reason is not None else "",
+                    detail,
+                    now,
+                ),
+            )
+            event_id = int(cursor.lastrowid)
+        return event_id
+
+    def list_watchdog_events(
+        self, job_id: int, *, limit: int | None = None
+    ) -> list[sqlite3.Row]:
+        """Return the job's watchdog events, newest last, optionally bounded."""
+        if limit is not None:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM (
+                    SELECT * FROM watchdog_events
+                    WHERE job_id = ? ORDER BY id DESC LIMIT ?
+                ) ORDER BY id
+                """,
+                (job_id, int(limit)),
+            )
+            return list(rows)
+        return list(
+            self._conn.execute(
+                "SELECT * FROM watchdog_events WHERE job_id = ? ORDER BY id",
+                (job_id,),
+            )
+        )
+
+    def latest_watchdog_event(
+        self, job_id: int, *, kind: str | None = None
+    ) -> sqlite3.Row | None:
+        """Return the newest watchdog event for *job_id* (optionally of *kind*)."""
+        if kind is None:
+            row = self._conn.execute(
+                "SELECT * FROM watchdog_events WHERE job_id = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (job_id,),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT * FROM watchdog_events WHERE job_id = ? AND kind = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (job_id, str(kind)),
+            ).fetchone()
+        return row
 
     # -- execution-elapsed accounting --------------------------------------
 

@@ -3055,3 +3055,268 @@ empirical performance, savings, or quality promise.
 
 - **WHEN** supervised usage and completion evidence exist for a job
 - **THEN** the projection reports cost-per-correct-completion with its definition, inputs, and stated limitations, and makes no performance claim
+
+### Requirement: The watchdog is a deterministic service-owned loop with no control-channel dependency
+
+The system SHALL provide a watchdog that supervises registered supervised jobs
+from within the trusted service domain. The watchdog loop SHALL be
+deterministic: its classification and reconstitution decisions SHALL be
+functions of durable ledger state, the authoritative plan state, the recorded
+execution identity, and the clock alone, with no dependency on a terminal, a
+streamed control channel, or any ephemeral in-memory state.
+
+A tick interrupted by a restart SHALL produce the same decision when it is
+re-evaluated from the same durable state, and the loop SHALL run unattended
+under the service host with no attached terminal.
+
+#### Scenario: A decision is reproducible from durable state
+
+- **WHEN** a tick is evaluated for a job, then the process is interrupted, and
+  the same tick is evaluated again from the same durable state and clock
+- **THEN** the two evaluations produce the same classification and the same
+  reconstitution decision
+
+#### Scenario: The loop runs with no terminal attached
+
+- **WHEN** the service host runs without an attached terminal or control
+  channel
+- **THEN** the watchdog still evaluates jobs and records its decisions
+
+### Requirement: Liveness, progress, and deadline are independent watchdog signals
+
+The watchdog SHALL derive three independent signals for each supervised job:
+
+- a **liveness** signal, true only when the job's recorded execution identity
+  matches a live process on the current boot (the recorded process start time
+  and boot identity, never a bare process id);
+- a **progress** signal, true only when the job's durable journal or evidence
+  has advanced within the configured progress window; and
+- a **deadline** signal, true when the job's execution-elapsed time has reached
+  its policy execution deadline, excluding expected human-wait duration.
+
+The signals SHALL be computed and reported separately: a live job with no
+recent progress and a job with recent progress but no live owner SHALL be
+distinguishable, and no signal SHALL be inferred from another.
+
+#### Scenario: Liveness and progress are reported separately
+
+- **WHEN** a job's recorded owner is a live process but its journal has not
+  advanced within the progress window
+- **THEN** the liveness signal is true and the progress signal is false, and
+  both are reported
+
+#### Scenario: Progress is reported without liveness
+
+- **WHEN** a job's journal advanced recently but its recorded execution
+  identity does not match a live process
+- **THEN** the progress signal is true and the liveness signal is false
+
+#### Scenario: The deadline signal excludes a human wait
+
+- **WHEN** a job has been waiting on a human-only gate for longer than its
+  remaining execution deadline
+- **THEN** its deadline signal reflects execution-elapsed time only, with the
+  human-wait duration excluded
+
+### Requirement: Jobs are classified as live, quiet, stalled, dead, or an expected human wait
+
+The watchdog SHALL classify each registered supervised job into exactly one of
+`live`, `quiet`, `stalled`, `dead`, or `expected_human_wait`. Classification
+SHALL be a pure decision over the job's durable state and the three signals and
+SHALL NOT itself dispatch, repair, or mutate state.
+
+An open human wait SHALL classify as `expected_human_wait` and take precedence
+over the other classes. A job whose recorded owner is live and whose progress
+signal is fresh SHALL classify as `live`. A job whose owner is live but whose
+progress window has elapsed short of the stall threshold SHALL classify as
+`quiet`. A job that is not making progress beyond the stall threshold, or whose
+execution deadline has been reached while still active, SHALL classify as
+`stalled`. A job that is active and non-terminal whose recorded owner is not
+live and is verified quiesced SHALL classify as `dead`.
+
+#### Scenario: An expected human wait takes precedence
+
+- **WHEN** a job has an open human wait and its owner is not live
+- **THEN** it classifies as `expected_human_wait`, not `dead`
+
+#### Scenario: A live job making progress is classified live
+
+- **WHEN** a job's owner is live and its journal advanced within the progress
+  window
+- **THEN** it classifies as `live`
+
+#### Scenario: A live job with no recent progress is quiet
+
+- **WHEN** a job's owner is live and its journal has not advanced within the
+  progress window but is short of the stall threshold
+- **THEN** it classifies as `quiet`
+
+#### Scenario: No progress beyond the stall threshold is stalled
+
+- **WHEN** a job is active and its journal has not advanced beyond the stall
+  threshold, or its execution deadline has been reached
+- **THEN** it classifies as `stalled`
+
+#### Scenario: A quiesced non-live owner is dead
+
+- **WHEN** a job is active, non-terminal, and its recorded owner is not live
+  and is verified quiesced
+- **THEN** it classifies as `dead`
+
+### Requirement: The watchdog takes no model or recovery action during an expected human wait
+
+For a job classified as `expected_human_wait`, the watchdog SHALL take no LLM,
+dispatch, recovery, or reconstitution action. A human wait SHALL be treated as
+normal durable state, and the watchdog SHALL NOT poll a model, restart the
+execution, or fail the job on its account, however long the wait lasts. The
+job SHALL wake only through the existing durable receipt scan.
+
+#### Scenario: No action is taken during a human wait
+
+- **WHEN** a job is classified as `expected_human_wait` across repeated ticks
+- **THEN** no model dispatch, recovery, or reconstitution is performed and the
+  wait remains intact
+
+#### Scenario: The deadline does not fail a human wait
+
+- **WHEN** a human wait lasts longer than the job's execution deadline
+- **THEN** the watchdog takes no failing or restarting action for it
+
+### Requirement: Boot reconciliation scans supervised jobs and reconnects before any respawn
+
+On service start, the watchdog SHALL scan the registered supervised jobs and
+reconcile each non-terminal job against the ledger and the authoritative plan
+state. For a job with a recorded session identity, the watchdog SHALL attempt
+to reconnect and adopt the existing session before considering any respawn. A
+job whose recorded session is still live SHALL be adopted and SHALL NOT be
+respawned; only a job with no adoptable live session SHALL become a
+reconstitution candidate. Terminal jobs SHALL be left untouched.
+
+#### Scenario: Boot reconciles each non-terminal job
+
+- **WHEN** the service starts with registered non-terminal supervised jobs
+- **THEN** the watchdog scans each one, reconciles it against the ledger and
+  authoritative state, and records its classification
+
+#### Scenario: A live session is adopted instead of respawned
+
+- **WHEN** a job's recorded session is still live at boot
+- **THEN** the watchdog reconnects and adopts that session and does not spawn a
+  replacement
+
+#### Scenario: A terminal job is untouched
+
+- **WHEN** the boot scan encounters a terminal supervised job
+- **THEN** no classification action, reconnect, or reconstitution is performed
+  for it
+
+### Requirement: Reconstitution happens only after verified quiescence
+
+Before any reconstitution of a job, the watchdog SHALL verify that the prior
+worker is quiesced: the kernel-held execution lock is no longer held and no
+live process matches the recorded fencing identity. The watchdog SHALL refuse
+to reconstitute while a live process still matches the recorded identity, even
+when the kernel-held lock has been released, and SHALL NOT interrupt a live
+worker's work. Every reconstitution SHALL record which prior owner was replaced.
+
+#### Scenario: A live owner blocks reconstitution
+
+- **WHEN** a job's recorded fencing identity still matches a live process,
+  including when the kernel-held lock has been released
+- **THEN** reconstitution is refused with a named error and the live owner's
+  work is not interrupted
+
+#### Scenario: Verified quiescence permits reconstitution
+
+- **WHEN** the execution lock is free and no live process matches the recorded
+  fencing identity
+- **THEN** the watchdog may reconstitute the job and records the prior owner it
+  replaced
+
+### Requirement: An unreconciled uncertain action blocks reconstitution
+
+When a job has an action that is uncertain or unreconciled, the watchdog SHALL
+treat the job as blocking: it SHALL NOT respawn, replay, or otherwise
+reconstitute the job until the action is reconciled from evidence, and SHALL
+surface the unreconciled action as blocking state. An unconfirmed outcome SHALL
+never be treated as safe to respawn.
+
+#### Scenario: An uncertain action blocks reconstitution
+
+- **WHEN** a dead or stalled job has an unreconciled uncertain action
+- **THEN** no reconstitution is performed and the uncertain action is surfaced
+  as blocking state
+
+#### Scenario: Reconciliation clears the block
+
+- **WHEN** evidence has been recorded and the uncertain action is reconciled
+- **THEN** the job is no longer blocked by it and may become a reconstitution
+  candidate
+
+### Requirement: Restart backoff is persisted and bounds restart loops
+
+Each reconstitution attempt SHALL be recorded durably under a stable restart
+attempt signature for the job, and identical restart attempts SHALL be bounded
+by the job policy's incident-attempt limit with a capped backoff delay. The
+restart attempt count SHALL survive `opsx-plan reset`: a reset SHALL NOT erase,
+reduce, or re-baseline it. When the bound is reached, further automatic
+reconstitution SHALL be refused with a named bounded-restarts state and the job
+SHALL surface an actionable blocker rather than looping.
+
+#### Scenario: Restart attempts are recorded and delayed under a cap
+
+- **WHEN** a job is repeatedly reconstituted for the same restart signature
+- **THEN** each attempt is recorded durably with a capped backoff delay before
+  the next
+
+#### Scenario: The restart bound is reached
+
+- **WHEN** reconstitution attempts reach the job's incident-attempt limit
+- **THEN** further automatic reconstitution is refused with a named
+  bounded-restarts state and an actionable operator blocker is surfaced
+
+#### Scenario: The restart count survives reset
+
+- **WHEN** `opsx-plan reset` runs between identical reconstitution attempts
+- **THEN** the restart attempt count continues to accumulate and is not
+  re-baselined
+
+### Requirement: Reconstitution events are durable and append-only
+
+Every watchdog classification transition and every reconstitution event SHALL
+be recorded as an append-only durable ledger record carrying the job id, the
+event kind, the classification, the reason, and the timestamp. The records
+SHALL survive a ledger reopen and a process restart, and SHALL NOT be rewritten
+or deleted by a later tick.
+
+#### Scenario: A reconstitution event survives a reopen
+
+- **WHEN** a reconstitution event is recorded and the ledger is closed and
+  reopened
+- **THEN** the event is present with its job id, kind, classification, reason,
+  and timestamp
+
+#### Scenario: Records are append-only
+
+- **WHEN** a later watchdog tick runs after events have been recorded
+- **THEN** the prior records are unchanged and new records are appended
+
+### Requirement: The watchdog leaves legacy runs and existing lifecycle behavior unchanged
+
+An ordinary, unregistered plan SHALL create no watchdog records and SHALL
+require no watchdog backend. The watchdog SHALL introduce no new DAG, stage
+machine, or dispatch path, and SHALL NOT release a gate, satisfy a checkpoint,
+mark a change done, or alter the existing lifecycle, broker, or
+implement/review/archive behavior.
+
+#### Scenario: A legacy run creates no watchdog state
+
+- **WHEN** an ordinary, unregistered plan run executes while the watchdog is
+  available
+- **THEN** no watchdog record is created for it and its execution is unchanged
+
+#### Scenario: The watchdog cannot progress a change
+
+- **WHEN** the watchdog classifies and reconstitutes a registered job
+- **THEN** no change is marked done, no gate is released, and no checkpoint is
+  satisfied by the watchdog itself

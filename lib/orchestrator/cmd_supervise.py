@@ -27,8 +27,10 @@ import argparse
 import json
 import os
 import sys
+import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 from lib.models import resolver as model_resolver
 from lib.orchestrator import base
@@ -41,6 +43,7 @@ from lib.supervisor import endpoints as endpoints_mod
 from lib.supervisor import lifecycle as lifecycle_mod
 from lib.supervisor import ledger as ledger_mod
 from lib.supervisor import lock as lock_mod
+from lib.supervisor import watchdog as watchdog_mod
 
 
 def cmd_supervise_status(args: argparse.Namespace) -> int:
@@ -108,7 +111,8 @@ def cmd_supervise_serve(args: argparse.Namespace) -> int:
         )
         job_id = getattr(args, "job_id", None)
         host = supervision_mod.open_service_host(
-            repo, cfg, store_path=store_path, job_id=job_id
+            repo, cfg, store_path=store_path, job_id=job_id,
+            watchdog_redrive=_watchdog_redrive(repo, getattr(args, "plan", None)),
         )
     except broker_mod.BrokerError as exc:
         print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -550,3 +554,149 @@ def _print_inspection(projection: dict[str, Any]) -> None:
         for cid, tasks in projection["pending_manual_tasks"].items():
             for task in tasks:
                 print(f"    {cid}: {task}")
+
+
+# ---------------------------------------------------------------------------
+# Watchdog: deterministic classification and bounded reconstitution
+# ---------------------------------------------------------------------------
+
+_WATCHDOG_ERRORS = _LIFECYCLE_ERRORS + (watchdog_mod.WatchdogError,)
+
+
+def _watchdog_redrive(repo: Path, plan: Any) -> Any:
+    """Return the production re-drive adapter for the watchdog.
+
+    The adapter reuses the existing supervised run engine (no new DAG); it is
+    the same engine ``supervise start``/``resume`` drive. When no plan can be
+    resolved the adapter refuses with the named watchdog error instead of
+    guessing, and the runner records that as blocking state.
+    """
+    try:
+        plan_src = planref.resolve_plan(repo, plan)
+    except Exception:  # noqa: BLE001 - a missing plan is a refusal, not a crash
+        plan_src = None
+
+    def redrive(ledger: Any, job_id: int) -> Any:
+        if plan_src is None:
+            raise watchdog_mod.WatchdogRefused(
+                "no resolvable plan is available to reconstitute the job"
+            )
+        return _drive_supervised_run(repo, plan_src)
+
+    return redrive
+
+
+def cmd_supervise_watchdog(args: argparse.Namespace) -> int:
+    """opsx-plan supervise watchdog — the deterministic watchdog tick.
+
+    Every tick drives :meth:`Watchdog.tick` over all registered non-terminal
+    jobs, so the command evaluates and reports each one; an explicit
+    ``--job-id`` only selects which job's report is shown at the top level and
+    never narrows the tick. It runs exactly one tick with ``--once`` or the
+    deterministic loop otherwise, reporting each job's classification, its
+    three separate signals, its restart-attempt state, and its recent
+    reconstitution events in human or ``--json`` form. It requires neither the
+    worktree execution lock nor a live service and fails closed with the named
+    unknown-job error when no registered supervised job exists.
+    """
+    repo = Path(args.repo).resolve()
+    try:
+        ledger = _open_ledger(repo, getattr(args, "store", None), create=False)
+        try:
+            jobs = list(ledger.list_jobs())
+            requested = getattr(args, "job_id", None)
+            if not jobs and requested is None:
+                raise lifecycle_mod.UnknownJobError(
+                    "no supervised job is registered for this worktree; the "
+                    "watchdog command fails closed"
+                )
+            non_terminal = [
+                job
+                for job in jobs
+                if str(job["state"]) not in ledger_mod.TERMINAL_JOB_STATES
+            ]
+            if requested is not None:
+                primary = lifecycle_mod.require_job(ledger, int(requested))
+            elif non_terminal:
+                primary = non_terminal[0]
+            else:
+                primary = jobs[0]
+
+            runner = watchdog_mod.Watchdog(
+                ledger,
+                repo=repo,
+                redrive=_watchdog_redrive(repo, getattr(args, "plan", None)),
+            )
+            if getattr(args, "once", False):
+                assessments = runner.tick()
+            else:
+                interval = float(getattr(args, "interval", 5.0) or 5.0)
+                assessments = runner.tick()
+                try:
+                    while True:
+                        time.sleep(interval)
+                        assessments = runner.tick()
+                except KeyboardInterrupt:  # pragma: no cover - interactive stop
+                    pass
+
+            reports = [_watchdog_job_report(runner, job) for job in non_terminal]
+            if int(primary["id"]) not in {item["job_id"] for item in reports}:
+                reports.append(_watchdog_job_report(runner, primary))
+        finally:
+            ledger.close()
+    except _WATCHDOG_ERRORS as exc:
+        return _fail(exc)
+
+    primary_id = int(primary["id"])
+    payload = dict(
+        next(item for item in reports if item["job_id"] == primary_id)
+    )
+    payload["jobs"] = reports
+    payload["assessments"] = [item.as_dict() for item in assessments]
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        _print_watchdog(payload)
+    return 0
+
+
+def _watchdog_job_report(runner: Any, job: Any) -> dict[str, Any]:
+    """Build one job's read-only watchdog report with its job id attached."""
+    report = runner.report(job)
+    report["job_id"] = int(job["id"])
+    return report
+
+
+def _print_watchdog(payload: dict[str, Any]) -> None:
+    for report in payload.get("jobs") or [payload]:
+        _print_watchdog_job(report)
+
+
+def _print_watchdog_job(report: dict[str, Any]) -> None:
+    print(
+        f"supervise watchdog: job {report['job_id']} "
+        f"classification={report['classification']} action={report['action']}"
+    )
+    signals = report["signals"]
+    print(
+        "  signals: liveness="
+        f"{signals['liveness']} progress={signals['progress']} "
+        f"deadline={signals['deadline']}"
+    )
+    restart = report["restart"]
+    print(
+        f"  restart: attempts={restart['attempts']} limit={restart['limit']} "
+        f"next_allowed_at={restart['next_allowed_at']}"
+    )
+    if report.get("reason"):
+        print(f"  reason: {report['reason']}")
+    if report.get("blocked"):
+        print("  blocked: an operator action is required")
+    events = report.get("recent_events") or []
+    if events:
+        print("  recent events:")
+        for event in events:
+            print(
+                f"    [{event['kind']}] {event['classification'] or '-'} "
+                f"{event['reason']} ({event['created_at']})"
+            )

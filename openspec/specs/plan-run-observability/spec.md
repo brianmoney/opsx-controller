@@ -1711,3 +1711,46 @@ usage, and the stated limitations of cost-per-correct-completion.
 
 - **WHEN** an operator reads the monitoring documentation
 - **THEN** it describes the supervision field models, identifier linkage, usage states, and the metric limitations
+
+### Requirement: Watchdog classification and reconstitution events are exposed as read-only observation state
+
+The system SHALL expose, for a registered supervised job, the watchdog's
+current classification, its separate liveness, progress, and deadline signals,
+its restart-attempt state, and its recent reconstitution events as read-only
+observation state. Building this observation state SHALL NOT mutate the
+ledger, the JSON execution state, or the watchdog's records, and SHALL NOT
+require the worktree execution lock or a live service. A plan with no
+registered supervised job SHALL expose no watchdog state.
+
+#### Scenario: Watchdog state is readable read-only
+
+- **WHEN** the observation state is built for a supervised job after watchdog
+  ticks have run
+- **THEN** it reports the current classification, the three separate signals,
+  the restart-attempt state, and the recent reconstitution events, and the
+  ledger and JSON execution state are unchanged
+
+#### Scenario: No registered job exposes no watchdog state
+
+- **WHEN** the observation state is built for a plan with no registered
+  supervised job
+- **THEN** it exposes no watchdog state and existing output is unchanged
+
+### Requirement: Watchdog observation does not alter legacy telemetry or the model leaderboard
+
+Recording and exposing watchdog observation state SHALL NOT change the legacy
+telemetry schema or the meaning of existing telemetry fields, and no
+watchdog or supervisor-family entry SHALL appear in the legacy per-change model
+leaderboard. Watchdog observation state SHALL be kept distinct from per-change
+model usage.
+
+#### Scenario: The legacy telemetry schema is unchanged
+
+- **WHEN** watchdog state is recorded and exposed
+- **THEN** the existing telemetry records and their fields are unchanged
+
+#### Scenario: Watchdog entries stay out of the leaderboard
+
+- **WHEN** the legacy model leaderboard is projected for a plan with watchdog
+  activity
+- **THEN** no watchdog or supervisor-family entry appears in it

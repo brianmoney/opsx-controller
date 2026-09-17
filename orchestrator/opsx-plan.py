@@ -5991,6 +5991,36 @@ def main() -> int:
     p_supervise_inspect.add_argument("--json", action="store_true")
     p_supervise_inspect.set_defaults(fn=cmd_supervise.cmd_supervise_inspect)
 
+    p_supervise_watchdog = supervise_sub.add_parser(
+        "watchdog",
+        help=(
+            "run the deterministic watchdog tick (classification and bounded "
+            "reconstitution) without the execution lock or a live service"
+        ),
+    )
+    p_supervise_watchdog.add_argument(
+        "plan", nargs="?", default=None, help="path to the plan TOML"
+    )
+    p_supervise_watchdog.add_argument("--store", default=None)
+    p_supervise_watchdog.add_argument(
+        "--job-id", type=int, default=None, dest="job_id",
+        help=(
+            "select the job whose report is shown at the top level; every "
+            "registered non-terminal job is still evaluated and reported each "
+            "tick"
+        ),
+    )
+    p_supervise_watchdog.add_argument(
+        "--once", action="store_true",
+        help="evaluate exactly one tick and exit",
+    )
+    p_supervise_watchdog.add_argument(
+        "--interval", type=float, default=5.0,
+        help="seconds between ticks when not using --once (default: 5)",
+    )
+    p_supervise_watchdog.add_argument("--json", action="store_true")
+    p_supervise_watchdog.set_defaults(fn=cmd_supervise.cmd_supervise_watchdog)
+
     for _verb, _help in (
         ("pause", "record the pause stop boundary (interrupt in-flight work)"),
         ("drain", "record the drain stop boundary (let in-flight work finish)"),

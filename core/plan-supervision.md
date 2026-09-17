@@ -824,6 +824,129 @@ durable wake-up for the owning job, so a human wait that retains permanent
 ownership never blocks an approval, and a receipt recorded while another
 process holds the lock is not lost.
 
+## Watchdog and reconstitution
+
+The watchdog (`lib/supervisor/watchdog.py`) supervises registered supervised
+jobs from within the trusted service domain across a restart. Its loop is
+**deterministic**: every classification and reconstitution decision is a
+function of durable ledger state, the authoritative plan state, the recorded
+execution identity, and the clock alone. It has no dependency on a terminal, a
+streamed control channel, or any in-memory state, so a tick interrupted by a
+restart produces the same decision when it is re-evaluated from the same
+durable state. The loop runs unattended under the service host
+(`ServiceEndpointHost`/`open_service_host`), which performs the boot-scan
+reconciliation before serving and a tick from `poll`/`serve_forever` when its
+interval elapses.
+
+### Three independent signals
+
+The watchdog derives three signals per job and reports them separately; no
+signal is inferred from another.
+
+- **Liveness** is true only when the job's recorded fencing identity (the
+  `(pid, process_start, boot_id)` triple) matches a live process on the current
+  boot. A bare process id is never proof.
+- **Progress** is true only when the job's durable journal advanced within the
+  configured progress window. The progress timestamp is the maximum durable
+  timestamp across the job row, its actions and dispatches, its incidents, and
+  its recorded evidence.
+- **Deadline** is true when the job's **execution-elapsed** time has reached
+  the policy's execution deadline. Human-wait duration never accrues to
+  execution elapsed, so a long human wait never trips the deadline.
+
+The progress and stall windows are module-level constants
+(`PROGRESS_WINDOW_SECONDS`, `STALL_THRESHOLD_SECONDS`) and are injectable in
+tests.
+
+### Classification vocabulary
+
+Exactly one class is reported per registered supervised job:
+
+- `expected_human_wait` — an open human wait exists. This takes precedence over
+  every other class.
+- `live` — the recorded owner is live and progress is fresh within the
+  progress window.
+- `quiet` — the recorded owner is live but progress is older than the progress
+  window and short of the stall threshold.
+- `stalled` — progress has not advanced beyond the stall threshold, or the
+  execution deadline has been reached while the job is still active.
+- `dead` — the job is active and non-terminal, the recorded owner is not live,
+  and quiescence is verified.
+
+Classification is a pure decision: it never dispatches, repairs, or mutates
+state.
+
+### Fixed decision order
+
+Each tick applies the same order:
+
+1. A terminal job is a no-op.
+2. An open human wait classifies as `expected_human_wait` and takes **no**
+   LLM, dispatch, recovery, or reconstitution action, however long it lasts.
+   The wait is normal durable state and wakes only through the existing durable
+   receipt scan.
+3. An unreconciled uncertain action **blocks**: no respawn, replay, or
+   reconstitution until recorded evidence reconciles it. An unconfirmed
+   outcome is never treated as safe to respawn.
+4. A recorded session identity is reconnected and adopted before any respawn;
+   the boot scan attempts reconnect first for every non-terminal job.
+5. A live owner is surfaced, never interrupted. A released (or otherwise
+   non-held) fencing record whose recorded identity still matches a live
+   process on the current boot is surfaced as a **blocking** hazard: the free
+   kernel lock alone never makes a still-live prior identity safe to replace.
+6. Only a `dead`, quiesced job that already had a prior execution is
+   reconstituted through the existing recovery/engine adapter. No new DAG,
+   stage machine, or dispatch path is introduced.
+
+### Quiescence-gated reconstitution
+
+Before any reconstitution the watchdog verifies the prior worker is quiesced:
+the kernel-held flock is free **and** no live process matches the recorded
+fencing identity. A live owner blocks reconstitution with a named error even
+when the kernel-held lock has been released, and the live owner's work is never
+interrupted. Every reconstitution records which prior owner was replaced.
+
+### Persisted bounded restart backoff
+
+Every reconstitution attempt is recorded through the durable incident-attempt
+accounting under the stable signature `watchdog_restart:<plan>`, so the job's
+`max_incident_attempts` bound applies and the delay is the capped
+`backoff_delay`. The next-allowed time is recomputed from the durable attempt
+count plus the last reconstitution event timestamp — no separate counter is
+stored — so the backoff survives a restart. The count lives in the external
+service-owned ledger and survives `opsx-plan reset` unchanged. When the bound
+is reached, further automatic reconstitution is refused with the named
+bounded-restarts state and an actionable operator blocker is surfaced instead
+of looping.
+
+### Durable, append-only reconstitution events
+
+Every classification transition and every reconstitution event (reconnect,
+reconstitution, blocked, bounded) is appended to the ledger's insert-only
+`watchdog_events` table (job id, kind, classification, reason, detail,
+timestamp). Guard triggers refuse every update and delete, so a later tick can
+only append. Records survive a ledger reopen and a process restart, and idle
+ticks record nothing.
+
+### Read-only observation
+
+`opsx-plan supervise watchdog` runs the same runner: exactly one tick with
+`--once`, or the deterministic loop otherwise. Every tick evaluates **all**
+registered non-terminal jobs and reports each one's classification, the three
+separate signals, its restart-attempt state, and its recent reconstitution
+events in human or `--json` form; an explicit `--job-id` only selects which
+job's report is shown at the top level. It requires neither the
+worktree execution lock nor a live service and exits non-zero with the named
+unknown-job error when no registered supervised job exists. The read-only
+supervision projection (`project_job`, surfaced by `supervise inspect`,
+`status`, `report`, and the dashboard) exposes the same watchdog state without
+mutating the ledger, the JSON execution state, or the watchdog records.
+
+An ordinary, unregistered plan creates no watchdog records, requires no
+watchdog backend, and observes no behavior change. Watchdog and supervisor
+activity is never written into per-change telemetry and never enters the legacy
+model leaderboard, which already excludes the supervisor family.
+
 ## Broker: sole approval authority
 
 For a registered supervised job, the **broker** (`lib/supervisor/broker.py` in
