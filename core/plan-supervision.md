@@ -490,6 +490,118 @@ verbs are backed by the ledger, remain inside the worker-domain authorization
 boundary, and accept evidence only for actions of the job the worker is bound
 to.
 
+## Acceptance stage
+
+A registered supervised job runs one additional stage between an implementation
+review `pass` and archive. It is a stage in the existing run loop, dispatched
+through the same journaled, gated boundary (`gated_dispatch`) under the job
+policy's pinned `acceptance_reviewer` role and its installed
+`opsx-acceptance-reviewer` agent. No new DAG, stage machine, or scheduler is
+introduced: the implement/review/archive loop and its gates remain the
+progression authority, and acceptance only gates advancement to archive. A
+legacy unregistered run never enters the stage; a registered run whose adapter
+ships no `acceptance_invoke` fails closed with a named error rather than
+skipping it.
+
+### Artifact review set and revision
+
+The acceptance reviewer judges the change's **real artifacts**, never a worker
+summary or transcript:
+
+- the protected canonical plan manifest snapshot hash and its dependency edges;
+- the change's authored artifacts — proposal, design, tasks;
+- its spec deltas with their delta identity (delta operation plus requirement
+  name, so a renamed requirement is a distinct identity from the one it
+  replaced);
+- the referenced canonical specs under `openspec/specs/`; and
+- the tracked change diff.
+
+The engine computes an **acceptance artifact revision** as a content hash over
+that canonical, order-independent review set. The revision is deliberately
+separate from the broker's `material_hash`: the material hash invalidates
+approval receipts on gate-field changes, while the artifact revision
+fingerprints the artifacts a verdict reviewed. An acceptance revision is never
+the material gate hash, and a valid approval receipt never satisfies the
+acceptance stage.
+
+A verdict is recorded against the exact revision it reviewed. Before the service
+records an `accept`, the engine recomputes the revision: a mismatch marks the
+verdict stale, the stale verdict does not satisfy the stage, and a fresh
+acceptance runs over the new revision (bounded by the change's round budget).
+
+The engine also derives an **authoritative artifact-identity list** from the
+captured review set — the protected manifest snapshot hash, every dependency
+edge, and every file artifact — and hands it to the reviewer together with the
+manifest/dependency ground truth (`ACCEPTANCE_ARTIFACTS`,
+`ACCEPTANCE_MANIFEST_SNAPSHOT_HASH`, `ACCEPTANCE_DEPENDS_ON`). An `accept` is
+valid only when its `artifacts_reviewed` names exactly that authoritative set:
+a partial, arbitrary, or manifest/dependency-omitting accept is a contract
+violation, fails the change with a named `acceptance_invalid` error, and never
+reaches the ledger or archive. The recorded verdict row therefore reflects an
+acknowledgment of the complete canonical review set, not an unverifiable worker
+claim.
+
+### Created-change check at the reviewed revision
+
+At the start of each acceptance attempt, before the reviewer is dispatched, the
+change's configured created-change check (`groundtruth.verify_change_created`,
+`openspec validate <change> --strict` by default) runs and the artifact
+revision is captured immediately after it, so the verdict binds to content that
+passed validation at the moment of review. A failing or timed-out check blocks
+the stage with the recorded reason and no `accept` is recorded.
+
+### Outcomes
+
+The reviewer returns exactly one of three outcomes:
+
+- **`accept`** — the change satisfies its accepted intent, with the reviewed
+  artifact set named as exactly the authoritative artifact-identity list the
+  engine derived from the captured review set (manifest snapshot hash,
+  dependency edges, and every file artifact). The loop advances to archive only
+  on a non-stale accept that acknowledges that complete set.
+- **`fix`** — a mechanical defect, named precisely enough for the job's pinned
+  cheap `fixer` to repair, with a `fix_prompt` carrying the defect and the check
+  that must pass. The engine dispatches the `fixer` role, then the independent
+  `verifier` role; the repair is consumed only when the verifier's verdict
+  passes on the actual diff (`repair_verified` and `diff_reviewed` true) in a
+  session distinct from the fixer's, recorded under the existing
+  repair-consumability contract. A verified repair recomputes the artifact
+  revision and runs a fresh acceptance. The route is bounded by the change's
+  existing round budget, and exhaustion fails the change with a reason naming
+  the unrepaired defect.
+- **`escalate`** — a hard judgment returned to the primary session rather than
+  decided by a subagent. The escalation is recorded as unresolved blocking
+  state; the engine never defaults it to `accept` or `fix`, and the change does
+  not advance to archive while it is unresolved. Only the primary resolves it
+  (`resolve_acceptance_escalation`), after which a fresh acceptance runs.
+
+### Acceptance is a review outcome, not an approval authority
+
+An acceptance verdict only gates advancement from review to archive. It never
+releases a `pause_before` / `pause_before_human_only` gate, never satisfies the
+operator `acceptance` receipt for an orchestrator-created change, never replaces
+the implementation review verdict or its findings, and never marks a task
+complete or waives the implement/review/archive task-completeness gates. An
+unchecked automatable task remains blocking regardless of any acceptance
+verdict, and a repair consumed by the acceptance fix route is validated by the
+independent verifier rather than accepted on the fixer's own account.
+
+Verdicts live in the append-only `acceptance_reviews` ledger table (job, change,
+outcome, artifact revision, reviewed artifact set, reason, fix prompt, dispatch
+action id, session id, created-check evidence, created at), added by the
+forward-only v6 → v7 migration. The per-change JSON `acceptance` posture is a
+projection of that ledger state for the operator, never an authority, and it
+surfaces a stale or unresolved verdict rather than hiding it.
+
+The durable writes fail closed. A verdict is authoritative only once its
+`acceptance_reviews` row exists: if that write fails, the verdict does not
+satisfy the stage, no `fix`/`escalate` transition is driven, the change is
+failed with a named persistence error, and archive is never reached. Likewise, a
+verified repair is authoritative only once its independent-verifier evidence row
+exists: if that write fails, the repair is not consumed and no fresh acceptance
+runs. Both failures are recorded as a named `persistence_error` in the
+`acceptance` projection instead of being logged and advanced past.
+
 ## Single supervised job per worktree
 
 At most one active supervised job owns a worktree. Registering a second

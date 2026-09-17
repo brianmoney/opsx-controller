@@ -54,6 +54,16 @@ def load_plan(path: Path, repo: Path | None = None) -> dict:
         "archive_invoke": plan.get(
             "archive_invoke", defaults.get("archive_invoke", "")
         ),
+        # Supervised-only stage invokes. They resolve to empty for adapters
+        # that do not ship a template; the supervised acceptance stage then
+        # fails closed with a named error instead of skipping itself.
+        "acceptance_invoke": plan.get(
+            "acceptance_invoke", defaults.get("acceptance_invoke", "")
+        ),
+        "fix_invoke": plan.get("fix_invoke", defaults.get("fix_invoke", "")),
+        "verify_invoke": plan.get(
+            "verify_invoke", defaults.get("verify_invoke", "")
+        ),
         "timeout_minutes": float(plan.get("timeout_minutes", 90)),
         "max_rounds": int(plan.get("max_rounds", 5)),
         "no_progress_limit": int(plan.get("no_progress_limit", 2)),

@@ -63,6 +63,35 @@ def default_last_stage() -> dict:
     }
 
 
+def default_acceptance_state() -> dict:
+    """Per-change acceptance posture.
+
+    This is a **projection** of the ledger's acceptance verdicts for the
+    operator's benefit, never an authority: the ledger's append-only
+    ``acceptance_reviews`` rows are what the engine reads back and rechecks.
+    ``stale`` and ``blocking`` are surfaced rather than hidden so a stale
+    verdict or an unresolved escalation is visible in status output.
+    """
+    return {
+        "outcome": "",
+        "artifact_revision": "",
+        "reviewed_artifacts": [],
+        "manifest_snapshot_hash": "",
+        "depends_on": [],
+        "reason": "",
+        "fix_prompt": "",
+        "stale": False,
+        "blocking": False,
+        "escalated": False,
+        "escalation_round": 0,
+        "created_check": "",
+        "verified": False,
+        "persistence_error": "",
+        "fix": {},
+        "updated_at": "",
+    }
+
+
 def new_change_record() -> dict:
     return {
         "status": base.PENDING,
@@ -84,6 +113,7 @@ def new_change_record() -> dict:
         "context_cache": default_context_cache(),
         "last_review": default_last_review(),
         "archive": default_archive_state(),
+        "acceptance": default_acceptance_state(),
         "history": [],
         "last_stage": default_last_stage(),
         "last_log": "",

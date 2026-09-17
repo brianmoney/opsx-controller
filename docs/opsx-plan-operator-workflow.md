@@ -255,6 +255,9 @@ The plan manifest is a TOML file with a `[plan]` table and one or more
 | `implement_invoke` | string | adapter default | Direct implement command |
 | `review_invoke` | string | adapter default | Direct review command |
 | `archive_invoke` | string | adapter default | Direct archive command |
+| `acceptance_invoke` | string | adapter default (`""` on adapters without the stage) | Supervised acceptance-review command; the supervised acceptance stage fails closed when empty |
+| `fix_invoke` | string | adapter default (`""` on adapters without the stage) | Supervised fixer command used by the acceptance `fix` route |
+| `verify_invoke` | string | adapter default (`""` on adapters without the stage) | Supervised verifier command used by the acceptance `fix` route |
 
 ### `[[changes]]` entry fields
 
@@ -621,6 +624,59 @@ protected snapshot, plus the snapshot identity and explicit policy revision).
   `BrokerMediationError`.
 - **Legacy jobs are unchanged.** An unregistered worktree takes the legacy
   JSON path byte-identically and needs no broker, ledger, or backend.
+
+#### The acceptance stage in a supervised round
+
+A registered supervised job's change runs one extra review stage between an
+implementation review `pass` and archive. It is dispatched through the same
+gated journal boundary as the other stages, under the policy's pinned
+`acceptance_reviewer` role, and it reviews the change's **real artifacts** — the
+accepted plan and its dependency edges, proposal, design, tasks, spec deltas
+with their delta identity, and the referenced canonical specs. It returns
+exactly one of three outcomes:
+
+- **`accept`** — the change satisfies its accepted intent. The loop advances to
+  archive only on a non-stale accept whose `artifacts_reviewed` names exactly
+  the authoritative artifact set the engine derived from the captured review
+  set (the manifest snapshot hash, every dependency edge, and every file
+  artifact; a partial, arbitrary, or manifest-omitting accept fails the change
+  with a named `acceptance_invalid` error instead of advancing). The verdict is
+  recorded in the append-only `acceptance_reviews` ledger table against the
+  exact **artifact revision** it reviewed; the per-change JSON `acceptance`
+  posture is only a projection of that ledger state.
+- **`fix`** — a mechanical defect the pinned cheap `fixer` can repair. The
+  engine dispatches the fixer, then the independent `verifier`; the repair is
+  consumed only after the verifier validates the actual diff. A verified repair
+  runs a fresh acceptance, and the route is bounded by the change's round
+  budget, failing with a reason naming the unrepaired defect on exhaustion.
+- **`escalate`** — a hard judgment returned to the primary session. It is
+  recorded as unresolved blocking state and never defaulted to `accept` or
+  `fix`; archive is blocked until the primary resolves it, after which a fresh
+  acceptance runs.
+
+What the operator should expect:
+
+- A stale or unresolved verdict is surfaced, not hidden. If a worker edits the
+  change's artifacts between revision capture and the verdict, the engine
+  recomputes the revision before recording an `accept` and rejects the stale
+  verdict, running a fresh acceptance over the new revision (bounded by the
+  round budget).
+- A failing created-change check (`openspec validate <change> --strict` by
+  default) blocks the stage with the recorded reason and no accept is recorded.
+- An `accept` is a review outcome, not an approval authority: it releases no
+  `pause_before` gate, does not satisfy the operator `acceptance` receipt for an
+  orchestrator-created change, and does not replace the implementation review
+  verdict or the task-completeness gates.
+- OpenCode is the first adapter with the stage's invocations. A supervised run
+  on an adapter whose `acceptance_invoke` is empty fails closed with a named
+  error rather than skipping acceptance; legacy unregistered runs never enter
+  the stage.
+- The acceptance and repair durable writes fail closed. If the verdict cannot be
+  written to the `acceptance_reviews` ledger, the accept does not satisfy the
+  stage and the change fails with a named persistence error instead of advancing
+  to archive; if the verifier's repair evidence cannot be written, the repair is
+  not consumed and no fresh acceptance runs. The `acceptance.persistence_error`
+  field in the state projection names the failure.
 
 ### Created-change acceptance: `review_created`
 

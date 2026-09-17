@@ -202,3 +202,34 @@ exactly as before.
 - **WHEN** an operator inspects a supervised job that completed with pending
   manual tasks
 - **THEN** the pending `(manual)` tasks are shown as the operator checklist
+
+### Requirement: Acceptance verdicts never self-certify completion
+
+An acceptance `accept` verdict SHALL NOT mark any task complete, release
+archive on its own, or waive the implement, review, or archive
+task-completeness gates. Those gates SHALL continue to apply to automatable
+tasks exactly as before, and an unchecked automatable task SHALL remain
+blocking regardless of any acceptance verdict. A repair consumed by the
+acceptance fix route SHALL be validated by the independent verifier against
+the actual diff; a fixer's own account SHALL NOT check a task or satisfy
+acceptance. The acceptance stage gates advancement between review and archive;
+it is not a task-completeness authority.
+
+#### Scenario: An accept verdict does not check a task
+
+- **WHEN** a change holds an acceptance `accept` verdict and an unchecked
+  automatable task remains
+- **THEN** the task remains unchecked and the existing implement, review, and
+  archive completeness gates still apply
+
+#### Scenario: Unchecked automatable work still blocks
+
+- **WHEN** a change reaches the acceptance stage with unchecked automatable
+  tasks
+- **THEN** an `accept` verdict does not waive the blocking incompleteness
+
+#### Scenario: A fix consumed by acceptance is independently verified
+
+- **WHEN** the acceptance fix route applies a fixer repair
+- **THEN** the repair does not satisfy acceptance or check any task until the
+  independent verifier validates the actual diff

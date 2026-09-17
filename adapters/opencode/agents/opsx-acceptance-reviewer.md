@@ -62,7 +62,12 @@ Return exactly one line of JSON:
 `{"role":"acceptance_reviewer","outcome":"accept|fix|escalate","artifacts_reviewed":["path"],"reason":"one short sentence","fix_prompt":"empty unless outcome is fix"}`
 
 - `accept`: the change satisfies its accepted intent, with the reviewed
-  artifact set named.
+  artifact set named. Your input block carries the engine-derived authoritative
+  set (`ACCEPTANCE_ARTIFACTS`) plus the manifest/dependency ground truth
+  (`ACCEPTANCE_MANIFEST_SNAPSHOT_HASH`, `ACCEPTANCE_DEPENDS_ON`): an `accept`
+  is valid only when `artifacts_reviewed` names exactly that set — a partial,
+  arbitrary, or manifest/dependency-omitting list is rejected as a contract
+  violation and fails the change rather than advancing it to archive.
 - `fix`: a mechanical defect is named precisely enough for the inexpensive
   `fixer` to repair, with a `fix_prompt` carrying the defect and the check
   that must pass.

@@ -2451,3 +2451,217 @@ loop's existing authorities.
   a supervised job
 - **THEN** no change is marked done, no gate is released, and no checkpoint
   is satisfied by that command
+
+### Requirement: The supervised acceptance stage reviews real artifacts before archive
+
+The run engine SHALL provide a supervised `acceptance` stage distinct from the
+implementation `review` stage. When a registered supervised job's change
+passes implementation review, the engine SHALL dispatch the acceptance stage
+before archive through the existing journaled, gated dispatch boundary, using
+the job policy's pinned `acceptance_reviewer` role and its installed
+`opsx-acceptance-reviewer` agent. The acceptance reviewer SHALL inspect the
+change's real artifacts — the accepted plan and its dependency edges, the
+change's proposal, design, tasks, and spec deltas with their delta identity,
+and the referenced canonical specs — and SHALL return exactly one of `accept`,
+`fix`, or `escalate`. A worker or primary claim of completion, or a summary
+that is not the artifact, SHALL NOT be accepted as the review input.
+
+The stage SHALL introduce no new DAG or stage machine: the existing
+implement/review/archive loop and its gates remain the progression authority,
+and acceptance only gates advancement to archive.
+
+#### Scenario: Acceptance runs between review and archive
+
+- **WHEN** a change in a registered supervised job returns an implementation
+  review `pass`
+- **THEN** the engine dispatches the `acceptance` stage under the pinned
+  `acceptance_reviewer` role before any archive dispatch
+
+#### Scenario: Acceptance is not the implementation review
+
+- **WHEN** an acceptance verdict is recorded for a change
+- **THEN** the implementation review's stored verdict and findings are
+  unchanged, and the acceptance outcome is recorded as a separate stage result
+
+#### Scenario: A claim is not the artifact
+
+- **WHEN** the acceptance reviewer is asked to judge a change using only a
+  worker summary or transcript rather than the change's real artifacts
+- **THEN** that input does not satisfy the stage
+
+### Requirement: Acceptance verdicts bind to an exact artifact revision
+
+The engine SHALL compute an acceptance artifact revision as a content hash
+over the protected canonical plan manifest snapshot and its dependency edges,
+the change's authored artifacts (proposal, design, tasks), its spec deltas with
+their delta identity (delta operation plus requirement name), the referenced
+canonical specs, and the tracked change diff. The revision SHALL be computed
+on canonicalized inputs so an unrelated path or ordering difference does not
+change it.
+
+The acceptance verdict SHALL be recorded against the exact artifact revision
+it reviewed. Before the service records an `accept`, the engine SHALL recompute
+the revision and reject a verdict whose revision no longer matches the
+artifacts under review as stale; a stale verdict SHALL NOT satisfy the stage,
+and the stage SHALL be re-run over the new revision. Acceptance revision
+binding SHALL be separate from approval checkpoint binding: an acceptance
+revision SHALL NOT be the broker's material gate hash, and an approval receipt
+SHALL NOT satisfy the acceptance stage.
+
+The engine SHALL derive an authoritative artifact-identity list from the
+captured review set — the protected manifest snapshot hash, every dependency
+edge, and every file artifact — and SHALL present it to the acceptance
+reviewer with the manifest/dependency ground truth. An `accept` verdict SHALL
+acknowledge exactly that authoritative set: a partial, arbitrary, or
+manifest/dependency-omitting `accept` is a contract violation and SHALL NOT
+satisfy the stage or advance the change to archive.
+
+#### Scenario: The revision is captured before review
+
+- **WHEN** the acceptance stage begins for a change
+- **THEN** the artifact revision is computed and recorded before the
+  acceptance reviewer is dispatched against it
+
+#### Scenario: A changed artifact makes a verdict stale
+
+- **WHEN** a change's plan, dependency edges, or reviewed artifacts change
+  after an acceptance verdict was recorded
+- **THEN** the recorded verdict's revision no longer matches the current
+  artifacts and the verdict does not satisfy the stage
+
+#### Scenario: A stale verdict is rejected
+
+- **WHEN** an `accept` verdict for an earlier artifact revision is presented
+  for a change whose artifacts have since changed
+- **THEN** the stage refuses to accept it as satisfied and requires a fresh
+  acceptance
+
+#### Scenario: Approval binding does not satisfy acceptance
+
+- **WHEN** a change holds a valid approval receipt bound to its material gate
+  revision but no matching acceptance verdict
+- **THEN** the acceptance stage is not satisfied by the approval receipt
+
+#### Scenario: An accept must acknowledge the complete authoritative set
+
+- **WHEN** an `accept` verdict names only a subset of the authoritative
+  artifact identities, names arbitrary paths, or omits the manifest/dependency
+  ground truth
+- **THEN** the verdict is rejected as a contract violation and the change does
+  not advance to archive
+
+#### Scenario: A complete acknowledgment advances
+
+- **WHEN** an `accept` verdict names exactly the authoritative artifact
+  identities for the reviewed revision and is not stale
+- **THEN** the verdict satisfies the stage and the change advances to archive
+
+### Requirement: Acceptance re-validates creation evidence at the reviewed revision
+
+At the start of an acceptance attempt, before dispatching the acceptance
+reviewer, the engine SHALL run the change's configured created-change check
+(the `created_check` command, `openspec validate <change> --strict` by default)
+and capture the artifact revision immediately after it, so a verdict binds to
+validated content. A failing or timed-out created-change check SHALL block the
+stage with the recorded reason, and the service SHALL NOT record an `accept`
+for a revision whose creation evidence failed.
+
+#### Scenario: The created-change check and revision capture precede the verdict
+
+- **WHEN** the acceptance stage begins
+- **THEN** the configured created-change check runs and the artifact revision
+  is captured immediately after it, before the service records any `accept`
+
+#### Scenario: A failing created-change check blocks acceptance
+
+- **WHEN** the created-change check exits non-zero or times out
+- **THEN** the stage is blocked with the recorded check reason and no `accept`
+  is recorded
+
+### Requirement: Acceptance fix routes to the cheap fixer and a fresh acceptance
+
+On a `fix` outcome, the verdict SHALL name the mechanical defect precisely
+enough for the job's pinned `fixer` role to repair. The repair SHALL be
+consumed only after the independent `verifier` validates the actual diff and
+records its verdict under the existing repair-consumability contract; a
+fixer's own account SHALL NOT be sufficient. After the verified repair, the
+engine SHALL run a fresh acceptance over the new artifact revision. The route
+SHALL be bounded by the change's existing round budget, and exhaustion SHALL
+fail the change with a reason naming the unrepaired defect.
+
+#### Scenario: A fix is routed to the fixer
+
+- **WHEN** the acceptance reviewer returns `fix`
+- **THEN** the named mechanical defect is dispatched to the pinned `fixer`
+  role and not to an expensive subagent
+
+#### Scenario: A fix is verified before it is consumed
+
+- **WHEN** a fixer reports the acceptance defect repaired
+- **THEN** the repair is not consumed until the independent `verifier`
+  validates the real diff and records its verdict
+
+#### Scenario: A fresh acceptance follows a verified fix
+
+- **WHEN** a verified repair changes the change's artifacts
+- **THEN** the engine recomputes the artifact revision and runs a fresh
+  acceptance over the new revision
+
+#### Scenario: The fix route is bounded
+
+- **WHEN** the acceptance fix route reaches the change's round budget without
+  an `accept`
+- **THEN** the change fails with a reason naming the unrepaired defect
+
+### Requirement: Acceptance escalation returns the hard judgment to the primary
+
+On an `escalate` outcome, the engine SHALL return the judgment to the primary
+session rather than deciding it with a subagent, and SHALL NOT silently
+default to `accept` or `fix`. The escalation SHALL be recorded as blocking
+state, and the change SHALL NOT advance to archive while it is unresolved.
+
+#### Scenario: Escalation goes to the primary
+
+- **WHEN** the acceptance reviewer returns `escalate`
+- **THEN** the judgment is returned to the primary session and is not decided
+  by the acceptance reviewer or any other subagent
+
+#### Scenario: Escalation is never silently defaulted
+
+- **WHEN** an `escalate` outcome is received
+- **THEN** the stage does not treat it as `accept` or `fix`, and records the
+  escalation as unresolved blocking state
+
+#### Scenario: An unresolved escalation blocks archive
+
+- **WHEN** a change has an unresolved acceptance escalation
+- **THEN** the change does not advance to archive
+
+### Requirement: The acceptance stage never releases a human gate or replaces the review gate
+
+The acceptance verdict SHALL be a review outcome, not an approval authority.
+It SHALL NOT release a `pause_before` or `pause_before_human_only` gate,
+satisfy the operator `acceptance` receipt for an orchestrator-created change,
+or substitute for the implementation review verdict. The implement, review,
+and archive gates, the operator acceptance receipt, and the broker's approval
+authority SHALL remain the sole authorities for the decisions they own; the
+acceptance stage only gates advancement to archive.
+
+#### Scenario: A human-only gate is not released by acceptance
+
+- **WHEN** an `accept` verdict is recorded for a change whose gate resolves to
+  human-only
+- **THEN** the gate remains unreleased until an operator approval receipt
+  releases it
+
+#### Scenario: Operator acceptance of a created change is still required
+
+- **WHEN** an orchestrator-created change holds an `accept` verdict but no
+  operator `acceptance` receipt
+- **THEN** the created-change acceptance remains outstanding
+
+#### Scenario: The review gate is not replaced
+
+- **WHEN** the acceptance stage returns `accept` for a change
+- **THEN** the implementation review's gate behavior, verdict, and findings
+  are unchanged and still apply

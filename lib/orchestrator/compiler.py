@@ -282,6 +282,7 @@ def build_schema_guidance(adapter: str = "opencode") -> str:
     impl_invoke = defaults.get("implement_invoke", "")
     review_invoke = defaults.get("review_invoke", "")
     archive_invoke = defaults.get("archive_invoke", "")
+    acceptance_invoke = defaults.get("acceptance_invoke", "")
     return (
         "## Expected TOML manifest shape\n"
         "\n"
@@ -298,6 +299,7 @@ def build_schema_guidance(adapter: str = "opencode") -> str:
         f"| implement_invoke | string | ``{impl_invoke}`` | direct implement command |\n"
         f"| review_invoke | string | ``{review_invoke}`` | direct review command |\n"
         f"| archive_invoke | string | ``{archive_invoke}`` | direct archive command |\n"
+        f"| acceptance_invoke | string | ``{acceptance_invoke}`` | supervised acceptance-review command (empty on adapters without an acceptance stage; the stage fails closed) |\n"
         "| timeout_minutes | float | ``90`` | per-change stage timeout |\n"
         "| max_rounds | int | ``5`` | implement-review loop ceiling |\n"
         "| no_progress_limit | int | ``2`` | consecutive no-progress rounds before failing |\n"
@@ -361,6 +363,7 @@ def build_schema_guidance(adapter: str = "opencode") -> str:
         f"implement_invoke = \"{_escape_toml_value(defaults['implement_invoke'])}\"\n"
         f"review_invoke = \"{_escape_toml_value(defaults['review_invoke'])}\"\n"
         f"archive_invoke = \"{_escape_toml_value(defaults['archive_invoke'])}\"\n"
+        f"acceptance_invoke = \"{_escape_toml_value(acceptance_invoke)}\"\n"
         "```\n"
     )
 

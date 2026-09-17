@@ -241,3 +241,34 @@ introduce no separate plan-completion or plan-retirement authority.
 - **THEN** completion is determined from the same archive evidence as an
   unsupervised run, and the completed plan retires under the existing
   retirement semantics unchanged
+
+### Requirement: Acceptance consumes the canonical manifest and artifact ground truth
+
+The acceptance artifact revision SHALL be derived from the protected canonical
+plan manifest snapshot and its dependency edges together with the change's
+real artifacts, so that a change to the manifest, the dependency graph, or the
+reviewed artifacts invalidates a stale acceptance. Acceptance SHALL consume the
+same manifest ground truth as registration and as an unsupervised run: it SHALL
+introduce no separate plan-completion authority and SHALL NOT treat a prior
+archive as proof of done.
+
+#### Scenario: A manifest change invalidates a stale acceptance
+
+- **WHEN** the plan manifest or its dependency edges change after an
+  acceptance verdict was recorded for a change
+- **THEN** the recorded verdict no longer satisfies acceptance because its
+  artifact revision no longer matches the canonical manifest ground truth
+
+#### Scenario: Artifact changes invalidate a stale acceptance
+
+- **WHEN** a change's proposal, design, tasks, spec deltas, or canonical spec
+  references change after an acceptance verdict was recorded
+- **THEN** the recorded verdict is stale and a fresh acceptance over the new
+  revision is required
+
+#### Scenario: Acceptance adds no plan-completion authority
+
+- **WHEN** a supervised job's plan completion is evaluated
+- **THEN** completion is determined from the same archive and check evidence
+  as an unsupervised run, and the acceptance verdict does not by itself mark
+  the plan or a change complete

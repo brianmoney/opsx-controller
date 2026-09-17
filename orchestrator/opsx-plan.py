@@ -97,6 +97,8 @@ try:
     from lib.supervisor import ledger as ledger_mod
     from lib.supervisor import lifecycle as lifecycle_mod
     from lib.supervisor import lock as lock_mod
+    from lib.supervisor import acceptance as acceptance_mod
+    from lib.supervisor import agent_contracts as agent_contracts_mod
 except ModuleNotFoundError as exc:  # pragma: no cover
     sys.exit(f"opsx-plan requires the lib.orchestrator runtime package: {exc}")
 base._RUNTIME_ROOTS = _RUNTIME_ROOTS
@@ -761,6 +763,29 @@ def build_worker_input(repo: Path, cfg: dict, state: dict, cid: str, stage: str 
     ]
     if stage == "review":
         lines.append(f"PRIOR_FINDING_LOCI: {', '.join(_prior_finding_loci(r, cfg))}")
+    if stage == "acceptance":
+        acceptance_state = r.get("acceptance", {}) or {}
+        lines.append(
+            "ACCEPTANCE_ARTIFACT_REVISION: "
+            f"{acceptance_state.get('artifact_revision', '')}"
+        )
+        lines.append(
+            "ACCEPTANCE_MANIFEST_SNAPSHOT_HASH: "
+            f"{acceptance_state.get('manifest_snapshot_hash', '')}"
+        )
+        lines.append(
+            "ACCEPTANCE_DEPENDS_ON: "
+            + ", ".join(acceptance_state.get("depends_on", []) or [])
+        )
+        lines.append(
+            "ACCEPTANCE_ARTIFACTS: "
+            + ", ".join(acceptance_state.get("reviewed_artifacts", []) or [])
+        )
+        lines.append(
+            "ACCEPTANCE_ACCEPT_RULE: an accept verdict's artifacts_reviewed "
+            "must name exactly the ACCEPTANCE_ARTIFACTS set; a partial, "
+            "arbitrary, or manifest/dependency-omitting accept is rejected"
+        )
     return "\n".join(lines)
 
 
@@ -1609,7 +1634,10 @@ def _locus_recurrence_rounds(history: list[dict], blocking: set[str]) -> dict[st
     return locus_rounds
 
 
-def apply_review_result(repo: Path, cfg: dict, state: dict, cid: str, payload: dict) -> str:
+def apply_review_result(
+    repo: Path, cfg: dict, state: dict, cid: str, payload: dict, *,
+    supervised: bool = False,
+) -> str:
     r = state_mod.rec(state, cid)
     if payload.get("status") != "reviewed":
         state_mod.set_status(
@@ -1670,7 +1698,10 @@ def apply_review_result(repo: Path, cfg: dict, state: dict, cid: str, payload: d
     if passed:
         r["latest_fix_prompt"] = ""
         r["last_result"] = "review_passed"
-        r["phase"] = "archive"
+        # A registered supervised job runs the acceptance stage between a
+        # review pass and archive. Legacy unregistered runs are unchanged and
+        # still advance straight to archive.
+        r["phase"] = "acceptance" if supervised else "archive"
         state_mod.set_status(state, cid, base.PENDING, summary)
         return "continue"
     r["latest_fix_prompt"] = fix_prompt
@@ -1698,6 +1729,546 @@ def apply_review_result(repo: Path, cfg: dict, state: dict, cid: str, payload: d
     r["phase"] = "implement"
     state_mod.set_status(state, cid, base.PENDING, summary)
     return "continue"
+
+
+# ---------------------------------------------------------------------------
+# Acceptance stage (supervised-only artifact review between review and archive)
+# ---------------------------------------------------------------------------
+
+#: The change's authored artifacts, hashed into the acceptance artifact
+#: revision. ``design.md`` is optional and hashed as absent when missing.
+ACCEPTANCE_AUTHORED_ARTIFACTS = ("proposal.md", "design.md", "tasks.md")
+
+
+def _read_optional_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def collect_acceptance_review_set(
+    repo: Path, cfg: dict, state: dict, cid: str, *, manifest_snapshot_hash: str = ""
+) -> dict:
+    """Collect the change's real artifacts into a canonical review set.
+
+    Reads the authored artifacts, the change's spec deltas (with the canonical
+    specs they reference), and the tracked change files the run has recorded.
+    Failures to read a file are hashed as ``absent`` rather than raising: a
+    missing artifact is itself a revision-changing fact acceptance must see.
+    """
+    r = state_mod.rec(state, cid)
+    cdir = groundtruth.change_dir(repo, cid)
+    authored: dict[str, str | None] = {}
+    for name in ACCEPTANCE_AUTHORED_ARTIFACTS:
+        authored[f"openspec/changes/{cid}/{name}"] = _read_optional_text(cdir / name)
+
+    spec_deltas: dict[str, str | None] = {}
+    canonical_specs: dict[str, str | None] = {}
+    specs_dir = cdir / "specs"
+    if specs_dir.is_dir():
+        for path in sorted(specs_dir.rglob("*.md")):
+            if not path.is_file():
+                continue
+            rel = str(path.relative_to(repo))
+            spec_deltas[rel] = _read_optional_text(path)
+            canonical_rel = acceptance_mod.canonical_spec_rel_path(rel)
+            if canonical_rel and canonical_rel not in canonical_specs:
+                canonical_specs[canonical_rel] = _read_optional_text(repo / canonical_rel)
+
+    tracked: dict[str, str | None] = {}
+    seen: set[str] = set()
+    for rel in list(r.get("tracked_change_files", []) or []) + list(
+        state_mod.change_context_paths(repo, cid)
+    ):
+        normalized = acceptance_mod.normalize_rel_path(rel)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        tracked[normalized] = _read_optional_text(repo / normalized)
+
+    return acceptance_mod.build_review_set(
+        manifest_snapshot_hash=manifest_snapshot_hash,
+        depends_on=cfg["changes"][cid].get("depends_on", []),
+        authored_artifacts=authored,
+        spec_deltas=spec_deltas,
+        canonical_specs=canonical_specs,
+        tracked_change_files=tracked,
+    )
+
+
+def compute_acceptance_revision(
+    repo: Path, cfg: dict, state: dict, cid: str, *, gate: dict | None = None
+) -> tuple[str, dict, list[str]]:
+    """Return ``(revision, review_set, authoritative_identities)`` for the change now.
+
+    The third element is the engine-derived authoritative artifact-identity
+    list for the review set — the manifest/dependency ground truth plus every
+    file artifact — never a worker-supplied claim.
+    """
+    snapshot_hash = ""
+    if gate is not None:
+        snapshot_hash = str(gate.get("manifest_snapshot_hash") or "")
+    review_set = collect_acceptance_review_set(
+        repo, cfg, state, cid, manifest_snapshot_hash=snapshot_hash
+    )
+    revision = acceptance_mod.artifact_revision(review_set)
+    return revision, review_set, acceptance_mod.authoritative_artifact_identities(review_set)
+
+
+def prepare_acceptance_attempt(
+    repo: Path, cfg: dict, state: dict, cid: str, r: dict, *, gate: dict | None = None
+) -> dict:
+    """Run the created-change check and capture the revision it validated.
+
+    The configured created-change check runs first via the existing
+    ``groundtruth.verify_change_created`` path; the artifact revision is then
+    captured immediately, so the verdict the reviewer returns binds to content
+    that passed validation at the moment of review. A failing check blocks the
+    stage with the recorded reason and no ``accept`` is recorded. An unresolved
+    escalation is a blocking state that must be returned to the primary before
+    a fresh acceptance can run.
+    """
+    proj = r["acceptance"]
+    if proj.get("blocking") and proj.get("outcome") == acceptance_mod.ESCALATE:
+        return {
+            "blocked": (
+                "acceptance escalation is unresolved; the primary session must "
+                "return a judgment before the change can advance to archive"
+            ),
+            "last_result": "acceptance_escalation_unresolved",
+            "retryable": True,
+        }
+    try:
+        ok, why = groundtruth.verify_change_created(repo, cfg, cid)
+    except Exception as exc:  # noqa: BLE001 - a check crash is a failed check
+        ok, why = False, f"created-change check raised: {exc}"
+    if not ok:
+        proj["created_check"] = why or "failed"
+        proj["updated_at"] = base.utcnow()
+        return {
+            "blocked": f"created-change check blocked acceptance: {why}",
+            "last_result": "acceptance_created_check_failed",
+        }
+    proj["created_check"] = "passed"
+    revision, review_set, reviewed = compute_acceptance_revision(
+        repo, cfg, state, cid, gate=gate
+    )
+    proj["artifact_revision"] = revision
+    proj["reviewed_artifacts"] = reviewed
+    # The manifest/dependency ground truth is captured with the revision so the
+    # reviewer is shown, and an accept is bound to, the protected plan identity
+    # rather than only the file artifacts.
+    proj["manifest_snapshot_hash"] = str(
+        review_set.get("manifest_snapshot_hash", "") or ""
+    )
+    proj["depends_on"] = list(review_set.get("depends_on", []) or [])
+    proj["updated_at"] = base.utcnow()
+    return {"revision": revision, "reviewed_artifacts": reviewed}
+
+
+def _dispatch_session_identity(ledger, action_id) -> str:
+    """Best-available session identity for one dispatched action.
+
+    The journal's bound dispatch session is authoritative when present; when
+    session binding is unavailable (the orchestrator does not bind a session id
+    today) the action identity is used, because two distinct dispatches are two
+    distinct worker sessions. This is what lets the existing repair gate treat
+    the fixer and verifier as independent sessions.
+    """
+    if ledger is None or action_id is None:
+        return ""
+    try:
+        dispatch = ledger.latest_dispatch(int(action_id))
+    except Exception:  # noqa: BLE001 - identity absence is not a crash
+        dispatch = None
+    if dispatch is not None and dispatch["session_id"]:
+        return str(dispatch["session_id"]).strip()
+    return f"action:{int(action_id)}"
+
+
+def apply_acceptance_result(
+    repo: Path,
+    cfg: dict,
+    state: dict,
+    cid: str,
+    payload: dict,
+    *,
+    gate: dict | None = None,
+    action_id: int | None = None,
+) -> str:
+    """Apply one acceptance reviewer verdict to the run's control flow.
+
+    Records the verdict against the revision the reviewer judged, rejects a
+    stale ``accept`` as unsatisfying the stage, routes ``fix`` to the pinned
+    fixer (bounded by the change round budget), and returns an ``escalate`` to
+    the primary as blocking state that stops the change before archive.
+    """
+    r = state_mod.rec(state, cid)
+    proj = r["acceptance"]
+    # Compute the authoritative artifact identity set before trusting any
+    # worker claim: an accept binds to the set the reviewer was shown at
+    # prepare time (falling back to the freshly computed set), never to a
+    # worker-supplied list alone.
+    recorded_revision = str(proj.get("artifact_revision", "") or "")
+    current_revision, _review_set, current_reviewed = compute_acceptance_revision(
+        repo, cfg, state, cid, gate=gate
+    )
+    required_artifacts = list(proj.get("reviewed_artifacts", []) or []) or list(
+        current_reviewed
+    )
+    try:
+        verdict = acceptance_mod.normalize_verdict(
+            payload, required_artifacts=required_artifacts
+        )
+    except acceptance_mod.AcceptanceContractError as exc:
+        proj["outcome"] = ""
+        proj["stale"] = False
+        proj["blocking"] = False
+        proj["updated_at"] = base.utcnow()
+        r["last_result"] = "acceptance_invalid"
+        state_mod.set_status(state, cid, base.FAILED, f"acceptance output invalid: {exc}")
+        _try_notify(cfg, "change_failed", f"acceptance output invalid: {exc}", change_id=cid)
+        return "stop"
+
+    outcome = verdict["outcome"]
+    # A verdict binds to the revision the reviewer judged; the freshly computed
+    # revision decides staleness. An approval receipt can never stand in: this
+    # reads only the acceptance verdict and the artifacts.
+    stale = acceptance_mod.revision_is_stale(recorded_revision, current_revision)
+    reviewed = verdict["artifacts_reviewed"] or list(
+        proj.get("reviewed_artifacts", []) or current_reviewed
+    )
+    proj.update(
+        {
+            "outcome": outcome,
+            "artifact_revision": recorded_revision or current_revision,
+            "reviewed_artifacts": reviewed,
+            "reason": verdict["reason"],
+            "fix_prompt": verdict["fix_prompt"],
+            "stale": stale,
+            "escalated": outcome == acceptance_mod.ESCALATE,
+            "blocking": outcome == acceptance_mod.ESCALATE,
+            "updated_at": base.utcnow(),
+        }
+    )
+    if outcome == acceptance_mod.ACCEPT:
+        proj["blocking"] = False
+        proj["escalated"] = False
+
+    if gate is not None:
+        try:
+            gate["ledger"].record_acceptance_review(
+                int(gate["job_id"]),
+                change_id=cid,
+                outcome=outcome,
+                artifact_revision=recorded_revision or current_revision,
+                reviewed_artifacts=reviewed,
+                reason=verdict["reason"],
+                fix_prompt=verdict["fix_prompt"],
+                dispatch_action_id=action_id,
+                session_id=_dispatch_session_identity(
+                    gate.get("ledger"), action_id
+                )
+                or None,
+                created_check_evidence=proj.get("created_check", ""),
+            )
+        except Exception as exc:  # noqa: BLE001 - a lost verdict must fail closed
+            # The verdict is authoritative only once its ledger row exists. A
+            # failed durable write must not satisfy the stage or drive a
+            # transition: keep the change out of archive/fix/escalate, clear the
+            # unrecorded outcome from the projection, and surface the named
+            # persistence error instead of advancing.
+            reason = (
+                f"acceptance verdict persistence failed for {cid} "
+                f"(outcome={outcome}): {type(exc).__name__}: {exc}"
+            )
+            base.log(f"error: {reason}")
+            proj["outcome"] = ""
+            proj["persistence_error"] = reason
+            proj["stale"] = False
+            proj["escalated"] = False
+            proj["blocking"] = False
+            proj["updated_at"] = base.utcnow()
+            r["last_result"] = "acceptance_persistence_error"
+            state_mod.set_status(state, cid, base.FAILED, reason)
+            _try_notify(cfg, "change_failed", reason, change_id=cid)
+            return "stop"
+
+    append_history(
+        state,
+        cid,
+        {
+            "round": r["round"],
+            "phase": "acceptance",
+            "status": outcome,
+            "summary": verdict["reason"] or f"acceptance {outcome}",
+            "artifact_revision": recorded_revision or current_revision,
+            "stale": stale,
+            "reviewed_artifacts": reviewed,
+        },
+    )
+
+    if outcome == acceptance_mod.ESCALATE:
+        proj["escalation_round"] = r["round"]
+        reason = verdict["reason"] or "hard judgment required"
+        r["last_result"] = "acceptance_escalated"
+        state_mod.set_status(
+            state,
+            cid,
+            base.PENDING,
+            f"acceptance escalation returned to the primary session: {reason}",
+        )
+        _try_notify(
+            cfg,
+            "acceptance_escalated",
+            f"change {cid} acceptance escalated to the primary: {reason}",
+            change_id=cid,
+        )
+        return "stop"
+
+    if outcome == acceptance_mod.FIX:
+        defect = verdict["fix_prompt"] or verdict["reason"] or "unspecified acceptance defect"
+        r["latest_fix_prompt"] = verdict["fix_prompt"]
+        if r["round"] >= r["max_rounds"]:
+            reason = f"acceptance fix budget exhausted; unrepaired defect: {defect}"
+            r["last_result"] = "acceptance_fix_exhausted"
+            state_mod.set_status(state, cid, base.FAILED, reason)
+            _try_notify(cfg, "change_failed", reason, change_id=cid)
+            return "stop"
+        r["round"] += 1
+        r["phase"] = "fix"
+        r["last_result"] = "acceptance_fix_requested"
+        state_mod.set_status(
+            state, cid, base.PENDING, f"acceptance requested a mechanical fix: {defect}"
+        )
+        return "continue"
+
+    # accept
+    r["latest_fix_prompt"] = ""
+    if stale:
+        reason = (
+            "acceptance verdict is stale: the reviewed artifact revision no "
+            "longer matches the artifacts under review"
+        )
+        proj["stale"] = True
+        if r["round"] >= r["max_rounds"]:
+            r["last_result"] = "acceptance_stale_budget_exhausted"
+            state_mod.set_status(state, cid, base.FAILED, f"{reason}; round budget exhausted")
+            _try_notify(cfg, "change_failed", reason, change_id=cid)
+            return "stop"
+        r["round"] += 1
+        r["phase"] = "acceptance"
+        r["last_result"] = "acceptance_stale"
+        state_mod.set_status(state, cid, base.PENDING, f"{reason}; rerunning acceptance")
+        return "continue"
+    proj["stale"] = False
+    r["last_result"] = "acceptance_passed"
+    r["phase"] = "archive"
+    state_mod.set_status(state, cid, base.PENDING, verdict["reason"] or "acceptance passed")
+    return "continue"
+
+
+def apply_fix_result(
+    repo: Path,
+    cfg: dict,
+    state: dict,
+    cid: str,
+    payload: dict,
+    *,
+    action_id: int | None = None,
+) -> str:
+    """Apply one fixer report: a claim that is never self-certifying.
+
+    The report is stored as a claim and the change advances to the independent
+    ``verify`` stage. It marks nothing complete and satisfies nothing on its
+    own; only the verifier's verdict on the real diff can make the repair
+    consumable.
+    """
+    r = state_mod.rec(state, cid)
+    proj = r["acceptance"]
+    payload = payload if isinstance(payload, dict) else {}
+    role = str(payload.get("role") or "fixer").strip()
+    if role != "fixer":
+        r["last_result"] = "fix_invalid"
+        state_mod.set_status(
+            state, cid, base.FAILED, f"fixer returned unexpected role={role}"
+        )
+        _try_notify(cfg, "change_failed", f"fixer returned unexpected role={role}", change_id=cid)
+        return "stop"
+    checks = payload.get("checks")
+    report = {
+        "repair": str(payload.get("repair") or ""),
+        "files": [str(path) for path in payload.get("files", []) if isinstance(path, str)],
+        "checks": checks if isinstance(checks, list) else [],
+        # A fixer report is a claim; ``self_certified`` is always false here
+        # regardless of what the worker sent.
+        "self_certified": False,
+    }
+    proj["fix"] = report
+    proj["verified"] = False
+    proj["fix_action_id"] = action_id
+    proj["updated_at"] = base.utcnow()
+    append_history(
+        state,
+        cid,
+        {
+            "round": r["round"],
+            "phase": "fix",
+            "status": "reported",
+            "summary": report["repair"] or "fixer reported a repair",
+            "files": report["files"],
+        },
+    )
+    r["phase"] = "verify"
+    r["last_result"] = "fix_reported"
+    state_mod.set_status(
+        state, cid, base.PENDING, "fixer reported a repair; awaiting independent verification"
+    )
+    return "continue"
+
+
+def apply_verify_result(
+    repo: Path,
+    cfg: dict,
+    state: dict,
+    cid: str,
+    payload: dict,
+    *,
+    gate: dict | None = None,
+    action_id: int | None = None,
+) -> str:
+    """Apply one verifier verdict and enforce the repair-consumability gate.
+
+    A repair is consumed only when the independent verifier validated the real
+    diff (``pass`` + ``repair_verified`` + ``diff_reviewed``) in a session
+    distinct from the fixer's. The decision is recorded as durable journal
+    evidence so the next gated dispatch re-reads and re-enforces it. A failed
+    or unverifiable repair fails the change naming the unrepaired defect.
+    """
+    r = state_mod.rec(state, cid)
+    proj = r["acceptance"]
+    payload = payload if isinstance(payload, dict) else {}
+    ledger = gate.get("ledger") if gate is not None else None
+    fixer_report = proj.get("fix") or None
+    fixer_action_id = proj.get("fix_action_id")
+    fixer_session = _dispatch_session_identity(ledger, fixer_action_id)
+    verifier_session = _dispatch_session_identity(ledger, action_id)
+
+    if not fixer_report:
+        reason = "no fixer report exists to verify; refusing a repair with no claim"
+        proj["verified"] = False
+        proj["blocking"] = False
+        proj["updated_at"] = base.utcnow()
+        r["last_result"] = "repair_unverified"
+        state_mod.set_status(state, cid, base.FAILED, reason)
+        _try_notify(cfg, "change_failed", reason, change_id=cid)
+        return "stop"
+
+    enriched_fixer = dict(fixer_report)
+    enriched_fixer["session_id"] = fixer_session
+    enriched_verdict = dict(payload)
+    enriched_verdict["session_id"] = verifier_session
+    decision = agent_contracts_mod.repair_consumable(
+        fixer_report=enriched_fixer,
+        verifier_verdict=enriched_verdict,
+        fixer_session_id=fixer_session or None,
+        verifier_session_id=verifier_session or None,
+    )
+    if ledger is not None and action_id is not None:
+        # Attach the claim+verdict pair to the action that produced the repair.
+        # The repair gate reads the fixer session identity from that action's
+        # dispatch record, so recording the pair on the verify action would
+        # collapse the two session identities and wrongly refuse the repair as
+        # not independently verified.
+        evidence_action_id = (
+            fixer_action_id if fixer_action_id is not None else action_id
+        )
+        try:
+            agent_contracts_mod.record_repair_evidence(
+                ledger,
+                int(evidence_action_id),
+                fixer_report=enriched_fixer,
+                verifier_verdict=enriched_verdict,
+                decision=decision,
+            )
+        except Exception as exc:  # noqa: BLE001 - a repair needs durable evidence
+            # A repair may only be consumed against durable independent-verifier
+            # evidence. A failed write must not advance to a fresh acceptance or
+            # leave the repair gate reading an unrecorded verdict: fail closed
+            # naming the persistence error instead.
+            reason = (
+                f"repair evidence persistence failed for {cid}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            base.log(f"error: {reason}")
+            proj["verified"] = False
+            proj["blocking"] = False
+            proj["persistence_error"] = reason
+            proj["updated_at"] = base.utcnow()
+            r["last_result"] = "repair_evidence_persistence_error"
+            state_mod.set_status(state, cid, base.FAILED, reason)
+            _try_notify(cfg, "change_failed", reason, change_id=cid)
+            return "stop"
+
+    append_history(
+        state,
+        cid,
+        {
+            "round": r["round"],
+            "phase": "verify",
+            "status": "consumable" if decision["consumable"] else "blocked",
+            "summary": decision["reason"] or "repair independently verified",
+            "verifier_verdict": decision.get("verifier_verdict"),
+        },
+    )
+    if decision["consumable"]:
+        proj["verified"] = True
+        proj["blocking"] = False
+        proj["updated_at"] = base.utcnow()
+        r["phase"] = "acceptance"
+        r["last_result"] = "repair_verified"
+        state_mod.set_status(
+            state,
+            cid,
+            base.PENDING,
+            "independent verifier validated the repair; running a fresh acceptance",
+        )
+        return "continue"
+
+    defect = str(
+        proj.get("fix_prompt")
+        or (fixer_report or {}).get("repair")
+        or "acceptance defect"
+    )
+    reason = f"unrepaired acceptance defect ({defect}): {decision['reason']}"
+    proj["verified"] = False
+    proj["updated_at"] = base.utcnow()
+    r["last_result"] = "repair_unverified"
+    state_mod.set_status(state, cid, base.FAILED, reason)
+    _try_notify(cfg, "change_failed", reason, change_id=cid)
+    return "stop"
+
+
+def resolve_acceptance_escalation(state: dict, cid: str, *, note: str = "") -> None:
+    """Primary action: resolve an unresolved acceptance escalation.
+
+    Clears the blocking escalation state and returns the change to the
+    acceptance stage so a fresh acceptance runs over the (possibly corrected)
+    revision. This is the only sanctioned way past the escalation boundary —
+    the engine never defaults an ``escalate`` to ``accept`` or ``fix``.
+    """
+    r = state_mod.rec(state, cid)
+    proj = r["acceptance"]
+    if not proj.get("escalated") and not proj.get("blocking"):
+        return
+    proj["blocking"] = False
+    proj["escalated"] = False
+    proj["reason"] = note or "escalation resolved by the primary session"
+    proj["updated_at"] = base.utcnow()
+    r["phase"] = "acceptance"
+    r["last_result"] = "acceptance_escalation_resolved"
+    state_mod.set_status(state, cid, base.PENDING, proj["reason"])
 
 
 def reactivate_archived_change(repo: Path, cid: str, archive: dict) -> tuple[bool, str]:
@@ -2307,7 +2878,15 @@ def _recover_supervised_dispatch(
         pending_detail = {}
     if not isinstance(pending_detail, dict):
         pending_detail = {}
-    stage_order = {"create": 0, "implement": 1, "review": 2, "archive": 3}
+    stage_order = {
+        "create": 0,
+        "implement": 1,
+        "review": 2,
+        "acceptance": 3,
+        "fix": 4,
+        "verify": 5,
+        "archive": 6,
+    }
     if pending_stage not in stage_order or stage not in stage_order:
         return {
             "blocked": (
@@ -2779,9 +3358,54 @@ def _run_direct_change_loop_inner(
                     base.log(f"  {reason}")
                     persist_direct_state(repo, cfg, state, cid)
                     return "budget"
-        if stage not in {"implement", "review", "archive"}:
+        if stage not in {"implement", "review", "acceptance", "fix", "verify", "archive"}:
             r["phase"] = "implement"
             stage = "implement"
+        if stage in {"acceptance", "fix", "verify"} and supervised_gate is None:
+            # The acceptance stage and its fix/verify helpers are
+            # supervised-only; a leftover phase from a deregistered run is
+            # driven back onto the ordinary path.
+            r["phase"] = "implement"
+            stage = "implement"
+
+        if stage == "acceptance":
+            if not cfg.get("acceptance_invoke"):
+                reason = (
+                    f"acceptance stage invoke is not configured for adapter "
+                    f"'{cfg.get('adapter', '')}'; refusing to skip the supervised "
+                    "acceptance stage"
+                )
+                r["last_result"] = "acceptance_invoke_unconfigured"
+                state_mod.set_status(state, cid, base.FAILED, reason)
+                _try_notify(cfg, "change_failed", reason, change_id=cid)
+                persist_direct_state(repo, cfg, state, cid)
+                return "failed"
+            prepared = prepare_acceptance_attempt(
+                repo, cfg, state, cid, r, gate=supervised_gate
+            )
+            if prepared.get("blocked"):
+                reason = prepared["blocked"]
+                r["last_result"] = prepared.get(
+                    "last_result", "acceptance_blocked"
+                )
+                blocked_status = (
+                    base.PENDING if prepared.get("retryable") else base.FAILED
+                )
+                state_mod.set_status(state, cid, blocked_status, reason)
+                base.log(f"  {reason}")
+                persist_direct_state(repo, cfg, state, cid)
+                return "budget" if prepared.get("retryable") else "failed"
+        elif stage in {"fix", "verify"} and not cfg.get(f"{stage}_invoke"):
+            reason = (
+                f"{stage} stage invoke is not configured for adapter "
+                f"'{cfg.get('adapter', '')}'; the acceptance repair route cannot "
+                "run and is not skipped"
+            )
+            r["last_result"] = f"{stage}_invoke_unconfigured"
+            state_mod.set_status(state, cid, base.FAILED, reason)
+            _try_notify(cfg, "change_failed", reason, change_id=cid)
+            persist_direct_state(repo, cfg, state, cid)
+            return "failed"
 
         input_block = build_worker_input(repo, cfg, state, cid, stage=stage)
         state_mod.set_status(state, cid, base.RUNNING, f"{stage} round {round_num}")
@@ -3060,7 +3684,27 @@ def _run_direct_change_loop_inner(
         if stage == "implement":
             action = apply_implement_result(repo, cfg, state, cid, payload)
         elif stage == "review":
-            action = apply_review_result(repo, cfg, state, cid, payload)
+            action = apply_review_result(
+                repo, cfg, state, cid, payload,
+                supervised=supervised_gate is not None,
+            )
+        elif stage == "acceptance":
+            action = apply_acceptance_result(
+                repo, cfg, state, cid, payload,
+                gate=supervised_gate,
+                action_id=(gate_reservation or {}).get("action_id"),
+            )
+        elif stage == "fix":
+            action = apply_fix_result(
+                repo, cfg, state, cid, payload,
+                action_id=(gate_reservation or {}).get("action_id"),
+            )
+        elif stage == "verify":
+            action = apply_verify_result(
+                repo, cfg, state, cid, payload,
+                gate=supervised_gate,
+                action_id=(gate_reservation or {}).get("action_id"),
+            )
         else:
             action = apply_archive_result(
                 repo, cfg, state, cid, payload,

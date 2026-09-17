@@ -30,11 +30,12 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from lib.supervisor import acceptance
 from lib.supervisor import budgets
 from lib.supervisor import clock
 from lib.supervisor import model_policy
 
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 CURRENT_POLICY_VERSION = 1
 
 # Durable broker receipt kinds and the authorities that may record them. A
@@ -582,6 +583,47 @@ def _migrate_5_to_6(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE jobs ADD COLUMN linkage_config TEXT")
 
 
+_ACCEPTANCE_OUTCOMES_SQL = "'" + "','".join(acceptance.OUTCOMES) + "'"
+
+_SCHEMA_V7_STATEMENTS = (
+    f"""
+    CREATE TABLE IF NOT EXISTS acceptance_reviews (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id INTEGER NOT NULL REFERENCES jobs (id),
+        change_id TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK (outcome IN ({_ACCEPTANCE_OUTCOMES_SQL})),
+        artifact_revision TEXT NOT NULL,
+        reviewed_artifacts TEXT NOT NULL,
+        reason TEXT,
+        fix_prompt TEXT,
+        dispatch_action_id INTEGER,
+        session_id TEXT,
+        created_check_evidence TEXT,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_acceptance_reviews_job_change
+        ON acceptance_reviews (job_id, change_id, id)
+    """,
+)
+
+
+def _migrate_6_to_7(conn: sqlite3.Connection) -> None:
+    """Add the append-only ``acceptance_reviews`` table.
+
+    Strictly additive: each row is one acceptance verdict recorded against the
+    exact artifact revision it reviewed, with the reviewed artifact set, the
+    outcome-specific reason/fix prompt, the journal dispatch action and session
+    linkage, and the created-change check evidence. Acceptance verdicts live
+    here rather than on the implementation-review projection, so the two
+    authorities never overwrite each other. The verdict table introduces no new
+    approval authority and no separate plan-completion state.
+    """
+    for statement in _SCHEMA_V7_STATEMENTS:
+        conn.execute(statement)
+
+
 MIGRATIONS: dict[int, Any] = {
     1: _migrate_0_to_1,
     2: _migrate_1_to_2,
@@ -589,6 +631,7 @@ MIGRATIONS: dict[int, Any] = {
     4: _migrate_3_to_4,
     5: _migrate_4_to_5,
     6: _migrate_5_to_6,
+    7: _migrate_6_to_7,
 }
 
 
@@ -1228,6 +1271,97 @@ class Ledger:
             "AND kind IN ('pause', 'drain') ORDER BY id DESC LIMIT 1",
             (job_id, STOP_REQUEST_CHANGE_ID),
         ).fetchone()
+
+    # -- acceptance verdicts ------------------------------------------------
+
+    def record_acceptance_review(
+        self,
+        job_id: int,
+        *,
+        change_id: str,
+        outcome: str,
+        artifact_revision: str,
+        reviewed_artifacts: Iterable[str] | None = None,
+        reason: str = "",
+        fix_prompt: str = "",
+        dispatch_action_id: int | None = None,
+        session_id: str | None = None,
+        created_check_evidence: Any = None,
+    ) -> int:
+        """Append one acceptance verdict bound to *artifact_revision*.
+
+        An unknown outcome, an empty change id or artifact revision, or an
+        unknown job is refused and nothing is written. ``reviewed_artifacts``
+        is stored as a canonical JSON array; ``created_check_evidence`` as
+        canonical JSON (a string is stored as a JSON string). The verdict is
+        append-only and never mutates the implementation review projection.
+        """
+        if outcome not in acceptance.OUTCOMES:
+            raise LedgerError(
+                f"unknown acceptance outcome: {outcome!r}; expected one of "
+                f"{', '.join(acceptance.OUTCOMES)}"
+            )
+        change_id = str(change_id or "").strip()
+        artifact_revision = str(artifact_revision or "").strip()
+        if not change_id:
+            raise LedgerError("an acceptance review requires a change id")
+        if not artifact_revision:
+            raise LedgerError("an acceptance review requires an artifact revision")
+        self.get_job(job_id)
+        reviewed = json.dumps(
+            [str(path) for path in (reviewed_artifacts or [])], sort_keys=True
+        )
+        evidence = (
+            created_check_evidence
+            if isinstance(created_check_evidence, str)
+            else json.dumps(created_check_evidence, sort_keys=True)
+        )
+        now = _utcnow()
+        with self._transaction():
+            cursor = self._conn.execute(
+                """
+                INSERT INTO acceptance_reviews (
+                    job_id, change_id, outcome, artifact_revision,
+                    reviewed_artifacts, reason, fix_prompt, dispatch_action_id,
+                    session_id, created_check_evidence, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id, change_id, outcome, artifact_revision, reviewed,
+                    str(reason or ""), str(fix_prompt or ""),
+                    dispatch_action_id, session_id, evidence, now,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def latest_acceptance_review(
+        self, job_id: int, change_id: str
+    ) -> sqlite3.Row | None:
+        """Return the most recent acceptance verdict for ``(job_id, change_id)``."""
+        return self._conn.execute(
+            "SELECT * FROM acceptance_reviews WHERE job_id = ? AND change_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (job_id, change_id),
+        ).fetchone()
+
+    def list_acceptance_reviews(
+        self, job_id: int, change_id: str | None = None
+    ) -> list[sqlite3.Row]:
+        """Return ``job_id``'s acceptance verdicts in insertion order."""
+        if change_id is None:
+            return list(
+                self._conn.execute(
+                    "SELECT * FROM acceptance_reviews WHERE job_id = ? ORDER BY id",
+                    (job_id,),
+                )
+            )
+        return list(
+            self._conn.execute(
+                "SELECT * FROM acceptance_reviews WHERE job_id = ? AND change_id = ? "
+                "ORDER BY id",
+                (job_id, change_id),
+            )
+        )
 
     # -- policy ------------------------------------------------------------
 
