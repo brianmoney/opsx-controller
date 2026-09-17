@@ -27,6 +27,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import uuid
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -35,7 +36,7 @@ from lib.supervisor import budgets
 from lib.supervisor import clock
 from lib.supervisor import model_policy
 
-CURRENT_SCHEMA_VERSION = 8
+CURRENT_SCHEMA_VERSION = 9
 CURRENT_POLICY_VERSION = 1
 
 # Durable broker receipt kinds and the authorities that may record them. A
@@ -63,6 +64,41 @@ WAIT_STATES = ("open", "ended")
 # receipt.
 STOP_REQUEST_CHANGE_ID = "*"
 STOP_CHECKPOINT_PREFIX = "job-stop:"
+
+# Steering-request acknowledgement states. A request-identified receipt starts
+# ``pending`` and becomes ``acknowledged`` exactly once, when the service
+# reaches the safe boundary for the request's kind. A receipt with no request
+# identity carries a NULL acknowledgement state and is never acknowledgeable.
+ACK_STATES = ("pending", "acknowledged")
+
+# Safe boundaries an acknowledgement may name. ``change`` is a per-change
+# boundary (a pause-after-change, retry/reset, or steer request observed at the
+# change it names), ``stop`` is the stop hold a job-scoped pause/drain reaches,
+# ``terminal`` is the job's terminal boundary (a cancel), and ``policy`` is the
+# boundary an applied job-level policy revision reaches immediately.
+ACK_BOUNDARY_CHANGE = "change"
+ACK_BOUNDARY_STOP = "stop"
+ACK_BOUNDARY_TERMINAL = "terminal"
+ACK_BOUNDARY_POLICY = "policy"
+ACK_BOUNDARIES = (
+    ACK_BOUNDARY_CHANGE,
+    ACK_BOUNDARY_STOP,
+    ACK_BOUNDARY_TERMINAL,
+    ACK_BOUNDARY_POLICY,
+)
+
+
+def new_request_id(kind: str) -> str:
+    """Return a new stable, kind-prefixed steering request identity.
+
+    The prefix keeps the recorded request family readable (``pause-…``,
+    ``steer-…``, ``drain-…``, ``cancel-…``) while the random suffix makes the
+    identity unique per job. The value is durable: it is stored on the receipt
+    and rides out a restart.
+    """
+    prefix = str(kind or "steer").strip() or "steer"
+    return f"{prefix}-{uuid.uuid4().hex}"
+
 
 # Fencing-record events. A fencing record describes one execution-lock
 # acquisition, release, or takeover for a supervised job; it never reassigns
@@ -688,6 +724,65 @@ def _migrate_7_to_8(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+# The version-9 migration adds steering request identity and acknowledgement to
+# ``receipts`` plus the durable per-consumer notification watermark. The
+# columns are declared separately from the version-5 ``receipts`` DDL so that
+# schema still describes exactly what version-5 code wrote.
+_SCHEMA_V9_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS notification_watermarks (
+        job_id INTEGER NOT NULL REFERENCES jobs (id),
+        consumer TEXT NOT NULL,
+        high_water INTEGER NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (job_id, consumer)
+    )
+    """,
+)
+
+_V9_RECEIPT_COLUMNS = (
+    ("request_id", "TEXT"),
+    ("ack_state", "TEXT CHECK (ack_state IN ('pending','acknowledged'))"),
+    ("ack_boundary", "TEXT"),
+    ("acked_at", "TEXT"),
+)
+
+
+def _migrate_8_to_9(conn: sqlite3.Connection) -> None:
+    """Add steering request identity/acknowledgement and the notification watermark.
+
+    Strictly additive and forward-only, in one migration transaction:
+
+    - ``receipts`` gains a nullable ``request_id`` (the durable steering
+      request identity), a nullable ``ack_state`` (``pending`` until the safe
+      boundary is reached, then ``acknowledged``), the ``ack_boundary`` the
+      acknowledgement named, and ``acked_at``. Existing rows keep ``NULL`` for
+      every new column and no receipt kind changes. A partial unique index on
+      ``(job_id, request_id)`` keeps a request identity unique per job.
+    - ``notification_watermarks`` records the durable delivery high-water per
+      ``(job_id, consumer)`` so a reboot does not replay a delivered
+      notification. The separate receipt wake-up scan is unaffected.
+
+    Nothing is rewritten and no receipt kind changes, so a version-8 ledger
+    migrates in place; a newer-than-code ledger is still refused before any
+    write with the named version error.
+    """
+    for column, declaration in _V9_RECEIPT_COLUMNS:
+        if not _column_exists(conn, "receipts", column):
+            conn.execute(
+                f"ALTER TABLE receipts ADD COLUMN {column} {declaration}"
+            )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_receipts_request
+            ON receipts (job_id, request_id)
+            WHERE request_id IS NOT NULL
+        """
+    )
+    for statement in _SCHEMA_V9_STATEMENTS:
+        conn.execute(statement)
+
+
 MIGRATIONS: dict[int, Any] = {
     1: _migrate_0_to_1,
     2: _migrate_1_to_2,
@@ -697,6 +792,7 @@ MIGRATIONS: dict[int, Any] = {
     6: _migrate_5_to_6,
     7: _migrate_6_to_7,
     8: _migrate_7_to_8,
+    9: _migrate_8_to_9,
 }
 
 
@@ -983,12 +1079,16 @@ class Ledger:
         authority: str,
         actor_principal: str | None = None,
         detail: str | None = None,
+        request_id: str | None = None,
     ) -> int:
         """Append one durable authority receipt in a single transaction.
 
         Receipts are insert-only: they record who released (or requested) a
         checkpoint against which material revision. An unknown job, kind, or
-        authority is refused and nothing is written.
+        authority is refused and nothing is written. A *request_id* records a
+        durable steering request identity on the receipt and starts its
+        acknowledgement ``pending``; the receipt stays acknowledgeable across a
+        restart until the safe boundary is reached.
         """
         if kind not in RECEIPT_KINDS:
             raise LedgerError(f"unknown receipt kind: {kind}")
@@ -998,6 +1098,11 @@ class Ledger:
             raise LedgerError(
                 "a receipt requires change_id, checkpoint, and material_hash"
             )
+        normalized_request = (
+            str(request_id).strip() if request_id is not None else None
+        )
+        if request_id is not None and not normalized_request:
+            raise LedgerError("a receipt request_id must be a non-empty string")
         self.get_job(job_id)
         now = _utcnow()
         with self._transaction():
@@ -1005,12 +1110,15 @@ class Ledger:
                 """
                 INSERT INTO receipts (
                     job_id, change_id, kind, checkpoint, material_hash,
-                    authority, actor_principal, detail, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    authority, actor_principal, detail, created_at,
+                    request_id, ack_state
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id, change_id, kind, checkpoint, material_hash,
                     authority, actor_principal, detail, now,
+                    normalized_request,
+                    "pending" if normalized_request else None,
                 ),
             )
             receipt_id = int(cursor.lastrowid)
@@ -1109,6 +1217,129 @@ class Ledger:
         ).fetchone()
         value = row["high_water"] if row is not None else None
         return int(value) if value is not None else 0
+
+    # -- steering request identity, acknowledgement, and notification watermarks
+
+    def get_receipt_by_request(self, job_id: int, request_id: str) -> sqlite3.Row:
+        """Return the receipt recorded for *request_id*, or raise."""
+        normalized = str(request_id).strip()
+        row = self._conn.execute(
+            "SELECT * FROM receipts WHERE job_id = ? AND request_id = ?",
+            (job_id, normalized),
+        ).fetchone()
+        if row is None:
+            raise UnknownRecordError(
+                f"no steering request {request_id!r} for job {job_id}"
+            )
+        return row
+
+    def steering_requests(
+        self, job_id: int, *, limit: int | None = None
+    ) -> list[sqlite3.Row]:
+        """Return *job_id*'s request-identified receipts in insertion order.
+
+        *limit* keeps only the most recent entries (the newest ``limit`` rows),
+        so a large ledger does not make a projection unbounded.
+        """
+        rows = list(
+            self._conn.execute(
+                "SELECT * FROM receipts WHERE job_id = ? AND request_id IS NOT NULL "
+                "ORDER BY id",
+                (job_id,),
+            )
+        )
+        if limit is not None and limit >= 0:
+            rows = rows[-int(limit):] if limit else []
+        return rows
+
+    def pending_acknowledgements(self, job_id: int) -> list[sqlite3.Row]:
+        """Return *job_id*'s request-identified receipts still awaiting a boundary."""
+        return list(
+            self._conn.execute(
+                "SELECT * FROM receipts WHERE job_id = ? AND ack_state = 'pending' "
+                "ORDER BY id",
+                (job_id,),
+            )
+        )
+
+    def latest_steering_request(self, job_id: int) -> sqlite3.Row | None:
+        """Return the most recent request-identified receipt, or ``None``."""
+        return self._conn.execute(
+            "SELECT * FROM receipts WHERE job_id = ? AND request_id IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1",
+            (job_id,),
+        ).fetchone()
+
+    def acknowledge_request(
+        self, job_id: int, request_id: str, *, boundary: str
+    ) -> sqlite3.Row:
+        """Acknowledge a steering request at the safe *boundary* reached.
+
+        Idempotent: a second acknowledgement of the same request is a no-op
+        that returns the already-acknowledged row, so a duplicated or stale
+        request is never acknowledged twice. An unknown request, or a receipt
+        that carries no request identity, is refused and nothing is written.
+        """
+        if boundary not in ACK_BOUNDARIES:
+            raise LedgerError(f"unknown acknowledgement boundary: {boundary}")
+        now = _utcnow()
+        with self._transaction():
+            row = self.get_receipt_by_request(job_id, request_id)
+            state = row["ack_state"]
+            if state == "acknowledged":
+                return row
+            if state != "pending":
+                raise JournalStateError(
+                    f"receipt {row['id']} carries no pending request identity; "
+                    "only a pending steering request is acknowledged"
+                )
+            result = self._conn.execute(
+                "UPDATE receipts SET ack_state = 'acknowledged', "
+                "ack_boundary = ?, acked_at = ? "
+                "WHERE id = ? AND ack_state = 'pending'",
+                (boundary, now, int(row["id"])),
+            )
+            if result.rowcount != 1:
+                raise JournalStateError(
+                    f"steering request {request_id!r} changed state while "
+                    "acknowledging; retry"
+                )
+        return self.get_receipt(int(row["id"]))
+
+    def notification_watermark(self, job_id: int, consumer: str) -> int:
+        """Return the persisted delivery high-water for *consumer* (0 when none)."""
+        row = self._conn.execute(
+            "SELECT high_water FROM notification_watermarks "
+            "WHERE job_id = ? AND consumer = ?",
+            (job_id, str(consumer)),
+        ).fetchone()
+        return int(row["high_water"]) if row is not None else 0
+
+    def advance_notification_watermark(
+        self, job_id: int, consumer: str, high_water: int
+    ) -> int:
+        """Persist an advanced delivery high-water for *consumer*, returning it.
+
+        Monotonic: a lower value never rewinds a recorded watermark, so an
+        out-of-order consumer cannot replay already-delivered notifications.
+        """
+        self.get_job(job_id)
+        value = max(0, int(high_water))
+        now = _utcnow()
+        with self._transaction():
+            _ = self._conn.execute(
+                """
+                INSERT INTO notification_watermarks (
+                    job_id, consumer, high_water, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT (job_id, consumer) DO UPDATE SET
+                    high_water = MAX(notification_watermarks.high_water,
+                                     excluded.high_water),
+                    updated_at = excluded.updated_at
+                """,
+                (job_id, str(consumer), value, now),
+            )
+        return self.notification_watermark(job_id, consumer)
 
     def record_manifest_snapshot(
         self, job_id: int, *, content: str
@@ -1272,6 +1503,7 @@ class Ledger:
         authority: str,
         actor_principal: str | None = None,
         detail: str | None = None,
+        request_id: str | None = None,
     ) -> int:
         """Record a durable job-scoped stop request in one transaction.
 
@@ -1280,7 +1512,9 @@ class Ledger:
         boundary hold a restarted execution must still observe). Both are
         written atomically, never requiring the worktree execution lock. The
         material hash is derived from the job's current policy revision, so the
-        request is bound to the policy it was recorded against.
+        request is bound to the policy it was recorded against. A *request_id*
+        records the durable steering request identity and starts its
+        acknowledgement ``pending``.
         """
         stop_kinds = ("pause", "drain")
         if kind not in stop_kinds:
@@ -1294,17 +1528,25 @@ class Ledger:
         )
         checkpoint = STOP_CHECKPOINT_PREFIX + kind
         now = _utcnow()
+        normalized_request = (
+            str(request_id).strip() if request_id is not None else None
+        )
+        if request_id is not None and not normalized_request:
+            raise LedgerError("a stop request request_id must be non-empty")
         with self._transaction():
             cursor = self._conn.execute(
                 """
                 INSERT INTO receipts (
                     job_id, change_id, kind, checkpoint, material_hash,
-                    authority, actor_principal, detail, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    authority, actor_principal, detail, created_at,
+                    request_id, ack_state
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id, STOP_REQUEST_CHANGE_ID, kind, checkpoint,
                     material_hash, authority, actor_principal, detail, now,
+                    normalized_request,
+                    "pending" if normalized_request else None,
                 ),
             )
             receipt_id = int(cursor.lastrowid)
@@ -1539,6 +1781,88 @@ class Ledger:
         else:
             self._conn.execute("COMMIT")
         return policy_id
+
+    def apply_policy_revision(
+        self,
+        job_id: int,
+        *,
+        revision: int,
+        policy: Mapping[str, Any],
+        operator: str,
+        request_id: str,
+        change_id: str,
+        kind: str,
+        checkpoint: str,
+        material_hash: str,
+        authority: str,
+        actor_principal: str | None = None,
+        detail: str | None = None,
+        policy_version: int = CURRENT_POLICY_VERSION,
+    ) -> tuple[int, int]:
+        """Validate, apply, and acknowledge a policy revision atomically.
+
+        The policy payload is validated and the revision increment checked
+        *before* any write; the supersede, the new policy row, and the
+        request-identified receipt — recorded already acknowledged at
+        :data:`ACK_BOUNDARY_POLICY`, because the revision's application and
+        its safe boundary commit together — then land in a single
+        transaction. A validation failure, a wrong revision, or a crash
+        mid-transaction rolls everything back, so no unapplied pending
+        request can ever be observed. Returns ``(policy_id, receipt_id)``.
+        """
+        if kind not in RECEIPT_KINDS:
+            raise LedgerError(f"unknown receipt kind: {kind}")
+        if authority not in RECEIPT_AUTHORITIES:
+            raise LedgerError(f"unknown receipt authority: {authority}")
+        if not change_id or not checkpoint or not material_hash:
+            raise LedgerError(
+                "a receipt requires change_id, checkpoint, and material_hash"
+            )
+        normalized_request = str(request_id).strip()
+        if not normalized_request:
+            raise LedgerError("a receipt request_id must be a non-empty string")
+        self.get_job(job_id)
+        # Validation happens before any write: an invalid policy or a wrong
+        # revision leaves no receipt behind.
+        fields = self._validate_policy(policy)
+        current = self.current_policy(job_id)
+        expected = int(current["revision"]) + 1
+        if int(revision) != expected:
+            raise PolicyRevisionError(
+                f"policy revision {revision} is not the next revision "
+                f"({expected}); policy changes require an explicit increment"
+            )
+        now = _utcnow()
+        with self._transaction():
+            _ = self._conn.execute(
+                "UPDATE job_policies SET is_current = 0 WHERE job_id = ? AND is_current = 1",
+                (job_id,),
+            )
+            policy_id = self._insert_policy(
+                self._conn, job_id=job_id, revision=int(revision),
+                policy_version=policy_version, fields=fields, operator=operator,
+                now=now, is_current=1,
+            )
+            # The revision applies in this same transaction, so its safe
+            # boundary is reached by commit time: the receipt is recorded
+            # already acknowledged at the policy boundary, and there is no
+            # intermediate state in which an unapplied pending request exists.
+            cursor = self._conn.execute(
+                """
+                INSERT INTO receipts (
+                    job_id, change_id, kind, checkpoint, material_hash,
+                    authority, actor_principal, detail, created_at,
+                    request_id, ack_state, ack_boundary, acked_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id, change_id, kind, checkpoint, material_hash,
+                    authority, actor_principal, detail, now,
+                    normalized_request, "acknowledged", ACK_BOUNDARY_POLICY, now,
+                ),
+            )
+            receipt_id = int(cursor.lastrowid)
+        return policy_id, receipt_id
 
     @staticmethod
     def _decode_policy(row: sqlite3.Row) -> dict[str, Any]:

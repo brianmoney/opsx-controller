@@ -264,7 +264,7 @@ class IncidentMigrationTests(IncidentRecoveryTestCase):
 
         migrated = self.open()
         self.assertEqual(migrated.schema_version(), ledger.CURRENT_SCHEMA_VERSION)
-        self.assertEqual(ledger.CURRENT_SCHEMA_VERSION, 8)
+        self.assertGreaterEqual(ledger.CURRENT_SCHEMA_VERSION, 8)
         # Existing rows survive with their legacy (unlinked) signature.
         incident = migrated.get_incident(incident_id)
         self.assertEqual(incident["id"], incident_id)

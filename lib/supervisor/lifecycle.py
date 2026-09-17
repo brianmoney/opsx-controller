@@ -354,14 +354,21 @@ def pause(
     _require_source(job, "active", "pause")
     _require_transition(job, "paused")
     _interrupt_in_flight(ledger, int(job_id), detail="interrupted by pause")
+    request_id = ledger_module.new_request_id("pause")
     ledger.record_stop_request(
         int(job_id),
         kind="pause",
         authority=authority,
         actor_principal=actor_principal,
         detail=detail,
+        request_id=request_id,
     )
     ledger.set_job_state(int(job_id), "paused")
+    # The pause hold is reached as soon as the job is paused, so the request is
+    # acknowledged at the stop boundary in the same durable transaction path.
+    ledger.acknowledge_request(
+        int(job_id), request_id, boundary=ledger_module.ACK_BOUNDARY_STOP
+    )
     return ledger.get_job(int(job_id))
 
 
@@ -385,15 +392,20 @@ def drain(
     _guard_mutable(job)
     _require_source(job, "active", "drain")
     _require_transition(job, "paused")
+    request_id = ledger_module.new_request_id("drain")
     ledger.record_stop_request(
         int(job_id),
         kind="drain",
         authority=authority,
         actor_principal=actor_principal,
         detail=detail,
+        request_id=request_id,
     )
     if not in_flight_actions(ledger, int(job_id)):
         ledger.set_job_state(int(job_id), "paused")
+        ledger.acknowledge_request(
+            int(job_id), request_id, boundary=ledger_module.ACK_BOUNDARY_STOP
+        )
     return ledger.get_job(int(job_id))
 
 
@@ -417,10 +429,40 @@ def cancel(
     job = require_job(ledger, job_id)
     _guard_mutable(job)
     reason = detail or "cancelled by operator"
-    _dispose_in_flight(ledger, int(job_id), reason=reason)
-    ledger.end_open_waits(int(job_id))
-    ledger.set_job_state(int(job_id), "cancelled")
-    return ledger.get_job(int(job_id))
+    job_id = int(job_id)
+    # The cancel is itself a steering request. It is recorded as a job-scoped
+    # ``steer`` receipt (no receipt kind changes) bound to the current policy
+    # revision, so the operator command has a durable request identity.
+    request_id = ledger_module.new_request_id("cancel")
+    policy = ledger.current_policy(job_id)
+    material_hash = ledger_module.snapshot_digest(
+        f"job-stop:{job_id}:{policy['revision']}"
+    )
+    ledger.record_receipt(
+        job_id,
+        change_id=ledger_module.STOP_REQUEST_CHANGE_ID,
+        kind=broker_module.STEER,
+        checkpoint=ledger_module.STOP_CHECKPOINT_PREFIX + "cancel",
+        material_hash=material_hash,
+        authority=authority,
+        actor_principal=actor_principal,
+        detail=detail,
+        request_id=request_id,
+    )
+    # Reaching the terminal boundary resolves any outstanding stop/steer request.
+    for pending in ledger.pending_acknowledgements(job_id):
+        if pending["request_id"] == request_id:
+            continue
+        ledger.acknowledge_request(
+            job_id, pending["request_id"], boundary=ledger_module.ACK_BOUNDARY_TERMINAL
+        )
+    _dispose_in_flight(ledger, job_id, reason=reason)
+    ledger.end_open_waits(job_id)
+    ledger.set_job_state(job_id, "cancelled")
+    ledger.acknowledge_request(
+        job_id, request_id, boundary=ledger_module.ACK_BOUNDARY_TERMINAL
+    )
+    return ledger.get_job(job_id)
 
 
 def complete(ledger: Any, job_id: int) -> sqlite3.Row:
@@ -515,11 +557,31 @@ def observe_stop_request(ledger: Any, job_id: int) -> dict[str, Any] | None:
         }
     if state == "active":
         ledger.set_job_state(job_id, "paused")
+    _acknowledge_latest_stop(ledger, job_id)
     return {
         "disposition": "paused",
         "dispatch_allowed": False,
         "checkpoint": str(hold["checkpoint"]),
     }
+
+
+def _acknowledge_latest_stop(ledger: Any, job_id: int) -> Any:
+    """Acknowledge the newest pending stop request at the stop boundary.
+
+    Called when a stop hold has been reached (the job is paused, or a drain's
+    in-flight work has all reached a terminal outcome). A request recorded
+    before a crash is still ``pending`` here and is acknowledged exactly once;
+    an already-acknowledged request is a no-op.
+    """
+    receipt = ledger.latest_stop_receipt(int(job_id))
+    if receipt is None:
+        return None
+    request_id = receipt["request_id"]
+    if not request_id or receipt["ack_state"] == "acknowledged":
+        return receipt
+    return ledger.acknowledge_request(
+        int(job_id), request_id, boundary=ledger_module.ACK_BOUNDARY_STOP
+    )
 
 
 def stop_request_pending(ledger: Any, job_id: int) -> bool:

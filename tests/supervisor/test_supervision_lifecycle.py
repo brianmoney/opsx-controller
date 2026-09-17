@@ -1494,7 +1494,17 @@ class MigrationTests(LifecycleTestCase):
             )
             """
         )
-        conn.execute("INSERT INTO receipts SELECT * FROM receipts_v5_old")
+        conn.execute(
+            """
+            INSERT INTO receipts (
+                id, job_id, change_id, kind, checkpoint, material_hash,
+                authority, actor_principal, detail, created_at
+            )
+            SELECT id, job_id, change_id, kind, checkpoint, material_hash,
+                   authority, actor_principal, detail, created_at
+            FROM receipts_v5_old
+            """
+        )
         conn.execute("DROP TABLE receipts_v5_old")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_receipts_job_change_kind "

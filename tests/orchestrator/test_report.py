@@ -1587,4 +1587,149 @@ class ReportCommandTests(unittest.TestCase):
         self.assertIn("unresolved", stdout)
 
 
+class ReportSupervisionTests(ReportCommandTests):
+    """The additive supervision projection in ``report`` output modes."""
 
+    def _register_supervised_job(self, plan_name: str) -> tuple[int, Path]:
+        from lib.supervisor import ledger as ledger_mod
+        from lib.supervisor import model_policy
+
+        storage_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(storage_tmp.cleanup)
+        storage = Path(storage_tmp.name)
+        db_path = storage / "supervisor.sqlite3"
+        policy = {
+            "authority_config": {"mode": "policy-bound"},
+            "model_selection": {
+                "version": model_policy.MODEL_POLICY_VERSION,
+                "roles": {"implementer": "cheap/model-a"},
+                "stages": {"implement": "implementer"},
+            },
+            "inexpensive_allowlist": {
+                "version": model_policy.MODEL_POLICY_VERSION,
+                "models": ["cheap/model-a"],
+                "source": "test",
+            },
+            "manifest_snapshot_hash": "placeholder",
+            "budgets": {
+                "version": 1, "total_cost_usd": 5.0, "per_action_cost_usd": None,
+                "total_elapsed_minutes": None, "per_action_elapsed_minutes": None,
+                "max_incident_attempts": None,
+            },
+            "deadlines": {"version": 1, "execution_deadline_minutes": None},
+        }
+        handle = ledger_mod.open_ledger(db_path, repository_root=self.repo)
+        try:
+            job_id = handle.register_job(
+                run_id="run-1", worktree=self.repo, owner="service",
+                operator="operator",
+                manifest_content=(
+                    f"[plan]\nname='{plan_name}'\n"
+                    "[[changes]]\nid='ch-single'\n"
+                ),
+                policy=policy,
+            )
+            handle.set_job_state(job_id, "active")
+            action_id = handle.begin_action(job_id, kind="implement", run_id="run-1")
+            handle.insert_reservation(
+                job_id, action_id=action_id, role="supervised_author",
+                requested_model="super-model",
+                reserved_cost_usd=0.5, reserved_elapsed_minutes=1.0,
+            )
+        finally:
+            handle.close()
+        patcher = mock.patch.dict(
+            os.environ, {"OPSX_SUPERVISOR_STATE_FILE": str(db_path)},
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return job_id, db_path
+
+    def test_report_json_carries_supervision_and_excludes_supervisor_usage(self) -> None:
+        plan_name = "supervised-plan"
+        cid = "ch-single"
+        plan_path = self._write_plan_toml(plan_name, [cid])
+        records = [
+            self._build_record(
+                stage="implement", change_id=cid, plan_name=plan_name,
+                model_id="m1", role="implementer",
+            ),
+            self._build_record(
+                stage="create", change_id=cid, plan_name=plan_name,
+                model_id="super-model", role="supervised_author",
+            ),
+        ]
+        self._write_telemetry(plan_name, records)
+        self._write_state(plan_name, {
+            "plan": plan_name, "approvals": [],
+            "changes": {cid: {"status": "done", "round": 1, "phase": "done"}},
+        })
+        self._register_supervised_job(plan_name)
+
+        rc, stdout_json, _ = self._run_report(
+            plan_path=plan_path, plan_name=plan_name, json=True,
+        )
+        self.assertEqual(rc, 0)
+        data = json.loads(stdout_json)
+        # Existing keys still present.
+        for key in ("command", "plan_name", "run_id", "filters", "plan_metrics",
+                    "change_metrics", "stage_aggregates", "core_metrics",
+                    "model_leaderboard", "warnings"):
+            self.assertIn(key, data)
+        supervision = data["supervision"]
+        self.assertEqual(supervision["state"], "active")
+        metric = supervision["metrics"]["cost_per_correct_completion"]
+        self.assertEqual(
+            set(metric), {"value", "definition", "inputs", "limitations"}
+        )
+        self.assertGreaterEqual(
+            supervision["observed_usage"]["totals"]["reservation_count"], 1
+        )
+        # Supervisor-family usage stays out of the legacy leaderboard but the
+        # supervision projection still carries it.
+        for entry in data["model_leaderboard"]:
+            for model in (entry.get("implementer_model"),
+                          entry.get("reviewer_model"),
+                          entry.get("archiver_model")):
+                self.assertNotEqual(model, "super-model")
+        self.assertEqual(supervision["observed_usage"]["totals"]["reserved_cost_usd"],
+                         0.5)
+
+    def test_report_human_output_includes_supervision_section(self) -> None:
+        plan_name = "supervised-plan-human"
+        cid = "ch-single"
+        plan_path = self._write_plan_toml(plan_name, [cid])
+        self._write_telemetry(plan_name, [
+            self._build_record(stage="implement", change_id=cid, plan_name=plan_name),
+        ])
+        self._write_state(plan_name, {
+            "plan": plan_name, "approvals": [],
+            "changes": {cid: {"status": "done", "round": 1, "phase": "done"}},
+        })
+        self._register_supervised_job(plan_name)
+
+        rc, stdout, _ = self._run_report(plan_path=plan_path, plan_name=plan_name)
+        self.assertEqual(rc, 0)
+        self.assertIn("=== Supervision ===", stdout)
+        self.assertIn("Cost/correct completion:", stdout)
+        self.assertIn("limitation:", stdout)
+
+    def test_report_output_unchanged_without_a_supervised_job(self) -> None:
+        plan_name = "unregistered-plan"
+        cid = "ch-single"
+        plan_path = self._write_plan_toml(plan_name, [cid])
+        self._write_telemetry(plan_name, [
+            self._build_record(stage="implement", change_id=cid, plan_name=plan_name),
+        ])
+        self._write_state(plan_name, {
+            "plan": plan_name, "approvals": [],
+            "changes": {cid: {"status": "done", "round": 1, "phase": "done"}},
+        })
+        rc, stdout, _ = self._run_report(plan_path=plan_path, plan_name=plan_name)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("=== Supervision ===", stdout)
+        rc, stdout_json, _ = self._run_report(
+            plan_path=plan_path, plan_name=plan_name, json=True,
+        )
+        self.assertEqual(rc, 0)
+        self.assertNotIn("supervision", json.loads(stdout_json))

@@ -1039,3 +1039,47 @@ revalidation, and the `(manual)` operator checklist reporting.
 - **THEN** it covers the state machine, every lifecycle command, the stop
   boundaries, cancellation, human waits, completion evidence semantics, and
   the manual-task checklist
+
+### Requirement: `opsx-plan status` surfaces supervised job state
+
+`opsx-plan status` SHALL surface the supervised job state for the resolved
+plan when a supervised job is registered: job state and progress, open human
+and stop waits, policy revision, budget posture, and recent incidents.
+`opsx-plan status --json` SHALL emit the same information as a structured
+document that includes a supervision object. For a plan with no registered
+supervised job, `status` SHALL keep its current human output exactly and the
+new structured mode SHALL omit the supervision object.
+
+#### Scenario: Status shows a supervised job block
+
+- **WHEN** `opsx-plan status` runs for a plan with a registered supervised job
+- **THEN** it reports the job state, waits, policy revision, budget posture, and recent incidents in addition to the existing change list
+
+#### Scenario: Status JSON emits the supervision object
+
+- **WHEN** `opsx-plan status --json` runs for a plan with a registered supervised job
+- **THEN** the document includes a supervision object with the projected job state
+
+#### Scenario: Unregistered plans keep their status output
+
+- **WHEN** `opsx-plan status` runs for a plan with no registered supervised job
+- **THEN** its output is identical to the pre-existing behavior
+
+### Requirement: Operator steering commands return a durable request identity and safe-boundary acknowledgement
+
+For a registered supervised job, the `opsx-plan` operator steering commands —
+a policy revision, pause-after-change, stop or retry, and cancel — SHALL
+report the durable request identity of the recorded request and SHALL report
+the safe-boundary acknowledgement once it is reached. A request that cannot
+be recorded SHALL fail closed with a named error, and the commands SHALL NOT
+change behavior for unregistered plans.
+
+#### Scenario: A steering command returns a request identity
+
+- **WHEN** an operator runs a steering command for a registered supervised job
+- **THEN** the command reports the recorded request identity and, once reached, the safe-boundary acknowledgement
+
+#### Scenario: Unregistered plans are unaffected
+
+- **WHEN** a steering command is run for a plan with no registered supervised job
+- **THEN** existing behavior is unchanged and no supervision request identity is reported

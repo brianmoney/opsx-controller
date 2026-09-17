@@ -121,10 +121,16 @@ def serve_one(
     """Authenticate *conn*, dispatch one request, and write one response.
 
     *ledger_resolver*, when supplied, maps the raw request to a
-    ``(ledger, job_id)`` pair the broker handlers operate on (the
-    service-owned ledger is never sent over the wire). Handler exceptions are
+    ``(ledger, job_id)`` pair the broker handlers operate on (the service-owned
+    ledger is never sent over the wire). Handler exceptions are
     serialized with their type name so the client can raise the matching named
     error; a rejected peer is closed with no response.
+
+    A handler may return
+    :class:`lib.supervisor.endpoints.DeferredDelivery`, whose durable
+    acknowledgement is persisted only after the response has been written to
+    the peer. A delivery failure therefore leaves the acknowledgement pending
+    so a reboot or retry redelivers instead of silently dropping it.
     """
     try:
         if ledger_resolver is not None:
@@ -155,8 +161,14 @@ def serve_one(
                 {"ok": False, "error": "LedgerError", "message": str(exc)},
             )
             raise
-        write_json_response(conn, {"ok": True, "result": result})
-        return {"ok": True, "result": result}
+        deferred = result if isinstance(result, endpoints_module.DeferredDelivery) else None
+        payload = deferred.result if deferred is not None else result
+        write_json_response(conn, {"ok": True, "result": payload})
+        if deferred is not None:
+            # Persist the delivery high-water only after the response was
+            # written, so a failed delivery cannot suppress a later retry.
+            deferred.acknowledge()
+        return {"ok": True, "result": payload}
     finally:
         try:
             conn.close()

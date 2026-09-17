@@ -998,6 +998,120 @@ and tear the partially booted session down instead of escaping as a raw socket
 error.
 
 
+## Observability and steering
+
+The ledger is authoritative, but operators should not have to remember a
+separate inspection command to watch a supervised job. `opsx-plan status`,
+`opsx-plan report`, and `opsx-plan dashboard` project the same read-only
+supervision object that `opsx-plan supervise inspect` already exposes, so there
+is one field model rather than several re-derivations.
+
+### Read-only projection
+
+The projection is built by
+`lib.orchestrator.supervision.project_job` (through
+`project_registered_job`), which reads the ledger through its read APIs. It
+opens the ledger with `create=False` and a busy timeout, never calls the
+mutating projection path (`project_broker_state`, `persist_projection`,
+`save_state`), never acquires the worktree execution lock, and requires no live
+service. When no supervised job is registered for the resolved worktree the
+projection is empty, the new surfaces emit nothing, and unregistered-plan
+output is byte-identical to the pre-change behavior. Recent actions and
+incidents are bounded to a recent window so a large ledger does not make an
+operator surface unbounded.
+
+### Projection field model
+
+| Field | Meaning |
+|---|---|
+| `job_id`, `run_id`, `state`, `repo_root`, `worktree`, `owner` | job identity with its `run_id` link |
+| `created_at`, `updated_at` | job progress timestamps |
+| `policy` | the active policy revision, its schema version, the protected snapshot hash, and the budget-policy classification |
+| `budget_posture` | the protected `budgets`/`deadlines` and the derived `consumption` |
+| `observed_usage` | observed usage and consumption broken out by reservation state, against the protected limits |
+| `waits` | every wait interval (kind, checkpoint, state, start/end) |
+| `human_waits` | the evidence and human-approval briefing for each open human wait |
+| `steering_requests` | request-identified receipts with `request_id`, `ack_state`, `ack_boundary`, and `acked_at` |
+| `recent_actions` | in-flight and recent actions with their journal state and recorded evidence |
+| `recent_incidents` | open and recent incidents with their signatures and states |
+| `pending_manual_tasks` | the operator-only `(manual)` checklist |
+| `metrics.cost_per_correct_completion` | the metric definition below |
+
+Each action carries its own `action_id`, each incident its own `incident_id`,
+and each steering request its own `request_id`. These identifiers are generated
+in their own namespaces and are reported separately from `run_id`; records that
+belong to a plan run carry that run's `run_id` as link data, and `run_id` is
+never redefined or replaced by a supervision identifier.
+
+### Usage states
+
+Reservations are counted in one of three states, from `lib/supervisor/budgets`:
+
+- `reserved`: committed before dispatch, not yet observed.
+- `reconciled`: replaced by observed usage after dispatch.
+- `retained`: an interrupted or unknown dispatch that stays charged at its
+  reserved estimate rather than becoming free.
+
+Only `reconciled` amounts are observed usage; `reserved` and `retained`
+amounts are estimates. A budget posture reports all three so an operator can
+see committed, observed, and unresolved consumption separately.
+
+### Steering request identity and safe-boundary acknowledgement
+
+Every operator steering request — a policy revision, pause-after-change, stop
+or retry, or cancel — is recorded as a durable broker transaction that carries
+a stable, kind-prefixed `request_id`. The service acknowledges the request only
+when it reaches a safe boundary for that request's kind (`change` for a
+per-change pause/steer or retry/reset, `stop` for a job-scoped stop hold,
+`terminal` for a cancel, `policy` for a job-level policy revision, which is
+applied atomically and reaches its boundary immediately), recording the
+boundary reached and the acknowledgement time on the receipt.
+
+Acknowledgement is idempotent: a request that is already `acknowledged` is
+never acknowledged twice, so a stale or duplicated request is a no-op. Because
+the request lives in the ledger, an unacknowledged request survives a service
+restart and is acknowledged once at the next safe boundary reached. A request
+that cannot be recorded fails closed with a named error, and an unregistered
+plan is unaffected.
+
+### Reboot-deduplicated notifications
+
+Steering and gate notifications are deduplicated through the durable
+`notification_watermarks(job_id, consumer, high_water, updated_at)` table. A
+consumer seeds its cursor from the persisted high-water and emits only receipts
+above it; the persisted watermark is the sole delivery cursor, so a
+caller-supplied offset is never honored and can neither suppress undelivered
+receipts nor replay delivered ones. Selecting a batch never advances the
+watermark: the advanced
+high-water is persisted only after the response has been delivered, so a reboot
+does not replay a notification already delivered, while a response or delivery
+failure leaves the cursor in place and a reboot or retry redelivers instead of
+silently suppressing the notification. This is separate from the receipt
+wake-up scan (`ReceiptWakeTracker`), which deliberately rescans pending
+receipts so a restart can still wake the job.
+
+Notification delivery is an optimization, never the record of a gate. The
+receipt (and its acknowledgement) is committed before any notification is
+attempted, so a notification failure never loses, delays, or alters a gate or
+approval, and satisfying a gate never depends on a notification being re-sent.
+
+### Cost per correct completion
+
+`metrics.cost_per_correct_completion` is a **definition**, computed as
+reconciled supervised cost divided by the number of changes that reached
+verified completion without a rework incident. It is reported as
+`{value, definition, inputs, limitations}`.
+
+Its stated limitations are part of the contract:
+
+- the numerator counts reconciled cost only; `reserved` and `retained` usage is
+  excluded by definition, so the value is only as complete as reconciled
+  pricing;
+- the denominator counts changes recorded as done with no rework incident and
+  is only as complete as the recorded completion evidence;
+- it is a metric definition, not a benchmark, a savings estimate, or a
+  performance or quality promise. No performance claim is made.
+
 ## Separation from execution state
 
 The supervisor ledger is storage separate from the authoritative JSON

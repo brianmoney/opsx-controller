@@ -1654,3 +1654,60 @@ values SHALL be computed exactly as before.
 - **WHEN** supervisor-family records are excluded from the leaderboard input
 - **THEN** the same records still appear in per-role telemetry views and in
   the collected core metrics
+
+### Requirement: `report` includes a read-only supervision projection
+
+`opsx-plan report` SHALL include a supervision projection for a plan with a
+registered supervised job, in both human-readable and `--json` output. The
+`--json` output SHALL expose a `supervision` object carrying job progress,
+actions, incidents, evidence, observed usage, waits, budget limitations,
+steering request acknowledgements, and the cost-per-correct-completion
+definition. Building the projection SHALL NOT mutate the ledger, telemetry,
+or execution state, and SHALL NOT change the existing `report` keys or their
+semantics. A plan with no registered supervised job SHALL produce output with
+no supervision section.
+
+#### Scenario: Report JSON carries the supervision projection
+
+- **WHEN** `opsx-plan report --json` runs for a plan with a registered supervised job
+- **THEN** the JSON includes a `supervision` object with the job, action, incident, evidence, usage, wait, budget-limit, and steering acknowledgement fields
+
+#### Scenario: Existing report output is unchanged without a supervised job
+
+- **WHEN** `opsx-plan report` runs for a plan with no registered supervised job
+- **THEN** its output and JSON keys are identical to the pre-existing behavior
+
+#### Scenario: Report projection is non-mutating
+
+- **WHEN** `opsx-plan report` builds the supervision projection
+- **THEN** the ledger, telemetry records, and JSON execution state are unchanged
+
+### Requirement: The dashboard includes a supervision section for supervised plans
+
+The `opsx-plan dashboard` SHALL render a supervision section when the plan has
+a registered supervised job, presenting job progress, incidents, waits,
+budget limitations, and steering state alongside the existing sections,
+without altering the existing sections for plans with no registered job.
+
+#### Scenario: Dashboard renders the supervision section
+
+- **WHEN** `opsx-plan dashboard` runs for a plan with a registered supervised job
+- **THEN** the generated HTML contains a supervision section with the job, incident, wait, budget, and steering state
+
+#### Scenario: Dashboard is unchanged without a supervised job
+
+- **WHEN** `opsx-plan dashboard` runs for a plan with no registered supervised job
+- **THEN** its section set and output are identical to the pre-existing behavior
+
+### Requirement: The supervision field models and limitations are documented
+
+The operator documentation SHALL describe the supervision projection's JSON
+field models and their limitations, including that it is a read-only
+projection of the ledger, the meaning and linkage of supervision identifiers
+versus `run_id`, the distinction between reserved, reconciled, and retained
+usage, and the stated limitations of cost-per-correct-completion.
+
+#### Scenario: Documentation covers the projection field models
+
+- **WHEN** an operator reads the monitoring documentation
+- **THEN** it describes the supervision field models, identifier linkage, usage states, and the metric limitations

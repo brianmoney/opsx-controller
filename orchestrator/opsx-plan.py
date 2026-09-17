@@ -5660,6 +5660,10 @@ def main() -> int:
 
     p_status = sub.add_parser("status", help="reconcile and show plan status")
     p_status.add_argument("plan", nargs="?", default=None, help="path to plan TOML")
+    p_status.add_argument(
+        "--json", action="store_true",
+        help="emit the plan summary and supervision object as JSON",
+    )
     p_status.set_defaults(fn=cmd_status.cmd_status)
 
     p_approve = sub.add_parser("approve", help="approve pause_before changes")

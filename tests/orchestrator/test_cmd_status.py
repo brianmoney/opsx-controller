@@ -366,3 +366,139 @@ class StatusCommandTests(unittest.TestCase):
         output = buf.getvalue()
         self.assertIn("\u2192 opsx-plan accept created-a", output)
         self.assertIn("\u2192 opsx-plan accept created-b", output)
+
+
+class StatusSupervisionTests(unittest.TestCase):
+    """The supervised-job block and the additive ``status --json`` mode."""
+
+    def setUp(self) -> None:
+        self.opsx_plan = load_opsx_plan()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        git(self.repo, "init")
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        git(self.repo, "add", "tracked.txt")
+        git(
+            self.repo,
+            "-c", "user.email=test@example.invalid",
+            "-c", "user.name=Test User",
+            "commit", "-m", "init",
+        )
+        self.storage_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.storage_tmp.cleanup)
+        self.storage = Path(self.storage_tmp.name)
+        self.db_path = self.storage / "supervisor.sqlite3"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _write_plan_toml(self) -> Path:
+        plan = self.repo / "openspec" / "plans" / "test.toml"
+        plan.parent.mkdir(parents=True, exist_ok=True)
+        plan.write_text(
+            '[plan]\nname = "test-plan"\nadapter = "opencode"\n\n'
+            '[[changes]]\nid = "test-change"\n',
+            encoding="utf-8",
+        )
+        return plan
+
+    def _register_job(self) -> tuple[int, Path]:
+        from lib.supervisor import ledger as ledger_mod
+        from lib.supervisor import model_policy
+
+        policy = {
+            "authority_config": {"mode": "policy-bound"},
+            "model_selection": {
+                "version": model_policy.MODEL_POLICY_VERSION,
+                "roles": {"implementer": "cheap/model-a"},
+                "stages": {"implement": "implementer"},
+            },
+            "inexpensive_allowlist": {
+                "version": model_policy.MODEL_POLICY_VERSION,
+                "models": ["cheap/model-a"],
+                "source": "test",
+            },
+            "manifest_snapshot_hash": "placeholder",
+            "budgets": {
+                "version": 1, "total_cost_usd": 5.0, "per_action_cost_usd": None,
+                "total_elapsed_minutes": None, "per_action_elapsed_minutes": None,
+                "max_incident_attempts": None,
+            },
+            "deadlines": {"version": 1, "execution_deadline_minutes": None},
+        }
+        handle = ledger_mod.open_ledger(self.db_path, repository_root=self.repo)
+        try:
+            job_id = handle.register_job(
+                run_id="run-1", worktree=self.repo, owner="service",
+                operator="operator",
+                manifest_content="[plan]\nname='test-plan'\n[[changes]]\nid='test-change'\n",
+                policy=policy,
+            )
+            handle.set_job_state(job_id, "active")
+            handle.record_wait(
+                job_id, kind="human", change_id="test-change",
+                checkpoint="gate:approval:test-change", material_hash="m",
+            )
+        finally:
+            handle.close()
+        env = mock.patch.dict(
+            os.environ, {"OPSX_SUPERVISOR_STATE_FILE": str(self.db_path)},
+        )
+        env.start()
+        self.addCleanup(env.stop)
+        return job_id, env
+
+    def _status_args(self, plan: Path, *, json_mode: bool = False) -> argparse.Namespace:
+        return argparse.Namespace(
+            repo=str(self.repo), plan=str(plan), json=json_mode,
+        )
+
+    def test_supervised_block_is_printed_for_a_registered_job(self) -> None:
+        plan = self._write_plan_toml()
+        self._register_job()
+        cfg = self.opsx_plan.planref.load_plan(plan)
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf):
+            self.opsx_plan.cmd_status.cmd_status_inner(
+                cfg, state, header="test", plan_arg=None, repo=self.repo,
+            )
+        output = buf.getvalue()
+        self.assertIn("supervised job:", output)
+        self.assertIn("job 1: active", output)
+        self.assertIn("policy revision: 1", output)
+        self.assertIn("budget: total_cost_usd=5.0", output)
+        self.assertIn("human wait: gate:approval:test-change", output)
+
+    def test_unregistered_status_output_has_no_supervised_block(self) -> None:
+        plan = self._write_plan_toml()
+        cfg = self.opsx_plan.planref.load_plan(plan)
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf):
+            self.opsx_plan.cmd_status.cmd_status_inner(
+                cfg, state, header="test", plan_arg=None, repo=self.repo,
+            )
+        self.assertNotIn("supervised job:", buf.getvalue())
+
+    def test_status_json_emits_the_supervision_object(self) -> None:
+        plan = self._write_plan_toml()
+        self._register_job()
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf):
+            rc = self.opsx_plan.cmd_status.cmd_status(self._status_args(plan, json_mode=True))
+        self.assertEqual(rc, 0)
+        document = json.loads(buf.getvalue())
+        self.assertEqual(document["command"], "opsx-plan status")
+        self.assertIn("changes", document)
+        self.assertEqual(document["supervision"]["state"], "active")
+        self.assertEqual(document["supervision"]["job_id"], 1)
+
+    def test_status_json_omits_supervision_when_unregistered(self) -> None:
+        plan = self._write_plan_toml()
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf):
+            rc = self.opsx_plan.cmd_status.cmd_status(self._status_args(plan, json_mode=True))
+        self.assertEqual(rc, 0)
+        document = json.loads(buf.getvalue())
+        self.assertNotIn("supervision", document)

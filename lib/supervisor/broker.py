@@ -33,6 +33,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from lib.supervisor import ledger as ledger_module
+
 # Authenticated principal roles. The kernel reports the peer identity; this
 # module only consumes the resulting trusted descriptor.
 OPERATOR = "operator"
@@ -50,6 +52,12 @@ ACCEPTANCE = "acceptance"
 RESET = "reset"
 PAUSE = "pause"
 STEER = "steer"
+
+# The durable notification consumer name for steering/gate notifications. The
+# persisted ``notification_watermarks`` high-water is stored per
+# ``(job_id, consumer)`` so a consumer that reboots resumes from what it
+# already delivered rather than replaying it.
+STEERING_NOTIFICATION_CONSUMER = "worker"
 
 # The service-reset policy bound key. A service reset requires an explicit
 # policy value; the broker never invents an unlimited allowance.
@@ -510,9 +518,12 @@ class RecordedReceipt:
     checkpoint: str
     material_hash: str
     authority: str
+    request_id: str | None = None
+    ack_state: str | None = None
+    ack_boundary: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "id": self.receipt_id,
             "change_id": self.change_id,
             "kind": self.kind,
@@ -520,6 +531,92 @@ class RecordedReceipt:
             "material_hash": self.material_hash,
             "authority": self.authority,
         }
+        if self.request_id is not None:
+            data["request_id"] = self.request_id
+            data["ack_state"] = self.ack_state
+            data["ack_boundary"] = self.ack_boundary
+        return data
+
+
+def make_request_id(kind: str) -> str:
+    """Generate a stable, kind-prefixed steering request identity."""
+    return ledger_module.new_request_id(kind)
+
+
+def acknowledge_request(
+    conn: Any, job_id: int, request_id: str, *, boundary: str
+) -> Any:
+    """Acknowledge *request_id* at the safe *boundary*, idempotently.
+
+    The durable acknowledgement is the receipt ledger's ``ack_state`` change:
+    a second call for an already-acknowledged request is a no-op, so a
+    duplicated or stale request is never acknowledged twice.
+    """
+    return conn.acknowledge_request(job_id, request_id, boundary=boundary)
+
+
+@dataclass(frozen=True)
+class NotificationBatch:
+    """One consumer's deduplicated delivery batch.
+
+    ``high_water`` is the value to persist once the batch has been confirmed
+    delivered; it is never persisted by selection itself.
+    """
+
+    consumer: str
+    cursor: int
+    high_water: int
+    receipts: list[Any]
+
+
+def select_steering_notifications(
+    conn: Any,
+    job_id: int,
+    *,
+    consumer: str = STEERING_NOTIFICATION_CONSUMER,
+) -> NotificationBatch:
+    """Select steering/gate notifications to deliver; never advance the watermark.
+
+    Selection and watermark advancement are deliberately separate. The
+    consumer's cursor is the persisted ``notification_watermarks`` high-water
+    and nothing else — a caller-supplied offset is never honored, so no caller
+    can suppress undelivered receipts (or replay delivered ones) — and only
+    receipts above it are returned. The returned ``high_water`` is the value
+    the caller persists through :func:`acknowledge_notification_delivery`
+    *after* the response has been delivered, so a response/delivery failure
+    cannot mark a notification consumed and suppress a later retry. The
+    receipt (and any gate/approval it records) is already durable and
+    independent of delivery, so a failed or repeated notification never loses
+    a gate.
+
+    This does not touch the separate ``ReceiptWakeTracker`` waking scan, which
+    must keep observing pending receipts to wake the job.
+    """
+    cursor = int(conn.notification_watermark(job_id, consumer))
+    rows = list(conn.receipts_after(job_id, cursor))
+    high_water = cursor
+    if rows:
+        high_water = max(int(row["id"]) for row in rows)
+    return NotificationBatch(
+        consumer=str(consumer), cursor=cursor, high_water=high_water, receipts=rows
+    )
+
+
+def acknowledge_notification_delivery(
+    conn: Any,
+    job_id: int,
+    *,
+    consumer: str = STEERING_NOTIFICATION_CONSUMER,
+    high_water: int,
+) -> int:
+    """Persist a delivered notification high-water for *consumer*.
+
+    Called only after the corresponding response has been delivered, so the
+    durable cursor advances on confirmed delivery rather than on selection.
+    Monotonic per the ledger: a lower value never rewinds the recorded
+    watermark.
+    """
+    return int(conn.advance_notification_watermark(job_id, consumer, int(high_water)))
 
 
 def record_approval(
@@ -730,6 +827,7 @@ def reset_change(
     principal: BrokerPrincipal,
     change_id: str,
     policy_bound: Mapping[str, Any] | None = None,
+    request_id: str | None = None,
 ) -> RecordedReceipt:
     """Record a bounded reset receipt through an authorized path.
 
@@ -737,7 +835,9 @@ def reset_change(
     explicit policy bound (:data:`SERVICE_RESET_BOUND_KEY`) and is refused once
     the bound is reached. A worker-domain reset is refused with
     :class:`BrokerMediationError` and records nothing. A committed receipt
-    regenerates the JSON projection from broker state.
+    regenerates the JSON projection from broker state. An optional *request_id*
+    records a durable steering request identity on the receipt so a retry/reset
+    request is request-identified and acknowledgeable at its change boundary.
     """
     if principal.role == WORKER:
         raise BrokerMediationError(
@@ -789,10 +889,13 @@ def reset_change(
         authority=authority,
         actor_principal=principal.name or str(principal.uid or ""),
         detail=detail,
+        request_id=request_id,
     )
     recorded = RecordedReceipt(
         receipt_id=receipt_id, change_id=change_id, kind=RESET,
         checkpoint=checkpoint, material_hash=digest, authority=authority,
+        request_id=request_id,
+        ack_state="pending" if request_id else None,
     )
     regenerate_projection(conn, job_id)
     return recorded
@@ -833,6 +936,7 @@ def record_pause_or_steer(
     )
     # Fail closed *before* committing (see :func:`record_approval`).
     require_projection_writer()
+    request_id = make_request_id(kind)
     receipt_id = conn.record_receipt(
         job_id,
         change_id=change_id,
@@ -842,10 +946,12 @@ def record_pause_or_steer(
         authority=principal.role,
         actor_principal=principal.name or str(principal.uid or ""),
         detail=detail,
+        request_id=request_id,
     )
     recorded = RecordedReceipt(
         receipt_id=receipt_id, change_id=change_id, kind=kind,
         checkpoint=checkpoint, material_hash=digest, authority=principal.role,
+        request_id=request_id, ack_state="pending",
     )
     regenerate_projection(conn, job_id)
     return recorded
@@ -1079,6 +1185,7 @@ __all__ = [
     "GateResolution",
     "HUMAN_ONLY",
     "MaterialState",
+    "NotificationBatch",
     "OPERATOR",
     "PAUSE",
     "PRINCIPAL_ROLES",
@@ -1089,14 +1196,18 @@ __all__ = [
     "SERVICE",
     "SERVICE_RESET_BOUND_KEY",
     "STEER",
+    "STEERING_NOTIFICATION_CONSUMER",
     "StaleMaterialError",
     "WORKER",
+    "acknowledge_request",
+    "acknowledge_notification_delivery",
     "assert_dispatchable",
     "assert_resume_clear",
     "checkpoint_for",
     "gate_fields",
     "is_dispatchable",
     "load_protected_snapshot",
+    "make_request_id",
     "material_hash",
     "material_state",
     "parse_snapshot",
@@ -1113,6 +1224,7 @@ __all__ = [
     "resolve_gate",
     "resolved_authority",
     "revalidate_receipts",
+    "select_steering_notifications",
     "selected_snapshot_changes",
     "set_projection_writer",
     "snapshot_change_gate",

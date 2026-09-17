@@ -777,6 +777,15 @@ computed status with phase ordering. Awaiting-approval, awaiting-acceptance,
 and failed changes print guidance for the next operator command (approve,
 accept, or reset respectively).
 
+When the resolved worktree has a registered supervised job, `status` also
+prints a supervised-job block: the job state and progress, the active policy
+revision, the budget posture against its protected limits, any open human or
+stop waits, and recent incidents. For a plan with no registered job the output
+is byte-identical to the pre-supervision behavior.
+
+`status --json` emits the same plan summary plus a structured `supervision`
+object; the object is omitted entirely when no supervised job is registered.
+
 Output example:
 
 ```
@@ -786,6 +795,11 @@ plan: my-plan  (active: plan.toml)
     → opsx-plan approve add-feature-b
   P2 add-feature-c          failed (no progress ceiling reached)
     → opsx-plan reset add-feature-c
+  supervised job:
+    job 7: paused (updated 2026-07-01T10:05:00+00:00)
+    policy revision: 2
+    budget: total_cost_usd=25.0 charged_cost_usd=4.5 elapsed_minutes=42
+    human wait: gate:approval:add-feature-a (2026-07-01T10:01:00+00:00)
 ```
 
 ### Logs
@@ -838,6 +852,33 @@ The report includes:
 - **Per-Change Metrics**: status, rounds, duration, tokens, cost per change
 - **Stage Aggregates**: average durations, review failure rate, cost per change
 - **Model Leaderboard**: grouped by `(implementer, reviewer, archiver)` tuple
+- **Supervision** (registered supervised jobs only): job state, budget posture,
+  open waits, recent incidents, steering request acknowledgements, and the
+  cost-per-correct-completion definition
+
+For a registered supervised job, `report --json` adds a top-level
+`supervision` object carrying the same fields. It is built read-only from the
+ledger, never mutates the ledger, telemetry, or execution state, and leaves
+every existing key and value untouched. A plan with no registered job produces
+output with no supervision section, and supervisor-family role usage stays out
+of the legacy model leaderboard.
+
+#### Steering acknowledgements
+
+`opsx-plan supervise pause`, `drain`, and `cancel` return the durable
+`request_id` of the recorded steering request and its acknowledgement. A
+request is acknowledged only at the safe boundary for its kind: `stop` for a
+pause or a drained stop hold, `terminal` for a cancel, `change` for a
+per-change pause/steer or retry/reset request, and `policy` for a job-level
+policy revision, which is applied atomically and reaches its boundary
+immediately. The acknowledgement names the boundary reached
+and is recorded once; re-acknowledging a request is a no-op, and an
+unacknowledged request survives a restart and is acknowledged at the next
+boundary. `--json` on those commands emits the same identity and
+acknowledgement as structured output. Notification selection never advances the
+durable delivery watermark; the high-water advances only after a response is
+delivered, so a delivery failure is redelivered on reboot or retry rather than
+suppressed.
 
 #### Repricing historical costs
 
@@ -906,6 +947,13 @@ table, failure breakdown, cost breakdown bar chart, rounds histogram, and stage
 timeline. `--reprice` recomputes costs the same way as
 `opsx-plan report --reprice` and adds a notice naming the catalog version used;
 telemetry and state are never modified.
+
+When the plan has a registered supervised job, the dashboard appends a
+supervision section: job state and progress, open waits, recent incidents,
+budget posture and limits, steering request acknowledgements, and the
+cost-per-correct-completion definition. The section is rendered read-only from
+the ledger, and a plan with no registered job renders the same seven sections
+byte-for-byte as before.
 
 ---
 

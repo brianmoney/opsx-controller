@@ -2949,3 +2949,109 @@ operator action rather than looping.
 - **WHEN** identical incidents recur across `opsx-plan reset`
 - **THEN** their attempt counts accumulate across the resets and the bound is
   not erased or refreshed
+
+### Requirement: Operator surfaces project supervisor state read-only from the ledger
+
+The operator-facing supervision projection SHALL be derived read-only from the
+supervisor ledger and the existing plan state. Building the projection SHALL
+NOT mutate the ledger, the JSON execution state, or any other durable record,
+and SHALL NOT require the worktree execution lock or a live service. When no
+supervised job is registered for the resolved plan or worktree, the projection
+SHALL be empty and SHALL NOT alter the existing output.
+
+#### Scenario: Projection is read-only
+
+- **WHEN** the projection is built for a registered job
+- **THEN** the ledger and JSON execution state are unchanged and no execution lock is acquired
+
+#### Scenario: No registered job yields an empty projection
+
+- **WHEN** the projection is built for a plan with no registered supervised job
+- **THEN** it is empty and the existing status and report output is unchanged
+
+### Requirement: The supervision projection exposes job, action, incident, evidence, usage, wait, and budget-limit state
+
+For a registered supervised job the projection SHALL expose: job identity and
+its `run_id` linkage, job state and progress timestamps; recent and in-flight
+actions with their journal state; open and recent incidents with their
+signatures and states; the evidence recorded for actions; observed usage and
+budget consumption reconciled against the protected policy limits; open human
+and stop waits; and the active policy revision. The projection SHALL include
+the evidence and human-approval briefing so an operator can see why a job is
+waiting and what authorized the most recent approval.
+
+#### Scenario: A supervised job projects its full state
+
+- **WHEN** the projection is built for an active job with actions, an open human wait, and reconciled usage
+- **THEN** it reports the job state, the action and incident views, the evidence, the observed usage against the policy limits, the open wait, and the policy revision
+
+#### Scenario: The evidence and human-approval briefing is recorded
+
+- **WHEN** a job is waiting on a human-only gate
+- **THEN** the projection includes the evidence and the human-approval briefing for that wait
+
+### Requirement: Steering requests carry a durable request identity and a safe-boundary acknowledgement
+
+Every operator steering request for a registered supervised job — a policy
+revision, pause-after-change, stop or retry, or cancel — SHALL be recorded as
+a durable broker transaction that carries a stable request identity. The
+service SHALL acknowledge the request only when it reaches a safe boundary for
+that request's kind, and the acknowledgement SHALL record the boundary
+reached and reference the request identity. A request SHALL remain
+acknowledgeable across a service restart, and a stale or duplicated request
+SHALL NOT be acknowledged twice.
+
+#### Scenario: A steering request is request-identified and acknowledged at a safe boundary
+
+- **WHEN** an operator submits a steering request and the service reaches the corresponding safe boundary
+- **THEN** one durable acknowledgement is recorded referencing the request identity and naming the boundary reached
+
+#### Scenario: A steering request survives restart
+
+- **WHEN** the service stops and restarts with an unacknowledged steering request
+- **THEN** the request is still present, is acknowledged once at the next safe boundary, and is not acknowledged twice
+
+### Requirement: Steering notifications are deduplicated across reboot and never lose a gate or approval
+
+Steering and gate notifications SHALL be deduplicated durably so that a reboot
+does not replay a notification already delivered, and the durable record of a
+gate, approval, or steering request SHALL be committed independently of
+notification delivery. A notification failure SHALL NOT lose, delay, or alter
+a gate or approval, and satisfying the gate SHALL NOT depend on a
+notification being re-sent.
+
+#### Scenario: A reboot does not replay a delivered notification
+
+- **WHEN** a notification has been delivered for a receipt and the service reboots
+- **THEN** no duplicate notification is emitted for that receipt
+
+#### Scenario: A notification failure does not lose a gate
+
+- **WHEN** notification delivery fails for a receipt that records an approval
+- **THEN** the approval remains durable and satisfies the gate without a re-sent notification
+
+### Requirement: Supervision identities stay distinct from and linked to the run identity
+
+Job, action, incident, and steering-request identifiers SHALL remain distinct
+from each other and from the plan `run_id`, and supervision records SHALL
+carry the owning `run_id` as link data without redefining it. The projection
+SHALL report supervision identifiers separately from `run_id` while exposing
+the linkage.
+
+#### Scenario: Job and action ids are distinct from run_id
+
+- **WHEN** a supervised job is projected
+- **THEN** job and action identifiers are reported separately from `run_id` and the records carry the owning `run_id` as link data
+
+### Requirement: Cost-per-correct-completion is a defined metric without empirical promises
+
+The projection SHALL define cost-per-correct-completion as the reconciled
+supervised cost divided by the count of changes that reached verified
+completion without a rework incident, and SHALL present it as a metric
+definition with its inputs and limitations named. It SHALL NOT assert an
+empirical performance, savings, or quality promise.
+
+#### Scenario: The metric is reported as a definition
+
+- **WHEN** supervised usage and completion evidence exist for a job
+- **THEN** the projection reports cost-per-correct-completion with its definition, inputs, and stated limitations, and makes no performance claim

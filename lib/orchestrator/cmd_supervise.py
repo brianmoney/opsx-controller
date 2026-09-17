@@ -33,7 +33,6 @@ from pathlib import Path
 from lib.models import resolver as model_resolver
 from lib.orchestrator import base
 from lib.orchestrator import planref
-from lib.orchestrator import state as state_mod
 from lib.orchestrator import supervision as supervision_mod
 from lib.supervisor import authority
 from lib.supervisor import broker as broker_mod
@@ -265,9 +264,19 @@ def _mediated_or_direct(
     ledger = _open_ledger(repo, store, create=False)
     try:
         job = _LIFECYCLE_VERBS[verb](ledger, job_id)
+        outcome: dict[str, Any] = {
+            "verb": verb,
+            "job_id": int(job_id),
+            "state": str(job["state"]),
+        }
+        request = ledger.latest_steering_request(int(job_id))
+        if request is not None and request["request_id"]:
+            outcome["request_id"] = str(request["request_id"])
+            outcome["ack_state"] = request["ack_state"]
+            outcome["ack_boundary"] = request["ack_boundary"]
     finally:
         ledger.close()
-    return {"verb": verb, "job_id": int(job_id), "state": str(job["state"])}
+    return outcome
 
 
 _LIFECYCLE_VERBS: dict[str, Any] = {
@@ -448,6 +457,11 @@ def _lifecycle_mutation(args: argparse.Namespace, verb: str) -> int:
         print(
             f"supervise {verb}: job {job_id} is {outcome.get('state', 'unknown')}"
         )
+        if outcome.get("request_id"):
+            ack = outcome.get("ack_state") or "pending"
+            boundary = outcome.get("ack_boundary")
+            suffix = f" at {boundary}" if boundary else ""
+            print(f"  request: {outcome['request_id']} ({ack}{suffix})")
     return 0
 
 
@@ -493,79 +507,14 @@ def cmd_supervise_inspect(args: argparse.Namespace) -> int:
 
 
 def _inspect_projection(ledger: Any, repo: Path, job: Any) -> dict[str, Any]:
-    job_id = int(job["id"])
-    policy = ledger.current_policy(job_id)
-    snapshot = ledger.current_manifest_snapshot(job_id)
-    change_ids = _snapshot_change_ids(snapshot)
-    manual: dict[str, list[str]] = {}
-    for cid in change_ids:
-        pending = state_mod.pending_manual_tasks(repo, cid)
-        if pending:
-            manual[cid] = pending
-    return {
-        "job_id": job_id,
-        "run_id": job["run_id"],
-        "state": str(job["state"]),
-        "repo_root": job["repo_root"],
-        "worktree": job["worktree_path"],
-        "owner": job["owner"],
-        "created_at": job["created_at"],
-        "updated_at": job["updated_at"],
-        "policy": {
-            "revision": int(policy["revision"]),
-            "policy_version": int(policy["policy_version"]),
-            "manifest_snapshot_hash": str(policy["manifest_snapshot_hash"]),
-            "budget_policy_state": dict(policy["budget_policy_state"]),
-        },
-        "budget_posture": {
-            "budgets": policy["budgets"],
-            "deadlines": policy["deadlines"],
-            "consumption": ledger.consumption_for_job(job_id),
-        },
-        "waits": [
-            {
-                "id": int(row["id"]),
-                "kind": str(row["kind"]),
-                "change_id": row["change_id"],
-                "checkpoint": str(row["checkpoint"]),
-                "state": str(row["state"]),
-                "started_at": row["started_at"],
-                "ended_at": row["ended_at"],
-            }
-            for row in ledger.list_waits(job_id)
-        ],
-        "recent_actions": [
-            {
-                "id": int(row["id"]),
-                "kind": str(row["kind"]),
-                "state": str(row["state"]),
-                "updated_at": row["updated_at"],
-            }
-            for row in ledger.list_actions(job_id)[-10:]
-        ],
-        "recent_incidents": [
-            {
-                "id": int(row["id"]),
-                "kind": str(row["kind"]),
-                "state": str(row["state"]),
-                "summary": row["summary"],
-                "created_at": row["created_at"],
-            }
-            for row in ledger.list_incidents(job_id)[-10:]
-        ],
-        "linkage_config": ledger.job_linkage_config(job_id),
-        "pending_manual_tasks": manual,
-    }
+    """Return the shared read-only supervision projection for *job*.
 
-
-def _snapshot_change_ids(snapshot: str | None) -> list[str]:
-    if not snapshot:
-        return []
-    try:
-        parsed = broker_mod.parse_snapshot(snapshot)
-    except broker_mod.BrokerError:
-        return []
-    return list(parsed.get("changes", {}))
+    Delegates to :func:`lib.orchestrator.supervision.project_job` so
+    ``supervise inspect``, ``status``, ``report``, and the dashboard all build
+    one field model. Every existing ``inspect`` key keeps its name; the
+    projection is a superset.
+    """
+    return supervision_mod.project_job(ledger, job, repo=repo)
 
 
 def _print_inspection(projection: dict[str, Any]) -> None:

@@ -85,7 +85,11 @@ class GoldenCommandOutputTests(unittest.TestCase):
              mock.patch.object(self.opsx_plan, "sync_direct_worker_state"), \
              redirect_stdout(out):
             self.assertEqual(self.opsx_plan.cmd_status.cmd_status(args), 0)
-        self._assert_golden("status.txt", out.getvalue())
+        output = out.getvalue()
+        # An unregistered worktree emits no supervised-job block, so the
+        # pre-change golden bytes are unchanged.
+        self.assertNotIn("supervised job:", output)
+        self._assert_golden("status.txt", output)
 
     def test_logs_output_matches_golden(self) -> None:
         args = argparse.Namespace(repo=str(self.repo), plan=str(self.plan),

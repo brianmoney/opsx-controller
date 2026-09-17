@@ -1022,4 +1022,95 @@ class DashboardCommandTests(unittest.TestCase):
         self.assertNotIn('<p class="reprice-notice">', html)
 
 
+class DashboardSupervisionTests(DashboardCommandTests):
+    """The supervision section renders only for a registered supervised job."""
 
+    def _register_supervised_job(self) -> None:
+        from lib.supervisor import ledger as ledger_mod
+        from lib.supervisor import model_policy
+
+        storage_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(storage_tmp.cleanup)
+        db_path = Path(storage_tmp.name) / "supervisor.sqlite3"
+        policy = {
+            "authority_config": {"mode": "policy-bound"},
+            "model_selection": {
+                "version": model_policy.MODEL_POLICY_VERSION,
+                "roles": {"implementer": "cheap/model-a"},
+                "stages": {"implement": "implementer"},
+            },
+            "inexpensive_allowlist": {
+                "version": model_policy.MODEL_POLICY_VERSION,
+                "models": ["cheap/model-a"],
+                "source": "test",
+            },
+            "manifest_snapshot_hash": "placeholder",
+            "budgets": {
+                "version": 1, "total_cost_usd": 5.0, "per_action_cost_usd": None,
+                "total_elapsed_minutes": None, "per_action_elapsed_minutes": None,
+                "max_incident_attempts": None,
+            },
+            "deadlines": {"version": 1, "execution_deadline_minutes": None},
+        }
+        handle = ledger_mod.open_ledger(db_path, repository_root=self.repo)
+        try:
+            job_id = handle.register_job(
+                run_id="run-1", worktree=self.repo, owner="service",
+                operator="operator",
+                manifest_content=(
+                    "[plan]\nname='test-plan'\n"
+                    "[[changes]]\nid='add-thing'\n"
+                    "[[changes]]\nid='add-other'\n"
+                ),
+                policy=policy,
+            )
+            handle.set_job_state(job_id, "active")
+            handle.record_wait(
+                job_id, kind="human", change_id="add-thing",
+                checkpoint="gate:approval:add-thing", material_hash="m",
+            )
+            handle.record_incident(job_id, kind="transient_provider", summary="boom")
+        finally:
+            handle.close()
+        patcher = mock.patch.dict(
+            os.environ, {"OPSX_SUPERVISOR_STATE_FILE": str(db_path)},
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _write_completed_state(self) -> None:
+        self._write_state({
+            "plan": self.plan_name,
+            "changes": {
+                "add-thing": {"status": "done", "round": 1, "max_rounds": 5},
+                "add-other": {"status": "pending", "round": 0, "max_rounds": 5},
+            },
+        })
+
+    def test_dashboard_renders_the_supervision_section(self) -> None:
+        self._write_telemetry([
+            self._make_telemetry_record("add-thing", "implement", 1),
+        ])
+        self._write_completed_state()
+        self._register_supervised_job()
+
+        stdout, rc = self._run_dashboard()
+        self.assertEqual(rc, 0)
+        html = self._read_output()
+        self.assertIn('<section class="supervision">', html)
+        self.assertIn("Supervision", html)
+        self.assertIn("Open waits", html)
+        self.assertIn("gate:approval:add-thing", html)
+        self.assertIn("Cost per correct completion", html)
+
+    def test_dashboard_without_a_supervised_job_is_unchanged(self) -> None:
+        self._write_telemetry([
+            self._make_telemetry_record("add-thing", "implement", 1),
+        ])
+        self._write_completed_state()
+
+        stdout, rc = self._run_dashboard()
+        self.assertEqual(rc, 0)
+        html = self._read_output()
+        self.assertNotIn('class="supervision"', html)
+        self.assertNotIn("Supervision", html)

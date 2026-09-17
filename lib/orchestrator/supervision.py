@@ -237,6 +237,413 @@ def is_registered(repo: Path) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# Read-only supervision projection
+# ---------------------------------------------------------------------------
+
+# Bounds so a large ledger never makes an operator surface unbounded.
+RECENT_ACTIONS_LIMIT = 10
+
+# An incident that is *not* a completion record indicates rework or a failure
+# the change had to be re-entered for; it counts against a correct completion.
+_COMPLETED_INCIDENT_KIND = "job_completed"
+
+
+def _snapshot_projection(snapshot: str | None) -> tuple[dict[str, Any], list[str]]:
+    """Return ``(parsed_snapshot, change_ids)`` for a protected snapshot."""
+    if not snapshot:
+        return {}, []
+    try:
+        parsed = broker_mod.parse_snapshot(snapshot)
+    except broker_mod.BrokerError:
+        return {}, []
+    return parsed, list(parsed.get("changes", {}))
+
+
+def _evidence_for_actions(ledger: Any, actions: list[Any]) -> dict[int, list[dict[str, Any]]]:
+    """Return evidence rows keyed by action id for *actions* (read-only)."""
+    evidence: dict[int, list[dict[str, Any]]] = {}
+    for action in actions:
+        rows = ledger.list_evidence(int(action["id"]))
+        if not rows:
+            continue
+        evidence[int(action["id"])] = [
+            {
+                "id": int(row["id"]),
+                "kind": str(row["kind"]),
+                "payload": row["payload"],
+                "recorded_at": row["recorded_at"],
+            }
+            for row in rows
+        ]
+    return evidence
+
+
+def _steering_request_items(
+    ledger: Any, job_id: int, *, recent_limit: int
+) -> list[dict[str, Any]]:
+    """Project request-identified receipts (steering acknowledgements)."""
+    return [
+        {
+            "receipt_id": int(row["id"]),
+            "request_id": str(row["request_id"]),
+            "kind": str(row["kind"]),
+            "change_id": row["change_id"],
+            "checkpoint": str(row["checkpoint"]),
+            "authority": str(row["authority"]),
+            "ack_state": row["ack_state"],
+            "ack_boundary": row["ack_boundary"],
+            "acked_at": row["acked_at"],
+            "created_at": row["created_at"],
+        }
+        for row in ledger.steering_requests(job_id, limit=recent_limit)
+    ]
+
+
+def _human_wait_briefings(
+    ledger: Any,
+    job_id: int,
+    *,
+    changes: Mapping[str, Any],
+    recent_actions: list[Any],
+    recent_limit: int,
+) -> list[dict[str, Any]]:
+    """Project the evidence and approval briefing for each open human wait.
+
+    Answers why the job is waiting (the gate and its resolved authority) and
+    what authorized the most recent approval, without mutating anything.
+    """
+    briefings: list[dict[str, Any]] = []
+    for wait in ledger.open_waits(job_id, kind="human"):
+        change_id = wait["change_id"]
+        authority = None
+        if change_id:
+            try:
+                authority = broker_mod.material_state(
+                    ledger, job_id, str(change_id)
+                ).authority
+            except Exception:  # noqa: BLE001 - briefing is advisory
+                authority = None
+        receipts: list[dict[str, Any]] = []
+        if change_id:
+            rows = ledger.receipts_for_change(job_id, str(change_id))
+            receipts = [
+                {
+                    "id": int(row["id"]),
+                    "kind": str(row["kind"]),
+                    "checkpoint": str(row["checkpoint"]),
+                    "authority": str(row["authority"]),
+                    "actor_principal": row["actor_principal"],
+                    "created_at": row["created_at"],
+                }
+                for row in rows[-recent_limit:]
+            ]
+        approval = next(
+            (item for item in reversed(receipts) if item["kind"] == "approval"),
+            None,
+        )
+        evidence: list[dict[str, Any]] = []
+        for action in recent_actions[-recent_limit:]:
+            for row in ledger.list_evidence(int(action["id"])):
+                payload = row["payload"]
+                if change_id and str(change_id) not in str(payload or ""):
+                    continue
+                evidence.append(
+                    {
+                        "action_id": int(action["id"]),
+                        "id": int(row["id"]),
+                        "kind": str(row["kind"]),
+                        "payload": payload,
+                        "recorded_at": row["recorded_at"],
+                    }
+                )
+        briefings.append(
+            {
+                "wait": {
+                    "id": int(wait["id"]),
+                    "kind": str(wait["kind"]),
+                    "change_id": change_id,
+                    "checkpoint": str(wait["checkpoint"]),
+                    "state": str(wait["state"]),
+                    "started_at": wait["started_at"],
+                    "ended_at": wait["ended_at"],
+                },
+                "change_id": change_id,
+                "checkpoint": str(wait["checkpoint"]),
+                "authority": authority,
+                "gate": dict(changes.get(str(change_id), {})) if change_id else {},
+                "reason": (
+                    f"awaiting {authority} approval"
+                    if authority
+                    else "awaiting operator input"
+                ),
+                "evidence": evidence[-recent_limit:],
+                "receipts": receipts,
+                "approval": approval,
+            }
+        )
+    return briefings
+
+
+def _cost_per_correct_completion(
+    *,
+    consumption: Mapping[str, Any],
+    incidents: list[Any],
+    plan_state: Mapping[str, Any] | None,
+    change_ids: list[str],
+    acceptance_reviews: list[Any],
+) -> dict[str, Any]:
+    """Define cost-per-correct-completion as a metric, never a promise.
+
+    The value is reconciled supervised cost over the count of changes that
+    reached verified completion without a rework incident. The definition,
+    its inputs, and its limitations travel with the value so no caller has to
+    guess what it measures.
+    """
+    reconciled = float(consumption.get("reconciled_cost_usd") or 0.0)
+    completed = 0
+    if isinstance(plan_state, Mapping):
+        records = plan_state.get("changes")
+        if isinstance(records, Mapping):
+            completed = sum(
+                1
+                for cid in change_ids
+                if isinstance(records.get(cid), Mapping)
+                and records[cid].get("status") == base.DONE
+            )
+    if not completed and acceptance_reviews:
+        accepted = {
+            str(row["change_id"])
+            for row in acceptance_reviews
+            if str(row["outcome"]) == "accept"
+        }
+        completed = len(accepted)
+    rework_incidents = sum(
+        1 for row in incidents if str(row["kind"]) != _COMPLETED_INCIDENT_KIND
+    )
+    correct = max(completed - rework_incidents, 0)
+    value = (reconciled / correct) if correct else None
+    return {
+        "value": value,
+        "definition": (
+            "reconciled supervised cost divided by the number of changes that "
+            "reached verified completion without a rework incident"
+        ),
+        "inputs": {
+            "reconciled_cost_usd": reconciled,
+            "completed_changes": completed,
+            "rework_incidents": rework_incidents,
+            "correct_completions": correct,
+        },
+        "limitations": [
+            "the numerator counts reconciled cost only; reserved and retained "
+            "usage is excluded by definition",
+            "the denominator counts changes recorded as done with no rework "
+            "incident and is only as complete as the recorded completion evidence",
+            "this is a metric definition, not a benchmark, a savings estimate, "
+            "or a performance or quality promise",
+        ],
+    }
+
+
+def project_job(
+    ledger: Any,
+    job: Any,
+    *,
+    repo: Path | None = None,
+    plan_name: str | None = None,
+    recent_limit: int = RECENT_ACTIONS_LIMIT,
+) -> dict[str, Any]:
+    """Build the read-only supervision projection for one job.
+
+    Reads the already-open ledger through its read APIs only: it never calls
+    the mutating projection path (``project_broker_state``,
+    ``persist_projection``, ``save_state``) and never acquires the worktree
+    execution lock. Actions and incidents are bounded to the most recent
+    *recent_limit* entries so a large ledger stays bounded.
+    """
+    job_id = int(job["id"])
+    policy = ledger.current_policy(job_id)
+    snapshot = ledger.current_manifest_snapshot(job_id)
+    parsed_snapshot, change_ids = _snapshot_projection(snapshot)
+    if plan_name is None:
+        plan = parsed_snapshot.get("plan") if isinstance(parsed_snapshot, Mapping) else {}
+        if isinstance(plan, Mapping):
+            plan_name = plan.get("name")
+
+    manual: dict[str, list[str]] = {}
+    if repo is not None:
+        for cid in change_ids:
+            pending = state_mod.pending_manual_tasks(repo, cid)
+            if pending:
+                manual[cid] = pending
+
+    actions = ledger.list_actions(job_id)
+    recent_actions = actions[-recent_limit:] if recent_limit else []
+    incidents = ledger.list_incidents(job_id)
+    recent_incidents = incidents[-recent_limit:] if recent_limit else []
+    evidence_index = _evidence_for_actions(ledger, recent_actions)
+    consumption = ledger.consumption_for_job(job_id)
+    steering = _steering_request_items(ledger, job_id, recent_limit=recent_limit)
+    human_waits = _human_wait_briefings(
+        ledger,
+        job_id,
+        changes=parsed_snapshot.get("changes", {}) if isinstance(parsed_snapshot, Mapping) else {},
+        recent_actions=recent_actions,
+        recent_limit=recent_limit,
+    )
+    plan_state: Mapping[str, Any] | None = None
+    if repo is not None and plan_name:
+        try:
+            plan_state = state_mod.load_state(repo, str(plan_name))
+        except Exception:  # noqa: BLE001 - metric is advisory
+            plan_state = None
+    metrics = _cost_per_correct_completion(
+        consumption=consumption,
+        incidents=incidents,
+        plan_state=plan_state,
+        change_ids=change_ids,
+        acceptance_reviews=ledger.list_acceptance_reviews(job_id),
+    )
+
+    return {
+        "job_id": job_id,
+        "run_id": job["run_id"],
+        "state": str(job["state"]),
+        "repo_root": job["repo_root"],
+        "worktree": job["worktree_path"],
+        "owner": job["owner"],
+        "created_at": job["created_at"],
+        "updated_at": job["updated_at"],
+        "policy": {
+            "revision": int(policy["revision"]),
+            "policy_version": int(policy["policy_version"]),
+            "manifest_snapshot_hash": str(policy["manifest_snapshot_hash"]),
+            "budget_policy_state": dict(policy["budget_policy_state"]),
+        },
+        "budget_posture": {
+            "budgets": policy["budgets"],
+            "deadlines": policy["deadlines"],
+            "consumption": consumption,
+        },
+        "observed_usage": {
+            "states": list(budget_mod.RESERVATION_STATES),
+            "totals": consumption,
+            "protected_limits": {
+                "budgets": policy["budgets"],
+                "deadlines": policy["deadlines"],
+            },
+        },
+        "waits": [
+            {
+                "id": int(row["id"]),
+                "kind": str(row["kind"]),
+                "change_id": row["change_id"],
+                "checkpoint": str(row["checkpoint"]),
+                "state": str(row["state"]),
+                "started_at": row["started_at"],
+                "ended_at": row["ended_at"],
+            }
+            for row in ledger.list_waits(job_id)
+        ],
+        "human_waits": human_waits,
+        "steering_requests": steering,
+        "recent_actions": [
+            {
+                "id": int(row["id"]),
+                "action_id": int(row["id"]),
+                "run_id": row["run_id"],
+                "kind": str(row["kind"]),
+                "state": str(row["state"]),
+                "updated_at": row["updated_at"],
+                "evidence": evidence_index.get(int(row["id"]), []),
+            }
+            for row in recent_actions
+        ],
+        "recent_incidents": [
+            {
+                "id": int(row["id"]),
+                "incident_id": int(row["id"]),
+                "kind": str(row["kind"]),
+                "state": str(row["state"]),
+                "signature": row["signature"],
+                "summary": row["summary"],
+                "created_at": row["created_at"],
+            }
+            for row in recent_incidents
+        ],
+        "linkage_config": ledger.job_linkage_config(job_id),
+        "pending_manual_tasks": manual,
+        "metrics": {
+            "cost_per_correct_completion": metrics,
+        },
+    }
+
+
+def project_registered_job(
+    repo: Path,
+    *,
+    plan_name: str | None = None,
+    recent_limit: int = RECENT_ACTIONS_LIMIT,
+) -> dict[str, Any] | None:
+    """Return the read-only projection for *repo*, or ``None`` when unregistered.
+
+    Observation includes a worktree's most recent terminal job as well as an
+    active one: a completed or cancelled job still has a durable supervision
+    record an operator should be able to inspect. The ledger is opened with
+    ``create=False`` and the projection never mutates it, so an unregistered
+    worktree opens nothing and its operator output stays byte-identical.
+    """
+    registration = _observability_registration(repo)
+    if registration is None:
+        return None
+    try:
+        return project_job(
+            registration.ledger,
+            registration.job,
+            repo=repo,
+            plan_name=plan_name,
+            recent_limit=recent_limit,
+        )
+    finally:
+        registration.close()
+
+
+def _observability_registration(repo: Path) -> Registration | None:
+    """Return the worktree's projection target, including a terminal job.
+
+    Unlike :func:`open_registration`, which gates mutating commands and
+    deliberately ignores a terminal job, observability resolves the active job
+    or the most recent terminal one. No job for the worktree yields ``None``.
+    """
+    for path in ledger_paths(repo):
+        if not path.exists():
+            continue
+        try:
+            handle = ledger_mod.open_ledger(
+                path, repository_root=repo, create=False
+            )
+        except Exception as exc:  # noqa: BLE001 - named fail-closed error
+            raise broker_mod.BrokerUnavailableError(
+                f"supervision ledger at {path} exists but could not be opened: {exc}"
+            ) from exc
+        try:
+            job = handle.find_job_by_worktree(repo, repository_root=repo)
+            if job is None:
+                handle.close()
+                continue
+            policy = handle.current_policy(int(job["id"]))
+        except Exception as exc:  # noqa: BLE001 - named fail-closed error
+            handle.close()
+            raise broker_mod.BrokerUnavailableError(
+                f"supervised job for {repo} could not be read: {exc}"
+            ) from exc
+        return Registration(
+            ledger=handle, job_id=int(job["id"]), job=job, policy=policy
+        )
+    return None
+
+
 def _live_supervised_fence(ledger: Any, job_id: int) -> Any | None:
     """Return the job's live supervised-execution fence row, or ``None``.
 

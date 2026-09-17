@@ -328,7 +328,8 @@ def _dataclass_to_dict(obj) -> dict:
 
 def _print_report_json(result, plan_name: str, run_id: str,
                        filters: dict, warnings: list[str],
-                       reprice_info: dict | None = None) -> None:
+                       reprice_info: dict | None = None,
+                       supervision: dict | None = None) -> None:
     """Emit a single JSON object to stdout."""
     import dataclasses
 
@@ -348,11 +349,73 @@ def _print_report_json(result, plan_name: str, run_id: str,
         ],
         "warnings": warnings,
     }
+    # Additive: present only for a registered supervised job, so the existing
+    # keys, order, and values are untouched for unregistered plans.
+    if supervision is not None:
+        output["supervision"] = supervision
     if reprice_info is not None:
         output["repriced"] = True
         output["repricing_catalog_version"] = reprice_info.get("version")
     # Deterministic: sort keys, ensure_ascii=True for byte-identical output
     print(json.dumps(output, sort_keys=True, ensure_ascii=True))
+
+
+def _print_supervision_section(supervision: dict | None) -> None:
+    """Print the human supervision section for a registered job."""
+    if not supervision:
+        return
+    print("\n=== Supervision ===")
+    print(
+        f"  Job:        {supervision.get('job_id')} "
+        f"({supervision.get('state')})"
+    )
+    print(f"  Run:        {supervision.get('run_id') or '—'}")
+    print(
+        f"  Policy:     revision "
+        f"{supervision.get('policy', {}).get('revision')}"
+    )
+    budgets = supervision.get("budget_posture", {}).get("budgets", {}) or {}
+    consumption = supervision.get("budget_posture", {}).get("consumption", {}) or {}
+    print(
+        f"  Budget:     total_cost_usd={budgets.get('total_cost_usd')} "
+        f"charged_cost_usd={consumption.get('cost_usd')} "
+        f"elapsed_minutes={consumption.get('elapsed_minutes')}"
+    )
+    open_waits = [
+        wait for wait in supervision.get("waits", []) if wait.get("state") == "open"
+    ]
+    if open_waits:
+        print("  Open waits:")
+        for wait in open_waits:
+            print(f"    [{wait.get('kind')}] {wait.get('checkpoint')}")
+    incidents = supervision.get("recent_incidents", [])
+    if incidents:
+        print("  Recent incidents:")
+        for incident in incidents:
+            print(
+                f"    {incident.get('id')} {incident.get('kind')} "
+                f"[{incident.get('state')}]: {incident.get('summary')}"
+            )
+    steering = supervision.get("steering_requests", [])
+    if steering:
+        print("  Steering requests:")
+        for request in steering:
+            print(
+                f"    {request.get('request_id')} "
+                f"[{request.get('ack_state')}"
+                + (f" at {request.get('ack_boundary')}" if request.get("ack_boundary") else "")
+                + "]"
+            )
+    metric = (
+        supervision.get("metrics", {}) or {}
+    ).get("cost_per_correct_completion")
+    if metric:
+        value = metric.get("value")
+        rendered = "—" if value is None else f"${value:.4f}"
+        print(f"  Cost/correct completion: {rendered}")
+        print(f"    definition: {metric.get('definition')}")
+        for limitation in metric.get("limitations", []):
+            print(f"    limitation: {limitation}")
 
 
 def _resolve_for_change_plan(
@@ -507,9 +570,18 @@ def cmd_report(args: argparse.Namespace) -> int:
 
     selected_run_id = result.plan_metrics.run_id or run_id or ""
 
+    # Read-only supervision projection: present only for a registered
+    # supervised job, built after aggregation so no existing key/value changes.
+    # Imported lazily so importing this diagnostics module never pulls in the
+    # supervisor authority/endpoint boundary.
+    from lib.orchestrator import supervision as supervision_mod
+    supervision = supervision_mod.project_registered_job(
+        repo, plan_name=plan_name
+    )
+
     if args.json:
         _print_report_json(result, plan_name, selected_run_id, filters,
-                           all_warnings, reprice_info)
+                           all_warnings, reprice_info, supervision=supervision)
     else:
         # Show active filter header
         active = {k: v for k, v in filters.items() if v}
@@ -530,6 +602,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         _print_manual_follow_up(result.change_metrics)
         _print_stage_aggregates(result.stage_aggregates, args.stage)
         _print_model_leaderboard(result.model_leaderboard)
+        _print_supervision_section(supervision)
 
         # Warnings section
         if all_warnings:

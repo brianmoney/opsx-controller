@@ -37,6 +37,7 @@ from typing import Any, Callable, Iterable, Mapping
 
 from lib.supervisor import agent_contracts as agent_contracts_module
 from lib.supervisor import broker as broker_module
+from lib.supervisor import ledger as ledger_module
 from lib.supervisor import lifecycle as lifecycle_module
 from lib.supervisor import recovery as recovery_module
 
@@ -71,6 +72,23 @@ class PeerCredentials:
     pid: int
     uid: int
     gid: int
+
+
+@dataclass(frozen=True)
+class DeferredDelivery:
+    """A handler response whose notification cursor follows confirmed delivery.
+
+    A handler that selects notifications does not advance the durable
+    high-water itself. It returns this wrapper so the transport writes the
+    response first and only then calls :attr:`acknowledge`; when delivery fails
+    the cursor is never advanced, so a reboot or retry redelivers the
+    notification instead of silently dropping it. The receipt (and any
+    gate/approval it records) is already durable, so nothing is lost either
+    way.
+    """
+
+    result: dict[str, Any]
+    acknowledge: Callable[[], Any]
 
 
 # ---------------------------------------------------------------------------
@@ -217,17 +235,40 @@ def _operator_reset_change(
             transition="reset",
             request=request,
         )
-    recorded = [
-        broker_module.reset_change(
-            ledger, job_id, principal=principal, change_id=change_id
+    recorded = []
+    acknowledgements = []
+    for change_id in change_ids:
+        # Every operator reset/retry carries its own durable request identity.
+        requested = broker_module.make_request_id("reset")
+        recorded.append(
+            broker_module.reset_change(
+                ledger,
+                job_id,
+                principal=principal,
+                change_id=change_id,
+                request_id=requested,
+            )
         )
-        for change_id in change_ids
-    ]
+        # The reset re-arms the change's gate immediately, so the change
+        # boundary is reached in the same durable path and the request is
+        # acknowledged exactly once there.
+        row = ledger.acknowledge_request(
+            job_id, requested, boundary=ledger_module.ACK_BOUNDARY_CHANGE
+        )
+        acknowledgements.append(
+            {
+                "request_id": str(row["request_id"]),
+                "ack_state": str(row["ack_state"]),
+                "ack_boundary": row["ack_boundary"],
+            }
+        )
     return {
         "verb": "reset_change",
         "operator_uid": credentials.uid,
         "reset": [receipt.change_id for receipt in recorded],
+        "request_ids": [receipt.request_id for receipt in recorded],
         "receipts": [receipt.as_dict() for receipt in recorded],
+        "acknowledgements": acknowledgements,
     }
 
 
@@ -287,10 +328,86 @@ def _worker_release_delegated_gate(
 
 
 def _operator_revise_policy(request: Mapping[str, Any], credentials: PeerCredentials) -> dict[str, Any]:
+    """Record an operator policy revision as a request-identified steering action.
+
+    A policy revision is a job-scoped steering request: it is durably recorded
+    with a stable request identity, applied through the operator-only budget
+    path when the request carries a policy payload, and acknowledged exactly
+    once at the policy boundary it reaches immediately. Recording and applying
+    a revision are one atomic ledger transaction: a validation failure or a
+    crash commits nothing, so an unapplied pending request never exists.
+    """
+    ledger, job_id = _broker_ledger(request)
+    _require_mutable_job(ledger, job_id)
+    principal = _principal_for(credentials, broker_module.OPERATOR)
+    revision = request.get("revision")
+    policy = request.get("policy")
+    operator = principal.name or str(principal.uid or "")
+    request_id = broker_module.make_request_id("revise")
+    current = ledger.current_policy(job_id)
+    material_hash = ledger_module.snapshot_digest(
+        f"job-stop:{job_id}:{current['revision']}"
+    )
+    if isinstance(policy, Mapping):
+        # An explicit operator identity is required to revise a budget.
+        if not operator.strip():
+            raise broker_module.BrokerError(
+                "revise_policy with a policy payload requires an operator identity"
+            )
+        raw_revision = revision
+        if raw_revision is None:
+            raise broker_module.BrokerError(
+                "revise_policy with a policy payload requires an integer revision"
+            )
+        try:
+            next_revision = int(raw_revision)
+        except (TypeError, ValueError) as exc:
+            raise broker_module.BrokerError(
+                "revise_policy with a policy payload requires an integer revision"
+            ) from exc
+        # Atomic: validate, apply, and record the already-acknowledged request
+        # receipt in one transaction, so a failed or interrupted revision
+        # leaves no phantom pending request behind.
+        ledger.apply_policy_revision(
+            job_id,
+            revision=next_revision,
+            policy=policy,
+            operator=operator.strip(),
+            request_id=request_id,
+            change_id=ledger_module.STOP_REQUEST_CHANGE_ID,
+            kind=broker_module.STEER,
+            checkpoint=ledger_module.STOP_CHECKPOINT_PREFIX + "revise_policy",
+            material_hash=material_hash,
+            authority=broker_module.OPERATOR,
+            actor_principal=operator,
+            detail=request.get("detail"),
+        )
+        acknowledged = ledger.get_receipt_by_request(job_id, request_id)
+    else:
+        ledger.record_receipt(
+            job_id,
+            change_id=ledger_module.STOP_REQUEST_CHANGE_ID,
+            kind=broker_module.STEER,
+            checkpoint=ledger_module.STOP_CHECKPOINT_PREFIX + "revise_policy",
+            material_hash=material_hash,
+            authority=broker_module.OPERATOR,
+            actor_principal=operator,
+            detail=request.get("detail"),
+            request_id=request_id,
+        )
+        # The revision applies atomically and waits on no change/stop boundary,
+        # so its own boundary is reached by the time this transaction
+        # completes.
+        acknowledged = ledger.acknowledge_request(
+            job_id, request_id, boundary=ledger_module.ACK_BOUNDARY_POLICY
+        )
     return {
         "verb": "revise_policy",
         "operator_uid": credentials.uid,
-        "revision": request.get("revision"),
+        "revision": revision,
+        "request_id": request_id,
+        "ack_state": str(acknowledged["ack_state"]),
+        "ack_boundary": acknowledged["ack_boundary"],
     }
 
 
@@ -298,13 +415,26 @@ def _operator_enable(request: Mapping[str, Any], credentials: PeerCredentials) -
     return {"verb": "enable", "operator_uid": credentials.uid}
 
 
-def _lifecycle_result(verb: str, job_id: int, credentials: PeerCredentials, job: Any) -> dict[str, Any]:
-    return {
+def _lifecycle_result(
+    verb: str, job_id: int, credentials: PeerCredentials, job: Any,
+    ledger: Any = None,
+) -> dict[str, Any]:
+    result = {
         "verb": verb,
         "operator_uid": credentials.uid,
         "job_id": int(job_id),
         "state": str(job["state"]),
     }
+    if ledger is not None:
+        try:
+            request = ledger.latest_steering_request(int(job_id))
+        except Exception:  # noqa: BLE001 - identity is supplementary
+            request = None
+        if request is not None and request["request_id"]:
+            result["request_id"] = str(request["request_id"])
+            result["ack_state"] = request["ack_state"]
+            result["ack_boundary"] = request["ack_boundary"]
+    return result
 
 
 def _operator_pause(request: Mapping[str, Any], credentials: PeerCredentials) -> dict[str, Any]:
@@ -316,7 +446,7 @@ def _operator_pause(request: Mapping[str, Any], credentials: PeerCredentials) ->
         actor_principal=str(credentials.uid),
         detail=request.get("detail"),
     )
-    return _lifecycle_result("pause", job_id, credentials, job)
+    return _lifecycle_result("pause", job_id, credentials, job, ledger=ledger)
 
 
 def _operator_drain(request: Mapping[str, Any], credentials: PeerCredentials) -> dict[str, Any]:
@@ -328,13 +458,13 @@ def _operator_drain(request: Mapping[str, Any], credentials: PeerCredentials) ->
         actor_principal=str(credentials.uid),
         detail=request.get("detail"),
     )
-    return _lifecycle_result("drain", job_id, credentials, job)
+    return _lifecycle_result("drain", job_id, credentials, job, ledger=ledger)
 
 
 def _operator_resume(request: Mapping[str, Any], credentials: PeerCredentials) -> dict[str, Any]:
     ledger, job_id = _broker_ledger(request)
     job = lifecycle_module.resume(ledger, job_id)
-    return _lifecycle_result("resume", job_id, credentials, job)
+    return _lifecycle_result("resume", job_id, credentials, job, ledger=ledger)
 
 
 def _operator_cancel(request: Mapping[str, Any], credentials: PeerCredentials) -> dict[str, Any]:
@@ -346,7 +476,7 @@ def _operator_cancel(request: Mapping[str, Any], credentials: PeerCredentials) -
         actor_principal=str(credentials.uid),
         detail=request.get("detail"),
     )
-    return _lifecycle_result("cancel", job_id, credentials, job)
+    return _lifecycle_result("cancel", job_id, credentials, job, ledger=ledger)
 
 
 def _worker_report_status(
@@ -558,7 +688,7 @@ def _worker_report_violation(
 
 def _worker_request_action(
     request: Mapping[str, Any], credentials: PeerCredentials
-) -> dict[str, Any]:
+) -> dict[str, Any] | DeferredDelivery:
     """Answer from journaled job state: the bound job's actionable items.
 
     The response lists unreconciled uncertain actions (which block silent
@@ -566,6 +696,10 @@ def _worker_request_action(
     gate releases. The richer lifecycle payload shape is deferred to
     ``add-supervised-plan-lifecycle``; this is the minimal actionable-items
     answer.
+
+    When undelivered notifications exist the response is a
+    :class:`DeferredDelivery` so the durable watermark advances only after the
+    transport has delivered the response.
     """
     ledger, job_id = _broker_ledger(request)
     _require_worker_contract(request, ledger, job_id)
@@ -578,24 +712,42 @@ def _worker_request_action(
         }
         for row in ledger.list_uncertain_actions(job_id)
     ]
-    try:
-        high_water = int(request.get("high_water", 0))
-    except (TypeError, ValueError):
-        high_water = 0
+    # Steering/gate notifications are deduplicated across reboot through a
+    # durable per-consumer watermark. Selection does not advance the watermark
+    # and never honors a caller-supplied high_water: the persisted consumer
+    # watermark is the sole delivery cursor, so a caller offset can neither
+    # suppress undelivered receipts nor replay delivered ones. The advanced
+    # high-water is persisted by the transport only after this response has
+    # been delivered, so a response/delivery failure leaves the cursor in
+    # place and a reboot or retry redelivers instead of silently dropping the
+    # notification. This is separate from the ``ReceiptWakeTracker`` waking
+    # scan, which must keep observing pending receipts to wake the job.
+    consumer = str(
+        request.get("consumer") or broker_module.STEERING_NOTIFICATION_CONSUMER
+    )
+    batch = broker_module.select_steering_notifications(
+        ledger,
+        job_id,
+        consumer=consumer,
+    )
     steering: list[dict[str, Any]] = []
     delegated_releases: list[dict[str, Any]] = []
-    for row in ledger.receipts_after(job_id, high_water):
+    for row in batch.receipts:
         item = {
             "receipt_id": int(row["id"]),
             "change_id": row["change_id"],
             "kind": row["kind"],
             "authority": row["authority"],
         }
+        if row["request_id"]:
+            item["request_id"] = row["request_id"]
+            item["ack_state"] = row["ack_state"]
+            item["ack_boundary"] = row["ack_boundary"]
         if row["kind"] == "steer":
             steering.append(item)
         if row["authority"] == "delegated":
             delegated_releases.append(item)
-    return {
+    result = {
         "verb": "request_action",
         "worker_uid": credentials.uid,
         "job_id": int(job_id),
@@ -603,6 +755,21 @@ def _worker_request_action(
         "steering_receipts": steering,
         "delegated_releases": delegated_releases,
     }
+    if not batch.receipts:
+        return result
+
+    delivery_consumer = batch.consumer
+    delivery_high_water = batch.high_water
+
+    def _acknowledge_delivery() -> int:
+        return broker_module.acknowledge_notification_delivery(
+            ledger,
+            job_id,
+            consumer=delivery_consumer,
+            high_water=delivery_high_water,
+        )
+
+    return DeferredDelivery(result=result, acknowledge=_acknowledge_delivery)
 
 
 def _evidence_payload_mapping(payload: Any) -> Mapping[str, Any]:
@@ -896,11 +1063,14 @@ class Endpoint:
         conn: Any,
         *,
         read_request: Callable[[Any], Mapping[str, Any]],
-    ) -> dict[str, Any]:
+    ) -> Any:
         """Authenticate *conn*, then read and dispatch exactly one request.
 
         *read_request* is invoked only after the peer is verified, so a
-        mismatched peer is closed before any request byte is interpreted.
+        mismatched peer is closed before any request byte is interpreted. The
+        result is normally the handler's response mapping; a handler whose
+        durable acknowledgement must follow delivery returns a
+        ``DeferredDelivery`` instead.
         """
         credentials = accept_verified_peer(conn, allowed_uids=self.allowed_uids)
         request = read_request(conn)
@@ -920,6 +1090,7 @@ def operator_credential_material_present(endpoint: Endpoint) -> bool:
 
 __all__ = [
     "DISPATCH_TABLES",
+    "DeferredDelivery",
     "ENDPOINT_OPERATOR",
     "ENDPOINT_WORKER",
     "Endpoint",
