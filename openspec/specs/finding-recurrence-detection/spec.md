@@ -160,6 +160,19 @@ existing no-progress ceiling.
 Recurrence halting SHALL be evaluated only after a failing review verdict, and
 SHALL NOT prevent a passing review from advancing the change to archive.
 
+For a registered supervised job, reaching the ceiling SHALL route the change to
+bounded incident recovery instead of immediately treating it as terminal: a
+recurring-findings incident SHALL be recorded under a stable attempt signature,
+the change SHALL not dispatch another ordinary implement round while recovery
+is pending, and the change SHALL be marked failed with the recurrence result
+only when recovery escalates or its bounded attempts are exhausted. A
+recurrence whose recovery resolves SHALL return the change to the normal
+implement/review loop under that loop's existing authorities.
+
+For an unsupervised, unregistered run, reaching the ceiling SHALL keep the
+existing behavior: the change is marked failed with the recurrence result and
+no recovery is attempted.
+
 #### Scenario: Ceiling reached stops further rounds
 
 - **WHEN** `finding_recurrence_limit` is `3`, a review fails, and a locus
@@ -181,8 +194,31 @@ SHALL NOT prevent a passing review from advancing the change to archive.
 
 #### Scenario: Recurrence result is not retried
 
-- **WHEN** a change has been halted for recurrence and the run is resumed
+- **WHEN** an unsupervised change has been halted for recurrence and the run is
+  resumed
 - **THEN** that change is not automatically returned to the implement phase
+
+#### Scenario: A supervised recurrence routes to bounded recovery
+
+- **WHEN** a change in a registered supervised job reaches the recurrence
+  ceiling after a failing review
+- **THEN** a recurring-findings incident is recorded under a stable attempt
+  signature, the change is routed to bounded incident recovery, and it is not
+  immediately marked failed
+
+#### Scenario: A recovered recurrence returns to the loop
+
+- **WHEN** a recurring-findings incident is resolved by a primary-chosen,
+  independently verified repair
+- **THEN** the change returns to the existing implement/review loop and
+  recurrence halting is not applied
+
+#### Scenario: Exhausted recovery marks the change failed
+
+- **WHEN** a recurring-findings incident's recovery escalates or its bounded
+  attempts are exhausted
+- **THEN** the change is marked failed with the recurrence result and its
+  recorded reason identifying the offending locus and rounds
 
 ### Requirement: Review dispatch carries the prior round's finding loci
 

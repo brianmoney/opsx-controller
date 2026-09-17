@@ -99,6 +99,7 @@ try:
     from lib.supervisor import lock as lock_mod
     from lib.supervisor import acceptance as acceptance_mod
     from lib.supervisor import agent_contracts as agent_contracts_mod
+    from lib.supervisor import recovery as recovery_mod
 except ModuleNotFoundError as exc:  # pragma: no cover
     sys.exit(f"opsx-plan requires the lib.orchestrator runtime package: {exc}")
 base._RUNTIME_ROOTS = _RUNTIME_ROOTS
@@ -1637,6 +1638,7 @@ def _locus_recurrence_rounds(history: list[dict], blocking: set[str]) -> dict[st
 def apply_review_result(
     repo: Path, cfg: dict, state: dict, cid: str, payload: dict, *,
     supervised: bool = False,
+    gate: dict | None = None,
 ) -> str:
     r = state_mod.rec(state, cid)
     if payload.get("status") != "reviewed":
@@ -1716,6 +1718,41 @@ def apply_review_result(
                     f"blocking finding in rounds {rounds_desc}"
                 )
                 r["last_result"] = "finding_recurrence_exceeded"
+                # For a registered supervised job the recurrence is routed to
+                # bounded incident recovery instead of turning terminal on the
+                # spot: the change is marked failed only when recovery escalates
+                # or its bounded attempts are exhausted. An unregistered run
+                # has no gate and keeps the existing terminal halt.
+                recovery = begin_supervised_recovery(
+                    gate,
+                    cid,
+                    "review",
+                    {
+                        "failure_class": "recurring_findings",
+                        "message": reason,
+                        "locus": locus,
+                    },
+                    discriminator=f"locus:{locus}",
+                    run_id=state.get("run_id", ""),
+                )
+                if isinstance(recovery, dict) and recovery.get("status") == "recovering":
+                    r["recovery"] = {
+                        "incident_id": recovery.get("incident_id"),
+                        "failure_class": recovery.get("failure_class"),
+                        "signature": recovery.get("signature"),
+                        "origin_stage": "review",
+                        "summary": reason,
+                    }
+                    r["phase"] = "recovery"
+                    state_mod.set_status(
+                        state, cid, base.PENDING,
+                        f"{reason}; bounded incident recovery is pending",
+                    )
+                    base.log(
+                        f"  {cid}: {reason}; routed to bounded incident recovery "
+                        f"(incident {recovery.get('incident_id')})"
+                    )
+                    return "continue"
                 state_mod.set_status(state, cid, base.FAILED, reason)
                 _try_notify(cfg, "change_failed", reason, change_id=cid)
                 return "stop"
@@ -2368,6 +2405,7 @@ def _archive_revalidation_failed(
     *,
     last_result: str | None,
     supervised: bool,
+    gate: dict | None = None,
 ) -> str:
     """Handle failed post-archive completion evidence for an archived change.
 
@@ -2383,43 +2421,41 @@ def _archive_revalidation_failed(
     archive["status"] = "failed"
     archive["reason"] = reason
     if supervised:
-        if last_result is not None:
-            r["last_result"] = last_result
-        if r["round"] < r["max_rounds"]:
-            # Fresh-review revalidation, bounded by the change's round budget.
-            # The loop can only resolve the change at its active location, so
-            # the archived artifacts must be reactivated before requeueing;
-            # without them the next round could not even find the change.
-            restored, restore_why = reactivate_archived_change(repo, cid, archive)
-            if not restored:
-                reason = f"{reason}; cannot rerun a fresh review: {restore_why}"
-                archive["reason"] = reason
-                state_mod.set_status(state, cid, base.FAILED, reason)
-                _try_notify(cfg, "change_failed", reason, change_id=cid)
-                return "stop"
-            append_history(
-                state,
-                cid,
-                {
-                    "round": r["round"],
-                    "phase": "archive",
-                    "status": "reactivated",
-                    "summary": (
-                        f"post-archive evidence failed ({reason}); reactivated "
-                        f"the archived change for a fresh review round"
-                    ),
-                    "archive_path": archive.get("path", ""),
-                },
-            )
-            r["round"] += 1
-            r["phase"] = "implement"
+        # Route the partial archive / failed post-archive evidence into
+        # bounded recovery for a registered job: the recovery driver
+        # revalidates the change through the existing review loop and the
+        # prior archive is never treated as done. Post-archive revalidation
+        # failures — an unverified archive, a failed fast check, or a dirty
+        # tracked tree — are all fresh-review revalidation. An unregistered
+        # run has no gate and consults no recovery code.
+        recovery = begin_supervised_recovery(
+            gate,
+            cid,
+            "archive",
+            {
+                "failure_class": "partial_archive",
+                "message": reason,
+            },
+            remedy=recovery_mod.REMEDY_FRESH_REVIEW,
+        )
+        if isinstance(recovery, dict) and recovery.get("status") == "recovering":
+            if last_result is not None:
+                r["last_result"] = last_result
+            r["recovery"] = {
+                "incident_id": recovery.get("incident_id"),
+                "failure_class": recovery.get("failure_class"),
+                "signature": recovery.get("signature"),
+                "origin_stage": "archive",
+                "summary": reason,
+            }
+            r["phase"] = "recovery"
             state_mod.set_status(
                 state, cid, base.PENDING,
-                f"{reason}; fresh review round {r['round']}",
+                f"{reason}; bounded incident recovery is pending",
             )
             base.log(
-                f"  {cid}: {reason}; reactivated the archived change and "
-                f"rerun a fresh review round ({r['round']}/{r['max_rounds']})"
+                f"  {cid}: {reason}; routed to bounded incident recovery "
+                f"(incident {recovery.get('incident_id')})"
             )
             return "continue"
     elif last_result is not None:
@@ -2437,6 +2473,7 @@ def apply_archive_result(
     payload: dict,
     *,
     supervised: bool = False,
+    gate: dict | None = None,
 ) -> str:
     r = state_mod.rec(state, cid)
     archive = r["archive"]
@@ -2506,19 +2543,19 @@ def apply_archive_result(
     if not ok:
         return _archive_revalidation_failed(
             repo, cfg, state, cid, r, f"archive unverified: {why}",
-            last_result=None, supervised=supervised,
+            last_result=None, supervised=supervised, gate=gate,
         )
     checks_ok, check_why = groundtruth.run_fast_checks(repo, cfg)
     if not checks_ok:
         return _archive_revalidation_failed(
             repo, cfg, state, cid, r, f"post-archive {check_why}",
-            last_result="post_archive_check_failed", supervised=supervised,
+            last_result="post_archive_check_failed", supervised=supervised, gate=gate,
         )
     clean_ok, clean_why = delivery.verify_post_archive_clean(repo, cfg)
     if not clean_ok:
         return _archive_revalidation_failed(
             repo, cfg, state, cid, r, f"post-archive {clean_why}",
-            last_result="post_archive_dirty_tracked", supervised=supervised,
+            last_result="post_archive_dirty_tracked", supervised=supervised, gate=gate,
         )
     r["phase"] = "done"
     # After the archive move, tasks.md lives in the archive directory; parse
@@ -2776,6 +2813,668 @@ def supervised_gate_record_incident(
         pass
 
 
+def supervised_recovery_context(gate: dict | None) -> tuple | None:
+    """Return ``(ledger, job_id)`` for a registered gate, or ``None``.
+
+    This is the single registered-job guard every recovery hook consults: an
+    unregistered run has no gate, so it enters no recovery code and keeps its
+    legacy behavior unchanged.
+    """
+    if not isinstance(gate, dict):
+        return None
+    ledger = gate.get("ledger")
+    job_id = gate.get("job_id")
+    if ledger is None or job_id is None:
+        return None
+    return ledger, int(job_id)
+
+
+def supervised_recovery_policy(gate: dict, ledger, job_id: int) -> dict:
+    """Return the job's current protected policy for recovery decisions."""
+    policy = gate.get("policy")
+    if isinstance(policy, dict) and policy:
+        return policy
+    try:
+        return ledger.current_policy(int(job_id))
+    except Exception:  # noqa: BLE001 - absent policy is durable-state absence
+        return {}
+
+
+def begin_supervised_recovery(
+    gate: dict | None,
+    cid: str,
+    stage: str,
+    failure,
+    *,
+    remedy: str | None = None,
+    discriminator: str = "",
+    run_id: str | None = None,
+) -> dict | None:
+    """Classify a supervised failure and enter bounded incident recovery.
+
+    Every hook is guarded on the registered-job gate: an unregistered run
+    (``gate is None``) returns ``None`` without consulting any recovery code.
+    A durable-write failure is likewise reported as ``None`` so the caller
+    keeps its existing terminal behavior rather than crashing the run.
+    """
+    context = supervised_recovery_context(gate)
+    if context is None:
+        return None
+    ledger, job_id = context
+    policy = supervised_recovery_policy(gate, ledger, job_id)
+    try:
+        result = recovery_mod.begin_recovery(
+            ledger,
+            job_id=job_id,
+            change_id=str(cid),
+            stage=str(stage),
+            failure=failure,
+            policy=policy,
+            remedy=remedy,
+            discriminator=discriminator,
+            run_id=run_id,
+        )
+    except recovery_mod.RemedyPolicyViolation:
+        return {"status": "escalated", "failure_class": "policy_violation"}
+    except Exception:  # noqa: BLE001 - recovery is best-effort over the journal
+        return None
+    if result.get("status") == "recovering":
+        try:
+            recovery_mod.bounded_recovery_attempt(
+                ledger,
+                job_id=job_id,
+                signature=str(result.get("signature", "")),
+                policy=policy,
+            )
+        except recovery_mod.BoundedRecoveryExceeded as exc:
+            escalated = recovery_mod.escalate_incident(
+                ledger,
+                int(result["incident_id"]),
+                reason=str(exc),
+                operator_action="review the recurring incident and intervene",
+            )
+            result = dict(result)
+            result["status"] = "escalated"
+            result["blocker"] = escalated["blocker"]
+        except Exception:  # noqa: BLE001 - the bound is best-effort durable
+            pass
+    return result
+
+
+class RecoveryDispatchError(Exception):
+    """A recovery stage dispatch failed before producing a usable payload."""
+
+    def __init__(self, message: str, *, evidence: dict | None = None) -> None:
+        super().__init__(message)
+        self.evidence = evidence if isinstance(evidence, dict) else {"message": message}
+
+
+#: Recovery paths whose remedy is executed by the cheap fixer plus an
+#: independent verifier, with the resuming effect gated on the verdict and
+#: the job's standing grant.
+_REPAIR_RECOVERY_PATHS = frozenset(
+    {
+        "corrective_redispatch",
+        "recurring_findings_repair",
+        "worktree_preserving_repair",
+        "delta_identity_repair",
+    }
+)
+
+
+def _recovery_fail_change(
+    state: dict, cid: str, cfg: dict, r: dict, reason: str, last_result: str
+) -> str:
+    r["last_result"] = last_result
+    state_mod.set_status(state, cid, base.FAILED, reason)
+    _try_notify(cfg, "change_failed", reason, change_id=cid)
+    return "failed"
+
+
+def _recovery_stage_dispatch(
+    repo: Path,
+    cfg: dict,
+    state: dict,
+    cid: str,
+    r: dict,
+    gate: dict,
+    stage: str,
+    *,
+    input_block: str | None = None,
+) -> tuple[dict, int | None]:
+    """Dispatch one stage through the journaled supervised boundary.
+
+    Every recovery dispatch crosses the same reserve/invoke/reconcile journal
+    boundary as an ordinary stage dispatch. Returns ``(payload, action_id)``
+    for a parsed result; raises :class:`RecoveryDispatchError` — carrying
+    failure-classification evidence — on a gate block, a non-clean outcome, or
+    unparseable worker output.
+    """
+    run_id = state.get("run_id", "")
+    resolved_model = _resolved_dispatch_model(repo, cfg, stage, r)
+    entry = supervised_gated_reserve(
+        repo, cfg, gate, cid, stage, r["round"], r, run_id,
+        resolved_model=resolved_model,
+    )
+    if entry.get("blocked"):
+        raise RecoveryDispatchError(str(entry["blocked"]))
+    if entry.get("recovered"):
+        raise RecoveryDispatchError(
+            f"{stage} dispatch recovered a prior completion during recovery; "
+            "recovery cannot reapply it"
+        )
+    if input_block is None:
+        input_block = build_worker_input(repo, cfg, state, cid, stage=stage)
+    outcome, log_path = invoke_direct_stage(
+        repo, cfg, cid, stage, r["round"], input_block
+    )
+    integration = _load_journal_dispatch()
+    integration.resolve_dispatch(
+        gate,
+        action_id=entry.get("action_id"),
+        reservation_id=entry.get("reservation_id"),
+        outcome=outcome,
+        record=None,
+    )
+    payload, parse_why, _envelope = parse_stage_json(log_path)
+    if outcome not in ("exited", "completed"):
+        raise RecoveryDispatchError(
+            f"{stage} dispatch ended with outcome={outcome}",
+            evidence=dispatch_failure_evidence(
+                outcome, {"message": f"{stage} ended with outcome={outcome}"}
+            ),
+        )
+    if payload is None:
+        raise RecoveryDispatchError(
+            f"{stage} output invalid: {parse_why}",
+            evidence=dispatch_failure_evidence(
+                "invalid_output", {"message": parse_why}
+            ),
+        )
+    return payload, entry.get("action_id")
+
+
+def _apply_recovered_stage_payload(
+    repo: Path,
+    cfg: dict,
+    state: dict,
+    cid: str,
+    r: dict,
+    gate: dict,
+    stage: str,
+    payload: dict,
+    action_id: int | None,
+) -> str:
+    """Apply the payload of a stage redispatched by bounded transient retry."""
+    if stage == "implement":
+        return apply_implement_result(repo, cfg, state, cid, payload)
+    if stage == "review":
+        return apply_review_result(
+            repo, cfg, state, cid, payload, supervised=True, gate=gate
+        )
+    if stage == "acceptance":
+        return apply_acceptance_result(
+            repo, cfg, state, cid, payload, gate=gate, action_id=action_id
+        )
+    if stage == "fix":
+        return apply_fix_result(repo, cfg, state, cid, payload, action_id=action_id)
+    if stage == "verify":
+        return apply_verify_result(
+            repo, cfg, state, cid, payload, gate=gate, action_id=action_id
+        )
+    return apply_archive_result(
+        repo, cfg, state, cid, payload, supervised=True, gate=gate
+    )
+
+
+def _route_resolved_recovery(r: dict, path: str, origin_stage: str) -> None:
+    """Route a resolved recovery to the loop its bounded path requires.
+
+    A recurring-findings repair earns a fresh review over the repaired work;
+    every other resolved recovery returns to the stage that failed, and a
+    fresh review over archive material re-enters the normal implement loop.
+    """
+    if path == recovery_mod.PATH_RECURRING_FINDINGS_REPAIR:
+        r["phase"] = "review"
+    elif path == recovery_mod.PATH_FRESH_REVIEW:
+        r["phase"] = "implement"
+    else:
+        r["phase"] = origin_stage
+
+
+def _drive_recovery_transient_retry(
+    repo: Path,
+    cfg: dict,
+    state: dict,
+    cid: str,
+    r: dict,
+    gate: dict,
+    ledger,
+    job_id: int,
+    rec_ctx: dict,
+    origin_stage: str,
+) -> str:
+    """Redispatch the failed stage under the bounded transient-retry path."""
+    incident_id = int(rec_ctx["incident_id"])
+    signature = str(rec_ctx.get("signature") or "")
+
+    def _attempt() -> tuple[dict, int | None]:
+        return _recovery_stage_dispatch(
+            repo, cfg, state, cid, r, gate, origin_stage
+        )
+
+    try:
+        payload, action_id = recovery_mod.bounded_transient_retry(
+            ledger, job_id=job_id, signature=signature, operation=_attempt
+        )
+    except Exception as exc:  # noqa: BLE001 - any failure escalates the incident
+        escalated = recovery_mod.escalate_incident(
+            ledger,
+            incident_id,
+            reason=f"bounded transient retry did not clear the failure: {exc}",
+            operator_action="inspect the provider failure and intervene",
+        )
+        reason = (
+            f"transient recovery for incident {incident_id} escalated: "
+            f"{escalated['reason']}"
+        )
+        return _recovery_fail_change(state, cid, cfg, r, reason, "recovery_escalated")
+    recovery_mod.resolve_incident(
+        ledger, incident_id, summary="bounded transient retry cleared the failure"
+    )
+    r["recovery"] = {}
+    state_mod.set_status(
+        state, cid, base.PENDING,
+        f"transient {origin_stage} failure cleared by bounded retry",
+    )
+    return _apply_recovered_stage_payload(
+        repo, cfg, state, cid, r, gate, origin_stage, payload, action_id
+    )
+
+
+def _drive_recovery_repair(
+    repo: Path,
+    cfg: dict,
+    state: dict,
+    cid: str,
+    r: dict,
+    gate: dict,
+    ledger,
+    job_id: int,
+    policy: dict,
+    rec_ctx: dict,
+    path: str,
+    origin_stage: str,
+) -> str:
+    """Run the fixer/independent-verifier repair and gate the resume effect."""
+    incident_id = int(rec_ctx["incident_id"])
+    failure_class = str(rec_ctx.get("failure_class") or "")
+    run_id = state.get("run_id", "")
+
+    def _dispatch(role: str, request: Mapping[str, Any]) -> dict:
+        stage = "fix" if role == "fixer" else "verify"
+        if not cfg.get(f"{stage}_invoke"):
+            raise RecoveryDispatchError(
+                f"{stage} invoke is not configured for adapter "
+                f"'{cfg.get('adapter', '')}'; the recovery repair cannot run "
+                "and is not skipped"
+            )
+        input_block = build_worker_input(repo, cfg, state, cid, stage=stage)
+        input_block += (
+            f"\nRECOVERY_INCIDENT_ID: {incident_id}"
+            f"\nRECOVERY_FAILURE_CLASS: {failure_class}"
+            f"\nRECOVERY_ROLE: {role}"
+            f"\nRECOVERY_SUMMARY: {single_line(str(rec_ctx.get('summary') or ''))}"
+        )
+        payload, action_id = _recovery_stage_dispatch(
+            repo, cfg, state, cid, r, gate, stage, input_block=input_block
+        )
+        result = dict(payload)
+        result["action_id"] = action_id
+        result["session_id"] = _dispatch_session_identity(ledger, action_id)
+        return result
+
+    try:
+        repair = recovery_mod.dispatch_repair(
+            ledger,
+            job_id=job_id,
+            change_id=cid,
+            stage=origin_stage,
+            incident_id=incident_id,
+            dispatch=_dispatch,
+            run_id=run_id,
+            context={
+                "failure_class": failure_class,
+                "summary": str(rec_ctx.get("summary") or ""),
+            },
+        )
+        recovery_mod.consume_recovery_effect(
+            ledger,
+            job_id=job_id,
+            incident_id=incident_id,
+            change_id=cid,
+            effect="resume",
+            policy=policy,
+            verdict=repair["verifier_verdict"],
+            fixer_report=repair["fixer_report"],
+            fixer_session_id=repair.get("fixer_session_id"),
+            verifier_session_id=repair.get("verifier_session_id"),
+            # Record the claim+verdict pair on the fixer action, exactly as
+            # the acceptance repair loop does: recording it on the verifier
+            # action would collapse the two session identities and later
+            # repair-gate reads would refuse the repair as not independent.
+            action_id=repair["fixer_report"].get("action_id"),
+            run_id=run_id,
+        )
+    except Exception as exc:  # noqa: BLE001 - any repair failure escalates
+        escalated = recovery_mod.escalate_incident(
+            ledger,
+            incident_id,
+            reason=f"recovery repair could not be consumed: {exc}",
+            operator_action="review the failed repair and intervene",
+        )
+        reason = (
+            f"recovery repair for incident {incident_id} escalated: "
+            f"{escalated['reason']}"
+        )
+        return _recovery_fail_change(state, cid, cfg, r, reason, "recovery_escalated")
+    recovery_mod.resolve_incident(
+        ledger,
+        incident_id,
+        summary="fixer repair independently verified; the change resumed",
+    )
+    r["recovery"] = {}
+    _route_resolved_recovery(r, path, origin_stage)
+    append_history(
+        state,
+        cid,
+        {
+            "round": r["round"],
+            "phase": "recovery",
+            "status": "resolved",
+            "summary": (
+                f"incident {incident_id} repaired and independently verified; "
+                f"resumed at {r['phase']}"
+            ),
+        },
+    )
+    state_mod.set_status(
+        state, cid, base.PENDING,
+        f"recovery repair verified; resumed at {r['phase']}",
+    )
+    base.log(
+        f"  {cid}: recovery incident {incident_id} resolved; "
+        f"resumed at {r['phase']}"
+    )
+    return "continue"
+
+
+def _drive_recovery_reconciliation(
+    repo: Path,
+    cfg: dict,
+    state: dict,
+    cid: str,
+    r: dict,
+    gate: dict,
+    ledger,
+    job_id: int,
+    rec_ctx: dict,
+    origin_stage: str,
+) -> str:
+    """Reconcile the recorded interrupted action from evidence before resume.
+
+    The process-interruption path re-attempts reconciliation of the specific
+    action recorded in the recovery context through the journal evidence
+    boundary. The change resumes only after that exact action is decisively
+    reconciled as completed — journal or repository evidence confirms its
+    completion. An action that is terminally failed, missing, mismatched, or
+    otherwise unreconciled escalates the incident and fails the change
+    terminally; the reconciliation-only pass never redispatches on an
+    assumption, and any other pending action keeps blocking independently.
+    """
+    incident_id = int(rec_ctx["incident_id"])
+    recorded_action_id = rec_ctx.get("action_id")
+
+    def _escalate(message: str) -> str:
+        decision = recovery_mod.reconcile_process_interruption(
+            evidence={"message": message},
+            action_id=(
+                int(recorded_action_id) if recorded_action_id is not None else None
+            ),
+        )
+        escalated = recovery_mod.escalate_incident(
+            ledger,
+            incident_id,
+            reason=(
+                message
+                or decision["reason"]
+                or "the interrupted action cannot be reconciled from evidence"
+            ),
+            operator_action="reconcile the interrupted action and intervene",
+        )
+        reason = (
+            f"process-interruption recovery for incident {incident_id} "
+            f"escalated: {escalated['reason']}"
+        )
+        return _recovery_fail_change(state, cid, cfg, r, reason, "recovery_escalated")
+
+    if recorded_action_id is None:
+        return _escalate(
+            "the process-interruption recovery context does not record the "
+            "interrupted action; the incident cannot be reconciled"
+        )
+    run_id = state.get("run_id", "") or telemetry.get_or_create_run_id(
+        repo, cfg, state
+    )
+    resolved_model = _resolved_dispatch_model(repo, cfg, origin_stage, r)
+    recovered = _recover_supervised_dispatch(
+        repo,
+        cfg,
+        gate,
+        cid,
+        origin_stage,
+        r["round"],
+        r,
+        run_id,
+        resolved_model,
+        reobserve=lambda: _reobserve_direct_stage_completion(
+            repo, cid, origin_stage, r
+        ),
+        allow_replay=False,
+        target_action_id=int(recorded_action_id),
+    )
+    if recovered is not None and recovered.get("recovered"):
+        recovery_mod.resolve_incident(
+            ledger,
+            incident_id,
+            summary=(
+                f"interrupted action {int(recorded_action_id)} reconciled "
+                "from decisive evidence"
+            ),
+        )
+        r["recovery"] = {}
+        if r["phase"] == "recovery":
+            r["phase"] = origin_stage
+        append_history(
+            state,
+            cid,
+            {
+                "round": r["round"],
+                "phase": "recovery",
+                "status": "resolved",
+                "summary": (
+                    f"incident {incident_id} reconciled from decisive "
+                    f"evidence; resumed at {r['phase']}"
+                ),
+            },
+        )
+        state_mod.set_status(
+            state, cid, base.PENDING,
+            f"process interruption reconciled; resumed at {r['phase']}",
+        )
+        base.log(
+            f"  {cid}: recovery incident {incident_id} resolved; "
+            f"resumed at {r['phase']}"
+        )
+        return "continue"
+    return _escalate(str((recovered or {}).get("blocked") or ""))
+
+
+def drive_supervised_recovery(
+    repo: Path, cfg: dict, state: dict, cid: str, r: dict, gate: dict | None
+) -> str:
+    """Execute the bounded recovery flow for a registered supervised job.
+
+    This is the production driver for the ``recovery`` phase: it consumes the
+    recovery context recorded when the failure was routed, executes the
+    incident's bounded path — bounded transient retry, or the primary-chosen
+    fixer/independent-verifier repair with standing-grant gating on the
+    resuming effect — and routes a resolved recovery to the required
+    normal/fresh-review loop. The change is marked failed only when the
+    recovery escalates or its durable per-signature bound is exhausted. An
+    unregistered run has no gate, is driven back onto the ordinary path, and
+    consults no recovery code.
+    """
+    context = supervised_recovery_context(gate)
+    if context is None:
+        r["phase"] = "implement"
+        return "continue"
+    ledger, job_id = context
+    rec_ctx = r.get("recovery") or {}
+    incident_id = rec_ctx.get("incident_id")
+    if incident_id is None:
+        r["phase"] = "implement"
+        return "continue"
+    policy = supervised_recovery_policy(gate, ledger, job_id)
+    try:
+        row = ledger.get_incident(int(incident_id))
+    except Exception:  # noqa: BLE001 - a missing incident cannot be driven
+        r["phase"] = "implement"
+        return "continue"
+    incident_state = str(row["state"])
+    failure_class = str(rec_ctx.get("failure_class") or row["kind"] or "")
+    origin_stage = str(rec_ctx.get("origin_stage") or "implement")
+    if origin_stage not in {"implement", "review", "acceptance", "fix", "verify", "archive"}:
+        origin_stage = "implement"
+    path = recovery_mod.CLASS_PATHS.get(failure_class, recovery_mod.PATH_ESCALATE)
+    if incident_state == "escalated":
+        reason = str(row["summary"] or f"incident {incident_id} escalated")
+        return _recovery_fail_change(state, cid, cfg, r, reason, "recovery_escalated")
+    if incident_state == "resolved":
+        r["recovery"] = {}
+        _route_resolved_recovery(r, path, origin_stage)
+        return "continue"
+    if path == recovery_mod.PATH_BOUNDED_TRANSIENT_RETRY:
+        return _drive_recovery_transient_retry(
+            repo, cfg, state, cid, r, gate, ledger, job_id, rec_ctx, origin_stage
+        )
+    if path in _REPAIR_RECOVERY_PATHS:
+        return _drive_recovery_repair(
+            repo, cfg, state, cid, r, gate, ledger, job_id, policy,
+            rec_ctx, path, origin_stage,
+        )
+    if path == recovery_mod.PATH_UNCERTAIN_ACTION_RECONCILIATION:
+        return _drive_recovery_reconciliation(
+            repo, cfg, state, cid, r, gate, ledger, job_id, rec_ctx,
+            origin_stage,
+        )
+    if path == recovery_mod.PATH_FRESH_REVIEW:
+        # The remedy is the loop's own fresh review: no repair is produced, so
+        # no consumption gate fires. The archived change is reactivated and
+        # re-enters the implement/review/archive loop, bounded by the change's
+        # existing round budget.
+        archive = r["archive"]
+        summary = str(rec_ctx.get("summary") or "post-archive evidence failed")
+        if r["round"] < r["max_rounds"]:
+            # Fresh-review revalidation, bounded by the change's round budget.
+            # The loop can only resolve the change at its active location, so
+            # the archived artifacts must be reactivated before requeueing;
+            # without them the next round could not even find the change.
+            restored, restore_why = reactivate_archived_change(repo, cid, archive)
+            if not restored:
+                reason = f"{summary}; cannot rerun a fresh review: {restore_why}"
+                archive["reason"] = reason
+                recovery_mod.escalate_incident(
+                    ledger,
+                    int(incident_id),
+                    reason=reason,
+                    operator_action="restore the archived change and intervene",
+                )
+                return _recovery_fail_change(
+                    state, cid, cfg, r, reason, "recovery_escalated"
+                )
+            recovery_mod.resolve_incident(
+                ledger,
+                int(incident_id),
+                summary="routed to a fresh review through the existing loop",
+            )
+            r["recovery"] = {}
+            append_history(
+                state,
+                cid,
+                {
+                    "round": r["round"],
+                    "phase": "archive",
+                    "status": "reactivated",
+                    "summary": (
+                        f"post-archive evidence failed ({summary}); reactivated "
+                        f"the archived change for a fresh review round"
+                    ),
+                    "archive_path": archive.get("path", ""),
+                },
+            )
+            r["round"] += 1
+            r["phase"] = "implement"
+            state_mod.set_status(
+                state, cid, base.PENDING,
+                f"{summary}; fresh review round {r['round']}",
+            )
+            base.log(
+                f"  {cid}: {summary}; reactivated the archived change and "
+                f"rerun a fresh review round ({r['round']}/{r['max_rounds']})"
+            )
+            return "continue"
+        reason = (
+            f"{summary}; the change's round budget is exhausted; "
+            "no fresh review remains"
+        )
+        recovery_mod.escalate_incident(
+            ledger,
+            int(incident_id),
+            reason=reason,
+            operator_action="review the change and intervene",
+        )
+        return _recovery_fail_change(state, cid, cfg, r, reason, "recovery_escalated")
+    escalated = recovery_mod.escalate_incident(
+        ledger,
+        int(incident_id),
+        reason=f"{failure_class} has no automated recovery path",
+        operator_action="triage the failure and intervene",
+    )
+    reason = (
+        f"recovery for incident {incident_id} escalated: {escalated['reason']}"
+    )
+    return _recovery_fail_change(state, cid, cfg, r, reason, "recovery_escalated")
+
+
+def dispatch_failure_evidence(outcome: str, record: dict | None) -> dict:
+    """Build classification evidence for a failed supervised dispatch.
+
+    The mapping is evidence, never an authority: an explicit class is supplied
+    only where the outcome itself names one (a timeout, an exhausted invalid
+    result); otherwise the recorded reason is classified, and an unknown reason
+    escalates rather than being guessed into a repair.
+    """
+    reason = ""
+    if isinstance(record, dict):
+        reason = str(record.get("reason") or record.get("message") or "")
+    if outcome == "timeout":
+        return {"failure_class": "transient_provider", "message": reason or "dispatch timed out"}
+    if outcome == "invalid_output":
+        return {"failure_class": "invalid_result", "message": reason or "invalid worker output"}
+    return {"message": reason, "outcome": str(outcome)}
+
+
 def create_outcome_state(outcome: str) -> str:
     """Map a ``run_stage`` outcome to the reconcile outcome vocabulary.
 
@@ -2850,16 +3549,71 @@ def _recover_supervised_dispatch(
     resolved_model: str | None,
     *,
     reobserve,
+    allow_replay: bool = True,
+    target_action_id: int | None = None,
 ) -> dict | None:
     integration = _load_journal_dispatch()
     pending = integration.reconcile_pending(gate)
+    if target_action_id is not None:
+        # A process-interruption recovery reconciles exactly the recorded
+        # interrupted action, never the job-wide pending inventory: another
+        # pending action is neither conflated with it nor resolved by it and
+        # keeps blocking its own dispatch independently.
+        item = next(
+            (
+                entry
+                for entry in pending
+                if int(entry["action_id"]) == int(target_action_id)
+            ),
+            None,
+        )
+        if item is None:
+            # The recorded action is no longer pending: inspect its journaled
+            # state directly. Only a decisive completion of that exact action
+            # reconciles the interruption; a failed, missing, or mismatched
+            # record keeps the incident blocking.
+            try:
+                row = gate["ledger"].get_action(int(target_action_id))
+            except Exception:  # noqa: BLE001 - a missing record is unreconciled
+                return {
+                    "blocked": (
+                        f"recorded interrupted action {int(target_action_id)} "
+                        "is missing from the journal"
+                    ),
+                    "last_result": "uncertain_action_pending",
+                    "action_id": int(target_action_id),
+                }
+            try:
+                recorded_detail = json.loads(row["detail"] or "{}")
+            except (TypeError, ValueError):
+                recorded_detail = {}
+            if not isinstance(recorded_detail, dict):
+                recorded_detail = {}
+            item = {
+                "action_id": int(target_action_id),
+                "kind": row["kind"],
+                "run_id": row["run_id"],
+                "detail": row["detail"],
+                "change_id": recorded_detail.get("change_id"),
+                "stage": recorded_detail.get("stage"),
+            }
+        pending = [item]
     if not pending:
         return None
     if len(pending) != 1:
-        ids = ", ".join(str(item["action_id"]) for item in pending)
+        ids = ", ".join(str(entry["action_id"]) for entry in pending)
+        own = [
+            entry
+            for entry in pending
+            if entry.get("change_id") == cid and entry.get("stage") == stage
+        ]
         return {
             "blocked": f"supervised actions {ids} require individual reconciliation",
             "last_result": "uncertain_action_pending",
+            # Attribute this dispatch attempt's own interrupted action when it
+            # is uniquely identifiable, so the recovery phase reconciles that
+            # recorded action rather than the job-wide inventory.
+            "action_id": int(own[0]["action_id"]) if len(own) == 1 else None,
         }
     item = pending[0]
     if item.get("change_id") != cid:
@@ -2870,6 +3624,7 @@ def _recover_supervised_dispatch(
                 f"{item.get('stage') or item['kind']}; reconcile it before {cid}/{stage}"
             ),
             "last_result": "uncertain_action_pending",
+            "action_id": item["action_id"],
         }
     pending_stage = item.get("stage")
     try:
@@ -2894,6 +3649,7 @@ def _recover_supervised_dispatch(
                 "context; reconcile it before dispatch"
             ),
             "last_result": "uncertain_action_pending",
+            "action_id": item["action_id"],
         }
     if stage_order[pending_stage] > stage_order[stage]:
         return {
@@ -2902,6 +3658,7 @@ def _recover_supervised_dispatch(
                 f"{pending_stage}; reconcile it before {cid}/{stage}"
             ),
             "last_result": "uncertain_action_pending",
+            "action_id": item["action_id"],
         }
 
     def _reobserve_pending_action() -> bool | None:
@@ -2914,8 +3671,17 @@ def _recover_supervised_dispatch(
             if not isinstance(baseline, list) or not baseline:
                 return None
             remaining = set(state_mod.remaining_automatable_tasks(repo, cid))
-            return all(str(task) not in remaining for task in baseline)
-        return reobserve()
+            complete = all(str(task) not in remaining for task in baseline)
+            if complete or allow_replay:
+                return complete
+            # A reconciliation-only pass never redispatches: work observed
+            # incomplete without decisive completion evidence stays
+            # unreconciled instead of triggering a fenced replay.
+            return None
+        observed = reobserve()
+        if observed is False and not allow_replay:
+            return None
+        return observed
 
     try:
         result = integration.replay_uncertain(
@@ -2969,6 +3735,7 @@ def _recover_supervised_dispatch(
                 "is not reflected in repository state"
             ),
             "last_result": "recovered_action_state_mismatch",
+            "action_id": item["action_id"],
         }
     return {
         "blocked": (
@@ -2976,6 +3743,7 @@ def _recover_supervised_dispatch(
             f"{result.get('reason', 'reconciliation required')}"
         ),
         "last_result": "uncertain_action_pending",
+        "action_id": item["action_id"],
     }
 
 
@@ -3335,6 +4103,15 @@ def _run_direct_change_loop_inner(
                 state_mod.set_status(state, cid, base.FAILED, f"completed state no longer verifiable: {why}")
             persist_direct_state(repo, cfg, state, cid)
             return r["status"]
+        if stage == "recovery":
+            # A registered supervised job drives its bounded recovery flow
+            # here; an unregistered run has no gate and is driven back onto
+            # the ordinary path with its behavior unchanged.
+            action = drive_supervised_recovery(repo, cfg, state, cid, r, supervised_gate)
+            persist_direct_state(repo, cfg, state, cid)
+            if action == "continue":
+                continue
+            return action
         # --- supervised budget pre-dispatch gate ---
         # Active only for a registered supervised job; it replaces the legacy
         # spend gate for that job while leaving the legacy path untouched. The
@@ -3469,15 +4246,20 @@ def _run_direct_change_loop_inner(
                 base.log(f"warning: failed to write telemetry for {cid}/{stage} r{round_num}: {exc}")
                 return None
 
-        def _reconcile_supervised(outcome: str, record: dict | None) -> None:
-            """Resolve the current action after a dispatch attempt."""
+        def _reconcile_supervised(outcome: str, record: dict | None) -> dict | None:
+            """Resolve the current action after a dispatch attempt.
+
+            Returns the bounded-recovery result for a failing outcome so the
+            caller can route the change into the driven recovery phase; a
+            clean outcome (or an unregistered run) returns ``None``.
+            """
             if supervised_gate is None:
-                return
+                return None
             entry = gate_reservation or {}
             reservation_id = entry.get("reservation_id")
             action_id = entry.get("action_id")
             if reservation_id is None and action_id is None:
-                return
+                return None
             _load_journal_dispatch().resolve_dispatch(
                 supervised_gate,
                 action_id=action_id,
@@ -3485,16 +4267,40 @@ def _run_direct_change_loop_inner(
                 outcome=outcome,
                 record=record,
             )
+            if outcome == "invalid_output" and action_id is not None:
+                # An invalid structured result is a definitive judgment, not
+                # an interrupted observation: the worker exited and its output
+                # was parsed and found unusable. Resolve the action to failed
+                # so it cannot linger uncertain and block the bounded retry or
+                # the recovery redispatch behind a nonexistent uncertainty.
+                _load_journal_dispatch().fail_judged_action(
+                    supervised_gate,
+                    action_id=action_id,
+                    detail="invalid structured worker output",
+                )
+            recovery = None
             # A non-clean outcome is one failing attempt at this stage's stable
             # signature; a clean outcome does not consume the bound.
             if outcome not in ("completed", "exited"):
                 supervised_gate_record_incident(
                     supervised_gate, cid, stage, discriminator="dispatch"
                 )
+                # Route the failed supervised dispatch into bounded recovery:
+                # classify it, link the incident to its signature, and record
+                # any primary-chosen remedy. An unregistered run has no gate
+                # and consults no recovery code.
+                recovery = begin_supervised_recovery(
+                    supervised_gate,
+                    cid,
+                    stage,
+                    dispatch_failure_evidence(outcome, record),
+                    run_id=state.get("run_id", ""),
+                )
             # The reconciled record is current; clear the pending action so a
             # retry within this stage cannot reconcile the same action twice.
             entry["reservation_id"] = None
             entry["action_id"] = None
+            return recovery
 
         # ---- escalation: swap OPSX_IMPLEMENTER_MODEL before each implement dispatch ----
         if stage == "implement":
@@ -3542,6 +4348,7 @@ def _run_direct_change_loop_inner(
         parse_why = ""
         envelope: dict | None = None
         recovered_stage = False
+        recovery_rerouted = False
         while True:
             # ---- supervised budget pre-dispatch gate ----
             # Reserve before any dispatch side effect. A reserve that cannot
@@ -3583,6 +4390,65 @@ def _run_direct_change_loop_inner(
                     r["last_result"] = gate_reservation.get(
                         "last_result", "budget_blocked"
                     )
+                    if r["last_result"] == "uncertain_action_pending":
+                        # An interrupted action could not be reconciled from
+                        # evidence: a registered job routes the process
+                        # interruption into the driven recovery phase, which
+                        # reconciles the recorded action through the journal
+                        # evidence boundary and resumes only after decisive
+                        # reconciliation. A bounded escalation fails the
+                        # change terminally. The registered-job guard is
+                        # inside the helper; an unregistered run keeps the
+                        # legacy pending-budget halt below.
+                        recovery = begin_supervised_recovery(
+                            supervised_gate,
+                            cid,
+                            stage,
+                            {
+                                "failure_class": "process_interruption",
+                                "message": reason,
+                            },
+                            run_id=state.get("run_id", ""),
+                        )
+                        if (
+                            isinstance(recovery, dict)
+                            and recovery.get("status") == "recovering"
+                        ):
+                            r["recovery"] = {
+                                "incident_id": recovery.get("incident_id"),
+                                "failure_class": recovery.get("failure_class"),
+                                "signature": recovery.get("signature"),
+                                "origin_stage": stage,
+                                "summary": reason,
+                                # The specific interrupted action this
+                                # incident reconciles before any resume.
+                                "action_id": gate_reservation.get("action_id"),
+                            }
+                            r["phase"] = "recovery"
+                            state_mod.set_status(
+                                state, cid, base.PENDING,
+                                f"{reason}; bounded incident recovery is pending",
+                            )
+                            base.log(
+                                f"  {reason}; routed to bounded incident "
+                                f"recovery (incident "
+                                f"{recovery.get('incident_id')})"
+                            )
+                            persist_direct_state(repo, cfg, state, cid)
+                            recovery_rerouted = True
+                            break
+                        if (
+                            isinstance(recovery, dict)
+                            and recovery.get("status") == "escalated"
+                        ):
+                            r["last_result"] = "recovery_escalated"
+                            state_mod.set_status(state, cid, base.FAILED, reason)
+                            _try_notify(
+                                cfg, "change_failed", reason, change_id=cid
+                            )
+                            base.log(f"  {reason}")
+                            persist_direct_state(repo, cfg, state, cid)
+                            return "failed"
                     blocked_status = (
                         base.FAILED
                         if r["last_result"] == "recovered_action_state_mismatch"
@@ -3643,8 +4509,27 @@ def _run_direct_change_loop_inner(
 
             if outcome == "timeout":
                 telemetry_record = _write_telemetry("timeout", f"{stage} timed out")
-                _reconcile_supervised("timeout", telemetry_record)
+                recovery = _reconcile_supervised("timeout", telemetry_record)
                 state_mod.rec(state, cid)["last_result"] = f"{stage}_timeout"
+                if isinstance(recovery, dict) and recovery.get("status") == "recovering":
+                    # A registered job's transient dispatch failure is routed
+                    # to the driven recovery phase (bounded retry) instead of
+                    # turning terminal; legacy runs keep the terminal halt.
+                    r["recovery"] = {
+                        "incident_id": recovery.get("incident_id"),
+                        "failure_class": recovery.get("failure_class"),
+                        "signature": recovery.get("signature"),
+                        "origin_stage": stage,
+                        "summary": f"{stage} timed out",
+                    }
+                    r["phase"] = "recovery"
+                    state_mod.set_status(
+                        state, cid, base.PENDING,
+                        f"{stage} timed out; bounded incident recovery is pending",
+                    )
+                    persist_direct_state(repo, cfg, state, cid)
+                    recovery_rerouted = True
+                    break
                 state_mod.set_status(state, cid, base.FAILED, f"{stage} timed out")
                 _try_notify(cfg, "change_failed", f"{stage} timed out", change_id=cid)
                 persist_direct_state(repo, cfg, state, cid)
@@ -3666,8 +4551,29 @@ def _run_direct_change_loop_inner(
                 attempt_input = input_block + "\n" + _INVALID_OUTPUT_RETRY_HINT
                 continue
             telemetry_record = _write_telemetry("invalid_output", parse_why)
-            _reconcile_supervised("invalid_output", telemetry_record)
+            recovery = _reconcile_supervised("invalid_output", telemetry_record)
             state_mod.rec(state, cid)["last_result"] = "subagent_output_invalid"
+            # The dispatch's built-in retries are exhausted: a registered job
+            # is routed to the driven recovery phase (fixer repair plus
+            # independent verification) and fails only when recovery escalates
+            # or its bound is exhausted. Legacy runs are untouched.
+            if isinstance(recovery, dict) and recovery.get("status") == "recovering":
+                r["recovery"] = {
+                    "incident_id": recovery.get("incident_id"),
+                    "failure_class": recovery.get("failure_class"),
+                    "signature": recovery.get("signature"),
+                    "origin_stage": stage,
+                    "summary": f"{stage} output invalid: {parse_why}",
+                }
+                r["phase"] = "recovery"
+                state_mod.set_status(
+                    state, cid, base.PENDING,
+                    f"{stage} output invalid: {parse_why}; "
+                    "bounded incident recovery is pending",
+                )
+                persist_direct_state(repo, cfg, state, cid)
+                recovery_rerouted = True
+                break
             if stage == "archive":
                 state_mod.rec(state, cid)["archive"]["status"] = "failed"
                 state_mod.rec(state, cid)["archive"]["reason"] = parse_why
@@ -3675,6 +4581,9 @@ def _run_direct_change_loop_inner(
             _try_notify(cfg, "change_failed", f"{stage} output invalid", change_id=cid)
             persist_direct_state(repo, cfg, state, cid)
             return "failed"
+
+        if recovery_rerouted:
+            continue
 
         if recovered_stage:
             continue
@@ -3687,6 +4596,7 @@ def _run_direct_change_loop_inner(
             action = apply_review_result(
                 repo, cfg, state, cid, payload,
                 supervised=supervised_gate is not None,
+                gate=supervised_gate,
             )
         elif stage == "acceptance":
             action = apply_acceptance_result(
@@ -3709,6 +4619,7 @@ def _run_direct_change_loop_inner(
             action = apply_archive_result(
                 repo, cfg, state, cid, payload,
                 supervised=supervised_gate is not None,
+                gate=supervised_gate,
             )
         persist_direct_state(repo, cfg, state, cid)
 

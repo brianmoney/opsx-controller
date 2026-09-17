@@ -45,6 +45,18 @@ from lib.supervisor import model_policy
 # of ``MODEL_POLICY_VERSION``.
 BUDGET_SCHEMA_VERSION = 1
 
+# The versioned ``standing_grants`` payload of the protected job policy. It is
+# an operator-established standing permission naming the recovery effects a job
+# may perform unattended and their bounds. It shares the forward-only version
+# discipline of the budget payloads: absent, unversioned, malformed, or
+# newer-than-supported is never interpreted as a current grant.
+STANDING_GRANT_SCHEMA_VERSION = 1
+
+#: The policy field name carrying the grant, and the complete closed vocabulary
+#: of durable effects it can authorize.
+STANDING_GRANT_FIELD = "standing_grants"
+STANDING_GRANT_EFFECTS: tuple[str, ...] = ("commit", "reset", "resume")
+
 # v1 conservative defaults. A reservation estimate is
 # ``rate(pinned model) x DEFAULT_TOKEN_CAP_ENVELOPE x HEADROOM_MULTIPLIER``,
 # where the envelope is the per-call token cap used when the provider exposes
@@ -105,6 +117,18 @@ class BudgetExhaustedError(BudgetError):
 
 class BoundedAttemptsExceededError(BudgetError):
     """An identical incident attempt reached the policy's bounded limit."""
+
+
+class StandingGrantError(BudgetError):
+    """Base class for standing-grant schema failures."""
+
+
+class StandingGrantVersionError(StandingGrantError):
+    """A recorded standing-grant version is newer than this code supports."""
+
+
+class StandingGrantShapeError(StandingGrantError):
+    """A standing-grant payload is malformed or has an unsupported shape."""
 
 
 def _check_required_keys(payload: Mapping[str, Any], required: Iterable[str], field: str) -> None:
@@ -276,6 +300,176 @@ def decode_deadlines(value: Any) -> dict[str, Any]:
         "field": "deadlines",
         "payload": validate_deadlines(value),
     }
+
+
+# ---------------------------------------------------------------------------
+# standing_grants payload
+# ---------------------------------------------------------------------------
+
+_STANDING_GRANT_KEYS = frozenset({"version", "effects"})
+_STANDING_GRANT_EFFECT_KEYS = frozenset({"max"})
+
+
+def _is_non_negative_int_value(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def validate_standing_grants(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate and normalize a versioned ``standing_grants`` payload.
+
+    The grant names a subset of :data:`STANDING_GRANT_EFFECTS` and, for each, a
+    ``max`` bound (a non-negative integer, or null for unbounded). Every
+    declared key SHALL be present and no unknown key is accepted. Raises
+    :class:`StandingGrantShapeError` on a malformed payload and
+    :class:`StandingGrantVersionError` on a newer-than-supported version. New
+    writes are strict: an unversioned payload is rejected here.
+    """
+    if not isinstance(payload, Mapping):
+        raise StandingGrantShapeError(
+            f"standing_grants must be a JSON object, got {type(payload).__name__}"
+        )
+    if "version" not in payload:
+        raise StandingGrantShapeError(
+            "standing_grants payload is missing its 'version' key"
+        )
+    version = payload["version"]
+    if not isinstance(version, int) or isinstance(version, bool):
+        raise StandingGrantShapeError(
+            f"standing_grants payload 'version' must be an integer, got {version!r}"
+        )
+    if version > STANDING_GRANT_SCHEMA_VERSION:
+        raise StandingGrantVersionError(
+            f"standing_grants version {version} is newer than supported version "
+            f"{STANDING_GRANT_SCHEMA_VERSION}; reinstall the matching runtime"
+        )
+    if version < STANDING_GRANT_SCHEMA_VERSION:
+        raise StandingGrantShapeError(
+            f"standing_grants version {version} is older than supported version "
+            f"{STANDING_GRANT_SCHEMA_VERSION}"
+        )
+    extra = sorted(set(payload) - _STANDING_GRANT_KEYS)
+    if extra:
+        raise StandingGrantShapeError(
+            "standing_grants payload has unsupported key(s): " + ", ".join(extra)
+        )
+    if "effects" not in payload:
+        raise StandingGrantShapeError(
+            "standing_grants payload is missing its 'effects' key"
+        )
+    effects = payload["effects"]
+    if not isinstance(effects, Mapping):
+        raise StandingGrantShapeError(
+            f"standing_grants 'effects' must be a JSON object, got "
+            f"{type(effects).__name__}"
+        )
+    normalized: dict[str, dict[str, Any]] = {}
+    for effect, bound in effects.items():
+        if effect not in STANDING_GRANT_EFFECTS:
+            raise StandingGrantShapeError(
+                f"standing_grants names unknown effect {effect!r}; expected one of "
+                + ", ".join(STANDING_GRANT_EFFECTS)
+            )
+        if not isinstance(bound, Mapping):
+            raise StandingGrantShapeError(
+                f"standing_grants effect {effect!r} must be an object, got "
+                f"{type(bound).__name__}"
+            )
+        unknown = sorted(set(bound) - _STANDING_GRANT_EFFECT_KEYS)
+        if unknown:
+            raise StandingGrantShapeError(
+                f"standing_grants effect {effect!r} has unsupported key(s): "
+                + ", ".join(unknown)
+            )
+        if "max" not in bound:
+            raise StandingGrantShapeError(
+                f"standing_grants effect {effect!r} is missing its 'max' bound"
+            )
+        maximum = bound["max"]
+        if maximum is not None and not _is_non_negative_int_value(maximum):
+            raise StandingGrantShapeError(
+                f"standing_grants effect {effect!r} 'max' must be a non-negative "
+                f"integer or null, got {maximum!r}"
+            )
+        normalized[effect] = {"max": maximum}
+    return {
+        "version": STANDING_GRANT_SCHEMA_VERSION,
+        "effects": {
+            effect: normalized[effect]
+            for effect in STANDING_GRANT_EFFECTS
+            if effect in normalized
+        },
+    }
+
+
+def encode_standing_grants(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate and normalize a versioned ``standing_grants`` payload for a write."""
+    return validate_standing_grants(payload)
+
+
+def decode_standing_grants(value: Any) -> dict[str, Any]:
+    """Decode a stored ``standing_grants`` payload, tagged like the others.
+
+    ``state`` is ``versioned`` (normalized payload under ``payload``) or
+    ``legacy_unversioned`` (the original value preserved and never interpreted
+    as a current grant). A consumer fails closed and authorizes no effect.
+    """
+    if not isinstance(value, Mapping) or "version" not in value:
+        return {
+            "state": "legacy_unversioned",
+            "field": STANDING_GRANT_FIELD,
+            "payload": value,
+        }
+    return {
+        "state": "versioned",
+        "field": STANDING_GRANT_FIELD,
+        "payload": validate_standing_grants(value),
+    }
+
+
+def standing_grants_value(policy: Mapping[str, Any] | None) -> Any:
+    """Return the stored grant payload from *policy*, or ``None`` when absent.
+
+    The grant is the operator-established standing permission, so it is read
+    either as a top-level policy key or from the protected ``authority_config``
+    payload, whichever shape the ledger holds.
+    """
+    if not isinstance(policy, Mapping):
+        return None
+    if STANDING_GRANT_FIELD in policy:
+        return policy[STANDING_GRANT_FIELD]
+    authority = policy.get("authority_config")
+    if isinstance(authority, Mapping) and STANDING_GRANT_FIELD in authority:
+        return authority[STANDING_GRANT_FIELD]
+    return None
+
+
+def standing_grant_state(policy: Mapping[str, Any] | None) -> str:
+    """Return ``versioned`` or ``legacy_unversioned`` for *policy*'s grant."""
+    return str(decode_standing_grants(standing_grants_value(policy))["state"])
+
+
+#: Namespace prefix for the durable per-effect grant consumption counter, which
+#: is stored in the existing ``incident_attempts`` table so it survives
+#: ``opsx-plan reset`` like every other incident signature count.
+GRANT_SIGNATURE_PREFIX = "standing_grant|"
+
+
+def grant_effect_consumption(ledger: Any, job_id: int, effect: str) -> int:
+    """Return the durable count of granted *effect* consumptions for a job."""
+    return int(
+        ledger.incident_attempt_count(
+            int(job_id), signature=f"{GRANT_SIGNATURE_PREFIX}{effect}"
+        )
+    )
+
+
+def record_grant_effect_consumption(ledger: Any, job_id: int, effect: str) -> int:
+    """Durably record one granted *effect* consumption and return the new count."""
+    return int(
+        ledger.record_incident_attempt(
+            int(job_id), signature=f"{GRANT_SIGNATURE_PREFIX}{effect}"
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -783,6 +977,10 @@ def operator_budget_increase(
 
 __all__ = [
     "BUDGET_SCHEMA_VERSION",
+    "STANDING_GRANT_SCHEMA_VERSION",
+    "STANDING_GRANT_FIELD",
+    "STANDING_GRANT_EFFECTS",
+    "GRANT_SIGNATURE_PREFIX",
     "DEFAULT_TOKEN_CAP_ENVELOPE",
     "HEADROOM_MULTIPLIER",
     "BACKOFF_BASE_SECONDS",
@@ -803,12 +1001,22 @@ __all__ = [
     "UnknownPricingError",
     "BudgetExhaustedError",
     "BoundedAttemptsExceededError",
+    "StandingGrantError",
+    "StandingGrantVersionError",
+    "StandingGrantShapeError",
     "validate_budgets",
     "encode_budgets",
     "decode_budgets",
     "validate_deadlines",
     "encode_deadlines",
     "decode_deadlines",
+    "validate_standing_grants",
+    "encode_standing_grants",
+    "decode_standing_grants",
+    "standing_grants_value",
+    "standing_grant_state",
+    "grant_effect_consumption",
+    "record_grant_effect_consumption",
     "budget_policy_state",
     "policy_block_reason",
     "enforce_policy",

@@ -437,7 +437,7 @@ class AcceptanceLedgerTests(unittest.TestCase):
         handle = self._open()
         handle.close()
         conn = sqlite3.connect(self.db_path)
-        conn.execute("PRAGMA user_version = 8")
+        conn.execute(f"PRAGMA user_version = {ledger.CURRENT_SCHEMA_VERSION + 1}")
         conn.commit()
         conn.close()
         with self.assertRaises(ledger.LedgerVersionError):
@@ -979,7 +979,11 @@ class AcceptanceStageDispatchTests(AcceptanceStageHarness):
         self.run_change()
         record = self.record()
         self.assertEqual(record["acceptance"]["outcome"], "accept")
-        self.assertEqual(record["phase"], "archive")
+        # The accept advanced the change to the archive stage dispatch.
+        self.assertEqual(
+            [entry["stage"] for entry in records[:4]],
+            ["implement", "review", "acceptance", "archive"],
+        )
         row = self.ledger.latest_acceptance_review(self.job_id, self.cid)
         self.assertIsNotNone(row)
         self.assertEqual(row["outcome"], "accept")

@@ -1065,6 +1065,41 @@ def record_session_binding(ledger: Any, action_id: int, session_id: str) -> int:
     )
 
 
+def fail_judged_action(gate: Mapping[str, Any], *, action_id: int, detail: str) -> str | None:
+    """Resolve a judged action to failed from a definitive outcome judgment.
+
+    Some outcomes are definitive judgments rather than interrupted
+    observations: the worker exited and its output was obtained and judged
+    unusable (an invalid structured result). Leaving such an action
+    ``uncertain`` would block the bounded retry and any recovery redispatch
+    behind an uncertainty that does not exist, so the action records a
+    decisive failed result and transitions to its terminal failed state. A
+    genuinely interrupted action (a crash, a timeout, a killed process) never
+    passes through here and keeps its uncertainty.
+    """
+    ledger = gate["ledger"]
+    try:
+        state = ledger.get_action(int(action_id))["state"]
+    except ledger_mod.UnknownRecordError:
+        return None
+    if state in JOURNAL_TERMINAL_STATES:
+        return state
+    ledger.record_evidence(
+        int(action_id),
+        kind=EVIDENCE_STAGE_RESULT,
+        payload={
+            "outcome": "failed",
+            "confirmed": True,
+            "completed": False,
+            "judgment": str(detail),
+        },
+    )
+    if state == "uncertain":
+        ledger.reconcile_action(int(action_id))
+    ledger.fail_action(int(action_id), detail=str(detail))
+    return "failed"
+
+
 # ---------------------------------------------------------------------------
 # Pending-uncertainty inventory and replay
 # ---------------------------------------------------------------------------
@@ -1334,6 +1369,7 @@ __all__ = [
     "end_active_dispatch",
     "evaluate_gates",
     "execution_elapsed_minutes",
+    "fail_judged_action",
     "gated_dispatch",
     "journal_disposition",
     "mark_active_uncertain",

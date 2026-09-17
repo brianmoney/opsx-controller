@@ -608,7 +608,10 @@ class ReservationWiringTests(SupervisedGateTestCase):
             discriminator="dispatch",
         )
         self.assertEqual(self.ledger.incident_attempt_count(1, signature), 1)
-        # A second identical failure is refused before it is dispatched.
+        # A second identical failure is refused before it is dispatched: the
+        # still-uncertain timed-out action routes to bounded incident
+        # recovery, which escalates the unreconcilable interruption and fails
+        # the change without redispatching.
         invoked: list[str] = []
         self.opsx_plan.invoke_direct_stage = lambda *a, **k: invoked.append("called")
         self.opsx_plan.state_mod.set_status(
@@ -616,8 +619,12 @@ class ReservationWiringTests(SupervisedGateTestCase):
         )
         self.opsx_plan.state_mod.rec(self.state, self.cid)["phase"] = "implement"
         result = self.run_change()
-        self.assertEqual(result, "budget")
+        self.assertEqual(result, "failed")
         self.assertEqual(invoked, [])
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
+        self.assertEqual(record["last_result"], "recovery_escalated")
+        # The bound still holds: no further dispatch attempt was consumed.
+        self.assertEqual(self.ledger.incident_attempt_count(1, signature), 1)
 
     def test_clean_dispatch_does_not_consume_attempt_bound(self) -> None:
         self.write_authored_change()
@@ -1566,6 +1573,646 @@ class RetainedDispatchElapsedTests(SupervisedGateTestCase):
         # The retained reservation still carries its reserved estimate.
         self.assertGreater(consumption_before["retained_cost_usd"], 0.0)
         self.assertEqual(consumption_before["reserved_cost_usd"], 0.0)
+
+
+class SupervisedRecoveryDriverTests(SupervisedGateTestCase):
+    """End-to-end supervised recovery: the recovery phase is driven.
+
+    Round-3 corrective coverage for ``add-bounded-incident-recovery``: the
+    production orchestrator must drive the bounded recovery flow (fixer plus
+    independent verifier through the journal boundary, bounded transient
+    retry, standing-grant gating, and routing to the normal/fresh-review
+    loop) instead of only recording recovery metadata, and must fail a
+    registered change only after escalation or bound exhaustion. Round-4
+    corrective coverage adds the process-interruption flow: an unreconciled
+    uncertain action is routed into the recovery phase, resumes only after
+    decisive reconciliation through the journal evidence boundary, and
+    otherwise escalates durably without redispatch. Round-5 corrective
+    coverage keys the reconciliation to the recorded action id: a terminally
+    failed or unrecorded interrupted action escalates, and a coexisting
+    unrelated pending action is neither conflated with the recorded action
+    nor cleared by its reconciliation.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.cfg["acceptance_invoke"] = (
+            "opencode run --agent opsx-acceptance-reviewer "
+            "--model $OPSX_ACCEPTANCE_REVIEWER_MODEL"
+        )
+        self.cfg["fix_invoke"] = (
+            "opencode run --agent opsx-fixer --model $OPSX_FIXER_MODEL"
+        )
+        self.cfg["verify_invoke"] = (
+            "opencode run --agent opsx-verifier --model $OPSX_VERIFIER_MODEL"
+        )
+        patcher = mock.patch.dict(
+            os.environ,
+            {
+                "OPSX_ACCEPTANCE_REVIEWER_MODEL": "openai/gpt-4o",
+                "OPSX_FIXER_MODEL": "openai/gpt-4o",
+                "OPSX_VERIFIER_MODEL": "openai/gpt-4o",
+            },
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    # -- fixture helpers --
+
+    def register_granted_job(self, *, resume_bound: int = 10) -> int:
+        policy = _policy()
+        policy["authority_config"]["standing_grants"] = {
+            "version": 1,
+            "effects": {"resume": {"max": resume_bound}},
+        }
+        job_id = self.register_job(policy=policy)
+        self.enable_gate_env()
+        return job_id
+
+    def record(self) -> dict:
+        return self.opsx_plan.state_mod.rec(self.state, self.cid)
+
+    def incidents(self) -> list:
+        return self.ledger.list_incidents(self.job_id)
+
+    def authoritative_artifacts(self) -> list[str]:
+        policy = self.ledger.current_policy(self.job_id)
+        gate = {"manifest_snapshot_hash": policy["manifest_snapshot_hash"]}
+        _revision, _review_set, identities = (
+            self.opsx_plan.compute_acceptance_revision(
+                self.repo, self.cfg, self.state, self.cid, gate=gate
+            )
+        )
+        return identities
+
+    def archive_change_in_repo(self) -> tuple[str, str]:
+        src = self.repo / "openspec" / "changes" / self.cid
+        archive_rel = f"openspec/changes/archive/2026-07-02-{self.cid}"
+        dst = self.repo / archive_rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dst)
+        tracked = subprocess.run(
+            ["git", "ls-files", "--", f"openspec/changes/{self.cid}"],
+            cwd=self.repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        if tracked:
+            git(self.repo, "add", "-A", "--", f"openspec/changes/{self.cid}")
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            cwd=self.repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        if not staged:
+            return archive_rel, ""
+        git(
+            self.repo,
+            "-c", "user.email=test@example.invalid",
+            "-c", "user.name=Test User",
+            "commit", "-m", f"archive({self.cid}): archive completed change",
+        )
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=self.repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        return archive_rel, commit
+
+    def recovery_runner(self, payloads: list[dict]) -> list[dict]:
+        records: list[dict] = []
+
+        def fake_invoke(repo, cfg, cid, stage, round_num, input_block):
+            integration = self.opsx_plan.journal_dispatch
+            if integration is not None and integration.active_dispatch() is not None:
+                context = integration.active_dispatch()
+                integration.record_session_binding(
+                    context["ledger"], context["action_id"],
+                    f"fake-{stage}-{round_num}-{len(records)}",
+                )
+            self.assertTrue(payloads, f"unexpected stage call: {stage}")
+            payload = payloads.pop(0)
+            self.assertEqual(stage, payload["stage"], "stage order mismatch")
+            mutate = payload.get("mutate")
+            if mutate is not None:
+                mutate(self)
+            if stage == "archive" and payload.get("archive_repo"):
+                archive_path, commit = self.archive_change_in_repo()
+                payload = {
+                    **payload,
+                    "result": {
+                        **payload["result"],
+                        "archive_path": archive_path,
+                        "commit": commit,
+                    },
+                }
+            body = payload.get("body")
+            if body is None:
+                body = json.dumps(payload["result"]) + "\n"
+            log_path = self.opsx_plan.next_stage_log_path(repo, cid, stage, round_num)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(body, encoding="utf-8")
+            outcome = payload.get("outcome", "exited")
+            records.append({"stage": stage, "round": round_num, "outcome": outcome})
+            return outcome, log_path
+
+        self.opsx_plan.invoke_direct_stage = fake_invoke
+        return records
+
+    # -- payload builders --
+
+    def implement_payload(self) -> dict:
+        return {
+            "stage": "implement",
+            "result": {
+                "status": "implemented", "change": self.cid, "round": 1,
+                "progress_made": True, "completed_tasks": ["1.1"],
+                "remaining_tasks": [], "task_counts": {"complete": 1, "total": 1},
+                "files_touched": [], "known_change_files": [],
+                "summary": "done",
+            },
+        }
+
+    def review_payload(self, verdict: str = "pass", locus: str = "") -> dict:
+        findings = []
+        counts = {"critical": 0, "warning": 0, "note": 0}
+        if verdict != "pass":
+            counts["critical"] = 1
+            findings = [
+                {
+                    "severity": "critical",
+                    "locus": [locus],
+                    "statement": "the recurring defect is still present",
+                }
+            ]
+        return {
+            "stage": "review",
+            "result": {
+                "status": "reviewed", "change": self.cid, "round": 1,
+                "verdict": verdict, "finding_counts": counts,
+                "findings": findings,
+                "summary": "review clean" if verdict == "pass" else "defect found",
+                "fix_prompt": "repair the defect" if verdict != "pass" else "",
+            },
+        }
+
+    def acceptance_payload(self) -> dict:
+        return {
+            "stage": "acceptance",
+            "result": {
+                "role": "acceptance_reviewer",
+                "outcome": "accept",
+                "artifacts_reviewed": self.authoritative_artifacts(),
+                "reason": "accept",
+                "fix_prompt": "",
+            },
+        }
+
+    def fixer_payload(self) -> dict:
+        return {
+            "stage": "fix",
+            "result": {
+                "role": "fixer",
+                "repair": "repaired the defect named by the incident",
+                "files": ["tracked.txt"],
+                "checks": [],
+                "self_certified": False,
+            },
+        }
+
+    def verifier_payload(self, verdict: str = "pass") -> dict:
+        return {
+            "stage": "verify",
+            "result": {
+                "role": "verifier",
+                "verdict": verdict,
+                "repair_verified": verdict == "pass",
+                "diff_reviewed": True,
+                "evidence": [],
+                "reason": f"verifier {verdict}",
+            },
+        }
+
+    def archive_payload(self) -> dict:
+        return {
+            "stage": "archive",
+            "archive_repo": True,
+            "result": {
+                "status": "archived", "change": self.cid,
+                "archive_path": "", "spec_sync_status": "no-delta",
+                "commit": "", "summary": "archive succeeded",
+            },
+        }
+
+    # -- tests --
+
+    def spawn_interrupted_implement_action(self) -> int:
+        """Dispatch an implement action whose outcome was never recorded.
+
+        The action is left in its dispatched state, so the next run's
+        reconcile pass marks it uncertain — the journaled shape of a process
+        interruption.
+        """
+        integration = self.opsx_plan._load_journal_dispatch()
+        with self.supervised_execution():
+            gate = self.opsx_plan.open_supervised_gate(
+                self.repo, self.cfg["_manifest_path"]
+            )
+            entry = integration.gated_dispatch(
+                self.repo, self.cfg, gate, self.cid, "implement", 1,
+                {"escalation": {"active": False}}, "run-1",
+                resolved_model="openai/gpt-4o",
+            )
+            self.opsx_plan.close_supervised_gate(gate)
+        # The interrupted controller lost its in-process dispatch context;
+        # only the journaled action survives.
+        integration.end_active_dispatch()
+        return int(entry["action_id"])
+
+    def unchecked_tasks(self) -> None:
+        tasks_path = self.opsx_plan.groundtruth.change_dir(
+            self.repo, self.cid
+        ) / "tasks.md"
+        tasks_path.write_text(
+            "## 1. Tasks\n\n- [ ] 1.1 Example task\n", encoding="utf-8"
+        )
+
+    def test_process_interruption_reconciles_from_decisive_evidence(self) -> None:
+        self.write_authored_change()
+        self.unchecked_tasks()
+        self.register_granted_job()
+        action_id = self.spawn_interrupted_implement_action()
+        with self.supervised_execution():
+            gate = self.opsx_plan.open_supervised_gate(
+                self.repo, self.cfg["_manifest_path"]
+            )
+            recovery = self.opsx_plan.begin_supervised_recovery(
+                gate,
+                self.cid,
+                "implement",
+                {
+                    "failure_class": "process_interruption",
+                    "message": "interrupted before the outcome was recorded",
+                },
+                run_id="run-1",
+            )
+            self.opsx_plan.close_supervised_gate(gate)
+        self.assertIsInstance(recovery, dict)
+        self.assertEqual(recovery.get("status"), "recovering")
+        record = self.record()
+        record["recovery"] = {
+            "incident_id": recovery.get("incident_id"),
+            "failure_class": recovery.get("failure_class"),
+            "signature": recovery.get("signature"),
+            "origin_stage": "implement",
+            "summary": "interrupted before the outcome was recorded",
+            "action_id": action_id,
+        }
+        record["phase"] = "recovery"
+        # Decisive repository evidence: the interrupted worker completed the
+        # change's tasks before its journal transition was interrupted.
+        tasks_path = self.opsx_plan.groundtruth.change_dir(
+            self.repo, self.cid
+        ) / "tasks.md"
+        tasks_path.write_text(
+            "## 1. Tasks\n\n- [x] 1.1 Example task\n", encoding="utf-8"
+        )
+        records = self.recovery_runner(
+            [
+                self.review_payload(),
+                self.acceptance_payload(),
+                self.archive_payload(),
+            ]
+        )
+        result = self.run_change()
+        self.assertEqual(result, self.opsx_plan.base.DONE)
+        # The interrupted implement action reconciled from decisive evidence
+        # and was never redispatched; the change resumed at review.
+        self.assertEqual(
+            [entry["stage"] for entry in records],
+            ["review", "acceptance", "archive"],
+        )
+        self.assertEqual(self.ledger.get_action(action_id)["state"], "completed")
+        incidents = [
+            row for row in self.incidents() if row["kind"] == "process_interruption"
+        ]
+        self.assertTrue(
+            incidents, "a process-interruption incident must be recorded"
+        )
+        self.assertEqual(incidents[-1]["state"], "resolved")
+        self.assertEqual(self.record()["recovery"], {})
+
+    def test_unreconciled_process_interruption_escalates_without_redispatch(
+        self,
+    ) -> None:
+        self.write_authored_change()
+        self.unchecked_tasks()
+        self.register_granted_job()
+        action_id = self.spawn_interrupted_implement_action()
+        records = self.recovery_runner([])
+        result = self.run_change()
+        self.assertEqual(result, "failed")
+        # No stage was redispatched: the unreconciled action routed to the
+        # driven recovery phase, which escalated instead of replaying on an
+        # assumption.
+        self.assertEqual(records, [])
+        record = self.record()
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
+        self.assertEqual(record["last_result"], "recovery_escalated")
+        incidents = [
+            row for row in self.incidents() if row["kind"] == "process_interruption"
+        ]
+        self.assertTrue(
+            incidents, "a process-interruption incident must be recorded"
+        )
+        self.assertEqual(incidents[-1]["state"], "escalated")
+        self.assertEqual(self.ledger.get_action(action_id)["state"], "uncertain")
+        # The escalation is durable: a rerun keeps the terminal change result
+        # and still dispatches nothing.
+        self.assertEqual(self.run_change(), "failed")
+        self.assertEqual(records, [])
+
+    def begin_interruption_recovery(self, action_id: "int | None") -> dict:
+        """Record a process-interruption recovery context as the gate does."""
+        with self.supervised_execution():
+            gate = self.opsx_plan.open_supervised_gate(
+                self.repo, self.cfg["_manifest_path"]
+            )
+            recovery = self.opsx_plan.begin_supervised_recovery(
+                gate,
+                self.cid,
+                "implement",
+                {
+                    "failure_class": "process_interruption",
+                    "message": "interrupted before the outcome was recorded",
+                },
+                run_id="run-1",
+            )
+            self.opsx_plan.close_supervised_gate(gate)
+        self.assertIsInstance(recovery, dict)
+        self.assertEqual(recovery.get("status"), "recovering")
+        record = self.record()
+        record["recovery"] = {
+            "incident_id": recovery.get("incident_id"),
+            "failure_class": recovery.get("failure_class"),
+            "signature": recovery.get("signature"),
+            "origin_stage": "implement",
+            "summary": "interrupted before the outcome was recorded",
+            "action_id": action_id,
+        }
+        record["phase"] = "recovery"
+        return recovery
+
+    def test_failed_interrupted_action_escalates_without_resume(self) -> None:
+        self.write_authored_change()
+        self.unchecked_tasks()
+        self.register_granted_job()
+        action_id = self.spawn_interrupted_implement_action()
+        self.begin_interruption_recovery(action_id)
+        # Decisive terminal-failure evidence: the interrupted worker failed
+        # before its journal transition was interrupted. Resume requires the
+        # recorded action to be decisively reconciled as *completed*; a
+        # terminally failed action escalates instead.
+        integration = self.opsx_plan._load_journal_dispatch()
+        self.ledger.record_evidence(
+            action_id,
+            kind=integration.EVIDENCE_STAGE_RESULT,
+            payload={"confirmed": True, "completed": False, "outcome": "failed"},
+        )
+        records = self.recovery_runner([])
+        result = self.run_change()
+        self.assertEqual(result, "failed")
+        self.assertEqual(records, [])
+        record = self.record()
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
+        self.assertEqual(record["last_result"], "recovery_escalated")
+        incidents = [
+            row for row in self.incidents() if row["kind"] == "process_interruption"
+        ]
+        self.assertTrue(
+            incidents, "a process-interruption incident must be recorded"
+        )
+        self.assertEqual(incidents[-1]["state"], "escalated")
+        self.assertEqual(self.ledger.get_action(action_id)["state"], "failed")
+
+    def test_coexisting_pending_action_is_not_conflated(self) -> None:
+        self.write_authored_change()
+        self.unchecked_tasks()
+        self.register_granted_job()
+        action_id = self.spawn_interrupted_implement_action()
+        # An unrelated interrupted action coexists in the same job journal.
+        other_action_id = self.ledger.begin_action(
+            self.job_id,
+            kind="review",
+            run_id="run-1",
+            detail=json.dumps({"change_id": "other-change", "stage": "review"}),
+        )
+        self.ledger.mark_uncertain(other_action_id)
+        self.begin_interruption_recovery(action_id)
+        # Decisive repository evidence completes the recorded action only.
+        tasks_path = self.opsx_plan.groundtruth.change_dir(
+            self.repo, self.cid
+        ) / "tasks.md"
+        tasks_path.write_text(
+            "## 1. Tasks\n\n- [x] 1.1 Example task\n", encoding="utf-8"
+        )
+        records = self.recovery_runner([])
+        result = self.run_change()
+        # The recorded action reconciled from decisive evidence and resolved
+        # its incident; the coexisting action was neither conflated with it
+        # nor resolved by it, and kept blocking independently until its own
+        # escalation.
+        self.assertEqual(result, "failed")
+        self.assertEqual(records, [])
+        self.assertEqual(self.ledger.get_action(action_id)["state"], "completed")
+        self.assertEqual(
+            self.ledger.get_action(other_action_id)["state"], "uncertain"
+        )
+        incidents = [
+            row for row in self.incidents() if row["kind"] == "process_interruption"
+        ]
+        self.assertEqual(len(incidents), 2)
+        self.assertEqual(incidents[0]["state"], "resolved")
+        self.assertEqual(incidents[1]["state"], "escalated")
+        record = self.record()
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
+        self.assertEqual(record["last_result"], "recovery_escalated")
+
+    def test_recovery_without_recorded_action_escalates(self) -> None:
+        self.write_authored_change()
+        self.unchecked_tasks()
+        self.register_granted_job()
+        action_id = self.spawn_interrupted_implement_action()
+        # A recovery context that does not record the interrupted action
+        # cannot be reconciled: an empty job-wide pending inventory is not
+        # decisive completion, so the incident escalates.
+        self.begin_interruption_recovery(None)
+        tasks_path = self.opsx_plan.groundtruth.change_dir(
+            self.repo, self.cid
+        ) / "tasks.md"
+        tasks_path.write_text(
+            "## 1. Tasks\n\n- [x] 1.1 Example task\n", encoding="utf-8"
+        )
+        records = self.recovery_runner([])
+        result = self.run_change()
+        self.assertEqual(result, "failed")
+        self.assertEqual(records, [])
+        record = self.record()
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
+        self.assertEqual(record["last_result"], "recovery_escalated")
+        incidents = [
+            row for row in self.incidents() if row["kind"] == "process_interruption"
+        ]
+        self.assertTrue(
+            incidents, "a process-interruption incident must be recorded"
+        )
+        self.assertEqual(incidents[-1]["state"], "escalated")
+        self.assertNotEqual(
+            self.ledger.get_action(action_id)["state"], "completed"
+        )
+
+    def test_exhausted_invalid_output_drives_fixer_verifier_recovery(self) -> None:
+        self.write_authored_change()
+        self.register_granted_job()
+        self.cfg["invalid_output_retries"] = 1
+        records = self.recovery_runner(
+            [
+                {"stage": "implement", "body": "not a json envelope\n"},
+                {"stage": "implement", "body": "still not a json envelope\n"},
+                self.fixer_payload(),
+                self.verifier_payload(),
+                self.implement_payload(),
+                self.review_payload(),
+                self.acceptance_payload(),
+                self.archive_payload(),
+            ]
+        )
+        result = self.run_change()
+        self.assertEqual(result, self.opsx_plan.base.DONE)
+        self.assertEqual(
+            [entry["stage"] for entry in records],
+            [
+                "implement", "implement", "fix", "verify",
+                "implement", "review", "acceptance", "archive",
+            ],
+        )
+        incidents = [row for row in self.incidents() if row["kind"] == "invalid_result"]
+        self.assertTrue(incidents, "an invalid-result incident must be recorded")
+        self.assertEqual(incidents[-1]["state"], "resolved")
+        self.assertEqual(self.record()["recovery"], {})
+
+    def test_review_recurrence_drives_repair_and_fresh_review(self) -> None:
+        self.write_authored_change()
+        self.register_granted_job()
+        self.cfg["finding_recurrence_limit"] = 2
+        locus = "tracked.txt:defect"
+        records = self.recovery_runner(
+            [
+                self.implement_payload(),
+                self.review_payload(verdict="fail", locus=locus),
+                self.implement_payload(),
+                self.review_payload(verdict="fail", locus=locus),
+                self.fixer_payload(),
+                self.verifier_payload(),
+                self.review_payload(),
+                self.acceptance_payload(),
+                self.archive_payload(),
+            ]
+        )
+        result = self.run_change()
+        self.assertEqual(result, self.opsx_plan.base.DONE)
+        stages = [entry["stage"] for entry in records]
+        self.assertEqual(
+            stages,
+            [
+                "implement", "review", "implement", "review", "fix", "verify",
+                "review", "acceptance", "archive",
+            ],
+        )
+        incidents = [
+            row for row in self.incidents() if row["kind"] == "recurring_findings"
+        ]
+        self.assertTrue(incidents, "a recurring-findings incident must be recorded")
+        self.assertEqual(incidents[-1]["state"], "resolved")
+        record = self.record()
+        self.assertEqual(record["recovery"], {})
+        # The change was not marked failed at the recurrence ceiling: recovery
+        # resolved and routed it to a fresh review.
+        self.assertEqual(record["status"], self.opsx_plan.base.DONE)
+
+    def test_transient_dispatch_failure_drives_bounded_retry(self) -> None:
+        self.write_authored_change()
+        self.register_granted_job()
+        records = self.recovery_runner(
+            [
+                self.implement_payload(),
+                {"stage": "review", "outcome": "timeout", "body": ""},
+                self.review_payload(),
+                self.acceptance_payload(),
+                self.archive_payload(),
+            ]
+        )
+        result = self.run_change()
+        self.assertEqual(result, self.opsx_plan.base.DONE)
+        stages = [entry["stage"] for entry in records]
+        self.assertEqual(
+            stages, ["implement", "review", "review", "acceptance", "archive"]
+        )
+        incidents = [
+            row for row in self.incidents() if row["kind"] == "transient_provider"
+        ]
+        self.assertTrue(incidents, "a transient-provider incident must be recorded")
+        self.assertEqual(incidents[-1]["state"], "resolved")
+        self.assertEqual(self.record()["recovery"], {})
+
+    def test_partial_archive_routes_to_fresh_review_recovery(self) -> None:
+        self.write_authored_change()
+        self.register_granted_job()
+        self.cfg["fast_checks"] = ["test -f .fast-check-ok"]
+
+        def _pass_checks(case) -> None:
+            (case.repo / ".fast-check-ok").write_text("ok\n", encoding="utf-8")
+
+        records = self.recovery_runner(
+            [
+                self.implement_payload(),
+                self.review_payload(),
+                self.acceptance_payload(),
+                self.archive_payload(),
+                {**self.implement_payload(), "mutate": _pass_checks},
+                self.review_payload(),
+                self.acceptance_payload(),
+                self.archive_payload(),
+            ]
+        )
+        result = self.run_change()
+        self.assertEqual(result, self.opsx_plan.base.DONE)
+        stages = [entry["stage"] for entry in records]
+        self.assertEqual(
+            stages,
+            [
+                "implement", "review", "acceptance", "archive",
+                "implement", "review", "acceptance", "archive",
+            ],
+        )
+        incidents = [row for row in self.incidents() if row["kind"] == "partial_archive"]
+        self.assertTrue(incidents, "a partial-archive incident must be recorded")
+        self.assertEqual(incidents[-1]["state"], "resolved")
+        record = self.record()
+        # The prior archive was never treated as done: the change reran a
+        # fresh review round through the existing loop.
+        self.assertEqual(record["round"], 2)
+        self.assertEqual(record["status"], self.opsx_plan.base.DONE)
+
+    def test_unregistered_run_keeps_terminal_invalid_output_halt(self) -> None:
+        self.write_authored_change()
+        self.cfg["invalid_output_retries"] = 0
+        self.recovery_runner(
+            [{"stage": "implement", "body": "not a json envelope\n"}]
+        )
+        result = self.run_change()
+        self.assertEqual(result, "failed")
+        record = self.record()
+        self.assertEqual(record["last_result"], "subagent_output_invalid")
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
+        self.assertEqual(record["recovery"], {})
+        self.assertEqual(self.ledger.list_jobs(), [])
 
 
 if __name__ == "__main__":  # pragma: no cover

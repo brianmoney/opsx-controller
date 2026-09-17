@@ -1146,6 +1146,121 @@ cannot be read, the run fails closed: it blocks before dispatch rather than
 falling back to the unbudgeted legacy path, so a registered job is never
 dispatched without a reservation.
 
+## Bounded incident recovery
+
+A registered supervised run does not replay blindly or stop on the first
+ordinary failure. `lib/supervisor/recovery.py` owns failure classification, the
+closed incident-class and remedy vocabularies, the class-to-path mapping, the
+standing grant's evaluation, and the recovery orchestration that consumes the
+existing journaled dispatch boundary. It is standard-library only and imports
+no other runtime package.
+
+### Incident lifecycle
+
+Every incident carries the **stable attempt signature** of the failure class,
+material identity, and stage (`budgets.incident_signature`), so a later attempt
+on the same signature finds the incident it belongs to. An incident starts
+`open`, moves to `recovering`, and reaches a terminal `resolved` or
+`escalated`. Both terminal states refuse all further transitions, every
+transition is a durable ledger transaction guarded against an illegal source
+state, and an illegal or terminal transition is refused with a named error
+without altering the record. State and signature survive a ledger reopen and a
+process restart. The durable per-signature attempt counter lives in the
+external ledger, so it survives `opsx-plan reset` and an identical incident that
+recurs after a reset continues to accumulate against the same bound; when the
+job policy's `max_incident_attempts` is reached, further identical attempts are
+refused with a named bounded-attempts state and the incident is escalated.
+
+### Closed failure-class and remedy model
+
+The known classes are: an exhausted invalid structured result; a transient
+provider failure; a permanent provider error; a delta `MODIFIED` identity
+mismatch; a dirty worktree; recurring review findings; a process interruption
+with an unreconciled action; a partial archive or failed post-archive fast
+check; and a root runtime defect. Each resolves to exactly one bounded path, so
+no known class is left without one.
+
+Classification is evidence-based and pure: a server error, timeout, or
+connection reset is **transient**; an authentication, authorization, billing,
+hard-quota, or configuration error is **permanent** and is never retried; a
+failure whose class cannot be determined is **undetermined** and is treated as
+permanent, so the worst case is an escalation rather than an unbounded retry.
+Retrying never requires a worker, agent, or model decision. A transient failure
+retries only under the existing bounded backoff schedule (base 0.5 s, cap 8 s,
+max 3 attempts), and every retry is recorded durably. A permanent or
+unclassified failure escalates through `blocker_state` for operator action.
+
+The remedies are a fixed vocabulary (`retry_transient`, `redispatch`,
+`repair_artifact`, `repair_delta_identity`, `repair_worktree_preserving`,
+`reconcile_uncertain_action`, `fresh_review`, `escalate`,
+`report_runtime_defect`). The frontier primary chooses one the incident's class
+permits, from recorded evidence; the choice is journaled as action evidence
+before the repair's side effect. A remedy outside the class's permitted set —
+including any destructive whole-tree reset, checkout, or stash — is refused and
+recorded as a durable `policy_violation`.
+
+### Primary, fixer, and independent verifier
+
+Recovery never self-certifies. The primary chooses the remedy, the cheap
+`fixer` role applies the mechanical repair, and an independent `verifier`
+session reviews the actual diff. The fixer and verifier **dispatches** are
+repair *production* and are deliberately not gated on a verdict that does not
+exist yet; the gate fires on the repair-*consuming* durable effect — the
+`commit`, `reset`, or `resume` — through the existing
+`agent_contracts.assert_repair_consumable`. A fixer-only report, a same-session
+verdict, a missing `diff_reviewed`, or a contradicting verdict blocks
+consumption exactly as it does for the acceptance repair loop.
+
+### Standing grant
+
+A recovery effect that changes durable state is authorized by a **standing
+grant** recorded as durable protected job policy. The grant is a versioned
+`standing_grants` payload inside the protected `authority_config` (the policy's
+standing-permissions payload), naming the effects the job may perform
+unattended (`commit`, `reset`, `resume`) and each effect's bound. It is
+validated on write and decoded on read under one schema version; absent,
+malformed, or `legacy_unversioned` fails closed and authorizes no effect. The
+grant is
+consumed only after the independent verifier verdict passes, and an effect that
+is not covered or that would exceed its bound is escalated rather than
+performed. Only an explicit operator revision can create, change, or remove a
+grant; no worker, model session, fixer, verifier, reset, or automated path can
+create, widen, or bypass it.
+
+### Class-specific repairs preserve canonical intent and unrelated work
+
+The delta `MODIFIED` identity repair derives the corrected identity from the
+canonical specification, matching the delta requirement by content: the
+canonical specification stays the authority for the requirement's meaning and
+is never rewritten from the delta. The dirty-worktree path records the
+tracked, staged, and untracked state before touching anything, restricts the
+repair to the paths its remedy names, and verifies afterward that all unrelated
+work is intact; a remedy proposing a destructive whole-tree operation is
+refused by the vocabulary. A partial archive or failed post-archive fast check
+is never proof of done: it routes to a fresh review over the repaired revision
+through the existing implement/review/archive loop, bounded by that loop's
+round budget, and recovery introduces no separate completion, archive, or
+spec-synchronization authority.
+
+### Root runtime defects are never self-repaired
+
+A failure whose root cause is a defect in the installed supervision runtime or
+service classifies as `runtime_defect`, whose only path is an operator blocker.
+`lib/supervisor/recovery.py` exposes no API that edits the installed runtime or
+service, reloads it, or redeploys it, and dispatches no repair against the
+installed service, so the guarantee is structural rather than procedural.
+
+### Legacy runs are unchanged
+
+Every orchestrator recovery hook is guarded on the registered-job check: an
+unregistered run has no gate, consults no recovery code, and keeps its existing
+halt semantics. Reaching the recurrence ceiling still marks a change failed
+with the recurrence result for an unregistered run; for a registered
+supervised job the change is routed to bounded recovery and is marked failed
+with that result only when recovery escalates or its bounded attempts are
+exhausted. A recurrence whose recovery resolves returns the change to the
+normal implement/review loop under that loop's existing authorities.
+
 ## OpenCode session bridge
 
 The supervised primary session is driven through a documented, versioned

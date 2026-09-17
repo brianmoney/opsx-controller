@@ -46,6 +46,7 @@ SERVICE_VERBS: tuple[str, ...] = (
     "heartbeat",
     "release_delegated_gate",
     "report_violation",
+    "choose_remedy",
 )
 
 # Environment the shim reads. The socket env names are the broker client's, so

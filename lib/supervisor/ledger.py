@@ -35,7 +35,7 @@ from lib.supervisor import budgets
 from lib.supervisor import clock
 from lib.supervisor import model_policy
 
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 8
 CURRENT_POLICY_VERSION = 1
 
 # Durable broker receipt kinds and the authorities that may record them. A
@@ -71,6 +71,20 @@ FENCING_EVENTS = ("acquired", "released", "fenced")
 
 JOB_STATES = ("registered", "active", "paused", "completed", "failed", "cancelled")
 TERMINAL_JOB_STATES = ("completed", "failed", "cancelled")
+
+# Incident lifecycle. An incident starts ``open``, enters ``recovering`` while a
+# bounded recovery is in flight, and finishes in a terminal ``resolved`` or
+# ``escalated`` state. ``open`` may escalate directly: a permanent or
+# unclassified failure is surfaced for operator triage without a recovery
+# attempt ever starting. Terminal incidents refuse every further transition.
+INCIDENT_STATES = ("open", "recovering", "resolved", "escalated")
+TERMINAL_INCIDENT_STATES = ("resolved", "escalated")
+INCIDENT_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    "open": ("recovering", "escalated"),
+    "recovering": ("resolved", "escalated"),
+    "resolved": (),
+    "escalated": (),
+}
 
 # Journal states for an action. ``intent`` is committed before any side
 # effect; ``dispatched`` means the side effect was attempted; ``uncertain``
@@ -126,6 +140,28 @@ class JournalStateError(LedgerError):
 
 class UnknownRecordError(LedgerError):
     """A referenced job, action, or incident does not exist."""
+
+
+class IncidentTransitionError(LedgerError):
+    """An incident transition was attempted from an illegal source state."""
+
+
+class TerminalIncidentError(IncidentTransitionError):
+    """A terminal incident refuses all further transitions."""
+
+
+def legal_incident_transitions(state: str) -> tuple[str, ...]:
+    """Return the legal target states for incident *state*.
+
+    An unknown or terminal state has no legal targets, so a caller can guard a
+    proposed transition without duplicating the vocabulary.
+    """
+    return INCIDENT_TRANSITIONS.get(str(state), ())
+
+
+def incident_transition_allowed(source: str, target: str) -> bool:
+    """True when an incident may move from *source* to *target*."""
+    return str(target) in legal_incident_transitions(source)
 
 
 def _utcnow() -> str:
@@ -624,6 +660,34 @@ def _migrate_6_to_7(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+# The incidents table gained a nullable ``signature`` link in version 8. It is
+# declared separately from the version-1 ``incidents`` DDL so the version-1
+# schema still describes exactly what version-1 code wrote.
+_SCHEMA_V8_STATEMENTS = (
+    """
+    CREATE INDEX IF NOT EXISTS idx_incidents_signature
+        ON incidents (job_id, signature)
+    """,
+)
+
+
+def _migrate_7_to_8(conn: sqlite3.Connection) -> None:
+    """Link each incident to its stable attempt signature.
+
+    Strictly additive and forward-only: a nullable ``incidents.signature``
+    column plus an index, written inside the same single migration transaction
+    as every other step. Legacy rows keep ``NULL`` and are classified as
+    unlinked rather than reinterpreted; nothing about the existing incident
+    lifecycle state is rewritten. The same signature string is the key the
+    durable ``incident_attempts`` counter already uses, so an incident can find
+    the attempts recorded for its failure class.
+    """
+    if not _column_exists(conn, "incidents", "signature"):
+        conn.execute("ALTER TABLE incidents ADD COLUMN signature TEXT")
+    for statement in _SCHEMA_V8_STATEMENTS:
+        conn.execute(statement)
+
+
 MIGRATIONS: dict[int, Any] = {
     1: _migrate_0_to_1,
     2: _migrate_1_to_2,
@@ -632,6 +696,7 @@ MIGRATIONS: dict[int, Any] = {
     5: _migrate_4_to_5,
     6: _migrate_5_to_6,
     7: _migrate_6_to_7,
+    8: _migrate_7_to_8,
 }
 
 
@@ -1387,6 +1452,18 @@ class Ledger:
         # rejected here, mirroring the model-policy fields.
         fields["budgets"] = budgets.encode_budgets(fields["budgets"])
         fields["deadlines"] = budgets.encode_deadlines(fields["deadlines"])
+        # The operator-established standing grant is part of the protected
+        # authority configuration. When present it is validated against its own
+        # versioned schema here, so a malformed or unversioned grant is refused
+        # at the write rather than decoded leniently later. Absence is allowed
+        # at write time (it fails closed on read as legacy_unversioned).
+        authority = fields["authority_config"]
+        if isinstance(authority, Mapping) and budgets.STANDING_GRANT_FIELD in authority:
+            authority = dict(authority)
+            authority[budgets.STANDING_GRANT_FIELD] = budgets.encode_standing_grants(
+                authority[budgets.STANDING_GRANT_FIELD]
+            )
+            fields["authority_config"] = authority
         return fields
 
     def _insert_policy(
@@ -1492,6 +1569,11 @@ class Ledger:
         # 'version' key is classified legacy_unversioned and returned
         # unmodified.
         record["budget_policy_state"] = budgets.budget_policy_state(record)
+        # The standing grant shares the same read contract: a newer nested
+        # version raises StandingGrantVersionError, and an absent or
+        # unversioned value is classified legacy_unversioned so a consumer
+        # authorizes no recovery effect.
+        record["standing_grant_state"] = budgets.standing_grant_state(record)
         return record
 
     def current_policy(self, job_id: int) -> dict[str, Any]:
@@ -1528,17 +1610,35 @@ class Ledger:
         kind: str,
         summary: str = "",
         state: str = "open",
+        signature: str | None = None,
         run_id: str | None = None,
     ) -> int:
+        """Record one durable incident against *job_id*.
+
+        *signature* is the stable attempt signature of the failure class and
+        material identity the incident represents; it is the same string the
+        durable ``incident_attempts`` counter is keyed by, so an incident can
+        find the attempts already recorded for it. It is optional so existing
+        callers keep their behavior; a new incident is normally ``open``.
+        """
         self.get_job(job_id)
+        if str(state) not in INCIDENT_STATES:
+            raise LedgerError(f"unknown incident state: {state}")
+        normalized_signature = str(signature).strip() if signature else None
         now = _utcnow()
         with self._transaction():
             cursor = self._conn.execute(
                 """
-                INSERT INTO incidents (job_id, run_id, kind, state, summary, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO incidents (
+                    job_id, run_id, kind, state, summary, signature,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (job_id, run_id, kind, state, summary, now, now),
+                (
+                    job_id, run_id, kind, state, summary, normalized_signature,
+                    now, now,
+                ),
             )
             incident_id = int(cursor.lastrowid)
             _ = self._conn.execute(
@@ -1546,6 +1646,57 @@ class Ledger:
                 (incident_id, now, job_id),
             )
         return incident_id
+
+    def transition_incident(
+        self,
+        incident_id: int,
+        *,
+        target_state: str,
+        summary: str | None = None,
+    ) -> sqlite3.Row:
+        """Move *incident_id* to *target_state* in one durable transaction.
+
+        The transition is guarded against an illegal source state and against
+        every transition out of a terminal state. An illegal or terminal
+        transition raises a named error and leaves the incident record
+        unchanged; a transition succeeds only along the vocabulary declared in
+        :data:`INCIDENT_TRANSITIONS`. *summary*, when given, replaces the
+        incident summary so the resolved/escalated reason is durable.
+        """
+        if str(target_state) not in INCIDENT_STATES:
+            raise LedgerError(f"unknown incident state: {target_state}")
+        now = _utcnow()
+        with self._transaction():
+            row = self._conn.execute(
+                "SELECT * FROM incidents WHERE id = ?", (incident_id,)
+            ).fetchone()
+            if row is None:
+                raise UnknownRecordError(f"no such incident: {incident_id}")
+            source = str(row["state"])
+            if source in TERMINAL_INCIDENT_STATES:
+                raise TerminalIncidentError(
+                    f"incident {incident_id} is terminal ({source}); it refuses "
+                    f"further transitions (requested {target_state})"
+                )
+            if not incident_transition_allowed(source, target_state):
+                legal = legal_incident_transitions(source) or ("(none)",)
+                raise IncidentTransitionError(
+                    f"illegal incident transition {source} -> {target_state} for "
+                    f"incident {incident_id}; legal targets from {source}: "
+                    + ", ".join(legal)
+                )
+            self._conn.execute(
+                """
+                UPDATE incidents
+                SET state = ?, summary = COALESCE(?, summary), updated_at = ?
+                WHERE id = ?
+                """,
+                (target_state, summary, now, incident_id),
+            )
+            updated = self._conn.execute(
+                "SELECT * FROM incidents WHERE id = ?", (incident_id,)
+            ).fetchone()
+        return updated
 
     def get_incident(self, incident_id: int) -> sqlite3.Row:
         row = self._conn.execute(

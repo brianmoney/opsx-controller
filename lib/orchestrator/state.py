@@ -114,6 +114,7 @@ def new_change_record() -> dict:
         "last_review": default_last_review(),
         "archive": default_archive_state(),
         "acceptance": default_acceptance_state(),
+        "recovery": {},
         "history": [],
         "last_stage": default_last_stage(),
         "last_log": "",

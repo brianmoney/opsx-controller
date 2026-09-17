@@ -2665,3 +2665,287 @@ acceptance stage only gates advancement to archive.
 - **WHEN** the acceptance stage returns `accept` for a change
 - **THEN** the implementation review's gate behavior, verdict, and findings
   are unchanged and still apply
+
+### Requirement: Incidents have a durable lifecycle linked to their attempt signature
+
+Each incident SHALL carry the stable attempt signature of the failure class and
+material identity it represents, so a later attempt on the same signature can
+find the incident it belongs to. An incident SHALL progress through a defined
+state lifecycle: from `open` to `recovering`, and then to a terminal `resolved`
+or `escalated` state. `resolved` and `escalated` SHALL be terminal.
+
+Every incident state transition SHALL be a durable ledger transaction, SHALL be
+guarded against an illegal source state, and SHALL be refused with a named
+error without altering the record when it is not legal. A terminal incident
+SHALL refuse all further transitions. Incident state and signature SHALL
+survive a ledger reopen and a process restart.
+
+#### Scenario: An incident records its signature and starts open
+
+- **WHEN** a supervised failure is recorded as an incident
+- **THEN** the incident persists with its attempt signature in the `open`
+  state and the signature is queryable after the ledger is reopened
+
+#### Scenario: An incident is resolved through the lifecycle
+
+- **WHEN** recovery succeeds for an open incident
+- **THEN** the incident moves through `recovering` to `resolved`, durably, and
+  remains resolvable after a ledger reopen
+
+#### Scenario: An illegal incident transition is refused
+
+- **WHEN** a transition is requested from a state that is not a legal source
+  for it
+- **THEN** it is refused with a named error and the incident state is unchanged
+
+#### Scenario: A terminal incident refuses further transitions
+
+- **WHEN** a transition is requested on a `resolved` or `escalated` incident
+- **THEN** it is refused with a named error and the incident record is
+  unchanged
+
+### Requirement: Known failure classes map to bounded recovery paths
+
+The system SHALL define a closed set of known failure classes and, for each, a
+bounded recovery path. The known classes SHALL include: an invalid structured
+result after the dispatch's built-in retries are exhausted; a transient
+provider failure; a permanent provider error; a delta `MODIFIED` identity
+mismatch; a dirty worktree; recurring review findings; a process interruption
+with an unreconciled action; and a partial archive with post-archive
+fast-check failures.
+
+A failure that does not classify into a known recoverable class SHALL NOT be
+recovered automatically: it SHALL be recorded and surfaced for operator
+triage. Recovery SHALL never invent a repair path for an unclassified failure.
+
+#### Scenario: Each known class resolves to its bounded path
+
+- **WHEN** a failure is classified for each known failure class
+- **THEN** each resolves to its defined bounded recovery path and none is left
+  without one
+
+#### Scenario: An unclassified failure is not auto-recovered
+
+- **WHEN** a failure does not match any known recoverable class
+- **THEN** no recovery is attempted, and the failure is recorded and surfaced
+  for operator triage
+
+### Requirement: Transient provider failures retry under a bound while permanent errors escalate
+
+A transient provider failure — a server error, a timeout, or a connection
+reset — SHALL be classified as transient and retried only under a bounded
+retry schedule with a capped delay and a limited attempt count. Every retry
+SHALL be recorded durably.
+
+A permanent provider error — an authentication, authorization, billing, hard
+quota, or configuration error — SHALL be classified as permanent and SHALL NOT
+be retried. It SHALL be escalated for operator action instead.
+
+Classification SHALL be evidence-based, and a failure whose class cannot be
+determined SHALL be treated as permanent rather than retried. Retrying SHALL
+not require a worker, agent, or model decision.
+
+#### Scenario: A transient provider failure retries under a bound
+
+- **WHEN** a dispatch fails with a transient provider server error
+- **THEN** it is retried under the bounded schedule, each retry is recorded,
+  and exceeding the bound surfaces the failure instead of retrying further
+
+#### Scenario: A permanent provider error is not retried
+
+- **WHEN** a dispatch fails with a permanent authentication, billing, quota, or
+  configuration error
+- **THEN** no retry is attempted and the failure is escalated for operator
+  action
+
+#### Scenario: An undetermined failure class is not retried
+
+- **WHEN** a failure cannot be classified as either transient or permanent
+- **THEN** it is treated as permanent and is not retried automatically
+
+### Requirement: Recovery follows a primary-chosen remedy, a cheap fixer, and independent verification
+
+Recovery SHALL NOT replay blindly. For a recoverable incident, the frontier
+primary SHALL choose a remedy from the closed set the incident's failure class
+permits, based on recorded evidence, and the choice SHALL be journaled before
+its side effect. A chosen remedy outside the class's permitted set SHALL be
+refused and recorded as a policy violation.
+
+The mechanical repair SHALL be applied by the cheap fixer role. The repair
+SHALL be validated by an independent verifier in a session distinct from the
+fixer's, reviewing the actual diff. A commit, reset, or resume that consumes a
+recovery SHALL proceed only when the verifier's verdict passes and confirms
+the reviewed diff; a fixer's own report SHALL never self-certify a repair, a
+same-session verdict SHALL NOT count as independent, and a missing or
+contradicting verdict SHALL block consumption.
+
+#### Scenario: The primary chooses a remedy from evidence
+
+- **WHEN** a recoverable incident is presented with its evidence
+- **THEN** the primary's chosen remedy is recorded before the repair's side
+  effect, and a remedy outside the class's permitted set is refused as a
+  policy violation
+
+#### Scenario: A fixer claim alone does not consume a repair
+
+- **WHEN** a fixer reports a repair but no independent verifier verdict exists
+- **THEN** the commit, reset, or resume is blocked and no recovery effect
+  occurs
+
+#### Scenario: A same-session verdict is not independent
+
+- **WHEN** the verifier session is the fixer session
+- **THEN** the verdict does not satisfy the recovery gate and the effect is
+  blocked
+
+#### Scenario: A verified diff unlocks the recovery effect
+
+- **WHEN** an independent verifier returns a passing verdict that confirms the
+  repair against the actual diff
+- **THEN** the authorized commit, reset, or resume may proceed
+
+### Requirement: Recovery effects are authorized by an operator-established standing grant
+
+Recovery effects that change durable state — a commit, a reset, or a resume —
+SHALL be authorized by a standing grant recorded as durable protected job
+policy. The standing grant SHALL be established only by an explicit operator
+revision, SHALL name the recovery effects the job may perform unattended and
+their bounds, and SHALL survive restarts and `opsx-plan reset` unchanged.
+
+Recovery SHALL consume a standing grant only after the independent verifier
+verdict passes. No worker, model session, fixer, verifier, or automated path
+SHALL create, widen, or bypass a standing grant; a recovery effect that is not
+covered by the grant, or that would exceed its bounds, SHALL be escalated
+rather than performed. An absent standing grant SHALL authorize no recovery
+effect.
+
+#### Scenario: A covered effect runs under the grant
+
+- **WHEN** a verified recovery requests a commit, reset, or resume that the
+  job's standing grant covers and that is within its bounds
+- **THEN** the effect proceeds and the grant is recorded as the authorization
+
+#### Scenario: An uncovered effect is escalated
+
+- **WHEN** a verified recovery requests an effect that the standing grant does
+  not cover or that would exceed its bound
+- **THEN** the effect is not performed and the incident is escalated for
+  operator action
+
+#### Scenario: A worker cannot create or widen a grant
+
+- **WHEN** any non-operator path attempts to create, widen, or bypass a
+  standing grant
+- **THEN** the attempt is refused and the stored policy is unchanged
+
+#### Scenario: An absent grant authorizes nothing
+
+- **WHEN** a job has no standing grant and a verified recovery requests a
+  durable effect
+- **THEN** the effect is not performed and the request is escalated
+
+### Requirement: Each failure class repairs without altering canonical intent or discarding unrelated work
+
+The delta `MODIFIED` identity mismatch repair SHALL restore the delta's
+requirement identity to match the canonical specification while preserving the
+canonical intent: the canonical specification SHALL remain the authority for
+the requirement's meaning, and the repair SHALL NOT rewrite canonical
+requirement semantics to match the delta.
+
+The dirty-worktree recovery SHALL preserve all unrelated user work: tracked
+modifications, staged changes, and untracked files that are not part of the
+authorized repair SHALL remain intact. Recovery SHALL NOT discard, reset, or
+overwrite unrelated work, and SHALL change only the paths its authorized
+repair names.
+
+#### Scenario: Delta identity repair preserves canonical intent
+
+- **WHEN** a delta `MODIFIED` requirement identity does not match the
+  canonical specification and is repaired
+- **THEN** the repaired identity matches the canonical requirement while the
+  canonical requirement's meaning is preserved and not rewritten from the
+  delta
+
+#### Scenario: Unrelated worktree work is preserved
+
+- **WHEN** the worktree is dirty with modifications, staged changes, and
+  untracked files unrelated to the authorized repair and recovery proceeds
+- **THEN** all of that unrelated work remains intact, and only the authorized
+  repair's paths are changed
+
+#### Scenario: Discarding unrelated work is refused
+
+- **WHEN** a proposed recovery remedy would discard or reset unrelated
+  worktree work
+- **THEN** it is refused as outside the permitted remedy set and the unrelated
+  work is not touched
+
+### Requirement: Partial archive and failed fast checks require fresh review
+
+A partial archive, or an archive whose post-archive fast checks fail, SHALL NOT
+be treated as proof of done. Recovery SHALL revalidate the affected change
+against the same archive and check evidence an unsupervised run uses, and SHALL
+rerun an appropriate fresh review through the existing implement/review/archive
+loop when rework is required. Recovery SHALL introduce no separate completion
+authority, and the fresh review SHALL be bounded by the change's existing
+round budget.
+
+#### Scenario: A partial archive is not treated as done
+
+- **WHEN** recovery finds a change whose archive is partial or whose
+  post-archive fast check failed
+- **THEN** the change is not treated as done and an appropriate fresh review is
+  run through the existing loop
+
+#### Scenario: Recovery adds no completion authority
+
+- **WHEN** recovery repairs archive or completion material
+- **THEN** completion is still determined from the existing archive and check
+  evidence, and no recovery outcome by itself marks a change or plan complete
+
+### Requirement: A root runtime defect is reported and never self-repaired
+
+A failure whose root cause is a defect in the installed supervision runtime or
+service SHALL be classified as a runtime defect. Recovery SHALL record it as an
+operator blocker for operator or repository work and SHALL perform no
+self-repair: it SHALL NOT edit the installed runtime or service code, reload or
+redeploy the service, or dispatch a repair against the installed service.
+
+#### Scenario: A runtime defect becomes an operator blocker
+
+- **WHEN** a failure classifies as a root runtime defect in the installed
+  service
+- **THEN** recovery records an operator blocker naming the defect and performs
+  no automated repair
+
+#### Scenario: The service is never self-edited or self-deployed
+
+- **WHEN** a runtime defect is recorded
+- **THEN** no installed runtime or service file is modified and no service
+  reload, redeploy, or self-dispatch occurs
+
+### Requirement: Recovery attempts are bounded and durable across reset
+
+Each recovery attempt SHALL be recorded durably under the incident's attempt
+signature, and identical recovery attempts for the same signature SHALL be
+bounded by the job policy's incident-attempt limit. Signatures and their counts
+SHALL survive `opsx-plan reset`: a reset SHALL NOT erase, reduce, or re-baseline
+them, and an identical incident that recurs after a reset SHALL continue to
+accumulate against the same bound.
+
+When the bound is reached, further identical recovery attempts SHALL be refused
+with a named bounded-attempts state and the incident SHALL be escalated for
+operator action rather than looping.
+
+#### Scenario: Identical recovery attempts are bounded
+
+- **WHEN** the same incident signature recurs and recovery is attempted beyond
+  the job's incident-attempt limit
+- **THEN** further identical recovery attempts are refused with a named
+  bounded-attempts state and the incident is escalated
+
+#### Scenario: The bound survives a reset
+
+- **WHEN** identical incidents recur across `opsx-plan reset`
+- **THEN** their attempt counts accumulate across the resets and the bound is
+  not erased or refreshed

@@ -38,6 +38,7 @@ from typing import Any, Callable, Iterable, Mapping
 from lib.supervisor import agent_contracts as agent_contracts_module
 from lib.supervisor import broker as broker_module
 from lib.supervisor import lifecycle as lifecycle_module
+from lib.supervisor import recovery as recovery_module
 
 ENDPOINT_OPERATOR = "operator"
 ENDPOINT_WORKER = "worker-actions"
@@ -354,6 +355,80 @@ def _worker_report_status(
     ledger, job_id = _broker_ledger(request)
     _require_worker_contract(request, ledger, job_id)
     return {"verb": "report_status", "worker_uid": credentials.uid, "status": request.get("status")}
+
+
+def _worker_choose_remedy(
+    request: Mapping[str, Any], credentials: PeerCredentials
+) -> dict[str, Any]:
+    """Record the primary's class-scoped remedy choice for an incident.
+
+    The verb stays inside the worker-domain authorization boundary: the worker
+    identity contract is checked first, the job must be mutable, and the owning
+    action must belong to the bound job. The chosen remedy is validated against
+    the incident's failure class; an out-of-set or destructive choice records a
+    durable ``policy_violation`` and is refused. An accepted choice is journaled
+    as action evidence *before* any repair side effect, so the choice cannot be
+    made after the fact.
+    """
+    ledger, job_id = _broker_ledger(request)
+    _require_worker_contract(request, ledger, job_id)
+    _require_mutable_job(ledger, job_id)
+    incident_id = request.get("incident_id")
+    try:
+        incident = ledger.get_incident(int(incident_id))
+    except (TypeError, ValueError) as exc:
+        raise broker_module.BrokerError("choose_remedy requires an integer incident_id") from exc
+    except Exception as exc:  # noqa: BLE001 - surfaced as a named broker error
+        raise broker_module.BrokerError(f"unknown incident {incident_id}: {exc}") from exc
+    if int(incident["job_id"]) != int(job_id):
+        raise broker_module.BrokerMediationError(
+            f"incident {incident_id} is owned by job {incident['job_id']}, not the "
+            f"bound job {job_id}; refusing the worker-domain write"
+        )
+    failure_class = str(incident["kind"])
+    decision = recovery_module.remedy_decision(failure_class, request.get("remedy"))
+    if not decision["allowed"]:
+        violation_id = agent_contracts_module.record_policy_violation(
+            ledger,
+            int(job_id),
+            role=request.get("role"),
+            observed_agent=request.get("observed_agent"),
+            reason=f"choose_remedy refused: {decision['reason']}",
+            detail={
+                "incident_id": int(incident_id),
+                "failure_class": failure_class,
+                "remedy": str(request.get("remedy")),
+                "permitted": list(decision["permitted_remedies"]),
+            },
+        )
+        raise broker_module.BrokerMediationError(
+            f"choose_remedy refused: {decision['reason']} "
+            f"(policy_violation incident {violation_id} recorded against job {job_id})"
+        )
+    action_id = request.get("action_id")
+    if action_id is None:
+        raise broker_module.BrokerError(
+            "choose_remedy requires the action_id its choice is journaled against"
+        )
+    _bound_job_action(ledger, job_id, action_id)
+    journal = recovery_module.record_remedy_choice(
+        ledger,
+        int(job_id),
+        incident_id=int(incident_id),
+        failure_class=failure_class,
+        remedy=str(decision["remedy"]),
+        action_id=int(action_id),
+    )
+    return {
+        "verb": "choose_remedy",
+        "worker_uid": credentials.uid,
+        "job_id": int(job_id),
+        "incident_id": int(incident_id),
+        "failure_class": failure_class,
+        "remedy": str(decision["remedy"]),
+        "journaled": bool(journal["journaled"]),
+        "evidence_id": journal["evidence_id"],
+    }
 
 
 def _bound_job_action(ledger: Any, job_id: int, action_id: Any) -> Any:
@@ -693,6 +768,7 @@ WORKER_HANDLERS: Mapping[str, Callable[..., Any]] = MappingProxyType(
         "heartbeat": _worker_heartbeat,
         "release_delegated_gate": _worker_release_delegated_gate,
         "report_violation": _worker_report_violation,
+        "choose_remedy": _worker_choose_remedy,
     }
 )
 

@@ -653,6 +653,26 @@ class FreshReviewRevalidationTests(unittest.TestCase):
             "spec_sync_status": "no-delta",
             "summary": "archive succeeded",
         }
+        gate = None
+        if supervised:
+            # A registered supervised job routes post-archive revalidation
+            # through the driven bounded-recovery phase; the driver's
+            # fresh-review path is what reactivates and requeues the change.
+            storage = repo / "service-storage"
+            storage.mkdir()
+            handle = ledger.open_ledger(
+                storage / "supervisor.sqlite3", repository_root=repo
+            )
+            self.addCleanup(handle.close)
+            job_id = handle.register_job(
+                run_id="run-1",
+                worktree=repo,
+                owner="service",
+                policy=_policy(),
+                operator="operator",
+                manifest_content=MANIFEST,
+            )
+            gate = {"ledger": handle, "job_id": job_id, "policy": _policy()}
         with mock.patch.object(
             module, "verify_direct_archive_done", return_value=verify
         ), mock.patch.object(
@@ -665,8 +685,13 @@ class FreshReviewRevalidationTests(unittest.TestCase):
             module, "_try_notify"
         ):
             action = module.apply_archive_result(
-                repo, cfg, state, "change-a", payload, supervised=supervised
+                repo, cfg, state, "change-a", payload, supervised=supervised,
+                gate=gate,
             )
+            if action == "continue" and record["phase"] == "recovery":
+                action = module.drive_supervised_recovery(
+                    repo, cfg, state, "change-a", record, gate
+                )
         return action, state["changes"]["change-a"], repo
 
     def test_failed_fast_check_reruns_a_fresh_review_round(self) -> None:
@@ -735,7 +760,7 @@ class FreshReviewRevalidationTests(unittest.TestCase):
             checks=(False, "check failed: smoke"),
             with_archive_dir=False,
         )
-        self.assertEqual(action, "stop")
+        self.assertEqual(action, "failed")
         self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
         self.assertEqual(record["round"], 1)
         self.assertIn("cannot rerun a fresh review", record["reason"])
@@ -748,7 +773,7 @@ class FreshReviewRevalidationTests(unittest.TestCase):
             round_num=5,
             max_rounds=5,
         )
-        self.assertEqual(action, "stop")
+        self.assertEqual(action, "failed")
         self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
         self.assertEqual(record["round"], 5)
         self.assertIn("post-archive", record["reason"])
@@ -818,13 +843,32 @@ class FreshReviewRevalidationTests(unittest.TestCase):
         record["round"] = 1
         record["max_rounds"] = 5
         record["phase"] = "archive"
+        # A registered supervised job: post-archive revalidation routes
+        # through the driven bounded-recovery phase.
+        storage_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(storage_tmp.cleanup)
+        handle = ledger.open_ledger(
+            Path(storage_tmp.name) / "supervisor.sqlite3", repository_root=repo
+        )
+        self.addCleanup(handle.close)
+        job_id = handle.register_job(
+            run_id="run-1",
+            worktree=repo,
+            owner="service",
+            policy=_policy(),
+            operator="operator",
+            manifest_content=MANIFEST,
+        )
+        gate = {"ledger": handle, "job_id": job_id, "policy": _policy()}
 
         def run_archive_stage(date: str, checks: tuple | None = None) -> str:
             """Drive one archive stage dispatch: the archive worker moves the
             change into a dated archive directory (what `openspec archive`
             does) and reports the evidence; the controller then applies the
             result through the same function the run engine's stage dispatch
-            calls, with real archive verification against the repo."""
+            calls, with real archive verification against the repo. When the
+            outcome routes to bounded recovery, the recovery phase is driven
+            exactly as the run loop drives it."""
             archive_rel = f"openspec/changes/archive/{date}-{cid}"
             dst = repo / archive_rel
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -836,13 +880,27 @@ class FreshReviewRevalidationTests(unittest.TestCase):
                 "spec_sync_status": "no-delta",
                 "summary": "archive succeeded",
             }
+
+            def _apply_and_drive(checks_mock) -> str:
+                with checks_mock, mock.patch.object(module, "_try_notify"):
+                    action = module.apply_archive_result(
+                        repo, cfg, state, cid, payload, supervised=True, gate=gate
+                    )
+                    if action == "continue" and record["phase"] == "recovery":
+                        action = module.drive_supervised_recovery(
+                            repo, cfg, state, cid, record, gate
+                        )
+                    return action
+
             if checks is None:
                 # Real fast checks: cfg declares none, so the gate passes on
                 # its own evidence.
-                with mock.patch.object(module, "_try_notify"):
-                    return module.apply_archive_result(
-                        repo, cfg, state, cid, payload, supervised=True
-                    )
+                return _apply_and_drive(contextlib.nullcontext())
+            return _apply_and_drive(
+                mock.patch.object(
+                    module.groundtruth, "run_fast_checks", return_value=checks
+                )
+            )
             with mock.patch.object(
                 module.groundtruth, "run_fast_checks", return_value=checks
             ), mock.patch.object(module, "_try_notify"):
@@ -947,7 +1005,7 @@ class FreshReviewRevalidationTests(unittest.TestCase):
                 repo / "openspec/changes/archive/2026-01-01-change-a"
             ),
         )
-        self.assertEqual(action, "stop")
+        self.assertEqual(action, "failed")
         self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
         self.assertEqual(record["round"], 1)
         self.assertIn("cannot rerun a fresh review", record["reason"])
@@ -974,7 +1032,7 @@ class FreshReviewRevalidationTests(unittest.TestCase):
             recorded_path="openspec/changes/archive/../change-b",
             extra_setup=extra_setup,
         )
-        self.assertEqual(action, "stop")
+        self.assertEqual(action, "failed")
         self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
         self.assertIn("refusing reactivation", record["reason"])
         self.assertTrue(
@@ -1000,7 +1058,7 @@ class FreshReviewRevalidationTests(unittest.TestCase):
             recorded_path="openspec/changes/archive/2026-01-01-change-b",
             extra_setup=extra_setup,
         )
-        self.assertEqual(action, "stop")
+        self.assertEqual(action, "failed")
         self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
         self.assertIn("refusing reactivation", record["reason"])
         self.assertTrue(
@@ -1029,7 +1087,7 @@ class FreshReviewRevalidationTests(unittest.TestCase):
             with_archive_dir=False,
             extra_setup=extra_setup,
         )
-        self.assertEqual(action, "stop")
+        self.assertEqual(action, "failed")
         self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
         self.assertIn("refusing reactivation", record["reason"])
         self.assertTrue((repo / "outside/proposal.md").is_file())
@@ -1056,10 +1114,10 @@ class FreshReviewRevalidationTests(unittest.TestCase):
             checks=(False, "check failed: smoke"),
             extra_setup=extra_setup,
         )
-        self.assertEqual(action, "stop")
+        self.assertEqual(action, "failed")
         self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
         self.assertEqual(record["round"], 1)
-        self.assertEqual(record["phase"], "archive")
+        self.assertEqual(record["phase"], "recovery")
         self.assertIn("cannot rerun a fresh review", record["reason"])
         self.assertIn("refusing reactivation", record["reason"])
         # The archive remains untouched — nothing was restored or moved.
@@ -1092,7 +1150,7 @@ class FreshReviewRevalidationTests(unittest.TestCase):
             checks=(False, "check failed: smoke"),
             extra_setup=extra_setup,
         )
-        self.assertEqual(action, "stop")
+        self.assertEqual(action, "failed")
         self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
         self.assertEqual(record["round"], 1)
         self.assertIn("refusing reactivation", record["reason"])
@@ -1117,7 +1175,7 @@ class FreshReviewRevalidationTests(unittest.TestCase):
             checks=(False, "check failed: smoke"),
             extra_setup=extra_setup,
         )
-        self.assertEqual(action, "stop")
+        self.assertEqual(action, "failed")
         self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
         self.assertEqual(record["round"], 1)
         self.assertIn("refusing reactivation", record["reason"])

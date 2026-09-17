@@ -2073,15 +2073,23 @@ def compose_briefing(
     incident_lines: list[str] = []
     failed_remedy_lines: list[str] = []
     for row in ledger.list_incidents(int(job_id)):
+        keys = row.keys() if hasattr(row, "keys") else ()
+        signature = str(row["signature"]) if "signature" in keys and row["signature"] else ""
         incident_lines.append(
             f"incident {row['id']} kind={row['kind']} state={row['state']} "
+            f"signature={signature or '(unlinked)'} "
             f"summary={row['summary'] or '(none)'}"
         )
-        attempts = ledger.incident_attempt_count(int(job_id), str(row["kind"]))
+        # Attempts are keyed by the incident's stable signature, the same key
+        # the bounded-attempts gate uses; a legacy row with no signature is
+        # unlinked and has no attempt count to report.
+        attempts = (
+            ledger.incident_attempt_count(int(job_id), signature) if signature else 0
+        )
         if attempts:
             failed_remedy_lines.append(
-                f"remedy for incident {row['id']} kind={row['kind']} attempted "
-                f"{attempts} time(s) without resolution"
+                f"remedy for incident {row['id']} signature={signature} "
+                f"attempted {attempts} time(s) without resolution"
             )
     sections.append(
         BriefingSection(

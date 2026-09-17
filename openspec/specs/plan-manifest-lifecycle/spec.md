@@ -272,3 +272,39 @@ archive as proof of done.
 - **THEN** completion is determined from the same archive and check evidence
   as an unsupervised run, and the acceptance verdict does not by itself mark
   the plan or a change complete
+
+### Requirement: Recovery revalidates archive and completion material against canonical ground truth
+
+Incident recovery that touches archive or completion material SHALL consume the
+same canonical manifest snapshot and artifact ground truth as an unsupervised
+run. A partial archive, or an archive whose post-archive fast checks fail,
+SHALL NOT be treated as a completed change, and recovery SHALL require an
+appropriate fresh review over the repaired revision before completion is
+reasserted.
+
+A delta `MODIFIED` identity mismatch repaired by recovery SHALL derive the
+corrected identity from the canonical specification, so the canonical
+specification remains the authority for the requirement's intent and the
+canonical specs are updated only through the existing archive and delta
+application semantics. Recovery SHALL introduce no separate plan-completion,
+archive, or spec-synchronization authority.
+
+#### Scenario: A partial archive is not completion
+
+- **WHEN** recovery encounters a change whose archive did not complete or whose
+  post-archive fast check failed
+- **THEN** the change is not treated as complete and a fresh review over the
+  repaired revision is required before completion is reasserted
+
+#### Scenario: A repaired delta derives its identity from the canonical spec
+
+- **WHEN** recovery repairs a delta `MODIFIED` identity mismatch
+- **THEN** the corrected identity is derived from the canonical specification
+  and the canonical requirement's intent is preserved
+
+#### Scenario: Recovery adds no archive or completion authority
+
+- **WHEN** recovery repairs archive or completion material for a change
+- **THEN** completion and archive state are still determined by the existing
+  archive evidence and delta-application semantics, not by a recovery outcome
+  alone

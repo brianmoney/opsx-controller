@@ -1567,9 +1567,10 @@ class _FakeServerProcess:
 class BriefingTests(BridgeTestCase):
     def test_briefing_is_composed_from_durable_state_not_transcript(self) -> None:
         self.ledger.record_incident(self.job_id, kind="review_rejection",
+                                    signature="sig-review-rejection",
                                     summary="reviewer rejected round 1")
-        self.ledger.record_incident_attempt(self.job_id, signature="review_rejection")
-        self.ledger.record_incident_attempt(self.job_id, signature="review_rejection")
+        self.ledger.record_incident_attempt(self.job_id, signature="sig-review-rejection")
+        self.ledger.record_incident_attempt(self.job_id, signature="sig-review-rejection")
         action_id = self.ledger.begin_action(
             self.job_id, kind=bridge_mod.PROMPT_ACTION_KIND, run_id="run-1",
             detail=json.dumps({"request_id": "req_uncertain", "session_id": "ses_1"}),
@@ -1592,6 +1593,26 @@ class BriefingTests(BridgeTestCase):
         self.assertIn("review_rejection", rendered)
         self.assertIn("attempted 2 time(s)", rendered)
         self.assertNotIn("transcript", rendered.lower())
+
+    def test_failed_remedy_count_uses_incident_signature_not_kind(self) -> None:
+        self.ledger.record_incident(self.job_id, kind="provider_error",
+                                    signature="sig-provider",
+                                    summary="provider 503")
+        # An attempt keyed by the incident's kind is not the incident's
+        # signature and must not be counted against it.
+        self.ledger.record_incident_attempt(self.job_id, signature="provider_error")
+        self.ledger.record_incident_attempt(self.job_id, signature="provider_error")
+        rendered = bridge_mod.compose_briefing(
+            self.ledger, self.job_id, mode="full"
+        ).render()
+        self.assertNotIn("attempted 2 time(s)", rendered)
+        self.assertIn("signature=sig-provider", rendered)
+
+        self.ledger.record_incident_attempt(self.job_id, signature="sig-provider")
+        rendered = bridge_mod.compose_briefing(
+            self.ledger, self.job_id, mode="full"
+        ).render()
+        self.assertIn("attempted 1 time(s)", rendered)
 
     def test_uncertain_action_is_rendered_as_blocking_state(self) -> None:
         action_id = self.ledger.begin_action(

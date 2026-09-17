@@ -757,6 +757,10 @@ class EngineIntegrationTests(ActionJournalTestCase):
         self._write_change()
         job_id = self.register()
         cfg = self._cfg()
+        # Keep the invalid-output judgment to a single review dispatch: the
+        # worker exited and its output was judged unusable, so the action is
+        # resolved to failed rather than left uncertain.
+        cfg["invalid_output_retries"] = 0
         state = {"plan": cfg["name"], "approvals": [], "changes": {}}
         saved = self.opsx.invoke_direct_stage
         self.addCleanup(setattr, self.opsx, "invoke_direct_stage", saved)
@@ -798,7 +802,7 @@ class EngineIntegrationTests(ActionJournalTestCase):
         self.assertIn("stage_result", kinds)
         review = [a for a in actions if a["kind"] == "review"]
         self.assertEqual(len(review), 1)
-        self.assertEqual(review[0]["state"], "uncertain")
+        self.assertEqual(review[0]["state"], "failed")
 
 
 class LegacyPathTests(ActionJournalTestCase):
