@@ -308,3 +308,32 @@ archive, or spec-synchronization authority.
 - **THEN** completion and archive state are still determined by the existing
   archive evidence and delta-application semantics, not by a recovery outcome
   alone
+
+### Requirement: Interrupted supervised execution never records a false completion
+
+An interrupted or restarted supervised execution SHALL determine completion only
+from the canonical plan, archive, and fast-check evidence re-derived after
+restart, and SHALL NOT mark a change or a plan complete from a pre-interruption
+claim, a partial archive side effect, or a worker assertion. When that canonical
+ground truth is incomplete, the job SHALL resume, record a correct human wait, or
+surface a blocker rather than complete.
+
+#### Scenario: Completion follows re-derived evidence, not a dead worker's claim
+
+- **WHEN** a supervised execution is killed at the result or verification
+  checkpoint and a fresh service reconstructs the job
+- **THEN** completion is determined from the canonical plan, archive, and
+  fast-check evidence and the killed worker's completion claim is not accepted
+
+#### Scenario: A partial archive is not completion
+
+- **WHEN** an interrupted execution left a partial archive or a post-archive
+  fast check did not pass
+- **THEN** the change is not marked complete and an appropriate fresh review is
+  required before completion is reasserted
+
+#### Scenario: A recorded human wait is not resolved to completion
+
+- **WHEN** a restart reconstructs a job whose human wait is still open
+- **THEN** the wait remains open until a durable receipt releases it and the job
+  is not marked complete in the meantime

@@ -3320,3 +3320,97 @@ implement/review/archive behavior.
 - **WHEN** the watchdog classifies and reconstitutes a registered job
 - **THEN** no change is marked done, no gate is released, and no checkpoint is
   satisfied by the watchdog itself
+
+### Requirement: The supervision fault matrix is proven end to end with real processes and a loopback fake API
+
+The system SHALL provide an automated fault-injection suite that exercises the
+supervision stack end to end using real local subprocesses and a loopback fake
+OpenCode API, requiring no external network, no paid model call, and no operator
+global install or daemon provisioning. The suite SHALL kill the real controller,
+the supervised service, and a fake worker at each of the intent, dispatch,
+result, and verification checkpoints and then start a fresh service, and it
+SHALL observe real continuation or a correct human wait re-derived from durable
+state rather than merely calling a fixture method.
+
+#### Scenario: A kill at each checkpoint is followed by real continuation
+
+- **WHEN** the controller, the supervised service, or a fake worker is killed at
+  the intent, dispatch, result, or verification checkpoint and a fresh service is
+  started
+- **THEN** the fresh service reconciles the job from durable state and either
+  continues the execution or records a correct human wait, observed through the
+  real process and not a fixture stub
+
+#### Scenario: Recovery is observed from durable state
+
+- **WHEN** the suite restarts the service after a kill
+- **THEN** the continuation or wait it observes is derived from the durable
+  ledger and authority state, not from any in-memory or pre-interruption state
+
+### Requirement: The fault matrix covers the supervision failure scenarios with durable-correctness assertions
+
+The fault-injection suite SHALL cover at least: a lost event, a duplicate
+response, a stale approval, a spoofed worker `approve` attempt, a sandbox or
+authority bypass attempt, competing run and worker contention, a restart while a
+human wait is recorded, a budget reset, unknown cost, a wrong model identity,
+and a false completion claim. Every scenario SHALL assert that the durable
+ledger and authority state remain correct afterward and that no external effect
+is claimed exactly once: deduplication and re-observation SHALL precede any
+replay, an unknown or interrupted outcome SHALL never be treated as free or
+complete, and a stale approval, a wrong model, or a spoofed worker SHALL fail
+closed.
+
+#### Scenario: A spoofed worker approval fails closed
+
+- **WHEN** a real worker-domain subprocess attempts to `approve`, `reset`, or
+  run a registered supervised job during the fault matrix
+- **THEN** the attempt is refused, no gate is released, and the durable
+  authority state is unchanged
+
+#### Scenario: A duplicate response does not double dispatch or double bill
+
+- **WHEN** the fake API returns a duplicate response for a dispatched action
+- **THEN** the action is deduplicated and re-observed before any replay, and the
+  budget and ledger record one effect
+
+#### Scenario: A restart during a human wait preserves the wait
+
+- **WHEN** the service is restarted while a human wait is recorded
+- **THEN** the wait remains durable and is woken only by the durable receipt
+  scan, with no model polling or recovery action
+
+#### Scenario: A budget reset and unknown cost do not loosen policy
+
+- **WHEN** `opsx-plan reset` runs between identical attempts, or an action has
+  unknown cost
+- **THEN** reservations and attempt signatures survive the reset, and unknown
+  cost blocks dispatch rather than being treated as free
+
+#### Scenario: A false completion claim is rejected
+
+- **WHEN** a killed worker or a partial archive claims a change or plan is
+  complete
+- **THEN** completion is determined from canonical plan, archive, and check
+  evidence and the false claim is not accepted
+
+### Requirement: Automated supervision checks run under a hermetic fixture guard
+
+The fault-injection suite SHALL install a fixture guard that enforces the
+supervision test policy: external network access, paid model calls, and operator
+global installs or daemon provisioning SHALL be prohibited in automated checks.
+The guard SHALL fail closed — an attempt to reach a non-loopback address, use a
+paid model credential, or run a global installer SHALL fail the check rather
+than being silently permitted. Permitted resources SHALL be limited to local
+loopback fake servers, real local subprocesses, and temporary sandboxes.
+
+#### Scenario: Non-loopback egress is refused
+
+- **WHEN** a supervised check under the fixture guard attempts to connect to a
+  non-loopback address
+- **THEN** the guard refuses the connection and the check fails closed
+
+#### Scenario: Paid model and global install attempts are refused
+
+- **WHEN** a supervised check under the fixture guard attempts a paid model call
+  or an operator global install or daemon provisioning step
+- **THEN** the guard refuses it and the check fails closed

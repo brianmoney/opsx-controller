@@ -3,7 +3,8 @@
 Everything runs against a loopback fake OpenCode server (stdlib
 ``http.server`` in a thread) implementing exactly the documented API subset,
 plus fault knobs: version mismatch, accept-then-drop-ack, duplicate and
-out-of-order events, stream disconnect without replay, and slow terminal
+out-of-order events, a one-shot duplicate prompt response, stream disconnect
+without replay, and slow terminal
 state. Real local subprocesses stand in for the headless server where process
 identity matters. Model inputs are faked. No external network, no paid model.
 """
@@ -58,6 +59,23 @@ class FakeOpencodeState:
         self.drop_ack_once = False
         self.hold_prompt_record = False
         self.held_prompts: dict[str, dict] = {}
+        # Hold the prompt's HTTP response after the server has recorded the
+        # request, so a fault suite can keep the dispatcher blocked inside the
+        # dispatch side effect and kill it at a deterministic dispatch boundary.
+        # ``prompt_blocked`` is set once the request is accepted; the handler
+        # waits on ``release_prompt`` before answering.
+        self.hold_prompt_response = False
+        self.prompt_blocked = threading.Event()
+        self.release_prompt = threading.Event()
+        # One-shot duplicate response: the next answered prompt's completed
+        # assistant reply is emitted a second time with the same message
+        # identity, so a fault suite can drive a genuine duplicate response
+        # from the loopback API through the production bridge lifecycle and
+        # assert it deduplicates to one journal and one budget effect.
+        # ``duplicated_answers`` records the user message id whose reply was
+        # duplicated so the suite can assert the fault actually fired.
+        self.duplicate_response_once = False
+        self.duplicated_answers: list[str] = []
         self.slow = False
         self.slow_delay = 0.25
         self._counter = 0
@@ -195,6 +213,13 @@ def _record_prompt_answer(
         state.status[session_id] = "busy"
         return user_id
     _complete_turn(state, session_id, user_id)
+    if state.duplicate_response_once:
+        state.duplicate_response_once = False
+        # Re-emit the same completion: the duplicate carries the original
+        # message identity, exactly what a re-delivered response looks like.
+        duplicate = json.loads(json.dumps(state.messages[session_id][-1]))
+        state.messages[session_id].append(duplicate)
+        state.duplicated_answers.append(user_id)
     return user_id
 
 
@@ -226,7 +251,12 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         if body:
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                # A fault suite may kill the client while the response is in
+                # flight; the dropped response is the observation, not an error.
+                self.close_connection = True
 
     def _prompt_text(self, body: dict) -> str:
         return _prompt_text(body)
@@ -294,6 +324,13 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(404, {"error": "not found"})
                 return
             self.state.prompt_calls.append({"session_id": session_id, "body": body})
+            if self.state.hold_prompt_response:
+                # The dispatch side effect has been launched (the request is
+                # recorded) but the result is withheld, so a fault suite can
+                # kill the dispatcher at a deterministic dispatch boundary.
+                self.state.prompt_blocked.set()
+                self.state.release_prompt.wait(timeout=60.0)
+                self.state.prompt_blocked.clear()
             if self.state.hold_prompt_record:
                 # Accept the prompt but withhold any discoverable record, so
                 # lookup cannot yet find the marker (undiscoverable/delayed ack).

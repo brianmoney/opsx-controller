@@ -1529,6 +1529,28 @@ bounded-restart contracts.
 `doctor`, `status`, `logs`, and `report` acquire no boundary dependency and
 keep working unchanged on hosts where the boundary is unavailable.
 
+#### Hermetic supervised verification
+
+Automated verification of the supervision stack runs **hermetically**: the
+fault-injection suite (`tests/supervisor/test_supervision_faults.py`) uses only
+local loopback fake model servers, real local subprocesses, and temporary
+sandboxes. It opens no external network connection, makes no paid model call,
+and performs no global install or daemon provisioning. A `hermetic_supervision`
+guard enforces this and fails closed — a non-loopback connect, a real provider
+credential, a non-fake model identifier, or an operator installer command fails
+the check instead of being silently allowed — and the same guard is installed
+inside every helper subprocess the suite spawns, including the real controller
+and `reset` commands, each of which announces its guarded pid so the harness can
+assert the guard was live before its target ran. The suite kills every real
+participant — the fake worker at the journaled intent/dispatch/result/
+verification boundary, the supervised service inside its production receipt
+transaction, and the real controller in its mediated request path — with
+`Popen.kill()` plus a bounded wait, then restarts a fresh service against the
+same store to observe recovery. Supervised verification is
+therefore free and offline: it needs no credentials, no provisioned host, and
+no network. See `core/plan-supervision.md` ("Fault-injection and test policy")
+for the matrix and the checkpoint kill-and-recover evidence rule.
+
 ### Lifecycle commands
 
 ```

@@ -1754,3 +1754,33 @@ model usage.
 - **WHEN** the legacy model leaderboard is projected for a plan with watchdog
   activity
 - **THEN** no watchdog or supervisor-family entry appears in it
+
+### Requirement: The supervision projection reflects durable state after interruption and restart
+
+The read-only supervision projection SHALL reflect the durable ledger and
+authority state after an interrupted execution, a process restart, or an
+`opsx-plan reset`, rather than any stale in-memory or pre-interruption state. A
+job killed during an action SHALL be projected as its reconciled durable state —
+including an unreconciled uncertain action, an open human wait, reserved or
+retained usage, or a bounded incident — and SHALL NOT be projected as
+completed.
+
+#### Scenario: A killed job projects its reconciled state
+
+- **WHEN** a supervised job is killed at the result or verification checkpoint
+  and a fresh service projects it
+- **THEN** `opsx-plan status` and `opsx-plan report` show the reconciled durable
+  state, including any uncertain action, wait, or incident, and do not report
+  completion
+
+#### Scenario: A restart during a human wait projects the wait
+
+- **WHEN** a service restart occurs while a human wait is recorded
+- **THEN** the supervision projection reports the open human wait rather than
+  completion or progress
+
+#### Scenario: Reset does not erase the projection of retained state
+
+- **WHEN** `opsx-plan reset` runs for a registered supervised job
+- **THEN** the projection still reports the durable reservations and incident
+  attempts that survive the reset

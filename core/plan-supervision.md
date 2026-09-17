@@ -1829,3 +1829,115 @@ the briefing appears in the action journal as a `supervisor_prompt` action
 tagged with `stage=briefing` rather than bypassing the journal as an
 out-of-band write. A replacement session that cannot be briefed is torn down
 instead of being handed back unbriefed.
+
+## Fault-injection and test policy
+
+The supervision contract is proven end to end by
+`tests/supervisor/test_supervision_faults.py`, a fault-injection suite that
+runs the real controller, the real supervised service host, and a fake worker
+as **real local subprocesses** against a loopback fake OpenCode API. The suite
+proves the durable consequences of an interruption rather than the internals of
+a fixture: every scenario asserts on the ledger rows, the authority receipts,
+and the read-only projection.
+
+### The fault matrix
+
+| Fault | Mechanism | Durable assertion |
+|---|---|---|
+| Lost event / lost acknowledgement | `drop_ack_once`, `FAKE_EVENT_DISCONNECT`, authoritative poll fallback | the action is reconciled from observable durable state; exactly one prompt was issued |
+| Duplicate response | the fake server's one-shot `duplicate_response_once` knob emits the completion twice with the same message identity, and the duplicate is driven through the production `JournaledSessionBridge` prompt/poll/resolve lifecycle and re-observed | one journal effect and one budget effect; the reservation reconciles once |
+| Stale approval | a stale protected material revision | the gate fails closed; an unrelated repository update does not invalidate a valid gate |
+| Spoofed worker `approve` | a real worker-domain subprocess against the worker-actions endpoint | the verb is refused, no gate is released, and authority state is unchanged |
+| Sandbox / authority bypass | a worker-domain write against the authority store; a non-loopback connect | the write is denied and the guard refuses the egress |
+| Competing run/worker contention | two real mutating processes against one worktree execution lock | mutual exclusion holds with no interleaved state corruption |
+| Restart during a human wait | kill after the wait is recorded, then a fresh service | the wait stays durable and is woken only by the durable receipt scan, with no polling or recovery |
+| Budget reset / unknown cost | `opsx-plan reset` between identical attempts; an unpriceable model | reservations and incident/restart attempt signatures survive the reset; unknown cost blocks with a named error rather than being treated as free |
+| Wrong model | recorded-versus-observed model-identity mismatch under the model policy | the dispatch fails closed |
+| False completion | kill at the result and verification checkpoints | completion derives from canonical plan/archive/fast-check evidence, never from a killed worker's claim; a partial archive is not done |
+
+### The checkpoint kill-and-recover evidence rule
+
+A kill is meaningful only when it lands on a durable boundary, so the suite
+defines four checkpoints by the journal state they sit on:
+
+- **intent** — after the action intent is journaled but before the dispatch
+  record or any side effect;
+- **dispatch** — after the dispatch record exists and the side effect is
+  launched, before a result is observed;
+- **result** — after a result is produced, before evidence reconciliation;
+- **verification** — after an independent verifier/review began, before
+  completion or archive is recorded.
+
+Every real participant is killed at each boundary, and every participant is
+coupled to the **same** registered action flow — one journaled primary-prompt
+action against the loopback fake API:
+
+- the **fake worker**, a real process running the production journaled prompt
+  lifecycle against the loopback fake API, is rendezvoused inside that
+  lifecycle at the named checkpoint (before `dispatch_action` at intent,
+  inside the held `prompt_async` side effect at dispatch, between the
+  terminal poll and the resolve at result, and before `complete_action` at
+  verification);
+- the **supervised service**, a real `open_service_host` process bound and
+  serving, is called by the worker through the production worker-endpoint
+  `record_evidence` mediation *for the same action* and is rendezvoused
+  inside that evidence transaction — after the request is accepted,
+  authorized, and bound to the action, before any evidence row is written
+  (the rendezvous handshake carries the action id, so the test proves the
+  faulted transaction belongs to the checkpoint's action);
+- the **real controller** (`orchestrator/opsx-plan.py`) is blocked in its
+  production mediated stop-boundary request (`supervise pause`) against the
+  action's job — the stop boundary the dispatch path itself observes before
+  every dispatch — which the single-threaded service cannot serve while it
+  holds the action's evidence transaction; the controller announces its entry
+  into the mediated request before delegating to the real broker call, so the
+  kill is proven to land inside that request.
+
+The boundary and its side effect are therefore produced by production code —
+the intent and dispatch rows, the reserved budget, the launched prompt, the
+observed result, the verifier evidence, the service's mediated evidence
+transaction on the in-flight action, and the controller's mediated stop
+boundary against it — rather than by a fixture that writes ledger rows
+directly.
+Every handshake is deadline-enforced with readiness-driven pipe reads (no
+blocking `readline()` past the deadline, no fixed sleeps). Each participant
+is killed with `Popen.kill()` followed by a bounded `wait`, and a
+fresh service process then reopens the **same** durable store and reconciles
+from ledger and authority state. A kill never leaves a checkpoint treated as
+free or complete: the recovered state is re-derived after restart, so the
+evidence of continuation (or of a correct human wait) is the recovered durable
+state, not a pre-interruption in-memory claim. A mediated transaction killed
+before its write commits records nothing partial — no evidence row, no pause
+receipt, no stop request.
+
+### No exactly-once claim
+
+The suite asserts that no external effect is claimed exactly once. It checks
+that deduplication and re-observation precede any replay, that a duplicate
+delivery produces one journal effect and one budget effect, and that an
+unknown, uncertain, or interrupted outcome is retained at its reserved estimate
+and never treated as free or complete. This is the executable counterpart of
+the journal's no-exactly-once-claim rule.
+
+### The hermetic guard
+
+The suite installs a fail-closed `hermetic_supervision` guard for its
+duration. Permitted resources are limited to local loopback fake servers, real
+local subprocesses, and temporary sandboxes. The guard:
+
+- allows only `AF_UNIX` and loopback (`127.0.0.1`, `::1`) socket connections
+  and refuses every non-loopback address, including a resolvable name;
+- scrubs paid-provider credentials from the environment and refuses a non-fake
+  model identifier;
+- refuses operator global-install and daemon-provisioning commands; and
+- asserts every fake API address the suite uses is loopback.
+
+Because the suite spawns real subprocesses, a parent-only guard would give
+false assurance. Every helper — including the real controller and every
+`reset`/lifecycle command — is therefore launched through a guard preamble that
+installs the same socket, credential, and command guard inside the child before
+it runs its target, and announces the guarded pid. The harness asserts that
+announcement against the process it spawned, so a helper that did not install
+the guard fails the check. The guard fails closed: an attempt to reach a
+non-loopback address, use a paid model credential, or run a global installer
+fails the check rather than being silently permitted.
