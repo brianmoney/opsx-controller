@@ -1080,7 +1080,13 @@ def verify_direct_archive_done(repo: Path, cid: str, record: dict) -> tuple[bool
     archive = record["archive"]
     if archive.get("status") != "passed":
         return False, "no fresh archive worker result recorded"
-    if groundtruth.change_dir(repo, cid).exists():
+    # Only the exact canonical active path counts: a sibling directory whose
+    # name merely ends in ``-<cid>`` (which groundtruth.change_dir would
+    # suffix-match) is an unrelated change and must not fail verification.
+    # ``lexists`` also catches symlinks — including dangling ones — so link
+    # debris at the canonical path fails verification and routes to
+    # reactivation, which fails closed on non-directories.
+    if os.path.lexists(repo / "openspec" / "changes" / cid):
         return False, f"openspec/changes/{cid} still exists"
     archive_path = archive.get("path", "")
     if not archive_path:
@@ -1694,7 +1700,173 @@ def apply_review_result(repo: Path, cfg: dict, state: dict, cid: str, payload: d
     return "continue"
 
 
-def apply_archive_result(repo: Path, cfg: dict, state: dict, cid: str, payload: dict) -> str:
+def reactivate_archived_change(repo: Path, cid: str, archive: dict) -> tuple[bool, str]:
+    """Move an archived change back to its active location for a fresh round.
+
+    Supervised fresh-review revalidation requeues a change whose post-archive
+    evidence failed, but the implement/review/archive loop resolves a change
+    only at its active ``openspec/changes/<id>`` location — after a valid
+    archive that directory is necessarily absent. The archived artifacts are
+    therefore moved back before the fresh round is queued, which also frees
+    the dated archive name so the next archive worker run can produce fresh
+    dated evidence. Audit evidence is preserved: any ``archive(<id>):`` commit
+    stays reachable in git history, and the caller records a ``reactivated``
+    history entry with the source archive path and the failure reason. The
+    move is a no-op success when the change already sits at its active
+    location — e.g. the archive evidence itself was bogus and nothing ever
+    moved.
+
+    The recorded archive path comes from an unverified worker payload or a
+    mutable state file, so it is never trusted to select the move source.
+    Reactivation fails closed unless the recorded path is repo-relative and
+    resolves to exactly the canonical dated archive directory for this change
+    — derived independently via ``groundtruth.find_archive_dir`` — with both
+    ends confined beneath ``openspec/changes/archive``. Absolute, traversing,
+    mismatched, or symlink-escaping paths are rejected before any filesystem
+    mutation.
+
+    The existence check and the move target use the exact canonical active
+    path ``openspec/changes/<cid>`` — never ``groundtruth.change_dir``'s
+    loose suffix matching — so an unrelated sibling directory whose name
+    merely ends in ``-<cid>`` neither satisfies the no-op check nor receives
+    the restored artifacts. Only a real, non-symlink directory at that path
+    satisfies the no-op check: a symlink, dangling link, or plain file there
+    is rejected before any filesystem mutation, so the fresh loop can never
+    be requeued to follow a link into unrelated artifacts.
+    """
+    # Only a real, non-symlink directory at the exact canonical active path
+    # counts as "already active": a sibling directory whose name merely ends
+    # in ``-<cid>`` is an unrelated change, and a symlink (even one resolving
+    # to a directory) at the canonical path would satisfy ``exists()`` and
+    # skip the required move, letting the fresh loop follow the link into
+    # unrelated artifacts. Anything else occupying the canonical path — a
+    # symlink, a dangling link, or a plain file — is hostile debris, so fail
+    # closed before any filesystem mutation rather than requeueing or
+    # clobbering it.
+    change_dir = repo / "openspec" / "changes" / cid
+    if os.path.lexists(change_dir):
+        if change_dir.is_dir() and not change_dir.is_symlink():
+            return True, ""
+        return False, (
+            f"openspec/changes/{cid} exists but is not a real directory "
+            "(symlink, dangling link, or file), refusing reactivation"
+        )
+    archive_path = archive.get("path", "")
+    if not archive_path:
+        return False, "no archive path recorded to reactivate from"
+    if Path(archive_path).is_absolute():
+        return False, (
+            f"archive path is absolute, refusing reactivation: {archive_path}"
+        )
+    canonical = groundtruth.find_archive_dir(repo, cid)
+    if canonical is None:
+        return False, (
+            f"no canonical dated archive directory found for {cid}, "
+            "cannot reactivate"
+        )
+    archive_root = (repo / "openspec" / "changes" / "archive").resolve()
+    canonical_resolved = canonical.resolve()
+    if not canonical_resolved.is_relative_to(archive_root):
+        return False, (
+            f"canonical archive directory escapes openspec/changes/archive, "
+            f"refusing reactivation: {canonical.name}"
+        )
+    src = (repo / archive_path).resolve()
+    if src != canonical_resolved:
+        return False, (
+            f"archive path is not the canonical dated archive directory for "
+            f"{cid}, refusing reactivation: {archive_path}"
+        )
+    if not src.is_dir():
+        return False, f"archive path missing, cannot reactivate: {archive_path}"
+    try:
+        change_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(change_dir))
+    except OSError as exc:
+        return False, f"could not reactivate {archive_path}: {exc}"
+    return True, ""
+
+
+def _archive_revalidation_failed(
+    repo: Path,
+    cfg: dict,
+    state: dict,
+    cid: str,
+    r: dict,
+    reason: str,
+    *,
+    last_result: str | None,
+    supervised: bool,
+) -> str:
+    """Handle failed post-archive completion evidence for an archived change.
+
+    A supervised job never treats the prior archive as proof of done: while
+    the change's existing round budget remains, the archived change is
+    reactivated at its active OpenSpec location and the change reruns a fresh
+    review round through the existing implement/review/archive loop; the
+    failure turns terminal only when that budget is exhausted or the archived
+    artifacts can no longer be reactivated. A legacy unregistered run keeps
+    its previous terminal-failure behavior unchanged.
+    """
+    archive = r["archive"]
+    archive["status"] = "failed"
+    archive["reason"] = reason
+    if supervised:
+        if last_result is not None:
+            r["last_result"] = last_result
+        if r["round"] < r["max_rounds"]:
+            # Fresh-review revalidation, bounded by the change's round budget.
+            # The loop can only resolve the change at its active location, so
+            # the archived artifacts must be reactivated before requeueing;
+            # without them the next round could not even find the change.
+            restored, restore_why = reactivate_archived_change(repo, cid, archive)
+            if not restored:
+                reason = f"{reason}; cannot rerun a fresh review: {restore_why}"
+                archive["reason"] = reason
+                state_mod.set_status(state, cid, base.FAILED, reason)
+                _try_notify(cfg, "change_failed", reason, change_id=cid)
+                return "stop"
+            append_history(
+                state,
+                cid,
+                {
+                    "round": r["round"],
+                    "phase": "archive",
+                    "status": "reactivated",
+                    "summary": (
+                        f"post-archive evidence failed ({reason}); reactivated "
+                        f"the archived change for a fresh review round"
+                    ),
+                    "archive_path": archive.get("path", ""),
+                },
+            )
+            r["round"] += 1
+            r["phase"] = "implement"
+            state_mod.set_status(
+                state, cid, base.PENDING,
+                f"{reason}; fresh review round {r['round']}",
+            )
+            base.log(
+                f"  {cid}: {reason}; reactivated the archived change and "
+                f"rerun a fresh review round ({r['round']}/{r['max_rounds']})"
+            )
+            return "continue"
+    elif last_result is not None:
+        r["last_result"] = last_result
+    state_mod.set_status(state, cid, base.FAILED, reason)
+    _try_notify(cfg, "change_failed", reason, change_id=cid)
+    return "stop"
+
+
+def apply_archive_result(
+    repo: Path,
+    cfg: dict,
+    state: dict,
+    cid: str,
+    payload: dict,
+    *,
+    supervised: bool = False,
+) -> str:
     r = state_mod.rec(state, cid)
     archive = r["archive"]
     if payload.get("status") == "blocked":
@@ -1761,27 +1933,22 @@ def apply_archive_result(repo: Path, cfg: dict, state: dict, cid: str, payload: 
     r["last_result"] = "archive_passed"
     ok, why = verify_direct_archive_done(repo, cid, r)
     if not ok:
-        archive["status"] = "failed"
-        archive["reason"] = why
-        state_mod.set_status(state, cid, base.FAILED, f"archive unverified: {why}")
-        _try_notify(cfg, "change_failed", f"archive unverified: {why}", change_id=cid)
-        return "stop"
+        return _archive_revalidation_failed(
+            repo, cfg, state, cid, r, f"archive unverified: {why}",
+            last_result=None, supervised=supervised,
+        )
     checks_ok, check_why = groundtruth.run_fast_checks(repo, cfg)
     if not checks_ok:
-        archive["status"] = "failed"
-        archive["reason"] = f"post-archive {check_why}"
-        r["last_result"] = "post_archive_check_failed"
-        state_mod.set_status(state, cid, base.FAILED, f"post-archive {check_why}")
-        _try_notify(cfg, "change_failed", f"post-archive {check_why}", change_id=cid)
-        return "stop"
+        return _archive_revalidation_failed(
+            repo, cfg, state, cid, r, f"post-archive {check_why}",
+            last_result="post_archive_check_failed", supervised=supervised,
+        )
     clean_ok, clean_why = delivery.verify_post_archive_clean(repo, cfg)
     if not clean_ok:
-        archive["status"] = "failed"
-        archive["reason"] = f"post-archive {clean_why}"
-        r["last_result"] = "post_archive_dirty_tracked"
-        state_mod.set_status(state, cid, base.FAILED, f"post-archive {clean_why}")
-        _try_notify(cfg, "change_failed", f"post-archive {clean_why}", change_id=cid)
-        return "stop"
+        return _archive_revalidation_failed(
+            repo, cfg, state, cid, r, f"post-archive {clean_why}",
+            last_result="post_archive_dirty_tracked", supervised=supervised,
+        )
     r["phase"] = "done"
     # After the archive move, tasks.md lives in the archive directory; parse
     # it there for the operator's post-archive manual checklist.
@@ -2895,7 +3062,10 @@ def _run_direct_change_loop_inner(
         elif stage == "review":
             action = apply_review_result(repo, cfg, state, cid, payload)
         else:
-            action = apply_archive_result(repo, cfg, state, cid, payload)
+            action = apply_archive_result(
+                repo, cfg, state, cid, payload,
+                supervised=supervised_gate is not None,
+            )
         persist_direct_state(repo, cfg, state, cid)
 
         # Determine telemetry status from the control-flow decision.

@@ -599,8 +599,20 @@ done from the existing ground truth — archive evidence per change
 (`delivery.verify_post_archive_clean`). A worker or primary session's claim of
 done never completes the job; without that evidence the change continues
 through the existing implement/review/archive loop, and a repeated failure is
-bounded by the change's existing round budget. Non-supervised runs determine
-completion exactly as before.
+bounded by the change's existing round budget. Because a valid archive
+removes the active change directory, a supervised requeue first reactivates
+the archived change at its active `openspec/changes/<id>` location — the
+prior archive stays auditable through any `archive(<id>):` commit and a
+`reactivated` history entry carrying the source archive path and failure
+reason — and a requeue whose archived artifacts are unrecoverable fails
+closed instead of requeuing a change the loop cannot resolve. Reactivation
+never trusts the recorded archive path to select the move source: only the
+canonical dated archive directory for the change — derived independently via
+`groundtruth.find_archive_dir` and confined beneath
+`openspec/changes/archive` — may be moved back, and a recorded path that is
+absolute, traversing, mismatched, or symlink-escaping is rejected before any
+filesystem mutation. Non-supervised
+runs determine completion exactly as before.
 
 Pending `(manual)` tasks are collected via `state.pending_manual_tasks`,
 attached to the completion record, and shown on the `inspect` surface as the

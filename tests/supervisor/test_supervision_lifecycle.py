@@ -10,8 +10,14 @@ receipt kind, and the registration linkage configuration.
 
 from __future__ import annotations
 
+import argparse
+import contextlib
 import hashlib
+import io
+import json
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -587,6 +593,801 @@ class CompletionTests(unittest.TestCase):
         self.assertTrue(complete)
         self.assertEqual(failures, [])
         self.assertEqual(manual, {"change-a": ["1.2 Plant fixtures (manual)"]})
+
+
+class FreshReviewRevalidationTests(unittest.TestCase):
+    """Failed completion evidence reruns a fresh review for a supervised job."""
+
+    def setUp(self) -> None:
+        import importlib.util
+        import sys
+
+        script = Path(__file__).resolve().parents[2] / "orchestrator" / "opsx-plan.py"
+        spec = importlib.util.spec_from_file_location("opsx_plan", script)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["opsx_plan"] = module
+        spec.loader.exec_module(module)
+        self.opsx_plan = module
+
+    def _apply(
+        self,
+        *,
+        supervised: bool,
+        verify: tuple = (True, ""),
+        checks: tuple = (True, ""),
+        clean: tuple = (True, ""),
+        round_num: int = 1,
+        max_rounds: int = 5,
+        with_archive_dir: bool = True,
+        recorded_path=None,
+        extra_setup=None,
+    ) -> tuple:
+        module = self.opsx_plan
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Path(tmp.name)
+        archive_rel = "openspec/changes/archive/2026-01-01-change-a"
+        if with_archive_dir:
+            archived = repo / archive_rel
+            archived.mkdir(parents=True)
+            (archived / "proposal.md").write_text("# proposal\n", encoding="utf-8")
+            (archived / "tasks.md").write_text("- [x] 1.1 done\n", encoding="utf-8")
+        if extra_setup is not None:
+            extra_setup(repo)
+        state = {"changes": {}}
+        record = module.state_mod.rec(state, "change-a")
+        record["round"] = round_num
+        record["max_rounds"] = max_rounds
+        record["phase"] = "archive"
+        cfg = {"name": "plan"}
+        archive_path = archive_rel
+        if recorded_path is not None:
+            archive_path = (
+                recorded_path(repo) if callable(recorded_path) else recorded_path
+            )
+        payload = {
+            "status": "archived",
+            "archive_path": archive_path,
+            "commit": "",
+            "spec_sync_status": "no-delta",
+            "summary": "archive succeeded",
+        }
+        with mock.patch.object(
+            module, "verify_direct_archive_done", return_value=verify
+        ), mock.patch.object(
+            module.groundtruth, "run_fast_checks", return_value=checks
+        ), mock.patch.object(
+            module.delivery, "verify_post_archive_clean", return_value=clean
+        ), mock.patch.object(
+            module.state_mod, "pending_manual_tasks", return_value=[]
+        ), mock.patch.object(
+            module, "_try_notify"
+        ):
+            action = module.apply_archive_result(
+                repo, cfg, state, "change-a", payload, supervised=supervised
+            )
+        return action, state["changes"]["change-a"], repo
+
+    def test_failed_fast_check_reruns_a_fresh_review_round(self) -> None:
+        action, record, repo = self._apply(
+            supervised=True, checks=(False, "check failed: smoke")
+        )
+        self.assertEqual(action, "continue")
+        self.assertEqual(record["round"], 2)
+        self.assertEqual(record["phase"], "implement")
+        self.assertEqual(record["status"], self.opsx_plan.base.PENDING)
+        self.assertEqual(record["last_result"], "post_archive_check_failed")
+        self.assertEqual(record["archive"]["status"], "failed")
+        self.assertIn("post-archive", record["archive"]["reason"])
+
+    def test_requeue_reactivates_the_archived_change(self) -> None:
+        """The fresh round can only resolve the change at its active
+        location, so requeueing must move the archived artifacts back."""
+        action, record, repo = self._apply(
+            supervised=True, checks=(False, "check failed: smoke")
+        )
+        self.assertEqual(action, "continue")
+        change_dir = repo / "openspec" / "changes" / "change-a"
+        self.assertTrue(change_dir.is_dir())
+        self.assertTrue((change_dir / "proposal.md").is_file())
+        self.assertTrue((change_dir / "tasks.md").is_file())
+        self.assertFalse(
+            (repo / "openspec/changes/archive/2026-01-01-change-a").exists()
+        )
+        reactivated = [
+            entry for entry in record["history"]
+            if entry.get("status") == "reactivated"
+        ]
+        self.assertEqual(len(reactivated), 1)
+        self.assertEqual(
+            reactivated[0]["archive_path"],
+            "openspec/changes/archive/2026-01-01-change-a",
+        )
+
+    def test_unverified_archive_reruns_a_fresh_review_round(self) -> None:
+        action, record, repo = self._apply(
+            supervised=True, verify=(False, "no fresh archive worker result recorded")
+        )
+        self.assertEqual(action, "continue")
+        self.assertEqual(record["round"], 2)
+        self.assertEqual(record["phase"], "implement")
+        self.assertEqual(record["status"], self.opsx_plan.base.PENDING)
+        self.assertEqual(record["archive"]["status"], "failed")
+        self.assertIn("archive unverified", record["reason"])
+        self.assertTrue((repo / "openspec/changes/change-a").is_dir())
+
+    def test_post_archive_dirt_reruns_a_fresh_review_round(self) -> None:
+        action, record, repo = self._apply(
+            supervised=True, clean=(False, "tracked worktree is dirty")
+        )
+        self.assertEqual(action, "continue")
+        self.assertEqual(record["round"], 2)
+        self.assertEqual(record["last_result"], "post_archive_dirty_tracked")
+        self.assertEqual(record["status"], self.opsx_plan.base.PENDING)
+        self.assertTrue((repo / "openspec/changes/change-a").is_dir())
+
+    def test_requeue_without_recoverable_artifacts_fails_closed(self) -> None:
+        """A requeue that cannot restore the change must not pretend the next
+        round can resolve it: the failure turns terminal with a named reason."""
+        action, record, repo = self._apply(
+            supervised=True,
+            checks=(False, "check failed: smoke"),
+            with_archive_dir=False,
+        )
+        self.assertEqual(action, "stop")
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
+        self.assertEqual(record["round"], 1)
+        self.assertIn("cannot rerun a fresh review", record["reason"])
+        self.assertFalse((repo / "openspec/changes/change-a").exists())
+
+    def test_revalidation_is_bounded_by_the_round_budget(self) -> None:
+        action, record, repo = self._apply(
+            supervised=True,
+            checks=(False, "check failed: smoke"),
+            round_num=5,
+            max_rounds=5,
+        )
+        self.assertEqual(action, "stop")
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
+        self.assertEqual(record["round"], 5)
+        self.assertIn("post-archive", record["reason"])
+
+    def test_legacy_run_keeps_terminal_failure(self) -> None:
+        action, record, repo = self._apply(
+            supervised=False, checks=(False, "check failed: smoke")
+        )
+        self.assertEqual(action, "stop")
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
+        self.assertEqual(record["round"], 1)
+        self.assertEqual(record["last_result"], "post_archive_check_failed")
+        # Legacy runs never touch the archived artifacts.
+        self.assertTrue(
+            (repo / "openspec/changes/archive/2026-01-01-change-a").is_dir()
+        )
+        self.assertFalse((repo / "openspec/changes/change-a").exists())
+
+    def test_legacy_unverified_archive_keeps_terminal_failure(self) -> None:
+        action, record, repo = self._apply(
+            supervised=False, verify=(False, "no fresh archive worker result")
+        )
+        self.assertEqual(action, "stop")
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
+        self.assertEqual(record["round"], 1)
+        self.assertEqual(record["phase"], "archive")
+
+    def _git(self, repo: Path, *args: str) -> None:
+        res = subprocess.run(
+            ["git", *args], cwd=repo, capture_output=True, text=True
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_reactivated_change_completes_a_fresh_archive_round(self) -> None:
+        """Loop-level regression: archive a real change, fail a post-archive
+        check, then prove the reactivated artifacts are consumed by the real
+        implement/review/archive loop — each fresh stage dispatch applies its
+        result through the same control-flow functions the run engine uses —
+        and the fresh round completes against verified archive evidence."""
+        module = self.opsx_plan
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Path(tmp.name)
+        self._git(repo, "init")
+        (repo / ".gitignore").write_text(
+            "openspec/changes/archive/\n", encoding="utf-8"
+        )
+        (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        self._git(repo, "add", ".")
+        self._git(
+            repo, "-c", "user.email=test@example.invalid",
+            "-c", "user.name=Test User", "commit", "-m", "init",
+        )
+        cid = "change-a"
+        change_dir = repo / "openspec" / "changes" / cid
+        change_dir.mkdir(parents=True)
+        (change_dir / "proposal.md").write_text("# proposal\n", encoding="utf-8")
+        (change_dir / "tasks.md").write_text("- [x] 1.1 done\n", encoding="utf-8")
+        cfg = {
+            "name": "plan",
+            "check_timeout_minutes": 1,
+            "fast_checks": [],
+            "no_progress_limit": 3,
+        }
+        state = {"changes": {}}
+        record = module.state_mod.rec(state, cid)
+        record["round"] = 1
+        record["max_rounds"] = 5
+        record["phase"] = "archive"
+
+        def run_archive_stage(date: str, checks: tuple | None = None) -> str:
+            """Drive one archive stage dispatch: the archive worker moves the
+            change into a dated archive directory (what `openspec archive`
+            does) and reports the evidence; the controller then applies the
+            result through the same function the run engine's stage dispatch
+            calls, with real archive verification against the repo."""
+            archive_rel = f"openspec/changes/archive/{date}-{cid}"
+            dst = repo / archive_rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(change_dir), str(dst))
+            payload = {
+                "status": "archived",
+                "archive_path": archive_rel,
+                "commit": "",
+                "spec_sync_status": "no-delta",
+                "summary": "archive succeeded",
+            }
+            if checks is None:
+                # Real fast checks: cfg declares none, so the gate passes on
+                # its own evidence.
+                with mock.patch.object(module, "_try_notify"):
+                    return module.apply_archive_result(
+                        repo, cfg, state, cid, payload, supervised=True
+                    )
+            with mock.patch.object(
+                module.groundtruth, "run_fast_checks", return_value=checks
+            ), mock.patch.object(module, "_try_notify"):
+                return module.apply_archive_result(
+                    repo, cfg, state, cid, payload, supervised=True
+                )
+
+        # Round 1, archive stage: the archive evidence is real and verified
+        # against the repo, but the post-archive fast check fails. The loop
+        # must reactivate the change at its active location and requeue a
+        # fresh round rather than treating the prior archive as done.
+        action = run_archive_stage(
+            "2026-01-01", checks=(False, "check failed: smoke")
+        )
+        self.assertEqual(action, "continue")
+        self.assertEqual(record["round"], 2)
+        self.assertEqual(record["phase"], "implement")
+        self.assertEqual(record["last_result"], "post_archive_check_failed")
+        self.assertTrue(change_dir.is_dir())
+        self.assertTrue((change_dir / "proposal.md").is_file())
+        self.assertTrue((change_dir / "tasks.md").is_file())
+        self.assertFalse(
+            (repo / "openspec/changes/archive/2026-01-01-change-a").exists()
+        )
+
+        # Round 2, fresh implement stage dispatch: the result is applied
+        # against the reactivated artifacts — the completeness gate parses
+        # the restored tasks.md at the active location and advances the
+        # change to review.
+        with mock.patch.object(module, "_try_notify"):
+            action = module.apply_implement_result(
+                repo, cfg, state, cid,
+                {
+                    "status": "implemented",
+                    "summary": "fresh round implementation complete",
+                    "progress_made": True,
+                    "task_counts": {"complete": 1, "total": 1},
+                    "completed_tasks": ["1.1 done"],
+                    "remaining_tasks": [],
+                    "files_touched": [f"openspec/changes/{cid}/proposal.md"],
+                },
+            )
+        self.assertEqual(action, "continue")
+        self.assertEqual(record["phase"], "review")
+        self.assertEqual(record["last_result"], "implement_completed")
+
+        # Round 2, fresh review stage dispatch: a clean pass advances the
+        # change to archive.
+        with mock.patch.object(module, "_try_notify"):
+            action = module.apply_review_result(
+                repo, cfg, state, cid,
+                {
+                    "status": "reviewed",
+                    "verdict": "pass",
+                    "summary": "fresh review passed",
+                    "finding_counts": {"critical": 0, "warning": 0, "note": 0},
+                    "findings": [],
+                    "fix_prompt": "",
+                },
+            )
+        self.assertEqual(action, "continue")
+        self.assertEqual(record["phase"], "archive")
+        self.assertEqual(record["last_result"], "review_passed")
+
+        # Round 2, fresh archive stage dispatch: the worker archives the
+        # reactivated change again with fresh dated evidence; real archive
+        # verification, real fast checks, and the real post-archive
+        # cleanliness gate all pass, so the loop completes the change.
+        action = run_archive_stage("2026-01-02")
+        self.assertEqual(action, "done")
+        self.assertEqual(record["phase"], "done")
+        self.assertEqual(record["status"], module.base.DONE)
+        self.assertEqual(record["archive"]["status"], "passed")
+        self.assertEqual(
+            record["archive"]["path"],
+            "openspec/changes/archive/2026-01-02-change-a",
+        )
+        self.assertFalse(change_dir.exists())
+        self.assertTrue(
+            (repo / "openspec/changes/archive/2026-01-02-change-a").is_dir()
+        )
+        self.assertTrue(
+            (repo / "openspec/changes/archive/2026-01-02-change-a/tasks.md").is_file()
+        )
+        history = [
+            (entry.get("round"), entry.get("phase"), entry.get("status"))
+            for entry in record["history"]
+        ]
+        self.assertIn((1, "archive", "archived"), history)
+        self.assertIn((1, "archive", "reactivated"), history)
+        self.assertIn((2, "implement", "implemented"), history)
+        self.assertIn((2, "review", "pass"), history)
+        self.assertIn((2, "archive", "archived"), history)
+
+    def test_hostile_absolute_archive_path_fails_closed(self) -> None:
+        """An absolute recorded path — even one pointing at the real
+        canonical archive directory — is rejected before any move."""
+        action, record, repo = self._apply(
+            supervised=True,
+            checks=(False, "check failed: smoke"),
+            recorded_path=lambda repo: str(
+                repo / "openspec/changes/archive/2026-01-01-change-a"
+            ),
+        )
+        self.assertEqual(action, "stop")
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
+        self.assertEqual(record["round"], 1)
+        self.assertIn("cannot rerun a fresh review", record["reason"])
+        self.assertIn("refusing reactivation", record["reason"])
+        # Nothing was moved: the archive directory is intact and the change
+        # was not reactivated.
+        self.assertTrue(
+            (repo / "openspec/changes/archive/2026-01-01-change-a/proposal.md").is_file()
+        )
+        self.assertFalse((repo / "openspec/changes/change-a").exists())
+
+    def test_hostile_traversal_archive_path_fails_closed(self) -> None:
+        """A recorded path that traverses out of the archive root into
+        another change's active directory is rejected before any move."""
+
+        def extra_setup(repo: Path) -> None:
+            victim = repo / "openspec" / "changes" / "change-b"
+            victim.mkdir(parents=True)
+            (victim / "proposal.md").write_text("# victim\n", encoding="utf-8")
+
+        action, record, repo = self._apply(
+            supervised=True,
+            checks=(False, "check failed: smoke"),
+            recorded_path="openspec/changes/archive/../change-b",
+            extra_setup=extra_setup,
+        )
+        self.assertEqual(action, "stop")
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
+        self.assertIn("refusing reactivation", record["reason"])
+        self.assertTrue(
+            (repo / "openspec/changes/change-b/proposal.md").is_file()
+        )
+        self.assertTrue(
+            (repo / "openspec/changes/archive/2026-01-01-change-a").is_dir()
+        )
+        self.assertFalse((repo / "openspec/changes/change-a").exists())
+
+    def test_hostile_mismatched_archive_path_fails_closed(self) -> None:
+        """A recorded path naming a dated archive directory for a different
+        change is rejected before any move."""
+
+        def extra_setup(repo: Path) -> None:
+            other = repo / "openspec/changes/archive/2026-01-01-change-b"
+            other.mkdir(parents=True)
+            (other / "proposal.md").write_text("# other\n", encoding="utf-8")
+
+        action, record, repo = self._apply(
+            supervised=True,
+            checks=(False, "check failed: smoke"),
+            recorded_path="openspec/changes/archive/2026-01-01-change-b",
+            extra_setup=extra_setup,
+        )
+        self.assertEqual(action, "stop")
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
+        self.assertIn("refusing reactivation", record["reason"])
+        self.assertTrue(
+            (repo / "openspec/changes/archive/2026-01-01-change-b/proposal.md").is_file()
+        )
+        self.assertTrue(
+            (repo / "openspec/changes/archive/2026-01-01-change-a").is_dir()
+        )
+        self.assertFalse((repo / "openspec/changes/change-a").exists())
+
+    def test_hostile_symlink_escaping_archive_root_fails_closed(self) -> None:
+        """A canonical-looking archive entry that symlinks outside the
+        archive root is rejected before any move."""
+
+        def extra_setup(repo: Path) -> None:
+            outside = repo / "outside"
+            outside.mkdir()
+            (outside / "proposal.md").write_text("# outside\n", encoding="utf-8")
+            link = repo / "openspec/changes/archive/2026-01-01-change-a"
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(outside, target_is_directory=True)
+
+        action, record, repo = self._apply(
+            supervised=True,
+            checks=(False, "check failed: smoke"),
+            with_archive_dir=False,
+            extra_setup=extra_setup,
+        )
+        self.assertEqual(action, "stop")
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
+        self.assertIn("refusing reactivation", record["reason"])
+        self.assertTrue((repo / "outside/proposal.md").is_file())
+        self.assertFalse((repo / "openspec/changes/change-a").exists())
+
+    def test_symlinked_active_path_fails_closed(self) -> None:
+        """A symlink at the canonical active path must not satisfy the
+        'already active' no-op check — ``exists()`` follows the link, so
+        without the real-directory guard reactivation would requeue the
+        fresh loop straight into unrelated artifacts. Reactivation fails
+        closed: the archive stays untouched and no fresh round is
+        dispatched."""
+
+        def extra_setup(repo: Path) -> None:
+            outside = repo / "unrelated"
+            outside.mkdir()
+            (outside / "proposal.md").write_text("# unrelated\n", encoding="utf-8")
+            link = repo / "openspec" / "changes" / "change-a"
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(outside, target_is_directory=True)
+
+        action, record, repo = self._apply(
+            supervised=True,
+            checks=(False, "check failed: smoke"),
+            extra_setup=extra_setup,
+        )
+        self.assertEqual(action, "stop")
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
+        self.assertEqual(record["round"], 1)
+        self.assertEqual(record["phase"], "archive")
+        self.assertIn("cannot rerun a fresh review", record["reason"])
+        self.assertIn("refusing reactivation", record["reason"])
+        # The archive remains untouched — nothing was restored or moved.
+        self.assertTrue(
+            (repo / "openspec/changes/archive/2026-01-01-change-a/proposal.md").is_file()
+        )
+        # The symlink was not followed or clobbered: it still points at the
+        # unrelated directory and no change artifacts appeared through it.
+        active = repo / "openspec/changes/change-a"
+        self.assertTrue(active.is_symlink())
+        self.assertEqual(active.readlink(), repo / "unrelated")
+        self.assertFalse((active / "tasks.md").exists())
+        self.assertEqual(
+            (repo / "unrelated/proposal.md").read_text(encoding="utf-8"),
+            "# unrelated\n",
+        )
+
+    def test_dangling_link_at_active_path_fails_closed(self) -> None:
+        """A dangling symlink at the canonical active path fails ``exists()``
+        but must still fail closed rather than being clobbered by the
+        restored archive or treated as absent-and-safe."""
+
+        def extra_setup(repo: Path) -> None:
+            link = repo / "openspec" / "changes" / "change-a"
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(repo / "gone", target_is_directory=True)
+
+        action, record, repo = self._apply(
+            supervised=True,
+            checks=(False, "check failed: smoke"),
+            extra_setup=extra_setup,
+        )
+        self.assertEqual(action, "stop")
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
+        self.assertEqual(record["round"], 1)
+        self.assertIn("refusing reactivation", record["reason"])
+        # The archive remains untouched and the dangling link survives.
+        self.assertTrue(
+            (repo / "openspec/changes/archive/2026-01-01-change-a/proposal.md").is_file()
+        )
+        self.assertTrue((repo / "openspec/changes/change-a").is_symlink())
+
+    def test_plain_file_at_active_path_fails_closed(self) -> None:
+        """A plain file occupying the canonical active path is not the
+        active change: reactivation fails closed instead of moving the
+        archive over it."""
+
+        def extra_setup(repo: Path) -> None:
+            blocker = repo / "openspec" / "changes" / "change-a"
+            blocker.parent.mkdir(parents=True, exist_ok=True)
+            blocker.write_text("not a change\n", encoding="utf-8")
+
+        action, record, repo = self._apply(
+            supervised=True,
+            checks=(False, "check failed: smoke"),
+            extra_setup=extra_setup,
+        )
+        self.assertEqual(action, "stop")
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
+        self.assertEqual(record["round"], 1)
+        self.assertIn("refusing reactivation", record["reason"])
+        self.assertTrue(
+            (repo / "openspec/changes/archive/2026-01-01-change-a/proposal.md").is_file()
+        )
+        self.assertEqual(
+            (repo / "openspec/changes/change-a").read_text(encoding="utf-8"),
+            "not a change\n",
+        )
+
+    def test_suffix_matching_sibling_is_not_the_active_change(self) -> None:
+        """A sibling directory whose name merely ends in ``-<cid>`` must
+        never count as the active change: reactivation still restores the
+        canonical archive at the exact active path — the sibling is neither
+        accepted as active nor receives the restored artifacts a fresh
+        dispatch would act on."""
+        def extra_setup(repo: Path) -> None:
+            sibling = repo / "openspec" / "changes" / "unrelated-change-a"
+            sibling.mkdir(parents=True)
+            (sibling / "proposal.md").write_text("# unrelated\n", encoding="utf-8")
+
+        action, record, repo = self._apply(
+            supervised=True,
+            checks=(False, "check failed: smoke"),
+            extra_setup=extra_setup,
+        )
+        self.assertEqual(action, "continue")
+        # The canonical archive was moved to the exact active path.
+        active = repo / "openspec" / "changes" / "change-a"
+        self.assertTrue(active.is_dir())
+        self.assertEqual(
+            (active / "proposal.md").read_text(encoding="utf-8"), "# proposal\n"
+        )
+        self.assertTrue((active / "tasks.md").is_file())
+        self.assertFalse(
+            (repo / "openspec/changes/archive/2026-01-01-change-a").exists()
+        )
+        # The unrelated sibling was left completely untouched.
+        sibling = repo / "openspec" / "changes" / "unrelated-change-a"
+        self.assertEqual(
+            (sibling / "proposal.md").read_text(encoding="utf-8"), "# unrelated\n"
+        )
+
+    def test_verify_archive_ignores_suffix_matching_sibling(self) -> None:
+        """Archive verification checks the exact canonical active path, so a
+        suffix-matching sibling left behind by unrelated work does not read
+        as 'the change is still active' and spuriously fail verification."""
+        module = self.opsx_plan
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Path(tmp.name)
+        self._git(repo, "init")
+        (repo / ".gitignore").write_text(
+            "openspec/changes/archive/\n", encoding="utf-8"
+        )
+        (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        self._git(repo, "add", ".")
+        self._git(
+            repo, "-c", "user.email=test@example.invalid",
+            "-c", "user.name=Test User", "commit", "-m", "init",
+        )
+        cid = "change-a"
+        archive_rel = f"openspec/changes/archive/2026-01-01-{cid}"
+        archived = repo / archive_rel
+        archived.mkdir(parents=True)
+        (archived / "proposal.md").write_text("# proposal\n", encoding="utf-8")
+        (archived / "tasks.md").write_text("- [x] 1.1 done\n", encoding="utf-8")
+        sibling = repo / "openspec" / "changes" / f"unrelated-{cid}"
+        sibling.mkdir(parents=True)
+        (sibling / "proposal.md").write_text("# unrelated\n", encoding="utf-8")
+        state = {"changes": {}}
+        record = module.state_mod.rec(state, cid)
+        record["archive"].update(
+            {"status": "passed", "path": archive_rel, "commit": "", "reason": ""}
+        )
+        ok, why = module.verify_direct_archive_done(repo, cid, record)
+        self.assertTrue(ok, why)
+
+    def test_verify_archive_fails_on_symlink_at_active_path(self) -> None:
+        """A symlink — even a dangling one — at the canonical active path
+        counts as 'still exists', so verification fails and routes to
+        reactivation, which itself fails closed on non-directories."""
+        module = self.opsx_plan
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Path(tmp.name)
+        self._git(repo, "init")
+        (repo / ".gitignore").write_text(
+            "openspec/changes/archive/\n", encoding="utf-8"
+        )
+        (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        self._git(repo, "add", ".")
+        self._git(
+            repo, "-c", "user.email=test@example.invalid",
+            "-c", "user.name=Test User", "commit", "-m", "init",
+        )
+        cid = "change-a"
+        archive_rel = f"openspec/changes/archive/2026-01-01-{cid}"
+        archived = repo / archive_rel
+        archived.mkdir(parents=True)
+        (archived / "proposal.md").write_text("# proposal\n", encoding="utf-8")
+        (archived / "tasks.md").write_text("- [x] 1.1 done\n", encoding="utf-8")
+        link = repo / "openspec" / "changes" / cid
+        link.symlink_to(repo / "gone", target_is_directory=True)
+        state = {"changes": {}}
+        record = module.state_mod.rec(state, cid)
+        record["archive"].update(
+            {"status": "passed", "path": archive_rel, "commit": "", "reason": ""}
+        )
+        ok, why = module.verify_direct_archive_done(repo, cid, record)
+        self.assertFalse(ok)
+        self.assertIn("still exists", why)
+
+
+class CliLifecycleCommandTests(LifecycleTestCase):
+    """Each lifecycle command end to end through the cmd_supervise handlers."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        from lib.orchestrator import cmd_supervise
+
+        self.cli = cmd_supervise
+        (self.repo / "plan.toml").write_text(
+            '[plan]\nname = "cli-plan"\nadapter = "opencode"\n'
+            "\n[[changes]]\nid = \"change-a\"\npause_before = false\ndepends_on = []\n",
+            encoding="utf-8",
+        )
+
+    def _args(self, **overrides: object) -> argparse.Namespace:
+        ns = argparse.Namespace(
+            repo=str(self.repo),
+            plan="plan.toml",
+            store=str(self.db_path),
+            job_id=None,
+            json=False,
+            no_drive=True,
+            primary_session=False,
+            budget_usd=0.0,
+            budget_minutes=None,
+            per_action_usd=None,
+            per_action_minutes=None,
+            deadline_minutes=None,
+            max_incident_attempts=None,
+        )
+        for key, value in overrides.items():
+            setattr(ns, key, value)
+        return ns
+
+    def _register(self) -> int:
+        with mock.patch.object(
+            authority, "require_authority_backend", return_value=mock.Mock()
+        ):
+            rc = self.cli.cmd_supervise_register(self._args())
+        self.assertEqual(rc, 0)
+        job = lifecycle.job_for_worktree(
+            self.ledger, self.repo, repository_root=self.repo
+        )
+        return int(job["id"])
+
+    def _start(self) -> int:
+        rc = self.cli.cmd_supervise_start(self._args(no_drive=True))
+        self.assertEqual(rc, 0)
+        job = lifecycle.job_for_worktree(
+            self.ledger, self.repo, repository_root=self.repo
+        )
+        self.assertEqual(job["state"], "active")
+        return int(job["id"])
+
+    def _mute_endpoint(self):
+        return mock.patch.object(
+            self.cli, "_operator_socket_configured", return_value=False
+        )
+
+    def test_register_records_the_full_job(self) -> None:
+        job_id = self._register()
+        job = self.ledger.get_job(job_id)
+        self.assertEqual(job["state"], "registered")
+        # The ledger stores the worktree relative to the repository root.
+        self.assertEqual(
+            (self.repo / job["worktree_path"]).resolve(), self.repo
+        )
+        policy = self.ledger.current_policy(job_id)
+        self.assertEqual(policy["revision"], 1)
+        self.assertTrue(policy["manifest_snapshot_hash"])
+        self.assertEqual(
+            self.ledger.job_linkage_config(job_id)["adapter"], "opencode"
+        )
+
+    def test_register_fails_closed_on_an_unsupported_host(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch.object(
+            authority,
+            "require_authority_backend",
+            side_effect=authority.UnsupportedHostError("no backend"),
+        ), contextlib.redirect_stderr(stderr):
+            rc = self.cli.cmd_supervise_register(self._args())
+        self.assertEqual(rc, 1)
+        self.assertIn("UnsupportedHostError", stderr.getvalue())
+        with self.assertRaises(lifecycle.UnknownJobError):
+            lifecycle.job_for_worktree(
+                self.ledger, self.repo, repository_root=self.repo
+            )
+
+    def test_start_then_inspect_projects_the_active_job(self) -> None:
+        job_id = self._register()
+        self.assertEqual(self._start(), job_id)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = self.cli.cmd_supervise_inspect(self._args(json=True))
+        self.assertEqual(rc, 0)
+        projection = json.loads(stdout.getvalue())
+        self.assertEqual(projection["job_id"], job_id)
+        self.assertEqual(projection["state"], "active")
+        self.assertEqual(projection["policy"]["revision"], 1)
+        self.assertEqual(projection["waits"], [])
+
+    def test_pause_resume_drain_and_cancel_drive_the_state_machine(self) -> None:
+        self._register()
+        job_id = self._start()
+        with self._mute_endpoint():
+            self.assertEqual(self.cli.cmd_supervise_pause(self._args()), 0)
+            self.assertEqual(self.ledger.get_job(job_id)["state"], "paused")
+            self.assertEqual(self.cli.cmd_supervise_resume(self._args()), 0)
+            self.assertEqual(self.ledger.get_job(job_id)["state"], "active")
+            self.assertEqual(self.cli.cmd_supervise_drain(self._args()), 0)
+            self.assertEqual(self.ledger.get_job(job_id)["state"], "paused")
+            self.assertEqual(self.cli.cmd_supervise_resume(self._args()), 0)
+            self.assertEqual(self.cli.cmd_supervise_cancel(self._args()), 0)
+            self.assertEqual(self.ledger.get_job(job_id)["state"], "cancelled")
+
+    def test_mutations_fail_closed_when_the_broker_is_unreachable(self) -> None:
+        self._register()
+        job_id = self._start()
+        stderr = io.StringIO()
+        with mock.patch.object(
+            self.cli, "_operator_socket_configured", return_value=True
+        ), mock.patch.object(
+            self.cli.supervision_mod,
+            "call_operator",
+            side_effect=broker_mod.BrokerUnavailableError("endpoint unreachable"),
+        ), contextlib.redirect_stderr(stderr):
+            rc = self.cli.cmd_supervise_pause(self._args())
+        self.assertEqual(rc, 1)
+        self.assertIn("BrokerUnavailableError", stderr.getvalue())
+        self.assertEqual(self.ledger.get_job(job_id)["state"], "active")
+
+    def test_unregistered_worktree_is_a_named_unknown_job_error(self) -> None:
+        stderr = io.StringIO()
+        with self._mute_endpoint(), contextlib.redirect_stderr(stderr):
+            rc = self.cli.cmd_supervise_pause(self._args())
+        self.assertEqual(rc, 1)
+        self.assertIn("UnknownJobError", stderr.getvalue())
+
+    def test_illegal_transition_and_terminal_job_are_named_errors(self) -> None:
+        self._register()
+        job_id = self._start()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            rc = self.cli.cmd_supervise_start(self._args(no_drive=True))
+        self.assertEqual(rc, 1)
+        self.assertIn("IllegalTransitionError", stderr.getvalue())
+        with self._mute_endpoint():
+            self.assertEqual(self.cli.cmd_supervise_cancel(self._args()), 0)
+        stderr = io.StringIO()
+        with self._mute_endpoint(), contextlib.redirect_stderr(stderr):
+            rc = self.cli.cmd_supervise_pause(self._args())
+        self.assertEqual(rc, 1)
+        self.assertIn("TerminalJobError", stderr.getvalue())
+        self.assertEqual(self.ledger.get_job(job_id)["state"], "cancelled")
 
 
 class MigrationTests(LifecycleTestCase):
