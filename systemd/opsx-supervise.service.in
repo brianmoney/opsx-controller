@@ -1,0 +1,70 @@
+# opsx-supervise.service.in — versioned systemd USER unit template for the
+# opsx-controller supervision service host.
+#
+# This file is installed DATA. Installing it neither enables nor starts
+# anything: no unit is written into any service-manager directory, no
+# operating-system account is created or modified, and the authority store is
+# untouched. The service is deployed disabled and stays inert until an operator
+# renders this template and enables it as part of the documented activation
+# step in docs/opsx-supervision-service.md.
+#
+# Activation is gated on the mandatory activation probe. Do not enable the
+# rendered unit before `opsx-plan supervise probe` passes on this host.
+#
+# Render the ${...} placeholders (for example with `envsubst`) and install the
+# result into the *service principal's* user unit directory:
+#
+#   /home/<service-principal>/.config/systemd/user/opsx-supervise.service
+#
+# A systemd user unit runs under whichever user manager loads it, so the
+# effective identity is the user manager's user, never an environment variable.
+# The AssertUser= directive below pins that identity: the unit refuses to start
+# unless it is loaded by the configured service principal's user manager. The
+# unit must therefore be rendered, reloaded, and enabled from that user's
+# manager (see docs/opsx-supervision-service.md for the required manager setup,
+# including `loginctl enable-linger`).
+#
+# Placeholders:
+#   ${OPSX_SUPERVISE_EXECUTABLE}
+#       Absolute path to the installed opsx-plan executable,
+#       e.g. /home/opsx-supervisor/.local/bin/opsx-plan
+#   ${OPSX_SUPERVISE_REPO}
+#       Repository the service host supervises (its .opsx-plan root).
+#   ${OPSX_SUPERVISE_SERVICE_PRINCIPAL}
+#       Provisioned service principal name (default: opsx-supervisor). This is
+#       both the process configuration identity and the manager user the unit
+#       is asserted to run under.
+#   ${OPSX_SUPERVISE_WORKER_PRINCIPAL}
+#       Provisioned worker principal name (default: opsx-worker).
+#   ${OPSX_SUPERVISE_STATE_FILE}
+#       Service-owned authority-store file the activation probe protects,
+#       e.g. /home/opsx-supervisor/.local/share/opsx-controller/supervisor/supervisor.sqlite3
+#
+# Only the Linux systemd user manager is supported in this pass. Porting this
+# template to another service manager or to a non-OpenCode session bridge is
+# explicitly unsupported: the activation gate fails closed rather than
+# substituting a weaker posture.
+
+[Unit]
+Description=opsx-controller supervision service host
+Documentation=file:%h/.local/lib/opsx-controller/docs/opsx-supervision-service.md
+After=network.target
+# Fail closed unless the loading user manager runs as the configured service
+# principal. This is an assertion (the start job fails loudly) rather than a
+# condition, so enabling the unit under the wrong identity is surfaced, not
+# silently skipped.
+AssertUser=${OPSX_SUPERVISE_SERVICE_PRINCIPAL}
+
+[Service]
+Type=simple
+WorkingDirectory=${OPSX_SUPERVISE_REPO}
+ExecStart=${OPSX_SUPERVISE_EXECUTABLE} supervise serve
+Environment=OPSX_SUPERVISOR_SERVICE_PRINCIPAL=${OPSX_SUPERVISE_SERVICE_PRINCIPAL}
+Environment=OPSX_SUPERVISOR_WORKER_PRINCIPAL=${OPSX_SUPERVISE_WORKER_PRINCIPAL}
+Environment=OPSX_SUPERVISOR_STATE_FILE=${OPSX_SUPERVISE_STATE_FILE}
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

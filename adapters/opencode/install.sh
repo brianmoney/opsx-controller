@@ -235,6 +235,7 @@ install_global() {
   do_verify
   verify_plugin_deployed "$config_root/plugins"
   verify_plan_authoring_reference "$config_root/opsx-controller"
+  verify_supervision_service_packaging "$HOME/.local/lib/opsx-controller" "$ROOT_DIR"
   verify_supervised_agents_and_skill \
     "$config_root/agents" "$config_root/skills" "$ROOT_DIR" "$HOME/.local/bin"
 }
@@ -276,6 +277,7 @@ install_project() {
   do_verify
   verify_plugin_deployed "$project_dir/.opencode/plugins"
   verify_plan_authoring_reference "$project_dir/.opencode/opsx-controller"
+  verify_supervision_service_packaging "$project_dir/.opsx-controller" "$ROOT_DIR"
   verify_supervised_agents_and_skill \
     "$project_dir/.opencode/agents" "$project_dir/.opencode/skills" "$ROOT_DIR" "$project_dir/.opsx-controller/bin"
 }

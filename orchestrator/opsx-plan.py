@@ -87,7 +87,7 @@ try:
         base, compiler, cmd_archive_plan, cmd_doctor, cmd_gates, cmd_logs,
         cmd_models, cmd_run_one, cmd_status, cmd_supervise, cmd_use, dashboard,
         delivery, doctor, groundtruth, logs, planref, report,
-        telemetry,
+        supervision_service, telemetry,
     )
     from lib.orchestrator import cost as cost_mod
     from lib.orchestrator import state as state_mod
@@ -4762,6 +4762,7 @@ def run_doctor_checks(repo: Path, plan_src: str | None,
 
     # Plan-independent checks
     checks.append(_check_stale_install(repo))
+    checks.append(supervision_service.doctor_check(repo))
     checks.append(doctor._check_model_resolution(repo, adapter))
     checks.append(doctor._check_model_identifier_syntax(repo, adapter))
     checks.append(doctor._check_supervised_models(repo, adapter))
@@ -4792,6 +4793,8 @@ def run_doctor_checks(repo: Path, plan_src: str | None,
             doctor._print_supervised_model_detail(repo, adapter)
         if label == "Model pricing resolves for configured roles":
             doctor._print_model_pricing_detail(repo, adapter)
+        if label == supervision_service.CHECK_LABEL:
+            supervision_service.print_detail(repo)
 
     return failures
 
@@ -4802,6 +4805,7 @@ def run_preflight_warnings(repo: Path, plan_src: str | None,
     checks: list[tuple[bool, str, str]] = []
 
     checks.append(_check_stale_install(repo))
+    checks.append(supervision_service.doctor_check(repo))
     checks.append(doctor._check_model_resolution(repo, adapter))
     checks.append(doctor._check_model_identifier_syntax(repo, adapter))
     checks.append(doctor._check_supervised_models(repo, adapter))

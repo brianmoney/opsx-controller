@@ -581,8 +581,13 @@ posture (for example same-UID conventions) when the baseline backend is
 unavailable.
 
 Provisioning of the accounts and service the backend requires SHALL be
-manual: detection and enablement SHALL NOT create accounts, install service
-units, or otherwise provision the host automatically.
+manual: detection and enablement SHALL NOT create accounts, install or enable
+service units, or otherwise provision the host automatically. Packaging a
+disabled service unit template and its provisioning document through the global
+installer SHALL NOT count as automatic provisioning, because a disabled
+template neither runs nor changes host authorization; the operator's documented
+activation step, gated on the mandatory activation probe, remains the only path
+that enables the service.
 
 #### Scenario: An unsupported host is refused
 
@@ -594,8 +599,16 @@ units, or otherwise provision the host automatically.
 #### Scenario: Detection never provisions
 
 - **WHEN** backend capability detection runs on any host
-- **THEN** it creates no accounts, installs no service units, and changes no
-  host configuration
+- **THEN** it creates no accounts, installs or enables no service units, and
+  changes no host configuration
+
+#### Scenario: Packaging a disabled template is not enablement
+
+- **WHEN** a global installer deploys the supervision unit template and
+  provisioning document
+- **THEN** the unit is deployed disabled, no account or authority store is
+  changed, and supervision remains unenabled until the operator activation step
+  passes the activation probe
 
 ### Requirement: An activation probe is mandatory before supervision is enabled
 
@@ -3414,3 +3427,90 @@ loopback fake servers, real local subprocesses, and temporary sandboxes.
 - **WHEN** a supervised check under the fixture guard attempts a paid model call
   or an operator global install or daemon provisioning step
 - **THEN** the guard refuses it and the check fails closed
+
+### Requirement: The supervision service is packaged for Linux and installed disabled by default
+
+The repository SHALL package the supervision runtime for a Linux OS-managed
+service. It SHALL version-control a systemd user unit template for the
+supervision service host and a provisioning document that names the manual
+steps to create the service and worker accounts, provision the authority store,
+render the unit template, and enable the service.
+
+Every global install performed through the shared orchestrator installer path,
+including the universal installer, SHALL deploy the unit template and the
+provisioning document into the installed runtime tree, and the deployment SHALL
+be idempotent so a repeated install replaces them.
+
+The service SHALL be deployed disabled: the installer SHALL NOT enable, start,
+or activate the service, and SHALL NOT create or modify operating-system
+accounts or the authority store. The installed unit SHALL remain inert until
+the operator performs the documented activation step.
+
+#### Scenario: A global install deploys the disabled service artifacts
+
+- **WHEN** an operator runs any adapter's global installer or the universal
+  installer
+- **THEN** the supervision unit template and provisioning document are installed
+  in the runtime tree, and the service is neither enabled nor started
+
+#### Scenario: Installation never creates accounts
+
+- **WHEN** any global install runs
+- **THEN** no operating-system account and no authority store is created or
+  modified
+
+#### Scenario: Repeated install refreshes the packaged artifacts
+
+- **WHEN** an operator reruns a global installer after the unit template or the
+  provisioning document changes in the repository
+- **THEN** the installed copies are replaced with the current repository
+  versions
+
+### Requirement: Unattended supervision activation is an explicit operator step gated on the activation probe
+
+Unattended operation of the packaged service SHALL be enabled only by an
+explicit, documented operator action, and only after the mandatory activation
+probe has verified that the worker domain cannot write the authority store.
+Activation SHALL fail closed on a host without a supported isolation backend
+with a named unsupported-host error, and SHALL NOT substitute a weaker posture.
+Non-Linux service managers and non-OpenCode session bridges SHALL remain
+unsupported: the packaging SHALL provide no silent fallback and no unverified
+activation path for them.
+
+#### Scenario: Activation requires a passing probe
+
+- **WHEN** an operator follows the documented activation step on a host whose
+  activation probe fails or cannot run
+- **THEN** the service is not enabled or started, and the failure is reported
+  with a named error
+
+#### Scenario: An unsupported host fails closed
+
+- **WHEN** activation is attempted on a host with no supported isolation backend
+  or no supported service manager
+- **THEN** the attempt fails closed with a named unsupported-host error and no
+  weaker posture is substituted
+
+### Requirement: `opsx-plan doctor` reports the supervision service, schema, and backend state
+
+`opsx-plan doctor` SHALL report the packaged service state — whether the unit
+template and provisioning document are installed and whether a service unit is
+present — the supervisor ledger schema version, and the backend capability
+status, alongside the existing installation checks. The service check SHALL be
+read-only: it SHALL NOT enable, start, or provision the service, create
+accounts, or write the authority store. An absent or unsupported service state
+SHALL be reported plainly and SHALL NOT fail the doctor check for an operator
+who has not enabled supervision.
+
+#### Scenario: Doctor reports the service state
+
+- **WHEN** an operator runs `opsx-plan doctor` after a global install
+- **THEN** the output reports the installed service artifacts, the supervisor
+  ledger schema version, and the backend capability status
+
+#### Scenario: Doctor stays green without supervision enablement
+
+- **WHEN** an operator runs `opsx-plan doctor` on a host where supervision has
+  not been enabled
+- **THEN** the service is reported as not enabled or unconfigured, and the
+  doctor check does not fail

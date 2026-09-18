@@ -351,3 +351,47 @@ command-line surface.
 - **THEN** the gate evaluation, journal lifecycle, and outcome recording are
   performed by the concern-named module, with the entrypoint providing only
   command parsing and call-site wiring
+
+### Requirement: The service-packaging sources and service doctor probe follow the runtime-module discipline
+
+The supervision service packaging SHALL keep its versioned unit template and
+provisioning document as shipped data under a versioned, concern-named path,
+and SHALL keep the read-only service/doctor probe in a concern-named,
+importable runtime module under `lib/orchestrator/`, under the shared
+runtime-module discipline: importable without executing the CLI and without
+reading or writing anything under `.opsx-plan/` at import time, standard
+library only, and cross-module references resolved through the owning module
+object.
+
+The probe SHALL be operable without the authority boundary and without the
+supervisor ledger: reporting the installed service artifacts, the ledger schema
+version when a ledger is present, and the backend capability status SHALL
+require no trusted service identity, write nothing, and provision nothing.
+
+#### Scenario: The service probe module is imported without running the CLI
+
+- **WHEN** a test or tool imports the module that owns the service/doctor probe
+- **THEN** the import succeeds, no argument parsing occurs, no process is
+  spawned, and no file under `.opsx-plan/` is read or written
+
+#### Scenario: The service probe runs without the boundary
+
+- **WHEN** the service/doctor probe runs as an ordinary process on a host where
+  the authority boundary is unavailable
+- **THEN** it reports the service artifact and backend status without requiring
+  the trusted service identity, writing the authority store, or provisioning
+  anything
+
+### Requirement: The service installation logic lives in a concern-named installer source
+
+The shared installer step that deploys the supervision service packaging SHALL
+live in a concern-named, version-controlled source rather than being inlined
+into each adapter installer, so that the adapter installers and the universal
+installer deploy identical service artifacts through one mechanism.
+
+#### Scenario: Adapter and universal installs share one installation path
+
+- **WHEN** an adapter installer and the universal installer deploy the
+  supervision service packaging
+- **THEN** both invoke the same shared installation source and produce the same
+  installed service artifacts

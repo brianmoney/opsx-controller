@@ -161,6 +161,13 @@ class SupervisorModuleLayoutTests(unittest.TestCase):
                     finally:
                         if saved is not None:
                             sys.modules[name] = saved
+                            # Reimporting rebinds ``lib.supervisor.<stem>`` on the
+                            # package to the fresh module; restore that attribute
+                            # too so ``from lib.supervisor import <stem>`` and
+                            # ``sys.modules`` stay consistent for later tests.
+                            package = sys.modules.get("lib.supervisor")
+                            if package is not None:
+                                setattr(package, pyfile.stem, saved)
         self.assertEqual(len(fresh_names), len(_supervisor_modules()))
         if not existed:
             self.assertFalse(

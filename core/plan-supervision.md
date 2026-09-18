@@ -377,6 +377,63 @@ A scheme a worker process can reach does not satisfy the boundary. Only a
 distinct principal enforced by the kernel does.
 
 
+## Service packaging and provisioning
+
+The supervision service host is packaged as Linux systemd data, not as an
+automatic provisioner. The repository version-controls two artifacts: a systemd
+**user** unit template (`systemd/opsx-supervise.service.in`) and a provisioning
+document (`docs/opsx-supervision-service.md`). Every global install through the
+shared orchestrator installer — adapter installs and the universal installer
+alike — deploys both into the installed runtime tree
+(`~/.local/lib/opsx-controller/systemd/` and `.../docs/`), replacing them on a
+repeated install. The installer only copies data: it writes no unit into a
+service-manager directory, runs no `systemctl`, and creates or modifies no
+operating-system account and no authority store.
+
+The service is therefore **disabled by default**. A deployed template is inert:
+it neither runs nor changes host authorization, so packaging a disabled unit
+template is not the automatic provisioning the boundary contract forbids.
+Enabling unattended operation is a separate, explicit operator action documented
+in the provisioning document: create the service and worker accounts, provision
+the authority-store file, render the template, run the mandatory activation
+probe, and only then enable the service. The installed unit stays inert until
+that step.
+
+Activation is gated on the existing mandatory activation probe, reached through
+the fail-closed `activation_gate`, which composes two checks. First, a read-only
+service-host capability check (in `lib/orchestrator/supervision_service.py`)
+requires a supported **systemd user manager** (a trusted `systemctl` and a live
+`$XDG_RUNTIME_DIR/systemd/private` user-manager socket) and a supported
+**OpenCode session bridge** (a resolvable `opencode` CLI or a pinned
+`OPSX_SESSION_SERVER_COMMAND`). Second, the existing `require_authority_backend`
+gate runs backend detection and the mandatory probe. A host whose probe fails
+or cannot run is not enabled. A host without a supported isolation backend
+(non-Linux, no peer credentials, missing or collapsed principals, untrusted
+store location) or without a supported service manager or session bridge is
+refused with the named `UnsupportedHostError`, and no weaker posture is
+substituted. Non-Linux service managers (launchd, Windows services) and
+non-OpenCode session bridges are explicitly unsupported and fail closed.
+
+Because the service is a systemd **user** unit, its effective identity is the
+user whose manager loads it, not a configuration value. The packaged template
+pins that identity with an `AssertUser=` assertion against the configured
+service principal, so the unit's start job fails loudly if it is enabled from
+any other user manager. The provisioning document requires the unit to be
+rendered, reloaded, and enabled from the service principal's own user manager
+(with `loginctl enable-linger` so that manager exists without an interactive
+login).
+
+`opsx-plan doctor` reports the packaged service state read-only through the
+concern-named `lib/orchestrator/supervision_service.py` probe: whether the unit
+template and the provisioning document are installed, whether a rendered
+service unit is present, the supervisor ledger schema version when a ledger is
+present, the isolation-backend capability status, and the service-host
+prerequisite status. The check never enables, starts, writes, or provisions
+anything, and an absent or unsupported service state is reported plainly
+without failing an operator who has not enabled supervision, so a legacy
+unsupervised installation stays green.
+
+
 ## Journal semantics
 
 The journal records intent before side effects and reconciles evidence rather

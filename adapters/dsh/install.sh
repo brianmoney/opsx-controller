@@ -155,6 +155,7 @@ install_global() {
   do_verify
   verify_shim_deployed "$HOME/.local/bin/opsx-dsh-worker"
   verify_plan_authoring_reference "$config_root"
+  verify_supervision_service_packaging "$HOME/.local/lib/opsx-controller" "$ROOT_DIR"
 }
 
 install_project() {
@@ -183,6 +184,7 @@ install_project() {
     "Installed opsx-watch-plan to $project_dir/.opsx-controller/bin/opsx-watch-plan"
   do_verify
   verify_plan_authoring_reference "$support_dir"
+  verify_supervision_service_packaging "$project_dir/.opsx-controller" "$ROOT_DIR"
 }
 
 if [[ $# -eq 0 ]]; then

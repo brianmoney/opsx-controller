@@ -34,8 +34,10 @@ install_orchestrator() {
   fi
 
   mkdir -p "$dest_dir"
-  rm -rf "$runtime_dir/lib" "$runtime_dir/samples"
-  mkdir -p "$runtime_dir/lib" "$runtime_dir/samples"
+  rm -rf "$runtime_dir/lib" "$runtime_dir/samples" \
+    "$runtime_dir/systemd" "$runtime_dir/docs"
+  mkdir -p "$runtime_dir/lib" "$runtime_dir/samples" \
+    "$runtime_dir/systemd" "$runtime_dir/docs"
 
   if [[ "$mode" == "--project" ]]; then
     # Project-scoped runtime is machine-local state: keep the installed lib,
@@ -51,10 +53,12 @@ install_orchestrator() {
         'lib/' \
         'bin/' \
         'samples/' \
+        'systemd/' \
+        'docs/' \
         '*.json' > "$gi"
     else
       local line
-      for line in 'lib/' 'bin/' 'samples/' '*.json'; do
+      for line in 'lib/' 'bin/' 'samples/' 'systemd/' 'docs/' '*.json'; do
         if ! grep -Fxq "$line" "$gi"; then
           printf '%s\n' "$line" >> "$gi"
         fi
@@ -76,6 +80,16 @@ install_orchestrator() {
     "$repo_root/core/plan-authoring.md" \
     "$runtime_dir/plan-authoring.md"
 
+  # Supervision service packaging: the versioned systemd user unit template and
+  # its provisioning document are installed disabled DATA. No unit is written
+  # to a service-manager directory, and no account or store is touched here.
+  install -m 0644 \
+    "$repo_root/systemd/opsx-supervise.service.in" \
+    "$runtime_dir/systemd/opsx-supervise.service.in"
+  install -m 0644 \
+    "$repo_root/docs/opsx-supervision-service.md" \
+    "$runtime_dir/docs/opsx-supervision-service.md"
+
   install -m 0755 \
     "$repo_root/orchestrator/opsx-plan.py" \
     "$dest_dir/opsx-plan"
@@ -90,6 +104,8 @@ install_orchestrator() {
     "Installed opsx-plan runtime libraries to $runtime_dir" \
     "Installed opsx-plan samples to $runtime_dir/samples" \
     "Installed plan-authoring reference to $runtime_dir/plan-authoring.md" \
+    "Installed supervision service template to $runtime_dir/systemd/opsx-supervise.service.in" \
+    "Installed supervision service provisioning document to $runtime_dir/docs/opsx-supervision-service.md" \
     "Installed opsx-plan to $dest_dir/opsx-plan" \
     "Installed opsx-run to $dest_dir/opsx-run" \
     "Installed opsx-watch-plan to $dest_dir/opsx-watch-plan"

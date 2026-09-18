@@ -392,6 +392,17 @@ importable `lib/orchestrator/` package alongside the existing `lib/metrics`,
   `groundtruth`.
 - `lib/orchestrator/doctor.py` — twelve individual `_check_*` preflight probes.
   Depends on `base`, `groundtruth`, `planref`, and `telemetry`.
+- `lib/orchestrator/supervision_service.py` — the read-only supervision service
+  probe and the documented activation gate. Reports the installed service unit
+  template and provisioning document paths, any rendered systemd user unit, the
+  supervisor ledger schema version when a ledger is present, the
+  isolation-backend capability status, and the service-host prerequisite status
+  (systemd user manager and OpenCode session bridge). `activation_gate` composes
+  the read-only `service_host_capability` check with
+  `lib.supervisor.authority.require_authority_backend`, so a host missing either
+  prerequisite fails closed with the named `UnsupportedHostError`. Imports
+  without side effects and depends only on the standard library and
+  `lib.supervisor`.
 - `lib/orchestrator/compiler.py` — compile source/output resolution, prompt
   construction, client invocation (`run_compile_client`), and TOML extraction.
   Depends on `base`.
@@ -427,6 +438,28 @@ no `orchestrator` package under
 `~/.local/lib/opsx-controller/lib`) exits with a diagnostic naming the
 missing package rather than a bare `ModuleNotFoundError`, and `opsx-plan
 doctor` reports such an installation as stale.
+
+### Installed supervision service artifacts
+
+A global install also deploys the supervision service packaging into the
+installed runtime tree:
+
+- `~/.local/lib/opsx-controller/systemd/opsx-supervise.service.in` — the
+  versioned systemd **user** unit template (rendered by the operator), and
+- `~/.local/lib/opsx-controller/docs/opsx-supervision-service.md` — the
+  provisioning document.
+
+Both are replaced on a repeated install and are deployed **disabled by
+default**: the installer copies data only and never writes a unit into a
+service-manager directory, runs `systemctl`, or creates an OS account or the
+authority store. Enabling the service is a separate, deliberate operator action
+gated on `opsx-plan supervise probe`; unsupported hosts fail closed.
+
+`opsx-plan doctor` includes a read-only service check beside the stale-install
+checks. It reports the installed template/document state, any rendered unit, the
+supervisor ledger schema version when a ledger is present, and the
+isolation-backend capability status, and it stays green for an operator who has
+not enabled supervision.
 
 ## Model Efficiency Workflow
 

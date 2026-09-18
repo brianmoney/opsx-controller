@@ -8,7 +8,19 @@ Provides a single repository-root installer that deploys every supported adapter
 
 ### Requirement: Universal installer installs every adapter
 
-The repository SHALL provide an `install.sh` at the repository root that installs all four supported adapters (opencode, claude-code, codex-cli, dsh) and the shared orchestrator in one invocation. Running the universal installer SHALL have the same effect as running each individual adapter installer's corresponding command.
+The repository SHALL provide an `install.sh` at the repository root that
+installs all four supported adapters (opencode, claude-code, codex-cli, dsh)
+and the shared orchestrator in one invocation. Running the universal installer
+SHALL have the same effect as running each individual adapter installer's
+corresponding command.
+
+The universal installer SHALL also deploy the supervision service packaging —
+the versioned systemd user unit template and its provisioning document —
+through the same shared orchestrator mechanism the adapter installers use, so
+that the installed service layout is identical whether the universal installer
+or an adapter installer performed the install. The universal installer SHALL
+NOT enable, start, or activate the service and SHALL NOT create or modify
+operating-system accounts.
 
 #### Scenario: Universal global install deploys every adapter
 
@@ -34,6 +46,11 @@ The repository SHALL provide an `install.sh` at the repository root that install
 
 - **WHEN** an operator runs the universal installer
 - **THEN** each adapter's own `install.sh` is invoked with the same mode and flags rather than the universal installer reimplementing adapter-specific installation logic
+
+#### Scenario: Universal install deploys the same disabled service artifacts
+
+- **WHEN** an operator runs `bash install.sh --global`
+- **THEN** the supervision unit template and provisioning document are installed through the shared mechanism, the service is neither enabled nor started, and no operating-system account is created or modified
 
 ### Requirement: Universal installer supports selection and verification flags
 

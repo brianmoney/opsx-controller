@@ -316,6 +316,40 @@ verify_command_available() {
   return 1
 }
 
+# Verify the supervision service packaging (the versioned systemd user unit
+# template and its provisioning document) that scripts/install-orchestrator.sh
+# deploys into the installed runtime tree. *runtime_dir* is the installed
+# runtime root (e.g. ~/.local/lib/opsx-controller or
+# <project>/.opsx-controller) and *repo_root* is the repository checkout. Every
+# missing or differing artifact is reported and makes the helper return
+# non-zero. This is read-only: the service is never enabled, started, or
+# provisioned by verification.
+verify_supervision_service_packaging() {
+  local runtime_dir="$1"
+  local repo_root="$2"
+  local failed=0
+  local rel src installed
+  for rel in \
+    "systemd/opsx-supervise.service.in" \
+    "docs/opsx-supervision-service.md"; do
+    src="$repo_root/$rel"
+    installed="$runtime_dir/$rel"
+    if [[ ! -f "$installed" ]]; then
+      printf '%s\n' \
+        "Verify: supervision service artifact MISSING from $installed" >&2
+      failed=1
+    elif cmp -s "$src" "$installed"; then
+      printf '%s\n' \
+        "Verify: supervision service artifact deployed and matches source at $installed"
+    else
+      printf '%s\n' \
+        "Verify: supervision service artifact at $installed differs from $src (re-run the installer)" >&2
+      failed=1
+    fi
+  done
+  return "$failed"
+}
+
 print_verify_notice() {
   local client="$1"
   printf '\n%s\n' "Verification: $client CLI not found in PATH. Skipping post-install verification."

@@ -1551,6 +1551,37 @@ therefore free and offline: it needs no credentials, no provisioned host, and
 no network. See `core/plan-supervision.md` ("Fault-injection and test policy")
 for the matrix and the checkpoint kill-and-recover evidence rule.
 
+#### Service packaging and activation
+
+Every global install also deploys the supervision service packaging — the
+versioned systemd user unit template (`systemd/opsx-supervise.service.in`) and
+the provisioning document (`docs/opsx-supervision-service.md`) — into the
+installed runtime tree (`~/.local/lib/opsx-controller/systemd/` and
+`.../docs/`). The deployment is **disabled by default**: the installer copies
+data only, never writes a unit into a service-manager directory, never enables
+or starts the service, and never creates or modifies an OS account or the
+authority store.
+
+Enabling unattended operation is a **separate, deliberate operator action**, not
+an install side effect. Follow `docs/opsx-supervision-service.md`: create the
+service and worker accounts, provision the authority-store file, enable the
+service principal's user manager (`loginctl enable-linger`), render and reload
+the template **from that manager**, run `opsx-plan supervise probe` (the
+mandatory activation probe), and only then `systemctl --user enable --now
+opsx-supervise.service` as the service principal. The unit pins its effective
+identity with `AssertUser=`: a user unit runs under whoever's manager loads it,
+so enabling it under any other user fails closed. A host whose probe fails or
+cannot run is not enabled; an unsupported host (non-Linux, no peer-credential
+backend, no distinct principals, no trusted store, no systemd user manager, or
+no OpenCode session bridge) fails closed with the named `UnsupportedHostError`
+and no weaker posture is substituted.
+
+A repeated install refreshes the template and document but never activates the
+service. `opsx-plan doctor` reports the packaged service state read-only —
+installed template/document, any rendered unit, the supervisor ledger schema
+version, the backend capability status, and the service-host prerequisites —
+and stays green for an operator who has not enabled supervision.
+
 ### Lifecycle commands
 
 ```
@@ -1645,6 +1676,13 @@ failed check, 0 if all pass. When a plan is resolved, its declared adapter is
 authoritative and `--adapter` is ignored. When no plan is active, `--adapter`
 selects the adapter to check model resolution and client PATH against (defaults
 to `opencode`).
+
+The checks include a read-only supervision service report: whether the service
+unit template and provisioning document are installed, whether a rendered unit
+is present, the supervisor ledger schema version (when a ledger is present), and
+the isolation-backend capability status. It reports an absent or unsupported
+service state plainly and never fails the run for an operator who has not
+enabled supervision.
 
 ### `opsx-plan approve`
 

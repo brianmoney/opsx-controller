@@ -32,13 +32,22 @@ invoked against.
 Each global adapter installer SHALL additionally deploy the client-neutral
 plan-authoring reference to `~/.local/lib/opsx-controller/plan-authoring.md`.
 
-The universal installer SHALL deploy the shared orchestrator through the same
-mechanism as the adapter installers, producing an installed layout identical
-to an adapter-only install.
+Each global adapter installer SHALL additionally deploy the supervision service
+packaging: the versioned systemd user unit template for the supervision service
+host and the provisioning document that describes the manual account, store,
+and activation steps. These artifacts SHALL be deployed into the installed
+runtime tree, SHALL be replaced on a repeated install, and SHALL be deployed
+disabled — the installer SHALL NOT enable, start, or activate the service and
+SHALL NOT create or modify operating-system accounts.
 
-The installed executable paths, runtime layout, sample paths, and reference
-path SHALL be identical regardless of whether OpenCode, Claude Code, Codex
-CLI, dsh, or the universal installer performed the installation.
+The universal installer SHALL deploy the shared orchestrator and the
+supervision service packaging through the same mechanism as the adapter
+installers, producing an installed layout identical to an adapter-only install.
+
+The installed executable paths, runtime layout, sample paths, reference path,
+and service-packaging paths SHALL be identical regardless of whether OpenCode,
+Claude Code, Codex CLI, dsh, or the universal installer performed the
+installation.
 
 #### Scenario: Claude global install provides the executables
 
@@ -91,6 +100,14 @@ CLI, dsh, or the universal installer performed the installation.
 - **WHEN** an operator runs any adapter's global installer
 - **THEN** `~/.local/lib/opsx-controller/plan-authoring.md` contains the
   current repository reference document
+
+#### Scenario: Global install provides the disabled supervision service artifacts
+
+- **WHEN** an operator runs any adapter's global installer or the universal
+  installer
+- **THEN** the supervision unit template and provisioning document are installed
+  in the runtime tree, the service is neither enabled nor started, and no
+  operating-system account is created or modified
 
 #### Scenario: Installed watcher follows stage logs
 

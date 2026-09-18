@@ -42,6 +42,28 @@ def _available_principals() -> authority.PrincipalSet:
     )
 
 
+def _patch_supported_service_host(cmd_supervise):
+    """Pin the composed gate's read-only service-host check to supported.
+
+    ``supervise probe`` now refuses a host without a systemd user manager or an
+    OpenCode bridge before reaching the authority gate. These fixtures exercise
+    the authority-gate path, so they inject a supported host instead of
+    depending on the test host's manager.
+    """
+    service = cmd_supervise.supervision_service_mod
+    report = service.ServiceHostReport(
+        status=service.HOST_AVAILABLE,
+        systemd_user_manager=True,
+        opencode_bridge=True,
+        reasons=(),
+    )
+    return mock.patch.object(
+        service,
+        "service_host_capability",
+        return_value=report,
+    )
+
+
 def _store_stat(*, uid: int = 1001, gid: int = 1001, mode: int = 0o600, is_dir: bool = False):
     """Build a synthetic stat result for a provisioned store file."""
     kind = stat.S_IFDIR if is_dir else stat.S_IFREG
@@ -1772,28 +1794,30 @@ class ActivationProbeTests(unittest.TestCase):
     def test_supervise_probe_exits_nonzero_on_unsupported(self) -> None:
         from lib.orchestrator import cmd_supervise
 
-        with mock.patch.object(
-            cmd_supervise.authority,
-            "require_authority_backend",
-            side_effect=cmd_supervise.authority.UnsupportedHostError("simulated"),
-        ):
-            err = io.StringIO()
-            with redirect_stderr(err):
-                code = cmd_supervise.cmd_supervise_probe(argparse.Namespace())
+        with _patch_supported_service_host(cmd_supervise):
+            with mock.patch.object(
+                cmd_supervise.authority,
+                "require_authority_backend",
+                side_effect=cmd_supervise.authority.UnsupportedHostError("simulated"),
+            ):
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    code = cmd_supervise.cmd_supervise_probe(argparse.Namespace())
         self.assertNotEqual(code, 0)
         self.assertIn("UnsupportedHostError", err.getvalue())
 
     def test_supervise_probe_names_probe_failure(self) -> None:
         from lib.orchestrator import cmd_supervise
 
-        with mock.patch.object(
-            cmd_supervise.authority,
-            "require_authority_backend",
-            side_effect=cmd_supervise.authority.ActivationProbeError("simulated"),
-        ):
-            err = io.StringIO()
-            with redirect_stderr(err):
-                code = cmd_supervise.cmd_supervise_probe(argparse.Namespace())
+        with _patch_supported_service_host(cmd_supervise):
+            with mock.patch.object(
+                cmd_supervise.authority,
+                "require_authority_backend",
+                side_effect=cmd_supervise.authority.ActivationProbeError("simulated"),
+            ):
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    code = cmd_supervise.cmd_supervise_probe(argparse.Namespace())
         self.assertNotEqual(code, 0)
         self.assertIn("ActivationProbeError", err.getvalue())
 
@@ -1801,13 +1825,14 @@ class ActivationProbeTests(unittest.TestCase):
         from lib.orchestrator import cmd_supervise
 
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(
-                cmd_supervise.authority,
-                "require_authority_backend",
-                side_effect=cmd_supervise.authority.UnsupportedHostError("simulated"),
-            ):
-                with redirect_stderr(io.StringIO()):
-                    cmd_supervise.cmd_supervise_probe(argparse.Namespace())
+            with _patch_supported_service_host(cmd_supervise):
+                with mock.patch.object(
+                    cmd_supervise.authority,
+                    "require_authority_backend",
+                    side_effect=cmd_supervise.authority.UnsupportedHostError("simulated"),
+                ):
+                    with redirect_stderr(io.StringIO()):
+                        cmd_supervise.cmd_supervise_probe(argparse.Namespace())
             self.assertEqual(list(Path(tmp).iterdir()), [])
 
 

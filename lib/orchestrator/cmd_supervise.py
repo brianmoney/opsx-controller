@@ -11,10 +11,11 @@ projection.
 
 - ``supervise status`` reports the capability of the host and always exits 0,
   because a report about an unsupported host is still a successful report.
-- ``supervise probe`` runs the single fail-closed gate: on an unsupported or
-  unprovisioned host it exits non-zero naming ``UnsupportedHostError``; on an
-  available host it runs the mandatory activation probe and exits non-zero
-  naming ``ActivationProbeError`` when the boundary does not hold.
+- ``supervise probe`` runs the single fail-closed gate: on an unsupported host
+  it exits non-zero naming ``UnsupportedHostError`` (including a missing systemd
+  user manager or OpenCode session bridge); on an available host it runs the
+  mandatory activation probe and exits non-zero naming
+  ``ActivationProbeError`` when the boundary does not hold.
 - ``supervise serve`` boots that trusted session and dispatches authenticated
   endpoint requests; it fails closed with ``BrokerUnavailableError`` when the
   service store, the registered job, the principals, or the endpoint sockets
@@ -36,6 +37,7 @@ from lib.models import resolver as model_resolver
 from lib.orchestrator import base
 from lib.orchestrator import planref
 from lib.orchestrator import supervision as supervision_mod
+from lib.orchestrator import supervision_service as supervision_service_mod
 from lib.supervisor import authority
 from lib.supervisor import broker as broker_mod
 from lib.supervisor import broker_client as broker_client_mod
@@ -70,9 +72,16 @@ def cmd_supervise_status(args: argparse.Namespace) -> int:
 
 
 def cmd_supervise_probe(args: argparse.Namespace) -> int:
-    """opsx-plan supervise probe — run the fail-closed enablement gate."""
+    """opsx-plan supervise probe — run the fail-closed enablement gate.
+
+    Runs the composed activation gate: the read-only service-host check (a
+    supported systemd user manager and OpenCode session bridge) followed by the
+    authority backend detection and the mandatory activation probe. Either
+    unsupported prerequisite fails closed with the named unsupported-host
+    error; a failing probe fails closed with ``ActivationProbeError``.
+    """
     try:
-        report = authority.require_authority_backend()
+        report = supervision_service_mod.activation_gate()
     except authority.UnsupportedHostError as exc:
         print(f"error: UnsupportedHostError: {exc}", file=sys.stderr)
         print(f"  provision: {authority.PROVISIONING_POINTER}", file=sys.stderr)
