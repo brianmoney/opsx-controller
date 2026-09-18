@@ -93,12 +93,16 @@ opsx-plan dashboard plan.toml --run-id <run_id_b> \
 ### Model selection is per-run, resolved once at plan load
 
 Model selection is stored in `~/.config/opsx-controller/models.toml`, keyed
-by adapter and role (`controller`, `implementer`, `reviewer`, `archiver`),
-with an optional `<repo>/.opsx-plan/models.toml` machine-local override.
-`opsx-plan` resolves all four roles for the active plan's adapter when the
+by adapter and role (`controller`, `implementer`, `reviewer`, `archiver`, plus
+the optional `implementer_escalation` and the supervised roles `supervisor`,
+`supervised_author`, `acceptance_reviewer`, `fixer`, `verifier`), with an
+optional `<repo>/.opsx-plan/models.toml` machine-local override.
+`opsx-plan` resolves the roles for the active plan's adapter when the
 plan loads and exports them as `OPSX_*_MODEL` for the rest of the process —
 so the active plan's adapter automatically gets the right model set, with no
-manual switching and no installer step.
+manual switching and no installer step. The supervised roles are optional and
+inert until the supervision enforcement changes land: a configuration that
+defines none of them resolves and dispatches exactly as before.
 
 Precedence, highest first: repo-local `[adapters.<adapter>]`, user-global
 `[adapters.<adapter>]`, repo-local `[defaults]`, user-global `[defaults]`,
@@ -106,12 +110,24 @@ then the ambient `OPSX_<ROLE>_MODEL` environment variable as a fallback while
 no `models.toml` exists. See `models.example.toml` at the repository root
 for the full file shape.
 
+Supervised jobs also use an operator-maintained inexpensive-model allowlist in
+an `[allowlist]` table in the same files (`models = [...]`). It resolves
+repo-local first then user-global, replaces rather than merges across files,
+and has no environment source. It is never consulted for ordinary
+unsupervised runs.
+
 | Role | Env var exported at plan load | Agent role |
 |---|---|---|
 | `controller` | `OPSX_CONTROLLER_MODEL` | plan‑drive orchestrator (`opsx-plan compile`) |
 | `implementer` | `OPSX_IMPLEMENTER_MODEL` | implement phase |
 | `reviewer` | `OPSX_REVIEWER_MODEL` | review phase |
 | `archiver` | `OPSX_ARCHIVER_MODEL` | archive phase |
+| `implementer_escalation` (optional) | `OPSX_IMPLEMENTER_ESCALATION_MODEL` | escalation after repeated review failures |
+| `supervisor` (optional) | `OPSX_SUPERVISOR_MODEL` | supervised frontier supervisor |
+| `supervised_author` (optional) | `OPSX_SUPERVISED_AUTHOR_MODEL` | supervised create stage |
+| `acceptance_reviewer` (optional) | `OPSX_ACCEPTANCE_REVIEWER_MODEL` | supervised acceptance stage |
+| `fixer` (optional) | `OPSX_FIXER_MODEL` | supervised fix stage |
+| `verifier` (optional) | `OPSX_VERIFIER_MODEL` | supervised verify stage |
 
 The resolved model value is captured in telemetry as `model.model_id` (and
 `model.provider` when the identifier follows `provider/model-id` convention).
@@ -608,6 +624,14 @@ you re‑aggregate old telemetry against a new catalog version, the estimates
 will differ. The catalog version recorded in telemetry
 (`cost.pricing_catalog_version`) identifies which catalog was current when the
 estimate was computed.
+
+Because telemetry is append-only, that recomputation is offered as a read-time
+view rather than a rewrite: `opsx-plan report --reprice` and
+`opsx-plan dashboard --reprice` recompute each selected record's cost from its
+stored `usage` and `model` against the current catalog, in memory, and name the
+catalog version used. Telemetry and state files are not modified, and records
+whose model still has no catalog entry remain `unresolved`. Run without
+`--reprice`, both commands report the stored values.
 
 ---
 

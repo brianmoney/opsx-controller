@@ -12,6 +12,9 @@ plus the shared plan-authoring reference for `opsx-plan compile`.
 - `state-schema.md`: durable state expectations and resume behavior
 - `phase-protocol.md`: input and output contracts for implement, review, and
   archive phases
+- `plan-supervision.md`: client-neutral durable supervision contract — the
+  supervisor ledger's record model, schema versioning, trusted-location rule,
+  and journal-before-side-effects semantics
 
 Current adapters:
 

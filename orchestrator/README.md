@@ -231,7 +231,10 @@ compatibility worker-state snapshots used as phase inputs live under
 See `orchestrator/samples/sample-plan.toml` for a canonical example. Per-change fields: `id` (required), `depends_on`,
 `phase` (informational), `pause_before` (requires explicit `approve` before
 dispatch — use for human gates like new-capability approvals or phase exit
-reviews), `enabled` (set `false` for deferred changes), and per-change
+reviews), `pause_before_human_only` (approval authority for a gate: absent on
+a gated change means human-only; `false` delegates release to the supervised
+job's policy-bound authority; `true` without `pause_before = true` is a load
+error), `enabled` (set `false` for deferred changes), and per-change
 `timeout_minutes` override.
 
 Review the `depends_on` graph by hand before an unattended run. The
@@ -371,7 +374,11 @@ importable `lib/orchestrator/` package alongside the existing `lib/metrics`,
   `resolve_plan`, and the rest of the plan-resolution closure). Depends on
   `base`.
 - `lib/orchestrator/cost.py` — `estimate_stage_cost` and its pricing-catalog
-  helpers. Depends on `base`.
+  helpers, plus the pre-dispatch reservation estimate derived from a role's
+  pinned model (`pinned_model_for_role`, `reservation_estimate_for_dispatch`)
+  that both the journal dispatch boundary and the supervision service resolve
+  through. Depends on `base` and the supervisor budget primitive
+  (`lib.supervisor.budgets`, for the pure `reservation_estimate`).
 - `lib/orchestrator/groundtruth.py` — `git`, `change_dir`, archive-locating
   helpers, `verify_change_*`, `run_fast_checks`, and tracked-worktree helpers.
   Depends on `base`.
@@ -385,6 +392,17 @@ importable `lib/orchestrator/` package alongside the existing `lib/metrics`,
   `groundtruth`.
 - `lib/orchestrator/doctor.py` — twelve individual `_check_*` preflight probes.
   Depends on `base`, `groundtruth`, `planref`, and `telemetry`.
+- `lib/orchestrator/supervision_service.py` — the read-only supervision service
+  probe and the documented activation gate. Reports the installed service unit
+  template and provisioning document paths, any rendered systemd user unit, the
+  supervisor ledger schema version when a ledger is present, the
+  isolation-backend capability status, and the service-host prerequisite status
+  (systemd user manager and OpenCode session bridge). `activation_gate` composes
+  the read-only `service_host_capability` check with
+  `lib.supervisor.authority.require_authority_backend`, so a host missing either
+  prerequisite fails closed with the named `UnsupportedHostError`. Imports
+  without side effects and depends only on the standard library and
+  `lib.supervisor`.
 - `lib/orchestrator/compiler.py` — compile source/output resolution, prompt
   construction, client invocation (`run_compile_client`), and TOML extraction.
   Depends on `base`.
@@ -421,8 +439,33 @@ no `orchestrator` package under
 missing package rather than a bare `ModuleNotFoundError`, and `opsx-plan
 doctor` reports such an installation as stale.
 
+### Installed supervision service artifacts
+
+A global install also deploys the supervision service packaging into the
+installed runtime tree:
+
+- `~/.local/lib/opsx-controller/systemd/opsx-supervise.service.in` — the
+  versioned systemd **user** unit template (rendered by the operator), and
+- `~/.local/lib/opsx-controller/docs/opsx-supervision-service.md` — the
+  provisioning document.
+
+Both are replaced on a repeated install and are deployed **disabled by
+default**: the installer copies data only and never writes a unit into a
+service-manager directory, runs `systemctl`, or creates an OS account or the
+authority store. Enabling the service is a separate, deliberate operator action
+gated on `opsx-plan supervise probe`; unsupported hosts fail closed.
+
+`opsx-plan doctor` includes a read-only service check beside the stale-install
+checks. It reports the installed template/document state, any rendered unit, the
+supervisor ledger schema version when a ledger is present, and the
+isolation-backend capability status, and it stays green for an operator who has
+not enabled supervision.
+
 ## Model Efficiency Workflow
 
 See [`core/model-efficiency-workflow.md`](../core/model-efficiency-workflow.md)
 for the operator workflow that uses `opsx-plan compile`, `opsx-plan run`,
 `opsx-plan report`, and `opsx-plan dashboard` to benchmark model choices.
+`opsx-plan report` and `opsx-plan dashboard` accept `--reprice` to recompute
+costs from stored usage against the current pricing catalog in memory, leaving
+telemetry and state unchanged.

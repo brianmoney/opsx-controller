@@ -14,6 +14,35 @@
 #
 # Roles: controller, implementer, reviewer, archiver (all required).
 #        implementer_escalation (optional, used by escalate_after_review_fails).
+#        supervisor, supervised_author, acceptance_reviewer, fixer, verifier
+#        (optional supervised roles; inert until the supervision enforcement
+#        changes land, so defining none of them behaves exactly as before).
+#
+# The four supervised roles with concrete OpenCode agents — supervisor,
+# acceptance_reviewer, fixer, verifier — are installed by the OpenCode adapter
+# only when their model is resolved. On a machine that configures none of them,
+# installation leaves the legacy agents byte-identical and reports the
+# supervised agents as unconfigured. `bash adapters/opencode/install.sh
+# --global --verify` re-renders each supervised agent from source with the
+# current environment and reports any missing or differing installed file by
+# name, alongside the existing plan-authoring reference, plugin, and supervised
+# service-tool shim checks. The adapter also deploys the tracked worker shell
+# wrapper `opsx-worker-exec`, which each worker role's `bash` permission allows
+# as its only command: an unjournaled model client, an agent runner, a nested
+# shell, or a shell indirection through it is refused and recorded as a
+# `policy_violation` incident rather than executed.
+#
+# Supervised jobs additionally use an operator-maintained inexpensive-model
+# allowlist in the `[allowlist]` table, with the same file precedence as
+# roles and no environment source:
+#
+#   [allowlist]
+#   models = ["deepseek/deepseek-v4-flash", "moonshotai/kimi-k2"]
+#
+# A repo-local `[allowlist].models` replaces the user-global list wholesale
+# (lists never merge). The allowlist is never consulted for legacy,
+# unsupervised runs. `opsx-plan models show` prints it and each supervised
+# dispatch role's membership.
 #
 # Optional reasoning variants: a `<role>_variant` key uses the canonical
 # effort labels `low`, `medium`, `high`, or `max`. Each adapter translates
@@ -73,3 +102,8 @@ implementer = "deepseek/deepseek-v4-pro"
 # implementer_escalation = "deepseek/deepseek-v4-ultra"  # optional
 reviewer = "deepseek/deepseek-v4-pro"
 archiver = "deepseek/deepseek-v4-pro"
+
+# The inexpensive-model allowlist shared by all adapters (optional; only used
+# by supervised jobs). Uncomment and edit to register supervised models.
+# [allowlist]
+# models = ["deepseek/deepseek-v4-flash", "moonshotai/kimi-k2"]

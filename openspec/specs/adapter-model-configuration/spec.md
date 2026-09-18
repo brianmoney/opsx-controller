@@ -6,13 +6,20 @@ Define how adapters support per-adapter, per-role model configuration and resolu
 
 ### Requirement: Model selection is stored per adapter and per role
 
-The system SHALL store model selection in a TOML configuration file keyed by adapter and by role, where the required roles are `controller`, `implementer`, `reviewer`, and `archiver`, and `implementer_escalation` is an additional optional role.
+The system SHALL store model selection in a TOML configuration file keyed by adapter and by role, where the required roles are `controller`, `implementer`, `reviewer`, and `archiver`, and the optional roles are `implementer_escalation` plus the supervised roles `supervisor`, `supervised_author`, `acceptance_reviewer`, `fixer`, and `verifier`.
 
-A required role is one every run needs; an optional role is one that only some configurations use, whose absence is not an error on its own.
+A required role is one every run needs; an optional role is one that only some configurations use, whose absence is not an error on its own. The supervised roles are optional roles that only supervised jobs use; no legacy run requires them, and a configuration that defines none of them SHALL resolve and dispatch exactly as before.
 
-The file SHALL support an `[adapters.<adapter>]` table per adapter carrying zero or more role keys, and a `[defaults]` table carrying role keys that apply to every adapter that does not override them. Optional roles SHALL be settable in the same tables and by the same key names as required roles.
+The file SHALL support an `[adapters.<adapter>]` table per adapter carrying zero or more role keys, and a `[defaults]` table carrying role keys that apply to every adapter that does not override them. Optional roles SHALL be settable in the same tables and by the same key names as required roles. The same files SHALL also carry the `[allowlist]` table defined below.
 
 The primary configuration location SHALL be `~/.config/opsx-controller/models.toml`. A repository-local `<repo>/.opsx-plan/models.toml` SHALL be honored as a machine-local override when present.
+
+Optional roles SHALL use the existing activation and inspection machinery
+generically: a resolved optional role SHALL be exported as its
+`OPSX_<ROLE>_MODEL` variable, an unresolved optional role SHALL be left
+explicitly unset during process activation, `opsx-plan models show` SHALL
+include every optional role, and `opsx-plan models env` SHALL emit only
+resolved optional-role exports without role-specific code.
 
 #### Scenario: Distinct adapters resolve distinct identifiers for the same role
 
@@ -34,10 +41,30 @@ The primary configuration location SHALL be `~/.config/opsx-controller/models.to
 - **WHEN** a configuration file sets `[adapters.opencode].implementer_escalation` and the `implementer_escalation` role is resolved for `opencode`
 - **THEN** resolution returns that value and reports the configuration file as its source
 
+#### Scenario: Supervised role is configured like any other role
+
+- **WHEN** a configuration file sets `[adapters.opencode].acceptance_reviewer` and the `acceptance_reviewer` role is resolved for `opencode`
+- **THEN** resolution returns that value and reports the configuration file as its source, and the four required roles resolve unaffected
+
 #### Scenario: Unset optional role is not an error
 
 - **WHEN** no configuration file or environment variable supplies `implementer_escalation` and models are resolved for an adapter
 - **THEN** resolution reports that role as unresolved and reports the four required roles normally, without raising
+
+#### Scenario: Unset supervised roles are not an error
+
+- **WHEN** no configuration file or environment variable supplies any supervised role and models are resolved for an adapter
+- **THEN** resolution reports each supervised role as unresolved, reports the required roles normally, and does not raise
+
+#### Scenario: Resolved and unresolved optional roles activate generically
+
+- **WHEN** a plan is loaded for an adapter where one optional role resolves and another does not
+- **THEN** the resolved optional role's `OPSX_<ROLE>_MODEL` variable is exported, the unresolved optional role's variable is left unset, and activation succeeds
+
+#### Scenario: Inspection output includes supervised roles
+
+- **WHEN** `opsx-plan models show` runs against a configuration with no supervised roles
+- **THEN** it prints each supervised role as unresolved rather than omitting it, and the command succeeds
 
 ### Requirement: Model resolution follows a defined precedence order
 
@@ -236,3 +263,187 @@ When resolution fails for the adapter being installed, the installer SHALL exit 
 
 - **WHEN** an adapter installer runs and a required role is unresolved
 - **THEN** the installer exits non-zero naming the unresolved role and installs no artifact containing an empty model value
+
+### Requirement: The inexpensive allowlist is operator-maintained model configuration
+
+The inexpensive-model allowlist SHALL be stored in the same model configuration files as roles, in an `[allowlist]` table with a `models` key whose value is an array of exact model-identifier strings. Each entry SHALL be a non-empty, non-whitespace exact identifier; there SHALL be no wildcard, pattern, prefix, or default entry, and entries SHALL NOT be inferred from any role.
+
+The effective allowlist SHALL be resolved from the same file locations and in
+the same precedence as role selection: repository-local configuration first,
+then user-global. If the repository-local file has no `[allowlist]` table,
+resolution SHALL fall through to the user-global table. A repository-local
+`[allowlist].models` SHALL replace the user-global list wholesale; lists SHALL
+NOT merge across files. The allowlist SHALL have no environment-variable
+source.
+
+When no `[allowlist]` table exists in either configuration file, the effective allowlist SHALL be empty rather than inherited or defaulted, and resolution SHALL succeed. An `[allowlist]` table present but malformed — a `models` value that is not an array, or an entry that is not a non-empty string — SHALL fail resolution with a named error identifying the offending configuration file, rather than being ignored or silently coerced.
+
+The allowlist SHALL NOT be consulted for legacy unsupervised runs: a configuration that defines no supervised roles SHALL behave exactly as before, with no allowlist required and no new error path.
+
+#### Scenario: Allowlist resolves from configuration
+
+- **WHEN** `[allowlist].models` lists exact identifiers in a configuration file
+- **THEN** the effective allowlist is that list and resolution reports the configuration file as its source
+
+#### Scenario: Repository-local allowlist replaces the user-global list
+
+- **WHEN** both configuration files define `[allowlist].models` with different entries
+- **THEN** the effective allowlist contains exactly the repository-local entries, with no merging
+
+#### Scenario: Missing repository-local table falls through to user-global
+
+- **WHEN** a repository-local configuration file exists without an `[allowlist]` table and the user-global file defines `[allowlist].models`
+- **THEN** the effective allowlist contains exactly the user-global entries and reports the user-global file as its source
+
+#### Scenario: No allowlist table means an empty allowlist
+
+- **WHEN** neither configuration file contains an `[allowlist]` table
+- **THEN** the effective allowlist is empty and resolution succeeds
+
+#### Scenario: Malformed allowlist fails with a named error
+
+- **WHEN** `[allowlist].models` is present but is not an array of non-empty strings
+- **THEN** resolution fails with a named error naming the offending configuration file
+
+#### Scenario: Environment supplies no allowlist entries
+
+- **WHEN** an ambient `OPSX_*` variable names a model and no `[allowlist]` table exists
+- **THEN** the effective allowlist remains empty, because the environment never contributes allowlist entries
+
+#### Scenario: A legacy run never consults the allowlist
+
+- **WHEN** an ordinary, unsupervised run resolves models in a configuration that defines no supervised roles and no allowlist
+- **THEN** resolution and dispatch behave exactly as before, with no allowlist-related error
+
+### Requirement: Supervised model-policy checks fail closed without an allowlisted model
+
+A supervised feature evaluating a dispatch SHALL use the pure model-policy check
+before dispatch. The check SHALL report a named blocking error when a required
+role is unresolved, when its resolved model is not on the effective allowlist,
+when its resolved model differs from the exact policy pin, or when the resolved
+model is unavailable. "Unavailable" SHALL mean only that the resolved
+identifier fails the target adapter's existing identifier-syntax validation;
+live availability probing is out of scope. There SHALL be no inherited,
+defaulted, or fallback model for a supervised dispatch: when the check reports
+a block, its consumer SHALL NOT dispatch. Applying this precondition to a live
+journal belongs to the later dispatch and lifecycle changes.
+
+The supervised dispatch roles SHALL be the existing dispatch roles `implementer`, `reviewer`, and `archiver`, plus `supervised_author`, `acceptance_reviewer`, `fixer`, `verifier`, and `implementer_escalation`; each SHALL be subject to the allowlist check. The `supervisor` role SHALL be exempt from the allowlist check, as the supervision policy defines. The legacy `controller` role SHALL NOT be a supervised dispatch role.
+
+The model-selection payload for a supervised job SHALL record an explicit
+`stages.create` mapping to `supervised_author`; the legacy `controller` role
+SHALL govern only non-supervised compilation. Routing a live create dispatch
+through that mapping belongs to the later dispatch and lifecycle changes.
+
+The allowlist SHALL NOT be consulted for legacy unsupervised runs: a configuration that defines no supervised roles SHALL behave exactly as before, with no allowlist required and no new error path.
+
+#### Scenario: A missing supervised role blocks before dispatch
+
+- **WHEN** the pure model-policy check evaluates a supervised feature requiring a role that no configuration source resolves
+- **THEN** it reports a named blocking error identifying the role before a consumer may dispatch
+
+#### Scenario: An unallowlisted model blocks before dispatch
+
+- **WHEN** the pure model-policy check evaluates a supervised dispatch role whose resolved model is not on the effective allowlist
+- **THEN** it reports a named blocking error identifying the role and the model, and no fallback model is substituted
+
+#### Scenario: A model different from the policy pin blocks
+
+- **WHEN** the pure model-policy check evaluates a supervised dispatch role whose resolved model differs from the exact `model_selection.roles` pin
+- **THEN** it reports a named blocking error and does not substitute another role's model
+
+#### Scenario: An available allowlisted role proceeds
+
+- **WHEN** the pure model-policy check evaluates a supervised dispatch role that resolves to a model on the effective allowlist and passes the adapter's identifier-syntax validation
+- **THEN** the check passes and a later dispatch consumer may proceed with that model
+
+#### Scenario: An identifier-syntax-invalid model counts as unavailable
+
+- **WHEN** the pure model-policy check evaluates a supervised dispatch role whose resolved identifier fails the target adapter's existing identifier-syntax validation
+- **THEN** it reports a named blocking error without making any live availability claim
+
+#### Scenario: The frontier supervisor is exempt from the allowlist check
+
+- **WHEN** the pure model-policy check evaluates the `supervisor` role whose resolved model is not on the effective allowlist
+- **THEN** the allowlist condition does not block it
+
+#### Scenario: A legacy run never consults the allowlist
+
+- **WHEN** an ordinary, unsupervised run resolves models in a configuration that defines no supervised roles and no allowlist
+- **THEN** resolution and dispatch behave exactly as before, with no allowlist-related error
+
+### Requirement: Operators can inspect the effective allowlist and supervised role membership
+
+`opsx-plan models show` SHALL display the effective allowlist and its resolution source when an allowlist is configured, and SHALL report for each supervised dispatch role whether its resolved model is a member of the effective allowlist. An unresolved supervised role SHALL be shown as unresolved rather than omitted, and inspection SHALL never fail for a configuration with no supervised roles.
+
+#### Scenario: Operator inspects the effective allowlist and membership
+
+- **WHEN** `opsx-plan models show --adapter opencode` runs with an `[allowlist]` table configured
+- **THEN** it prints the effective allowlist entries and their source, and for each supervised dispatch role reports whether its resolved model is a member
+
+#### Scenario: No allowlist is reported without failing
+
+- **WHEN** `opsx-plan models show` runs with no `[allowlist]` table and no supervised roles
+- **THEN** it reports the allowlist as absent or empty and the supervised roles as unconfigured, and the command succeeds
+
+### Requirement: The supervised author override is explicit and leaves the legacy compile role unchanged
+
+A supervised job's model-selection payload SHALL record its create-stage model
+as the `supervised_author` role, resolved like any other optional role, in the
+explicit `stages.create` mapping. The override SHALL be explicit: registering
+or resolving `supervised_author` SHALL NOT change the resolution, activation,
+or dispatch of the legacy `controller` role, and the legacy compile role for
+non-supervised runs SHALL remain `controller`. Actual supervised create
+routing belongs to the later dispatch and lifecycle changes.
+
+#### Scenario: The supervised author resolves independently
+
+- **WHEN** a configuration file sets `[adapters.opencode].supervised_author` and the role is resolved for `opencode`
+- **THEN** resolution returns that value for `supervised_author`, and the `controller` role resolves from its own sources unchanged
+
+#### Scenario: Configuring the override does not alter the legacy compile role
+
+- **WHEN** `supervised_author` is configured and a non-supervised compile runs
+- **THEN** the compile dispatches with the model resolved for `controller`, exactly as if `supervised_author` were unset
+
+### Requirement: Supervised budget pricing binds each role to its pinned model identity
+
+For a registered supervised job, cost estimation for budget purposes SHALL
+price each dispatch using the exact model identifier pinned for that
+dispatch's role in the job policy's `model_selection`, resolved through the
+existing per-adapter, per-role precedence. There SHALL be no cross-role
+fallback: a dispatch for one role SHALL NOT be priced using another role's
+resolved or configured model, and an ambient or default model SHALL NOT be
+substituted for the pin.
+
+The `supervisor` role SHALL be priced by the same binding: its exemption
+from the inexpensive allowlist does not exempt it from pricing or budget
+counting. This is a pricing and reservation contract for the role pin; it does
+not require this change to own a production supervisor-primary invocation. The
+supervisor primary's call site is wired by `add-opencode-session-bridge`, which
+routes its usage through this change's reserve/reconcile boundary.
+
+A role whose pinned identifier cannot be resolved to a price SHALL block
+budgeted dispatch with a named unknown-pricing error rather than falling
+back to any other identity or an assumed cost, as required by the budget
+policy's unknown-pricing rule.
+
+#### Scenario: Pricing uses the exact role pin
+
+- **WHEN** a reservation estimate is computed for a supervised dispatch
+- **THEN** the price lookup uses the exact model identifier pinned for that
+  dispatch's role in the job policy, resolved through the existing precedence
+
+#### Scenario: No cross-role pricing fallback
+
+- **WHEN** a supervised dispatch's role pin cannot be priced but another
+  role's resolved model can be
+- **THEN** the dispatch is not priced from the other role's identity; it is
+  blocked with the named unknown-pricing error
+
+#### Scenario: The allowlist-exempt supervisor is still priced
+
+- **WHEN** a reservation estimate is computed for the `supervisor` role
+- **THEN** its pinned frontier model is looked up in the pricing catalog and
+  budget-counted like any other role, and an unpriceable supervisor pin
+  blocks dispatch with the named unknown-pricing error

@@ -10,6 +10,7 @@ entrypoint publishes to this module after import (design D3).
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -65,6 +66,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         None if args.plan is None or (active and args.plan == active)
         else plan_src
     )
+    if getattr(args, "json", False):
+        return _emit_status_json(cfg, state, header=header, plan_arg=plan_arg, repo=repo)
     return cmd_status_inner(cfg, state, header=header, plan_arg=plan_arg, repo=repo)
 
 
@@ -145,4 +148,102 @@ def cmd_status_inner(cfg: dict, state: dict, header: str,
             print("    manual follow-up (operator checklist):")
             for task in r["manual_tasks_pending"]:
                 print(f"      - {_entry().single_line(task)}")
+    _print_supervision_block(cfg, repo)
+    return 1 if failed else 0
+
+
+def _supervision_projection(cfg: dict, repo: Path | None) -> dict | None:
+    """Return the supervised-job projection for *repo*, or ``None``.
+
+    Unregistered worktrees (or a caller with no repo, as several tests use)
+    open nothing, so the existing human output stays byte-identical.
+    """
+    if repo is None:
+        return None
+    # Imported lazily so importing this diagnostics module never pulls in the
+    # supervisor authority/endpoint boundary (see the boundary-free contract).
+    from lib.orchestrator import supervision as supervision_mod
+    return supervision_mod.project_registered_job(
+        repo, plan_name=cfg.get("name") if isinstance(cfg, dict) else None
+    )
+
+
+def _print_supervision_block(cfg: dict, repo: Path | None) -> None:
+    """Print the supervised-job block when a job is registered."""
+    projection = _supervision_projection(cfg, repo)
+    if not projection:
+        return
+    state = projection.get("state", "unknown")
+    print("  supervised job:")
+    print(f"    job {projection.get('job_id')}: {state} (updated {projection.get('updated_at')})")
+    print(f"    policy revision: {projection.get('policy', {}).get('revision')}")
+    budgets = projection.get("budget_posture", {}).get("budgets", {}) or {}
+    consumption = projection.get("budget_posture", {}).get("consumption", {}) or {}
+    print(
+        "    budget: total_cost_usd="
+        f"{budgets.get('total_cost_usd')} charged_cost_usd="
+        f"{consumption.get('cost_usd')} elapsed_minutes="
+        f"{consumption.get('elapsed_minutes')}"
+    )
+    open_waits = [
+        wait for wait in projection.get("waits", []) if wait.get("state") == "open"
+    ]
+    for wait in open_waits:
+        label = "human" if wait.get("kind") == "human" else "stop"
+        print(
+            f"    {label} wait: {wait.get('checkpoint')} "
+            f"({wait.get('started_at')})"
+        )
+    recent_incidents = projection.get("recent_incidents", [])
+    if recent_incidents:
+        print("    recent incidents:")
+        for incident in recent_incidents:
+            print(
+                f"      {incident.get('id')} {incident.get('kind')} "
+                f"[{incident.get('state')}]: {incident.get('summary')}"
+            )
+
+
+def _status_document(cfg: dict, state: dict, header: str,
+                     plan_arg: str | None, repo: Path | None) -> tuple[dict, int]:
+    """Build the structured status document and the failed-change count."""
+    changes: list[dict] = []
+    failed = 0
+    for cid in display_order(cfg):
+        status = _entry().classify(cfg, state, cid)
+        r = state_mod.rec(state, cid)
+        phase = cfg["changes"][cid].get("phase")
+        if status in (base.FAILED, "blocked"):
+            failed += 1
+        changes.append(
+            {
+                "id": cid,
+                "phase": phase,
+                "status": status,
+                "reason": r.get("reason") or "",
+                "manual_tasks_pending": list(r.get("manual_tasks_pending") or []),
+            }
+        )
+    document: dict = {
+        "command": "opsx-plan status",
+        "plan": cfg.get("name"),
+        "header": header,
+        "changes": changes,
+    }
+    _ = plan_arg
+    projection = _supervision_projection(cfg, repo)
+    if projection is not None:
+        document["supervision"] = projection
+    return document, failed
+
+
+def _emit_status_json(cfg: dict, state: dict, header: str,
+                      plan_arg: str | None, repo: Path | None) -> int:
+    """Emit the plan summary plus the same supervision object as JSON.
+
+    The supervision object is omitted entirely when no supervised job is
+    registered, so the structured mode mirrors the human gate.
+    """
+    document, failed = _status_document(cfg, state, header, plan_arg, repo)
+    print(json.dumps(document, indent=2, sort_keys=True))
     return 1 if failed else 0

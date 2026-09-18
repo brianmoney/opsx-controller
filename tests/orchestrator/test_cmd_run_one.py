@@ -1184,6 +1184,7 @@ class SingleChangeManifestTests(unittest.TestCase):
             self.repo, self.cid
         )
         self.assertTrue(manifest_path.is_file())
+        self.assertEqual(cfg["_manifest_path"], str(manifest_path))
 
         loaded = self.opsx_plan.planref.load_plan(manifest_path, repo=self.repo)
         self.assertEqual(loaded["name"], cfg["name"])
@@ -1226,6 +1227,10 @@ class SingleChangeManifestTests(unittest.TestCase):
 
         def fake_run_dc(repo, cfg, state, cid, budget_usd=0.0):
             self.assertEqual(cid, self.cid)
+            self.assertEqual(
+                cfg["_manifest_path"],
+                str(self.opsx_plan.planref.single_change_manifest_path(repo, cid)),
+            )
             r = self.opsx_plan.state_mod.rec(state, cid)
             r["phase"] = "done"
             self.opsx_plan.state_mod.set_status(state, cid, self.opsx_plan.base.DONE, "done")
@@ -1311,6 +1316,48 @@ class SingleChangeManifestTests(unittest.TestCase):
         self.assertEqual(after, before,
                           "cmd_run_one must preserve the active-plan pointer")
 
+    def test_registered_run_one_uses_active_protected_manifest(self):
+        self.write_authored_change(self.cid)
+        plans_dir = self.repo / "openspec" / "plans"
+        plans_dir.mkdir(parents=True)
+        source_manifest = plans_dir / "supervised.toml"
+        source_manifest.write_text(
+            '[plan]\nname = "supervised"\nadapter = "opencode"\n\n'
+            f'[[changes]]\nid = "{self.cid}"\n',
+            encoding="utf-8",
+        )
+        self.opsx_plan.write_active_plan(
+            self.repo, "openspec/plans/supervised.toml"
+        )
+        registration = mock.Mock()
+        registration.ledger = mock.Mock()
+        registration.job_id = 1
+        args = argparse.Namespace(repo=str(self.repo), change=self.cid)
+
+        def fake_run_dc(repo, cfg, state, cid, budget_usd=0.0):
+            self.assertEqual(cfg["_manifest_path"], str(source_manifest))
+            r = self.opsx_plan.state_mod.rec(state, cid)
+            r["phase"] = "done"
+            self.opsx_plan.state_mod.set_status(
+                state, cid, self.opsx_plan.base.DONE, "done"
+            )
+            return self.opsx_plan.base.DONE
+
+        with mock.patch.object(
+            self.opsx_plan.cmd_run_one.supervision_mod,
+            "require_supervised_authorization",
+            return_value=registration,
+        ), mock.patch.object(
+            self.opsx_plan.cmd_run_one.broker_mod,
+            "is_dispatchable",
+            return_value=True,
+        ), mock.patch.object(
+            self.opsx_plan, "run_direct_change", side_effect=fake_run_dc
+        ):
+            rc = self.opsx_plan.cmd_run_one.cmd_run_one(args)
+
+        self.assertEqual(rc, 0)
+
     def test_round_trip_with_nonzero_escalation_threshold(self):
         """2.5: non-zero escalate_after_review_fails survives round-trip"""
         self.write_authored_change(self.cid)
@@ -1331,6 +1378,47 @@ class SingleChangeManifestTests(unittest.TestCase):
             repo=self.repo,
         )
         self.assertEqual(reloaded["finding_recurrence_limit"], 3)
+
+    def test_delegated_gate_serializes_and_round_trips(self):
+        """5.2: a delegated gated change serializes the key and survives
+        the round-trip comparison."""
+        self.write_authored_change(self.cid)
+        cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
+        cfg["changes"][self.cid]["pause_before"] = True
+        cfg["changes"][self.cid]["pause_before_human_only"] = False
+        # render → load → compare; must not raise.
+        self.opsx_plan.write_single_change_manifest(self.repo, self.cid, cfg)
+
+        manifest_path = self.opsx_plan.planref.single_change_manifest_path(
+            self.repo, self.cid
+        )
+        serialized = manifest_path.read_text(encoding="utf-8")
+        self.assertIn("pause_before_human_only = false", serialized)
+
+        reloaded = self.opsx_plan.planref.load_plan(manifest_path, repo=self.repo)
+        change = reloaded["changes"][self.cid]
+        self.assertTrue(change["pause_before"])
+        self.assertFalse(change["pause_before_human_only"])
+
+    def test_human_only_gate_omits_key_and_still_round_trips(self):
+        """5.2: a human-only gated change omits the key (redundant) and the
+        round-trip resolves it back to human-only."""
+        self.write_authored_change(self.cid)
+        cfg = self.opsx_plan.build_single_change_config(self.repo, self.cid)
+        cfg["changes"][self.cid]["pause_before"] = True
+        cfg["changes"][self.cid]["pause_before_human_only"] = True
+        self.opsx_plan.write_single_change_manifest(self.repo, self.cid, cfg)
+
+        manifest_path = self.opsx_plan.planref.single_change_manifest_path(
+            self.repo, self.cid
+        )
+        serialized = manifest_path.read_text(encoding="utf-8")
+        self.assertNotIn("pause_before_human_only = true", serialized)
+
+        reloaded = self.opsx_plan.planref.load_plan(manifest_path, repo=self.repo)
+        self.assertTrue(
+            reloaded["changes"][self.cid]["pause_before_human_only"]
+        )
 
 
 class RunOneCommandTests(unittest.TestCase):

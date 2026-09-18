@@ -208,3 +208,190 @@ traceback in this case.
 
 - **WHEN** `opsx-plan doctor` runs against that same installation
 - **THEN** it reports the installed runtime as stale
+
+### Requirement: The supervisor runtime package follows the shared runtime-module discipline
+
+The supervisor ledger SHALL live in a `lib/supervisor/` package alongside the
+existing `lib/metrics`, `lib/pricing`, `lib/models`, and `lib/orchestrator`
+runtime packages, and SHALL be resolved by the same `sys.path` mechanism the
+entrypoint already uses for those packages. Each module in the package SHALL
+be importable as `lib.supervisor.<module>` without executing the CLI, SHALL be
+named for the single concern it owns, and SHALL NOT shadow a Python builtin or
+standard-library module name. The package SHALL depend only on the Python
+standard library and SHALL NOT import `lib.orchestrator` or any other runtime
+package, so its dependency graph is acyclic by construction; the absence of
+cycles SHALL be verified mechanically against the package.
+
+Cross-module references within the package SHALL resolve through the owning
+module object rather than name imports, under the same discipline as the
+orchestrator package.
+
+#### Scenario: A supervisor module is imported without running the CLI
+
+- **WHEN** a test or tool imports a `lib.supervisor.<module>` module
+- **THEN** the import succeeds, no argument parsing occurs, no process is
+  spawned, and no file under `.opsx-plan/` is read or written
+
+#### Scenario: The supervisor package dependency direction is checked mechanically
+
+- **WHEN** the `lib/supervisor/` package is analyzed for inter-module imports
+- **THEN** the resulting graph is acyclic and contains no import of another
+  runtime package, and the check is repeatable without reading the design
+  document
+
+#### Scenario: A patched definition is observed across supervisor modules
+
+- **WHEN** a test rebinds a definition on the supervisor module that owns it,
+  and code in a different supervisor module calls that definition
+- **THEN** the call reaches the replacement, not the original
+
+### Requirement: The authority boundary machinery lives in concern-named supervisor modules
+
+Backend detection, the capability report, the endpoint plumbing, and the
+activation probe SHALL live in concern-named modules of the
+`lib/supervisor/` runtime package, importable as `lib.supervisor.<module>`
+without executing the CLI and without reading or writing anything under
+`.opsx-plan/` at import time. The modules SHALL follow the existing
+supervisor-package discipline: standard library only, no import of another
+runtime package, and cross-module references resolved through the owning
+module object.
+
+Backend detection and the capability report SHALL be operable from the
+worker domain without any privileged operation: determining whether the host
+supports the boundary SHALL NOT require the trusted service identity, SHALL
+NOT open the authority store for writing, and SHALL NOT provision anything.
+
+#### Scenario: A boundary module is imported without running the CLI
+
+- **WHEN** a test or tool imports an authority-boundary module
+- **THEN** the import succeeds, no argument parsing occurs, no process is
+  spawned, and no file under `.opsx-plan/` is read or written
+
+#### Scenario: Detection runs unprivileged
+
+- **WHEN** backend capability detection runs as an ordinary worker-domain
+  process
+- **THEN** it reports the backend status without requiring the trusted
+  service identity, writing the authority store, or changing host
+  configuration
+
+### Requirement: The `supervise` command handler follows the command-module discipline
+
+The `opsx-plan supervise` namespace SHALL be registered in the
+`orchestrator/opsx-plan.py` entrypoint and SHALL delegate to a concern-named,
+importable module under `lib/orchestrator/`, under the same extraction
+discipline as the other self-contained operator commands: import without
+side effects, cross-module references through the owning module object, and
+no import cycle.
+
+#### Scenario: The supervise module is imported without running the CLI
+
+- **WHEN** a test or tool imports the module that owns the `supervise`
+  command handler
+- **THEN** the import succeeds, no argument parsing occurs, no process is
+  spawned, and no file under `.opsx-plan/` is read or written
+
+### Requirement: The execution lock module is importable and operable without the supervisor ledger
+
+The worktree execution lock SHALL live in a concern-named module of the
+`lib/supervisor/` runtime package, importable as `lib.supervisor.<module>`
+without executing the CLI and without reading or writing anything under
+`.opsx-plan/` at import time. The module SHALL follow the existing
+supervisor-package discipline: standard library only, no import of another
+runtime package, and cross-module references resolved through the owning
+module object.
+
+Lock acquisition for an ordinary, unsupervised run SHALL be operable
+without opening or requiring the supervisor ledger: the ledger-backed
+fencing persistence SHALL be an optional, explicitly supplied dependency so
+legacy runs carry no backend dependency.
+
+#### Scenario: The lock module is imported without running the CLI
+
+- **WHEN** a test or tool imports the execution-lock module
+- **THEN** the import succeeds, no argument parsing occurs, no process is
+  spawned, and no file under `.opsx-plan/` is read or written
+
+#### Scenario: Ordinary acquisition needs no ledger
+
+- **WHEN** an ordinary run acquires the worktree execution lock with no
+  ledger supplied and no ledger reachable
+- **THEN** the acquisition succeeds and the run proceeds without any ledger
+  dependency
+
+#### Scenario: Supervised acquisition persists fencing through the supplied ledger
+
+- **WHEN** a supervised execution acquires the lock with a ledger supplied
+- **THEN** the fencing record is persisted through that ledger, and the lock
+  module itself never constructs or opens one
+
+### Requirement: The journal dispatch integration lives in a concern-named orchestrator module
+
+The supervised journal dispatch integration — the pre-dispatch gate
+evaluation, journal lifecycle calls around stage dispatch, worker identity
+capture, outcome and evidence recording, and replay re-observation — SHALL
+live in a concern-named, importable runtime module under `lib/orchestrator/`,
+following the shared runtime-module discipline. The entrypoint SHALL retain
+the command-line surface and call into the module; the integration logic
+SHALL NOT be added as new inline entrypoint code beyond the calls themselves.
+The module SHALL be importable and exercisable in tests without invoking the
+command-line surface.
+
+#### Scenario: The integration module is importable on its own
+
+- **WHEN** the journal dispatch integration module is imported directly by a
+  test or another runtime module
+- **THEN** it loads without side effects and exposes the dispatch-boundary
+  operations the entrypoint calls
+
+#### Scenario: The entrypoint delegates rather than inlining
+
+- **WHEN** a registered supervised job dispatches a stage through any
+  entrypoint run path
+- **THEN** the gate evaluation, journal lifecycle, and outcome recording are
+  performed by the concern-named module, with the entrypoint providing only
+  command parsing and call-site wiring
+
+### Requirement: The service-packaging sources and service doctor probe follow the runtime-module discipline
+
+The supervision service packaging SHALL keep its versioned unit template and
+provisioning document as shipped data under a versioned, concern-named path,
+and SHALL keep the read-only service/doctor probe in a concern-named,
+importable runtime module under `lib/orchestrator/`, under the shared
+runtime-module discipline: importable without executing the CLI and without
+reading or writing anything under `.opsx-plan/` at import time, standard
+library only, and cross-module references resolved through the owning module
+object.
+
+The probe SHALL be operable without the authority boundary and without the
+supervisor ledger: reporting the installed service artifacts, the ledger schema
+version when a ledger is present, and the backend capability status SHALL
+require no trusted service identity, write nothing, and provision nothing.
+
+#### Scenario: The service probe module is imported without running the CLI
+
+- **WHEN** a test or tool imports the module that owns the service/doctor probe
+- **THEN** the import succeeds, no argument parsing occurs, no process is
+  spawned, and no file under `.opsx-plan/` is read or written
+
+#### Scenario: The service probe runs without the boundary
+
+- **WHEN** the service/doctor probe runs as an ordinary process on a host where
+  the authority boundary is unavailable
+- **THEN** it reports the service artifact and backend status without requiring
+  the trusted service identity, writing the authority store, or provisioning
+  anything
+
+### Requirement: The service installation logic lives in a concern-named installer source
+
+The shared installer step that deploys the supervision service packaging SHALL
+live in a concern-named, version-controlled source rather than being inlined
+into each adapter installer, so that the adapter installers and the universal
+installer deploy identical service artifacts through one mechanism.
+
+#### Scenario: Adapter and universal installs share one installation path
+
+- **WHEN** an adapter installer and the universal installer deploy the
+  supervision service packaging
+- **THEN** both invoke the same shared installation source and produce the same
+  installed service artifacts

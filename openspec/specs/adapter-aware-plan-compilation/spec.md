@@ -139,3 +139,28 @@ or after the payload, and malformed TOML.
 
 - **WHEN** a supported compile client returns prose surrounding a TOML fence or multiple TOML fences
 - **THEN** compilation fails without writing or replacing the output manifest
+
+### Requirement: Compile guidance documents `pause_before_human_only`
+
+The compiler schema guidance and compile prompt SHALL document
+`pause_before_human_only` as an optional per-change `[[changes]]` key
+alongside `pause_before`, for every supported compile adapter. The guidance
+SHALL state its resolution semantics — absent on a gated change resolves to
+human-only, an explicit `false` delegates approval to the supervised job's
+policy-bound authority — and the rule that `pause_before_human_only = true`
+without `pause_before = true` is invalid.
+
+#### Scenario: Schema guidance lists the key
+
+- **WHEN** the compiler builds schema guidance for a supported adapter
+- **THEN** the `[[changes]]` key documentation includes
+  `pause_before_human_only`, its human-only default, and its
+  valid-combination rule
+
+#### Scenario: Gate preservation covers the flag
+
+- **WHEN** the compile prompt instructs the compile model to preserve manual
+  gates from the source plan
+- **THEN** the instruction covers both `pause_before` and
+  `pause_before_human_only` so a compiled manifest can express delegated
+  approval

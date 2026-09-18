@@ -1820,5 +1820,66 @@ class Round4RegressionTests(unittest.TestCase):
         )
 
 
+class RecordTransformTests(unittest.TestCase):
+    """The optional `record_transform` hook is applied before aggregation and
+    never mutates the telemetry file (read-time reprice contract)."""
+
+    @staticmethod
+    def _reprice_to(value):
+        def _transform(record):
+            updated = dict(record)
+            cost = dict(record.get("cost", {}))
+            cost["status"] = "estimated"
+            cost["estimated_cost"] = value
+            cost["unresolved_reason"] = None
+            updated["cost"] = cost
+            return updated
+
+        return _transform
+
+    def _fixture(self, *, cost_status="unresolved"):
+        records = [
+            _make_telemetry_record(
+                uid="1", change_id="change-a", stage="implement",
+                cost_status=cost_status,
+                estimated_cost=None if cost_status == "unresolved" else 0.01,
+            ),
+        ]
+        state = _make_state(
+            changes={"change-a": _make_change_record(status="done")}
+        )
+        repo = _setup_fixture_dir(
+            tempfile.mkdtemp(), telemetry_records=records, state=state
+        )
+        return repo, repo / ".opsx-plan" / "telemetry" / "test-plan.jsonl"
+
+    def test_transform_changes_aggregated_cost(self) -> None:
+        repo, _ = self._fixture()
+        result = aggregate(str(repo), "test-plan",
+                           record_transform=self._reprice_to(1.25))
+        self.assertEqual(result.plan_metrics.total_estimated_cost, 1.25)
+
+    def test_transform_does_not_mutate_telemetry_file(self) -> None:
+        repo, jsonl = self._fixture()
+        before = jsonl.read_bytes()
+        aggregate(str(repo), "test-plan",
+                  record_transform=self._reprice_to(9.99))
+        self.assertEqual(jsonl.read_bytes(), before)
+
+    def test_transform_is_deterministic(self) -> None:
+        repo, _ = self._fixture()
+        first = aggregate(str(repo), "test-plan",
+                          record_transform=self._reprice_to(2.5))
+        second = aggregate(str(repo), "test-plan",
+                           record_transform=self._reprice_to(2.5))
+        self.assertEqual(first.plan_metrics.total_estimated_cost, 2.5)
+        self.assertEqual(second.plan_metrics.total_estimated_cost, 2.5)
+
+    def test_absent_transform_uses_stored_values(self) -> None:
+        repo, _ = self._fixture(cost_status="estimated")
+        result = aggregate(str(repo), "test-plan")
+        self.assertEqual(result.plan_metrics.total_estimated_cost, 0.01)
+
+
 if __name__ == "__main__":
     unittest.main()

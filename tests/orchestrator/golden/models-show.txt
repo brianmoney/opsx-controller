@@ -4,3 +4,20 @@ adapter: opencode
   reviewer     test-provider/test-reviewer  [ambient environment]
   archiver     test-provider/test-archiver  [ambient environment]
   implementer_escalation (unresolved)  [unresolved]
+  supervisor   (unresolved)  [unresolved]
+  supervised_author (unresolved)  [unresolved]
+  acceptance_reviewer (unresolved)  [unresolved]
+  fixer        (unresolved)  [unresolved]
+  verifier     (unresolved)  [unresolved]
+
+allowlist: (absent)
+
+supervised dispatch role membership:
+  implementer              NOT a member ('test-provider/test-implementer')
+  reviewer                 NOT a member ('test-provider/test-reviewer')
+  archiver                 NOT a member ('test-provider/test-archiver')
+  supervised_author        (unresolved)
+  acceptance_reviewer      (unresolved)
+  fixer                    (unresolved)
+  verifier                 (unresolved)
+  implementer_escalation   (unresolved)

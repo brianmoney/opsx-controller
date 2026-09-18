@@ -1,0 +1,187 @@
+[plan]
+name = "durable-plan-supervision"
+adapter = "opencode"
+# 150m, not the 90m default: every change here is a trust-boundary contract
+# whose verification reruns the full suite (~2.2 min) many times, and 90m
+# killed enforce-supervised-agent-contracts' round 2 mid-progress.
+timeout_minutes = 150
+# 8 rounds, not 5: these are adversarial contracts. The hardest
+# knowledge-forge plan (email-handoff-routing-safety) ran 17 review-failure
+# rounds at max_rounds = 8 and still completed; 5 exhausted here.
+max_rounds = 8
+no_progress_limit = 2
+require_clean_tracked = true
+plan_doc = "openspec/plans/durable-plan-supervision-plan.md"
+create_invoke = "opencode run --model {controller_model} \"/opsx-propose Please review @{plan_doc} and create a change for {change}\""
+create_timeout_minutes = 30
+create_max_attempts = 2
+created_check = "openspec validate {change} --strict"
+review_created = true
+# Escalate the implementer to the configured implementer_escalation model
+# (openai/gpt-5.6-terra) after two failed reviews. Without this the
+# inexpensive implementer patches one finding at a time while the frontier
+# reviewer finds the next; the two 5-round changes burned out exactly so.
+escalate_after_review_fails = 2
+# fast_checks run post-archive; 20m gives the suite margin. Running the real
+# suites makes the controller verify the workers' "green" claim independently.
+check_timeout_minutes = 20
+fast_checks = [
+  "openspec validate --all",
+  "python3 -m unittest discover -t . -s tests",
+  "node tests/opencode/test-opsx-usage-emitter.js",
+]
+
+# Phase 1: Contracts and Configuration Foundations
+
+[[changes]]
+id = "define-supervision-ledger-contract"
+phase = 1
+pause_before = true # first change in proposed `durable-plan-supervision` capability — human accepts the storage/policy contract before anything builds on it
+
+[[changes]]
+id = "add-human-only-pause-flag"
+phase = 1
+depends_on = ["define-supervision-ledger-contract"]
+
+[[changes]]
+id = "register-supervised-model-roles"
+phase = 1
+depends_on = ["define-supervision-ledger-contract"]
+
+# Phase 2: Authority Boundary and Human-Only Enforcement
+
+[[changes]]
+id = "establish-operator-authority-boundary"
+phase = 2
+depends_on = ["define-supervision-ledger-contract"]
+pause_before = true # suggested manual gate — first trust-boundary change; operator confirms the isolation backend, endpoint split, and fail-closed behavior
+
+[[changes]]
+id = "enforce-broker-mediated-approvals"
+phase = 2
+depends_on = [
+  "establish-operator-authority-boundary",
+  "add-human-only-pause-flag",
+  # schema coupling: add-supervision-budgets owns ledger v4, so the broker's
+  # v5 migration (_migrate_4_to_5) must land on top of it
+  "add-supervision-budgets",
+]
+pause_before = true # suggested manual gate — alters the approval trust posture; human accepts broker scope and rejected alternatives
+
+# Phase 3: Execution Ownership, Budgets, and Action Journal
+
+[[changes]]
+id = "add-process-singleton-lock"
+phase = 3
+depends_on = ["define-supervision-ledger-contract"]
+
+[[changes]]
+id = "add-supervision-budgets"
+phase = 3
+depends_on = ["define-supervision-ledger-contract"]
+
+[[changes]]
+id = "add-action-journal-dispatch"
+phase = 3
+depends_on = [
+  "add-process-singleton-lock",
+  "add-supervision-budgets",
+  "enforce-broker-mediated-approvals",
+  "register-supervised-model-roles",
+]
+
+# Phase 4: Session Bridge and Agent Contracts
+
+[[changes]]
+id = "add-opencode-session-bridge"
+phase = 4
+depends_on = ["add-action-journal-dispatch"]
+
+[[changes]]
+id = "enforce-supervised-agent-contracts"
+phase = 4
+# Above the 150m plan default: this change carries the largest file/test
+# surface and its round 2 was killed mid-progress by the old 90m cap.
+timeout_minutes = 180
+depends_on = [
+  "register-supervised-model-roles",
+  "establish-operator-authority-boundary",
+  "add-opencode-session-bridge",
+]
+
+# Phase 5: Lifecycle, Acceptance, Recovery, and Watchdog
+
+[[changes]]
+id = "add-supervised-plan-lifecycle"
+phase = 5
+pause_before = true # trust/contract gate (matches the kf pattern): execution ownership and durable lifecycle decisions; approves the P5 approach on top of P4 before it is built on
+depends_on = [
+  "add-action-journal-dispatch",
+  "enforce-broker-mediated-approvals",
+  "enforce-supervised-agent-contracts",
+]
+
+[[changes]]
+id = "add-acceptance-review-stage"
+phase = 5
+depends_on = [
+  "add-supervised-plan-lifecycle",
+  "enforce-supervised-agent-contracts",
+  "register-supervised-model-roles",
+]
+
+[[changes]]
+id = "add-bounded-incident-recovery"
+phase = 5
+pause_before = true # trust/contract gate: bounded recovery mutates durable supervision state and can reconstitute work; human accepts the incident/recovery policy before it runs unattended
+depends_on = [
+  "add-supervised-plan-lifecycle",
+  "enforce-supervised-agent-contracts",
+]
+
+[[changes]]
+id = "add-watchdog-reconstitution"
+phase = 5
+pause_before = true # trust/contract gate: the watchdog can restart/reconstitute a plan run; human accepts the reconstitution policy before unattended operation
+depends_on = [
+  "add-supervised-plan-lifecycle",
+  "add-acceptance-review-stage",
+  "add-bounded-incident-recovery",
+]
+
+# Phase 6: Observability, Regression, and Packaging
+
+[[changes]]
+id = "add-supervision-observability"
+phase = 6
+depends_on = [
+  "add-action-journal-dispatch",
+  "add-supervision-budgets",
+  "add-bounded-incident-recovery",
+  "add-supervised-plan-lifecycle",
+]
+
+[[changes]]
+id = "add-supervision-fault-injection-tests"
+phase = 6
+depends_on = [
+  "add-action-journal-dispatch",
+  "add-supervision-budgets",
+  "add-supervised-plan-lifecycle",
+  "add-acceptance-review-stage",
+  "add-bounded-incident-recovery",
+  "add-watchdog-reconstitution",
+  "enforce-broker-mediated-approvals",
+]
+
+[[changes]]
+id = "add-supervision-service-packaging"
+phase = 6
+depends_on = [
+  "add-supervision-fault-injection-tests",
+  "establish-operator-authority-boundary",
+  "enforce-broker-mediated-approvals",
+  "add-supervision-budgets",
+  "add-supervision-observability",
+]
+pause_before = true # suggested manual gate — unattended activation must be a deliberate operator decision after all foundations are green

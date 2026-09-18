@@ -65,6 +65,22 @@ ADAPTER_DEFAULTS = {
             'opencode run --agent opsx-archiver --model "$OPSX_ARCHIVER_MODEL" '
             '--variant "$OPSX_ARCHIVER_VARIANT"'
         ),
+        # Supervised-only stages. OpenCode is the first adapter to support the
+        # acceptance stage; an adapter without these defaults fails closed at
+        # dispatch rather than silently skipping acceptance.
+        "acceptance_invoke": (
+            'opencode run --agent opsx-acceptance-reviewer '
+            '--model "$OPSX_ACCEPTANCE_REVIEWER_MODEL" '
+            '--variant "$OPSX_ACCEPTANCE_REVIEWER_VARIANT"'
+        ),
+        "fix_invoke": (
+            'opencode run --agent opsx-fixer --model "$OPSX_FIXER_MODEL" '
+            '--variant "$OPSX_FIXER_VARIANT"'
+        ),
+        "verify_invoke": (
+            'opencode run --agent opsx-verifier --model "$OPSX_VERIFIER_MODEL" '
+            '--variant "$OPSX_VERIFIER_VARIANT"'
+        ),
     },
     "claude-code": {
         "state_file": ".claude/opsx-controller/{change}.json",

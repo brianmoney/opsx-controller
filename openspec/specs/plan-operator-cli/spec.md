@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change add-active-plan-resolution. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: Operators can archive a completed plan
 
 The orchestrator SHALL provide `opsx-plan archive-plan <plan.toml>` that retires a completed authored plan by moving its compiled manifest, and its markdown source when present, into `openspec/plans/archived/`.
@@ -220,7 +222,7 @@ The orchestrator SHALL accept `opsx-plan approve --all` and `opsx-plan accept --
 
 Each batch command SHALL print the exact change IDs it affected. If no changes match the requested gate state, the command SHALL report that nothing was changed.
 
-Existing single-change `approve <change-id>` and `accept <change-id>` forms SHALL remain supported and unchanged.
+Existing single-change `approve <change-id>` and `accept <change-id>` forms SHALL remain supported and unchanged for unregistered legacy jobs. In a registered supervised job, both batch and single-change forms SHALL remain supported but SHALL be broker mediated: affected changes are recorded as durable broker receipts rather than direct JSON mutations.
 
 #### Scenario: `approve --all` approves every change awaiting approval
 
@@ -245,6 +247,13 @@ Existing single-change `approve <change-id>` and `accept <change-id>` forms SHAL
 - **THEN** no plan state changes occur
 - **AND** the command output clearly reports that no changes were awaiting approval
 
+#### Scenario: Batch approval in a registered job records broker receipts
+
+- **GIVEN** a registered supervised job where `change-a` and `change-b` are awaiting approval
+- **WHEN** the operator runs `opsx-plan approve --all` through the operator path
+- **THEN** the broker records one durable approval receipt per affected change, each bound to its checkpoint and material revision
+- **AND** the command output lists exactly `change-a` and `change-b` as affected
+
 ### Requirement: `opsx-plan reset --failed` resets all failed changes to pending
 
 The orchestrator SHALL accept `opsx-plan reset --failed` for a resolved plan.
@@ -255,9 +264,12 @@ The command SHALL print the exact change IDs it reset. If no changes are failed,
 
 Existing single-change `reset <change-id>` SHALL remain supported and unchanged.
 
+In a registered supervised job, `reset --failed` SHALL be broker mediated like any other reset: an authorized operator reset is recorded as durable receipts, and a worker-domain `reset --failed` SHALL be refused with the named broker-mediation error and SHALL reset nothing.
+
 #### Scenario: `reset --failed` resets every failed change
 
-- **GIVEN** a resolved plan where `change-a` and `change-b` are failed, `change-c` is awaiting approval, and `change-d` is done
+- **GIVEN** a resolved plan where `change-a` and `change-b` are failed,
+  `change-c` is awaiting approval, and `change-d` is done
 - **WHEN** the operator runs `opsx-plan reset --failed`
 - **THEN** `change-a` and `change-b` are reset to pending
 - **AND** the command output lists exactly `change-a` and `change-b` as reset
@@ -269,6 +281,13 @@ Existing single-change `reset <change-id>` SHALL remain supported and unchanged.
 - **WHEN** the operator runs `opsx-plan reset --failed`
 - **THEN** no plan state changes occur
 - **AND** the command output clearly reports that no failed changes were reset
+
+#### Scenario: A worker cannot blanket-reset in a registered job
+
+- **WHEN** a worker-domain process runs `opsx-plan reset --failed` in a
+  registered supervised job
+- **THEN** the command fails with a named error identifying broker mediation
+  and no change is reset
 
 ### Requirement: `opsx-plan status` prints the next unblocking command for blocked changes
 
@@ -669,3 +688,457 @@ At minimum, the documentation SHALL explicitly describe:
   optional, or invocation-scoped
 - **THEN** the documentation states the default behavior and names the
   precedence rule or flag that changes it
+
+### Requirement: Operator documentation covers the `pause_before_human_only` key
+
+Operator-facing documentation for `opsx-plan` manifests SHALL describe the
+`pause_before_human_only` key: its human-only default when absent on a gated
+change, the explicit `false` delegation opt-out, and the invalidity of
+`true` without `pause_before = true`.
+
+#### Scenario: Workflow documentation explains the flag
+
+- **WHEN** an operator reads the manifest key documentation and the
+  manual-gates section of the operator workflow documentation
+- **THEN** the key, its human-only default, the delegation opt-out, and the
+  invalid combination are all described
+
+### Requirement: The `opsx-plan supervise` namespace reports backend capability
+
+The orchestrator SHALL provide an `opsx-plan supervise` command namespace.
+Its capability report SHALL state whether the host provides a supported
+isolation backend for the operator authority boundary, naming the detected
+backend status plainly so an operator can tell whether supervision can be
+enabled before attempting it.
+
+The capability report SHALL be a read-only diagnostic: it SHALL NOT create
+accounts, install service units, write the authority store, or change any
+host configuration, and it SHALL run without requiring the boundary to be
+active.
+
+#### Scenario: A supported host reports the backend
+
+- **WHEN** an operator runs the `opsx-plan supervise` capability report on a
+  host with a supported isolation backend
+- **THEN** the report states that the backend is available and exits
+  successfully
+
+#### Scenario: An unsupported host reports unavailability
+
+- **WHEN** an operator runs the `opsx-plan supervise` capability report on a
+  host without a supported isolation backend
+- **THEN** the report states that no supported backend is available, and the
+  report itself makes no change to the host
+
+### Requirement: Enabling supervision fails closed on an unsupported host
+
+When the capability surface is asked to enable supervision and the isolation
+backend is unavailable, the command SHALL exit non-zero with a named
+unsupported-host error. The command SHALL NOT silently downgrade to a weaker
+isolation posture and SHALL NOT provision accounts or services automatically:
+provisioning is a separate, manual operator step the error output points to.
+
+#### Scenario: Enablement refused with a named error
+
+- **WHEN** an operator attempts to enable supervision through `opsx-plan
+  supervise` on a host without a supported backend
+- **THEN** the command exits non-zero, names the unsupported-host error,
+  enables nothing, and substitutes no weaker posture
+
+#### Scenario: Enablement never auto-provisions
+
+- **WHEN** an operator attempts to enable supervision on any host
+- **THEN** the command creates no accounts, installs no service units, and
+  directs the operator to the manual provisioning step instead
+
+### Requirement: Existing diagnostics remain available without the boundary
+
+The independent diagnostic commands `opsx-plan doctor`, `opsx-plan status`,
+`opsx-plan logs`, and `opsx-plan report` SHALL remain fully available on a
+host without a supported isolation backend and without any supervision
+enablement, so legacy unsupervised operation keeps its observability
+unchanged.
+
+#### Scenario: Diagnostics run on an unsupported host
+
+- **WHEN** an operator runs `doctor`, `status`, `logs`, or `report` on a host
+  with no supported isolation backend and no supervised job
+- **THEN** each command behaves exactly as it does for legacy unsupervised
+  runs, with no boundary-related failure
+
+### Requirement: Operator documentation describes the boundary behavior
+
+The operator-facing `opsx-plan` documentation SHALL describe the `supervise`
+namespace's capability report, the named unsupported-host error, the
+fail-closed refusal with no silent downgrade, and the manual provisioning
+stance.
+
+#### Scenario: The boundary behavior is documented
+
+- **WHEN** an operator reads the documented `opsx-plan` supervision surface
+- **THEN** it shows the capability report, names the unsupported-host error,
+  states that no downgrade or automatic provisioning occurs, and points to
+  the manual provisioning step
+
+### Requirement: Mutating commands acquire the worktree execution lock
+
+The mutating commands `opsx-plan run`, `opsx-plan reset`, and the
+single-change handler shared by `opsx-run` and its documented alias
+`opsx-plan run-one` SHALL acquire the worktree execution lock before
+performing any mutating work and SHALL hold it for the duration of the
+command, releasing it on every exit path, normal or failed.
+
+When the lock is already held, the command SHALL fail with a named
+lock-contention error and a non-zero exit code rather than waiting for the
+lock or proceeding without it. Future supervised mutating paths (such as
+supervised recovery) SHALL acquire the same lock when they are introduced.
+
+#### Scenario: A mutating command holds the lock for its duration
+
+- **WHEN** an operator runs `opsx-plan run`, `opsx-plan reset`, `opsx-run`,
+  or `opsx-plan run-one` and no other process holds the worktree lock
+- **THEN** the command acquires the lock before mutating anything, holds it
+  until it exits, and releases it on both success and failure
+
+#### Scenario: Both names of the single-change command serialize
+
+- **WHEN** `opsx-run` holds the worktree lock and `opsx-plan run-one` is
+  invoked in the same worktree (or the reverse)
+- **THEN** the second invocation exits non-zero with the named
+  lock-contention error and performs no mutating work, because both names
+  dispatch to the same handler and acquire the same lock
+
+#### Scenario: Contention fails fast with a named error
+
+- **WHEN** a mutating command is invoked while another process holds the
+  worktree lock
+- **THEN** it exits non-zero with a named lock-contention error, performs no
+  mutating work, and leaves the holder undisturbed
+
+### Requirement: An ordinary mutating command is refused when it would race a supervised execution
+
+When the worktree lock is held by a supervised execution, an ordinary
+mutating command (`run`, `reset`, `opsx-run`, or its alias
+`opsx-plan run-one`) SHALL be refused with a documented named error stating
+that the worktree is owned by a supervised execution. This refusal is the one
+intentional behavior change for legacy runs; every other legacy behavior
+SHALL be preserved.
+
+#### Scenario: Ordinary run refused during supervised execution
+
+- **WHEN** a supervised execution holds the worktree lock and an operator
+  runs `opsx-plan run` or `opsx-plan reset` in that worktree
+- **THEN** the command exits non-zero with the documented named
+  supervised-ownership error and performs no mutating work
+
+#### Scenario: Ordinary run proceeds after the supervised execution releases
+
+- **WHEN** the supervised execution has released the worktree lock
+- **THEN** an ordinary mutating command acquires the lock and proceeds with
+  its normal legacy behavior
+
+### Requirement: Diagnostics and gate commands do not acquire the execution lock
+
+The read-only diagnostic commands `opsx-plan doctor`, `opsx-plan status`,
+`opsx-plan logs`, `opsx-plan report`, and `opsx-plan dashboard` SHALL run
+without acquiring the worktree execution lock, including while another
+process holds it.
+
+The gate commands `opsx-plan approve` and `opsx-plan accept` SHALL record
+their receipts without acquiring the worktree execution lock, so an
+operator can always release a gate while an execution is running or
+waiting.
+
+#### Scenario: Diagnostics run during a held lock
+
+- **WHEN** a mutating command holds the worktree lock
+- **THEN** `doctor`, `status`, `logs`, `report`, and `dashboard` still run
+  to completion in that worktree
+
+#### Scenario: A gate command succeeds during a held lock
+
+- **WHEN** a mutating command holds the worktree lock and a change is
+  awaiting approval
+- **THEN** `opsx-plan approve <change-id>` records the approval without
+  acquiring the lock and without failing for lock contention
+
+### Requirement: Operator documentation describes the execution lock behavior
+
+The operator-facing `opsx-plan` documentation SHALL describe the worktree
+execution lock: which commands acquire it, the named lock-contention error,
+the documented refusal of an ordinary mutating command that would race a
+supervised execution, and that diagnostics and gate commands never block on
+the lock.
+
+#### Scenario: The lock behavior is documented
+
+- **WHEN** an operator reads the documented `opsx-plan` workflow
+- **THEN** it names the lock-acquiring commands, shows the contention and
+  supervised-ownership errors, and states that diagnostics and approvals
+  run without the lock
+
+### Requirement: Gate and mutating commands in a registered supervised job are broker mediated
+
+When a worktree holds a registered supervised job, `opsx-plan approve`
+(including `--all` and `P<N>` forms), `opsx-plan accept`, `opsx-plan reset`
+(including `--failed`), `opsx-plan run`, `opsx-plan run-one`, and `opsx-run`
+SHALL be broker
+mediated: gate releases are recorded through the operator OS-authenticated
+path or the scoped job service action, and run dispatch is authorized against
+broker receipts and the protected job policy rather than unmediated JSON
+writes.
+
+A mutating command attempted by a worker-domain process in a registered job —
+approving, accepting without authority, resetting, or running outside the
+supervised execution — SHALL be refused with a named error identifying broker
+mediation, and SHALL NOT alter broker, ledger, or JSON phase authority.
+
+Registration detection SHALL NOT depend on repo-writable files alone: a
+worker that edits the JSON state or plan to drop supervised fields SHALL NOT
+turn a registered job back into an unmediated one.
+
+Read-only diagnostics (`status`, `logs`, `report`, `doctor`) SHALL remain
+available in a registered job without broker mediation and SHALL NOT be
+refused.
+
+#### Scenario: A worker cannot approve in a registered job
+
+- **WHEN** a worker-domain process runs `opsx-plan approve` for a gated
+  change in a registered supervised job
+- **THEN** the command fails with a named error identifying broker mediation
+  and no approval is recorded
+
+#### Scenario: A worker cannot run in a registered job
+
+- **WHEN** a worker-domain process runs `opsx-plan run`, `opsx-plan run-one`,
+  or `opsx-run` in a registered supervised job outside the supervised
+  execution
+- **THEN** the command fails with a named error identifying broker mediation
+  and no dispatch occurs
+
+#### Scenario: The operator approves through the authenticated path
+
+- **WHEN** the operator runs `opsx-plan approve` in a registered supervised
+  job and the request reaches the broker through the operator
+  OS-authenticated path
+- **THEN** the broker records a durable approval receipt bound to the exact
+  checkpoint and material revision, and the command reports the affected
+  changes
+
+#### Scenario: Diagnostics work during mediation
+
+- **WHEN** any principal runs `opsx-plan status` or `opsx-plan logs` in a
+  registered supervised job
+- **THEN** the read-only output is produced without requiring broker
+  mediation
+
+#### Scenario: Tampered supervised markers do not disable mediation
+
+- **WHEN** a worker-domain process removes supervised fields from the JSON
+  execution state or repo plan of a registered job and then runs
+  `opsx-plan approve`
+- **THEN** the command is still broker mediated and the worker attempt is
+  refused
+
+### Requirement: Operator documentation describes broker-mediated approval behavior
+
+Operator-facing documentation SHALL describe broker mediation for registered
+supervised jobs: which commands are mediated, the operator OS-authenticated
+approval path, the delegated-approval behavior of
+`pause_before_human_only = false`, the named worker-refusal errors, the
+material-revision binding of receipts (including when an explicit plan or
+policy revision re-arms a gate), and the unchanged behavior of unregistered
+legacy jobs.
+
+#### Scenario: Documentation covers the mediated surface
+
+- **WHEN** the operator workflow documentation is reviewed against this
+  change
+- **THEN** every element listed above is documented, with at least one
+  example of an operator approval and of a worker refusal
+
+### Requirement: `opsx-plan supervise` provides the supervised job lifecycle commands
+
+The `opsx-plan supervise` namespace SHALL provide the lifecycle commands
+`register`, `start`, `inspect`, `resume`, `pause`, `drain`, and `cancel`
+alongside its existing capability, probe, and serve commands.
+
+`register` SHALL record the supervised job for the resolved plan and SHALL
+fail with the named unsupported-host error on a host without a supported
+isolation backend. `start`, `resume`, `pause`, `drain`, and `cancel`
+targeting a worktree with no registered supervised job SHALL exit non-zero
+with a named unknown-job error. A command requesting an illegal transition
+SHALL exit non-zero with a named illegal-transition error, and a mutating
+command targeting a terminal job SHALL exit non-zero with a named
+terminal-job error.
+
+Mutating lifecycle commands for a live job SHALL be mediated through the
+operator OS-authenticated path, consistent with broker mediation: a
+worker-domain process SHALL NOT be able to invoke them. When the required
+authority path is unreachable, the command SHALL fail closed with the named
+broker-unavailable error rather than acting unmediated.
+
+`inspect` SHALL be a read-only projection of the job: its state, recorded
+waits, policy revision, budget posture, and recent actions and incidents.
+It SHALL require neither the worktree execution lock nor a live service, and
+SHALL exit non-zero with a named unknown-job error when no registered job
+exists.
+
+These commands SHALL NOT affect legacy unregistered runs: an operator who
+never registers a supervised job observes no behavior change in any existing
+command.
+
+#### Scenario: Register then start a supervised job
+
+- **WHEN** an operator runs `opsx-plan supervise register` for a plan on a
+  supported host and then `opsx-plan supervise start`
+- **THEN** the job is recorded with its full registration fields and
+  transitions to `active`
+
+#### Scenario: Lifecycle commands fail closed with named errors
+
+- **WHEN** a mutating lifecycle command targets an unregistered worktree, an
+  illegal transition, a terminal job, an unreachable authority path, or an
+  unsupported host
+- **THEN** it exits non-zero naming the corresponding error — unknown-job,
+  illegal-transition, terminal-job, broker-unavailable, or unsupported-host
+  — and records nothing
+
+#### Scenario: Pause, drain, resume, and cancel drive the state machine
+
+- **WHEN** the operator runs `pause`, `drain`, `resume`, or `cancel` for a
+  registered job in a legal source state
+- **THEN** each command records its durable effect and drives the documented
+  transition, and the effects are visible to a later `inspect`
+
+#### Scenario: Inspect is read-only and lock-free
+
+- **WHEN** an operator runs `inspect` for a registered job while its
+  execution holds the worktree lock or no service is live
+- **THEN** the command prints the job's state, waits, policy revision,
+  budget posture, and recent actions and incidents without acquiring the
+  lock or contacting a service
+
+#### Scenario: A worker process cannot invoke lifecycle mutation
+
+- **WHEN** a worker-domain process attempts to invoke a mutating lifecycle
+  verb, including through the worker-actions endpoint
+- **THEN** the attempt is refused and no lifecycle effect is recorded
+
+### Requirement: Operator documentation describes the supervised lifecycle
+
+The operator-facing `opsx-plan` documentation SHALL describe the supervised
+job lifecycle: the state machine, each lifecycle command with its named
+errors, the pause-versus-drain stop boundaries, cancellation effects, the
+durable human wait, evidence-based completion with fresh review on
+revalidation, and the `(manual)` operator checklist reporting.
+
+#### Scenario: The lifecycle surface is documented
+
+- **WHEN** an operator reads the documented `opsx-plan supervise` reference
+- **THEN** it covers the state machine, every lifecycle command, the stop
+  boundaries, cancellation, human waits, completion evidence semantics, and
+  the manual-task checklist
+
+### Requirement: `opsx-plan status` surfaces supervised job state
+
+`opsx-plan status` SHALL surface the supervised job state for the resolved
+plan when a supervised job is registered: job state and progress, open human
+and stop waits, policy revision, budget posture, and recent incidents.
+`opsx-plan status --json` SHALL emit the same information as a structured
+document that includes a supervision object. For a plan with no registered
+supervised job, `status` SHALL keep its current human output exactly and the
+new structured mode SHALL omit the supervision object.
+
+#### Scenario: Status shows a supervised job block
+
+- **WHEN** `opsx-plan status` runs for a plan with a registered supervised job
+- **THEN** it reports the job state, waits, policy revision, budget posture, and recent incidents in addition to the existing change list
+
+#### Scenario: Status JSON emits the supervision object
+
+- **WHEN** `opsx-plan status --json` runs for a plan with a registered supervised job
+- **THEN** the document includes a supervision object with the projected job state
+
+#### Scenario: Unregistered plans keep their status output
+
+- **WHEN** `opsx-plan status` runs for a plan with no registered supervised job
+- **THEN** its output is identical to the pre-existing behavior
+
+### Requirement: Operator steering commands return a durable request identity and safe-boundary acknowledgement
+
+For a registered supervised job, the `opsx-plan` operator steering commands —
+a policy revision, pause-after-change, stop or retry, and cancel — SHALL
+report the durable request identity of the recorded request and SHALL report
+the safe-boundary acknowledgement once it is reached. A request that cannot
+be recorded SHALL fail closed with a named error, and the commands SHALL NOT
+change behavior for unregistered plans.
+
+#### Scenario: A steering command returns a request identity
+
+- **WHEN** an operator runs a steering command for a registered supervised job
+- **THEN** the command reports the recorded request identity and, once reached, the safe-boundary acknowledgement
+
+#### Scenario: Unregistered plans are unaffected
+
+- **WHEN** a steering command is run for a plan with no registered supervised job
+- **THEN** existing behavior is unchanged and no supervision request identity is reported
+
+### Requirement: `opsx-plan supervise` provides the watchdog surface
+
+The `opsx-plan supervise` namespace SHALL provide a `watchdog` command that
+runs the deterministic watchdog loop or, with `--once`, exactly one tick. It
+SHALL report each supervised job's classification and recent reconstitution
+events, in human-readable form and as structured JSON. The command SHALL
+require neither the worktree execution lock nor a live service, and SHALL exit
+non-zero with a named unknown-job error when no registered supervised job
+exists.
+
+`opsx-plan supervise serve` SHALL run the boot-scan reconciliation and the
+periodic watchdog tick as part of the service host, so the service-owned loop
+supervises registered jobs unattended.
+
+The watchdog surface SHALL NOT affect legacy unregistered runs: an operator who
+never registers a supervised job observes no behavior change in any existing
+command.
+
+#### Scenario: A single tick runs from the command line
+
+- **WHEN** an operator runs `opsx-plan supervise watchdog --once` for a
+  registered job
+- **THEN** exactly one tick is evaluated and the job's classification and any
+  reconstitution events are reported
+
+#### Scenario: The watchdog surface fails closed without a registered job
+
+- **WHEN** `opsx-plan supervise watchdog` runs for a worktree with no
+  registered supervised job
+- **THEN** it exits non-zero with a named unknown-job error and records nothing
+
+#### Scenario: Serve supervises unattended
+
+- **WHEN** `opsx-plan supervise serve` runs for a registered job
+- **THEN** it performs the boot-scan reconciliation and periodic watchdog ticks
+  as part of the service host
+
+#### Scenario: Legacy runs are unaffected
+
+- **WHEN** an operator runs any existing `opsx-plan` command for a plan with no
+  registered supervised job
+- **THEN** its behavior is unchanged by the watchdog surface
+
+### Requirement: Operator documentation describes the watchdog and reconstitution behavior
+
+The operator-facing `opsx-plan` documentation SHALL describe the watchdog: the
+service-owned loop with no control-channel dependency, the separate liveness,
+progress, and deadline signals, the job classification vocabulary, boot-scan
+reconciliation with reconnect before respawn, quiescence-gated reconstitution,
+the restart backoff bound, the no-action rule for an expected human wait, and
+the read-only reconstitution-event surface.
+
+#### Scenario: The watchdog surface is documented
+
+- **WHEN** an operator reads the documented `opsx-plan supervise` reference
+- **THEN** it covers the watchdog loop, the signals and classifications, boot
+  reconciliation, quiescence-gated reconstitution, restart bounds, human-wait
+  handling, and the reconstitution-event surface

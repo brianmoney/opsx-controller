@@ -13,7 +13,14 @@ import tomllib
 from pathlib import Path
 from typing import Mapping, Optional
 
-from lib.models.types import ROLE_ENV, ROLE_VARIANT_ENV, ROLES, ALL_ROLES, ResolvedModel
+from lib.models.types import (
+    ROLE_ENV,
+    ROLE_VARIANT_ENV,
+    ROLES,
+    ALL_ROLES,
+    AllowlistResult,
+    ResolvedModel,
+)
 
 USER_CONFIG_PATH = Path.home() / ".config" / "opsx-controller" / "models.toml"
 REPO_CONFIG_RELATIVE = Path(".opsx-plan") / "models.toml"
@@ -119,6 +126,58 @@ def resolve(
         )
 
     return resolved
+
+
+def resolve_allowlist(repo: Optional[Path] = None) -> AllowlistResult:
+    """Resolve the effective inexpensive-model allowlist.
+
+    The allowlist lives in the same configuration files as roles, in an
+    ``[allowlist]`` table with a ``models`` array of exact identifier
+    strings. File precedence is identical to role resolution: the
+    repository-local file is consulted first, then the user-global file. A
+    repository-local ``[allowlist]`` table replaces the user-global list
+    wholesale (lists never merge), including when the local list is
+    explicitly empty. The allowlist has no environment-variable source.
+
+    Returns an :class:`AllowlistResult`. When neither file defines the table,
+    ``models`` is empty, ``source`` is ``"unconfigured"``, and ``configured``
+    is ``False``. A present-but-malformed table raises ``ModelConfigError``
+    naming the offending file.
+    """
+    for path in config_paths(repo):
+        data = _load_config(path)
+        if data is None:
+            continue
+        if "allowlist" not in data:
+            continue
+        table = data["allowlist"]
+        if not isinstance(table, dict) or "models" not in table:
+            raise ModelConfigError(
+                f"invalid [allowlist] table in model configuration file {path}: "
+                f"expected a 'models' array key"
+            )
+        raw_models = table["models"]
+        if not isinstance(raw_models, list):
+            raise ModelConfigError(
+                f"invalid [allowlist].models in model configuration file {path}: "
+                f"expected an array of exact identifier strings"
+            )
+        entries: list[str] = []
+        for entry in raw_models:
+            if not isinstance(entry, str) or not entry.strip():
+                raise ModelConfigError(
+                    f"invalid [allowlist].models entry in model configuration "
+                    f"file {path}: entries must be non-empty, non-whitespace "
+                    f"exact identifier strings"
+                )
+            entries.append(entry.strip())
+        return AllowlistResult(
+            models=tuple(entries),
+            source=f"{path} ([allowlist])",
+            configured=True,
+        )
+
+    return AllowlistResult(models=(), source="unconfigured", configured=False)
 
 
 def _resolve_key(

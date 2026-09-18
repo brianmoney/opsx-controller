@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -209,6 +210,67 @@ class DoctorPreflightTests(unittest.TestCase):
                     os.environ[v] = val
                 elif v in os.environ:
                     del os.environ[v]
+
+    def _set_required_models(self, mapping: dict[str, str]) -> None:
+        saved: dict[str, str | None] = {}
+        for role, value in mapping.items():
+            var = f"OPSX_{role.upper()}_MODEL"
+            saved[var] = os.environ.get(var)
+            os.environ[var] = value
+
+        def restore() -> None:
+            for var, val in saved.items():
+                if val is not None:
+                    os.environ[var] = val
+                elif var in os.environ:
+                    del os.environ[var]
+
+        self.addCleanup(restore)
+
+    def test_check_model_pricing_resolution_passes_for_catalog_models(self) -> None:
+        """Configured roles with catalog coverage pass the pricing check."""
+        self._set_required_models(
+            {
+                "controller": "moonshotai/kimi-k3",
+                "implementer": "commandcode/deepseek-v4.1-flash",
+                "reviewer": "openai/gpt-5.6-terra",
+                "archiver": "opencode-go/deepseek-v4.1-flash",
+            }
+        )
+        passed, label, remediation = doctor_mod._check_model_pricing_resolution(
+            self.repo, "opencode"
+        )
+        self.assertTrue(passed, f"check failed: {remediation}")
+
+    def test_check_model_pricing_resolution_fails_for_unknown_model(self) -> None:
+        """A configured role without a catalog entry fails with the role named."""
+        self._set_required_models(
+            {
+                "controller": "openai/no-such-model",
+                "implementer": "openai/no-such-model",
+                "reviewer": "openai/no-such-model",
+                "archiver": "openai/no-such-model",
+            }
+        )
+        passed, label, remediation = doctor_mod._check_model_pricing_resolution(
+            self.repo, "opencode"
+        )
+        self.assertFalse(passed)
+        self.assertIn("no pricing for", remediation)
+        self.assertIn("controller", remediation)
+
+    def test_split_model_identifier_uses_adapter_default_for_bare_ids(self) -> None:
+        self.assertEqual(
+            doctor_mod._split_model_identifier("claude-opus-5", "claude-code"),
+            ("anthropic", "claude-opus-5"),
+        )
+        self.assertIsNone(
+            doctor_mod._split_model_identifier("claude-opus-5", "opencode")
+        )
+        self.assertEqual(
+            doctor_mod._split_model_identifier("openai/gpt-5.6-terra", "opencode"),
+            ("openai", "gpt-5.6-terra"),
+        )
 
     def test_check_tracked_bytecode_no_false_positives_on_clean_tree(self) -> None:
         """A clean tree without bytecode should pass."""
@@ -756,6 +818,148 @@ class DshAdapterDoctorTests(unittest.TestCase):
         self.assertFalse(passed)
         self.assertIn("dsh", label)
         self.assertIn("npx", remediation)
+
+
+class SupervisedModelDoctorTests(unittest.TestCase):
+    """4.2 / 4.3 / 6.6: doctor reports the supervised model configuration and
+    the installation staleness probe covers lib/supervisor."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        self._models_patch = mock.patch.object(
+            resolver, "USER_CONFIG_PATH", self.repo / "unused-home" / "models.toml"
+        )
+        self._models_patch.start()
+        self.addCleanup(self._models_patch.stop)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _write_repo_config(self, content: str) -> None:
+        cfg = self.repo / ".opsx-plan" / "models.toml"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text(textwrap.dedent(content), encoding="utf-8")
+
+    def test_unconfigured_supervised_roles_never_fail(self) -> None:
+        passed, label, remediation = doctor_mod._check_supervised_models(
+            self.repo, "opencode"
+        )
+        self.assertTrue(passed, remediation)
+
+    def test_reports_supervised_roles_and_allowlist(self) -> None:
+        self._write_repo_config(
+            """\
+            [adapters.opencode]
+            implementer = "cheap/implementer"
+            supervised_author = "cheap/author"
+
+            [allowlist]
+            models = ["cheap/author"]
+            """
+        )
+        passed, label, remediation = doctor_mod._check_supervised_models(
+            self.repo, "opencode"
+        )
+        self.assertTrue(passed, remediation)
+        self.assertIn("allowlist", remediation)
+        self.assertIn("cheap/author", remediation)
+        self.assertIn("supervised_author", remediation)
+        self.assertIn("unconfigured", remediation)
+
+    def test_report_detail_prints_supervised_section(self) -> None:
+        self._write_repo_config(
+            """\
+            [adapters.opencode]
+            implementer = "cheap/implementer"
+
+            [allowlist]
+            models = ["cheap/implementer"]
+            """
+        )
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            doctor_mod._print_supervised_model_detail(self.repo, "opencode")
+        text = out.getvalue()
+        self.assertIn("allowlist", text)
+        self.assertIn("supervised_author", text)
+        self.assertIn("supervisor", text)
+        self.assertIn("allowlist-exempt", text)
+
+    def test_malformed_allowlist_surfaces_named_error(self) -> None:
+        # A present-but-malformed [allowlist] table is a configuration error,
+        # not an absent allowlist: doctor must not report success.
+        self._write_repo_config(
+            """\
+            [allowlist]
+            models = "not-an-array"
+            """
+        )
+        passed, label, remediation = doctor_mod._check_supervised_models(
+            self.repo, "opencode"
+        )
+        self.assertFalse(passed)
+        self.assertIn("allowlist", remediation)
+        self.assertIn("models.toml", remediation)
+
+    def test_absent_allowlist_still_passes(self) -> None:
+        self._write_repo_config(
+            """\
+            [adapters.opencode]
+            implementer = "cheap/implementer"
+            """
+        )
+        passed, label, remediation = doctor_mod._check_supervised_models(
+            self.repo, "opencode"
+        )
+        self.assertTrue(passed, remediation)
+        self.assertIn("allowlist: absent", remediation)
+
+    def test_configured_supervisor_reported_as_allowlist_exempt(self) -> None:
+        self._write_repo_config(
+            """\
+            [adapters.opencode]
+            supervisor = "frontier/supervisor"
+            implementer = "cheap/implementer"
+
+            [allowlist]
+            models = ["cheap/implementer"]
+            """
+        )
+        passed, label, remediation = doctor_mod._check_supervised_models(
+            self.repo, "opencode"
+        )
+        self.assertTrue(passed, remediation)
+        self.assertIn("supervisor: configured 'frontier/supervisor'", remediation)
+        self.assertIn("allowlist-exempt", remediation)
+        # The supervisor is not demanded as an allowlist member.
+        self.assertNotIn("supervisor: configured 'frontier/supervisor' (not a member)", remediation)
+
+    def test_stale_probe_detects_missing_supervisor_module(self) -> None:
+        repo = Path(self.tmp.name) / "repo"
+        repo_lib = repo / "lib" / "supervisor"
+        repo_lib.mkdir(parents=True)
+        (repo_lib / "model_policy.py").write_text("x = 1\n", encoding="utf-8")
+
+        fake_home = Path(self.tmp.name) / "fake-home"
+        installed = (
+            fake_home / ".local" / "lib" / "opsx-controller" / "lib" / "supervisor"
+        )
+        installed.mkdir(parents=True)
+        # model_policy.py missing from the installed copy.
+
+        with mock.patch.object(Path, "home", return_value=fake_home):
+            reason = load_opsx_plan()._diff_supervisor_package(repo_lib, installed)
+        self.assertIn("stale", reason.lower())
+
+    def test_stale_probe_passes_when_supervisor_matches(self) -> None:
+        repo_lib = Path(self.tmp.name) / "repo-lib"
+        installed = Path(self.tmp.name) / "installed-lib"
+        for target in (repo_lib, installed):
+            target.mkdir(parents=True)
+            (target / "model_policy.py").write_text("x = 1\n", encoding="utf-8")
+        reason = load_opsx_plan()._diff_supervisor_package(repo_lib, installed)
+        self.assertEqual(reason, "")
 
 
 class DoctorProbeCoverageTests(unittest.TestCase):

@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""opsx-supervise: the supervised primary's tracked service tool shim.
+
+The ``opsx-supervisor`` agent's permission contract allows exactly one shell
+command: ``opsx-supervise *``. This executable is that command. It resolves
+the installed ``lib/supervisor`` runtime from its own location (never from a
+repository checkout) and delegates to
+:func:`lib.supervisor.service_tool.main`, which maps a closed set of
+worker-actions verbs onto the scoped worker endpoint through
+:mod:`lib.supervisor.broker_client`.
+
+The worker socket and job identity travel in the worker-domain environment
+(``OPSX_SUPERVISOR_WORKER_SOCKET``, ``OPSX_SUPERVISOR_JOB_ID``); this shim
+never reads or forwards an operator socket, and it exposes no operator verb.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_SCRIPT_ROOT = Path(__file__).resolve().parents[1]
+_RUNTIME_ROOTS = (
+    _SCRIPT_ROOT,
+    _SCRIPT_ROOT / "lib" / "opsx-controller",
+    _SCRIPT_ROOT / ".opsx-controller",
+)
+
+
+def _ensure_runtime_modules() -> None:
+    for runtime_root in _RUNTIME_ROOTS:
+        if (runtime_root / "lib" / "supervisor").is_dir():
+            runtime_root_str = str(runtime_root)
+            if runtime_root_str not in sys.path:
+                sys.path.insert(0, runtime_root_str)
+            return
+
+
+def main() -> int:
+    _ensure_runtime_modules()
+    try:
+        from lib.supervisor import service_tool
+    except ModuleNotFoundError:
+        sys.stderr.write(
+            "opsx-supervise: the installed supervision runtime is missing; "
+            "reinstall the adapter (bash adapters/opencode/install.sh --global)\n"
+        )
+        return 4
+    return int(service_tool.main())
+
+
+if __name__ == "__main__":
+    sys.exit(main())

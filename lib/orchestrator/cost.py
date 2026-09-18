@@ -1,13 +1,18 @@
 """Cost estimation for direct-stage telemetry.
 
 Estimates a stage's cost from usage/model telemetry against the
-`lib.pricing` catalog.
+`lib.pricing` catalog, and owns the pre-dispatch reservation estimate derived
+from a role's pinned model. This module is a low layer: the journal dispatch
+boundary and the supervision service both resolve their pricing through it, so
+neither has to import the other.
 """
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, Mapping
 
 from lib.orchestrator import base
+from lib.supervisor import budgets as budget_mod
 
 # Subscription usage denominator configuration.
 # Maps provider -> model_id -> denominator (positive float).
@@ -16,6 +21,10 @@ SUBSCRIPTION_DENOMINATORS: dict[str, dict[str, float]] = {}
 
 # Module-level catalog instance (lazy-init).
 _cost_catalog: object = None  # PricingCatalog | None
+
+
+class RetryableCatalogLoadError(budget_mod.BudgetError):
+    """A pricing-catalog load failure the bounded retry may resolve."""
 
 
 def _get_catalog(repo: Path | None = None):
@@ -233,3 +242,117 @@ def estimate_stage_cost(usage, model,
             )
 
     return result
+
+
+def reprice_record(record, repo: Path | None = None):
+    """Return a shallow copy of *record* with ``cost`` recomputed.
+
+    The recomputation uses :func:`estimate_stage_cost` against the currently
+    loaded pricing catalog, from the record's stored ``usage`` and ``model``
+    fields. The input record is not modified, and no file is read or written
+    beyond the catalog already loaded by the estimator.
+    """
+    updated = dict(record)
+    updated["cost"] = estimate_stage_cost(
+        record.get("usage") or {},
+        record.get("model") or {},
+        repo=repo,
+    )
+    return updated
+
+
+# ---------------------------------------------------------------------------
+# Pinned-model reservation estimate (shared pricing boundary)
+# ---------------------------------------------------------------------------
+
+
+def pinned_model_for_role(policy: Mapping[str, Any], role: str) -> str | None:
+    """Return the exact model identifier pinned for *role*, or ``None``."""
+    return _pinned_model_for_role(policy, role)
+
+
+def _pinned_model_for_role(policy: Mapping[str, Any], role: str) -> str | None:
+    selection = policy.get("model_selection")
+    if not isinstance(selection, Mapping):
+        return None
+    roles = selection.get("roles")
+    if not isinstance(roles, Mapping):
+        return None
+    pin = roles.get(role)
+    return pin if isinstance(pin, str) and pin.strip() else None
+
+
+def _split_model_identity(model: str) -> tuple[str, str] | None:
+    if "/" not in model:
+        return None
+    provider, model_id = model.split("/", 1)
+    provider, model_id = provider.strip(), model_id.strip()
+    if not provider or not model_id:
+        return None
+    return provider, model_id
+
+
+def _pinned_rate_and_catalog_version(
+    repo: Path, policy: Mapping[str, Any], role: str
+) -> tuple[float, str | None]:
+    pin = _pinned_model_for_role(policy, role)
+    if pin is None:
+        raise budget_mod.UnknownPricingError(
+            f"role '{role}' has no model_selection pin to price"
+        )
+    identity = _split_model_identity(pin)
+    if identity is None:
+        raise budget_mod.UnknownPricingError(
+            f"role '{role}' pin '{pin}' is not a provider/model identifier"
+        )
+    try:
+        base.ensure_own_root_on_syspath()
+        from lib.pricing import PricingCatalog, UnresolvedPrice  # noqa: F401
+    except Exception as exc:  # pragma: no cover - pricing runtime missing
+        raise RetryableCatalogLoadError(
+            f"pricing runtime unavailable for role '{role}': {exc}"
+        ) from exc
+    catalog_info = _get_catalog(repo)
+    if catalog_info is None:
+        _reset_catalog()
+        raise RetryableCatalogLoadError(
+            f"pricing catalog failed to load for role '{role}'"
+        )
+    catalog, UnresolvedPriceCls = catalog_info
+    provider, model_id = identity
+    price = catalog.resolve(provider, model_id)
+    if isinstance(price, UnresolvedPriceCls):
+        raise budget_mod.UnknownPricingError(
+            f"role '{role}' pin '{pin}' is unpriceable: {price.reason}"
+        )
+    if price.billing_mode != "per_token":
+        raise budget_mod.UnknownPricingError(
+            f"role '{role}' pin '{pin}' is {price.billing_mode}; no per-token "
+            "rate is available to bound a reservation"
+        )
+    rates = (
+        price.input_price_per_mtok,
+        price.output_price_per_mtok,
+        price.cached_input_price_per_mtok,
+        price.reasoning_price_per_mtok,
+    )
+    positive = [rate for rate in rates if isinstance(rate, (int, float)) and rate > 0]
+    if not positive:
+        raise budget_mod.UnknownPricingError(
+            f"role '{role}' pin '{pin}' has no positive per-token rate"
+        )
+    return float(max(positive)), catalog.get_catalog_version()
+
+
+def _reset_catalog() -> None:
+    """Clear the cached catalog so the next lookup reloads it."""
+    global _cost_catalog
+    _cost_catalog = None
+
+
+def reservation_estimate_for_dispatch(
+    repo: Path, policy: Mapping[str, Any], role: str
+) -> tuple[float, str | None]:
+    """Estimate one dispatch's reserved cost from the pricing catalog."""
+    rate, catalog_version = _pinned_rate_and_catalog_version(repo, policy, role)
+    return budget_mod.reservation_estimate(rate), catalog_version

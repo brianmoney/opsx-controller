@@ -18,10 +18,28 @@ from lib.models.resolver import (
     USER_CONFIG_PATH,
     ModelConfigError,
     resolve as resolve_models,
+    resolve_allowlist,
     validate as validate_models,
 )
-from lib.models.types import ALL_ROLES, ROLE_ENV, ROLE_VARIANT_ENV, ROLES
+from lib.models.types import ALL_ROLES, OPTIONAL_ROLES, ROLE_ENV, ROLE_VARIANT_ENV, ROLES
 from lib.orchestrator import base, planref
+
+# The supervised dispatch roles, in display order. Imported lazily so a
+# partially-deployed runtime (missing lib.supervisor) still yields the
+# aggregate-mode error path rather than an import crash.
+try:  # pragma: no cover - exercised by deployment tests
+    from lib.supervisor.model_policy import SUPERVISED_DISPATCH_ROLES
+except Exception:  # pragma: no cover
+    SUPERVISED_DISPATCH_ROLES = (
+        "implementer",
+        "reviewer",
+        "archiver",
+        "supervised_author",
+        "acceptance_reviewer",
+        "fixer",
+        "verifier",
+        "implementer_escalation",
+    )
 
 
 def _resolve_models_adapter(args: argparse.Namespace, repo: Path) -> str:
@@ -61,6 +79,34 @@ def cmd_models_show(args: argparse.Namespace) -> int:
         if entry.variant:
             print(f"  {'':<12} variant: {entry.variant}  [{entry.variant_source}]")
 
+    try:
+        allowlist = resolve_allowlist(repo)
+    except ModelConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if allowlist.configured:
+        if allowlist.models:
+            print("\nallowlist:")
+            for model in allowlist.models:
+                print(f"  {model}")
+        else:
+            print("\nallowlist: (configured, empty)")
+        print(f"  source: {allowlist.source}")
+    else:
+        print("\nallowlist: (absent)")
+
+    print("\nsupervised dispatch role membership:")
+    members = set(allowlist.models)
+    for role in SUPERVISED_DISPATCH_ROLES:
+        entry = resolved.get(role)
+        if entry is None or not entry.model:
+            print(f"  {role:<24} (unresolved)")
+        elif entry.model in members:
+            print(f"  {role:<24} member")
+        else:
+            print(f"  {role:<24} NOT a member ('{entry.model}')")
+
     warnings = validate_models(adapter, resolved)
     if warnings:
         print("\nidentifier-syntax warnings:")
@@ -95,10 +141,12 @@ def cmd_models_env(args: argparse.Namespace) -> int:
 
     for role in ROLES:
         print(f"export {ROLE_ENV[role]}={shlex.quote(resolved[role].model)}")
-    # Emit the escalation export only when resolved.
-    esc_entry = resolved.get("implementer_escalation")
-    if esc_entry and esc_entry.model:
-        print(f"export {ROLE_ENV['implementer_escalation']}={shlex.quote(esc_entry.model)}")
+    # Emit an export for every resolved optional role and omit unresolved
+    # optional roles without failing the command.
+    for role in OPTIONAL_ROLES:
+        entry = resolved.get(role)
+        if entry and entry.model:
+            print(f"export {ROLE_ENV[role]}={shlex.quote(entry.model)}")
     # Emit reasoning-variant exports only when resolved; the installer keeps
     # the agent file's built-in default when no variant is configured.
     for role in ALL_ROLES:

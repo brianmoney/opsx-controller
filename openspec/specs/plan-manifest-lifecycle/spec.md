@@ -106,7 +106,234 @@ The sample SHALL NOT contain keys the current loader ignores.
 Completed authored plans SHALL retire to `openspec/plans/archived/`, retaining both the markdown source and the compiled manifest as a pair.
 
 Archived plan pairs SHALL remain available to the orchestrator as repository template plan references.
-
 #### Scenario: Archived pair keeps both artifacts together
+
 - **WHEN** a completed plan `openspec/plans/example.md` and `openspec/plans/example.toml` is retired
 - **THEN** both files reside at `openspec/plans/archived/example.md` and `openspec/plans/archived/example.toml`
+
+### Requirement: Supervision storage leaves JSON execution state authoritative and unchanged
+
+For unregistered legacy jobs, the JSON execution state under `.opsx-plan/`
+SHALL remain the authoritative state record for plan execution, whether or
+not any supervisor ledger exists. The supervisor ledger SHALL NOT be stored
+under `.opsx-plan/` or anywhere else inside the repository worktree, and
+introducing supervision storage SHALL NOT change the JSON execution state's
+format, location, or read/write semantics for unregistered jobs. Legacy jobs
+without a supervised registration SHALL keep their existing JSON handling
+with no dependency on the supervisor package or ledger.
+
+For a registered supervised job, the broker and supervisor ledger SHALL be
+the phase authority, and the JSON execution state SHALL be a projection of
+broker and ledger state rather than a competing authority: direct JSON writes
+SHALL NOT release gates, satisfy checkpoints, or alter supervised identity,
+and the projection SHALL be derivable from broker-recorded receipts and
+ledger records.
+
+#### Scenario: Legacy runs are untouched by the supervisor package
+
+- **WHEN** an ordinary (non-supervised) plan run executes with the supervisor
+  package present
+- **THEN** its JSON execution state handling is unchanged and no supervisor
+  ledger is created or consulted
+
+#### Scenario: The ledger never lands in the worktree
+
+- **WHEN** a supervisor ledger is created for a supervised job
+- **THEN** the ledger file resides in service-owned storage outside the
+  repository worktree, and no ledger file appears under `.opsx-plan/`
+
+#### Scenario: The JSON projection follows broker state
+
+- **WHEN** a broker receipt changes the gate state of a registered job and
+  the JSON projection is regenerated
+- **THEN** the projected state matches the broker and ledger records, and any
+  direct JSON edit that disagrees with them has no authority
+
+### Requirement: The plan loader validates and resolves `pause_before_human_only`
+
+The plan loader SHALL accept an optional boolean `pause_before_human_only`
+key on each `[[changes]]` entry. A non-boolean value SHALL be rejected with
+a named error identifying the key and the change, rather than coerced by
+truthiness. `pause_before_human_only = true` without `pause_before = true`
+on the same change SHALL be rejected with a named error identifying the key
+and the change.
+
+The loader SHALL resolve the key into the loaded change configuration: when
+`pause_before = true` is set and the key is absent, the resolved value SHALL
+be human-only (`true`); an explicit `false` SHALL be preserved as `false`.
+Manifests that never set the key SHALL load with exactly the same values for
+every previously existing field.
+
+Derived single-change manifests SHALL preserve the resolved value through
+the existing serialize-and-round-trip verification path, so a regenerated
+manifest cannot silently drop or alter the flag.
+
+#### Scenario: Legacy manifest loading is unchanged
+
+- **WHEN** a manifest with `pause_before = true` and no
+  `pause_before_human_only` key is loaded
+- **THEN** the change configuration resolves `pause_before_human_only` to
+  `true` and every previously existing field loads exactly as before
+
+#### Scenario: Explicit delegation survives loading
+
+- **WHEN** a manifest sets `pause_before = true` and
+  `pause_before_human_only = false` on a change
+- **THEN** the loaded change configuration carries `pause_before = true` and
+  `pause_before_human_only = false`
+
+#### Scenario: Human-only without a gate is a named error
+
+- **WHEN** a manifest sets `pause_before_human_only = true` on a change
+  without `pause_before = true`
+- **THEN** loading fails with a named error identifying the key and the
+  change
+
+#### Scenario: Non-boolean values are rejected
+
+- **WHEN** a manifest sets `pause_before_human_only` to a non-boolean value
+  such as a string or an integer
+- **THEN** loading fails with a named error identifying the key and the
+  change rather than coercing the value
+
+#### Scenario: Derived manifests round-trip the flag
+
+- **WHEN** a derived single-change manifest is generated for a change whose
+  resolved `pause_before_human_only` differs from the loader default
+- **THEN** the serialized manifest states the key explicitly and the
+  round-trip verification preserves the resolved value
+
+### Requirement: Supervised registration binds the job to the canonical plan manifest
+
+Registering a supervised job for a plan SHALL capture the protected manifest
+snapshot from the plan's canonical manifest content and record it with the
+job at registration. Gate and dispatch decisions for the job SHALL be
+evaluated against that protected snapshot, not against repo-writable copies.
+
+A manifest that changes after registration SHALL NOT be silently adopted:
+adopting a changed manifest SHALL require an explicit operator decision — a
+new registration or an explicit revision — and dispatch against stale
+material SHALL be blocked with the named stale-material error under the
+existing revalidation requirement.
+
+A supervised job's completion and plan retirement SHALL consume the same
+manifest ground truth as an unsupervised run: the existing archive evidence
+and the existing completed-plan retirement semantics. Supervision SHALL
+introduce no separate plan-completion or plan-retirement authority.
+
+#### Scenario: Registration snapshots the canonical manifest
+
+- **WHEN** an operator registers a supervised job for a plan
+- **THEN** the protected manifest snapshot is captured from the plan's
+  canonical manifest content and recorded with the job at registration
+
+#### Scenario: A changed manifest is not silently adopted
+
+- **WHEN** the plan manifest changes after registration and the supervised
+  job is about to dispatch
+- **THEN** dispatch is blocked with the named stale-material error until the
+  operator explicitly adopts the change through a new registration or an
+  explicit revision
+
+#### Scenario: Supervised completion uses the same plan ground truth
+
+- **WHEN** a supervised job's plan completes
+- **THEN** completion is determined from the same archive evidence as an
+  unsupervised run, and the completed plan retires under the existing
+  retirement semantics unchanged
+
+### Requirement: Acceptance consumes the canonical manifest and artifact ground truth
+
+The acceptance artifact revision SHALL be derived from the protected canonical
+plan manifest snapshot and its dependency edges together with the change's
+real artifacts, so that a change to the manifest, the dependency graph, or the
+reviewed artifacts invalidates a stale acceptance. Acceptance SHALL consume the
+same manifest ground truth as registration and as an unsupervised run: it SHALL
+introduce no separate plan-completion authority and SHALL NOT treat a prior
+archive as proof of done.
+
+#### Scenario: A manifest change invalidates a stale acceptance
+
+- **WHEN** the plan manifest or its dependency edges change after an
+  acceptance verdict was recorded for a change
+- **THEN** the recorded verdict no longer satisfies acceptance because its
+  artifact revision no longer matches the canonical manifest ground truth
+
+#### Scenario: Artifact changes invalidate a stale acceptance
+
+- **WHEN** a change's proposal, design, tasks, spec deltas, or canonical spec
+  references change after an acceptance verdict was recorded
+- **THEN** the recorded verdict is stale and a fresh acceptance over the new
+  revision is required
+
+#### Scenario: Acceptance adds no plan-completion authority
+
+- **WHEN** a supervised job's plan completion is evaluated
+- **THEN** completion is determined from the same archive and check evidence
+  as an unsupervised run, and the acceptance verdict does not by itself mark
+  the plan or a change complete
+
+### Requirement: Recovery revalidates archive and completion material against canonical ground truth
+
+Incident recovery that touches archive or completion material SHALL consume the
+same canonical manifest snapshot and artifact ground truth as an unsupervised
+run. A partial archive, or an archive whose post-archive fast checks fail,
+SHALL NOT be treated as a completed change, and recovery SHALL require an
+appropriate fresh review over the repaired revision before completion is
+reasserted.
+
+A delta `MODIFIED` identity mismatch repaired by recovery SHALL derive the
+corrected identity from the canonical specification, so the canonical
+specification remains the authority for the requirement's intent and the
+canonical specs are updated only through the existing archive and delta
+application semantics. Recovery SHALL introduce no separate plan-completion,
+archive, or spec-synchronization authority.
+
+#### Scenario: A partial archive is not completion
+
+- **WHEN** recovery encounters a change whose archive did not complete or whose
+  post-archive fast check failed
+- **THEN** the change is not treated as complete and a fresh review over the
+  repaired revision is required before completion is reasserted
+
+#### Scenario: A repaired delta derives its identity from the canonical spec
+
+- **WHEN** recovery repairs a delta `MODIFIED` identity mismatch
+- **THEN** the corrected identity is derived from the canonical specification
+  and the canonical requirement's intent is preserved
+
+#### Scenario: Recovery adds no archive or completion authority
+
+- **WHEN** recovery repairs archive or completion material for a change
+- **THEN** completion and archive state are still determined by the existing
+  archive evidence and delta-application semantics, not by a recovery outcome
+  alone
+
+### Requirement: Interrupted supervised execution never records a false completion
+
+An interrupted or restarted supervised execution SHALL determine completion only
+from the canonical plan, archive, and fast-check evidence re-derived after
+restart, and SHALL NOT mark a change or a plan complete from a pre-interruption
+claim, a partial archive side effect, or a worker assertion. When that canonical
+ground truth is incomplete, the job SHALL resume, record a correct human wait, or
+surface a blocker rather than complete.
+
+#### Scenario: Completion follows re-derived evidence, not a dead worker's claim
+
+- **WHEN** a supervised execution is killed at the result or verification
+  checkpoint and a fresh service reconstructs the job
+- **THEN** completion is determined from the canonical plan, archive, and
+  fast-check evidence and the killed worker's completion claim is not accepted
+
+#### Scenario: A partial archive is not completion
+
+- **WHEN** an interrupted execution left a partial archive or a post-archive
+  fast check did not pass
+- **THEN** the change is not marked complete and an appropriate fresh review is
+  required before completion is reasserted
+
+#### Scenario: A recorded human wait is not resolved to completion
+
+- **WHEN** a restart reconstructs a job whose human wait is still open
+- **THEN** the wait remains open until a durable receipt releases it and the job
+  is not marked complete in the meantime

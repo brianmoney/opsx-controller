@@ -81,8 +81,8 @@
 # ---------------------------------------------------------------------------
 
 [catalog]
-version = "1.3.0"
-updated = "2026-07-28"
+version = "1.4.0"
+updated = "2026-09-15"
 
 # ---------------------------------------------------------------------------
 # OpenAI entries
@@ -418,3 +418,78 @@ output_price_per_mtok = 1.20
 cached_input_price_per_mtok = 0.041
 effective_date = "2026-07-28"
 notes = "NVIDIA Nemotron 3 Ultra 550B via Lightning AI; MoE architecture with 55B active params"
+
+# ---------------------------------------------------------------------------
+# Operator-qualified coverage for pinned models (2026-09-15)
+#
+# Adds pricing for the inexpensive models that direct-dispatch and supervised
+# jobs pin. Client route prefixes (commandcode, opencode-go) resolve to the
+# canonical provider here via PROVIDER_ALIASES in lib/pricing/loader.py.
+# The reasoning rate mirrors the output rate where the provider bills
+# reasoning tokens as output.
+# ---------------------------------------------------------------------------
+
+[[entries]]
+provider = "moonshotai"
+model_id = "kimi-k3"
+display_name = "Kimi K3"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 3.00
+output_price_per_mtok = 15.00
+cached_input_price_per_mtok = 0.30
+reasoning_price_per_mtok = 15.00
+effective_date = "2026-09-15"
+notes = "Moonshot official API (platform.kimi.ai, observed 2026-09): $3.00 input / $0.30 cache-hit / $15.00 output per Mtok, flat across the 1,048,576-token context. Only reasoning_effort 'max' is exposed and thinking is always on; reasoning tokens bill as output."
+
+[[entries]]
+provider = "deepseek"
+model_id = "deepseek-v4.1-flash"
+display_name = "DeepSeek V4.1 Flash"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 0.15
+output_price_per_mtok = 0.60
+cached_input_price_per_mtok = 0.003
+reasoning_price_per_mtok = 0.60
+effective_date = "2026-09-10"
+notes = "DeepSeek-V4.1-Flash (served as model id 'deepseek-flash') off-peak rates, effective 2026-09-10 04:00 UTC per api-docs.deepseek.com/quick_start/pricing: $0.15 cache-miss input / $0.003 cache-hit / $0.60 output per Mtok. Peak (Mon-Fri 01:00-04:00 and 06:00-10:00 UTC) is exactly double; this entry stores the off-peak rate. Thinking on by default; reasoning bills as output."
+
+[[entries]]
+provider = "openai"
+model_id = "gpt-5.6-terra"
+display_name = "GPT-5.6 Terra (short context)"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 2.00
+output_price_per_mtok = 12.00
+cached_input_price_per_mtok = 0.20
+reasoning_price_per_mtok = 12.00
+effective_date = "2026-09-15"
+notes = "Corrected to the published short-context rate (developers.openai.com/api/docs/pricing): $2.00 input / $0.20 cache-read / $12.00 output per Mtok. Prompts >272K input are 2x input and 1.5x output for the whole request. Reasoning tokens bill as output. Supersedes the 2026-07-28 entry."
+
+[[entries]]
+provider = "openai"
+model_id = "gpt-5.6-luna"
+display_name = "GPT-5.6 Luna (short context)"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 0.20
+output_price_per_mtok = 1.20
+cached_input_price_per_mtok = 0.02
+reasoning_price_per_mtok = 1.20
+effective_date = "2026-09-15"
+notes = "Corrected to the published short-context rate (developers.openai.com/api/docs/pricing): $0.20 input / $0.02 cache-read / $1.20 output per Mtok. Prompts >272K input are 2x input and 1.5x output. Reasoning tokens bill as output. Supersedes the 2026-07-28 entry."
+
+[[entries]]
+provider = "openai"
+model_id = "gpt-5.6-sol"
+display_name = "GPT-5.6 Sol (short context)"
+billing_mode = "per_token"
+currency = "USD"
+input_price_per_mtok = 4.00
+output_price_per_mtok = 20.00
+cached_input_price_per_mtok = 0.40
+reasoning_price_per_mtok = 20.00
+effective_date = "2026-09-15"
+notes = "Corrected to the published short-context rate (developers.openai.com/api/docs/pricing): $4.00 input / $0.40 cache-read / $20.00 output per Mtok. Prompts >272K input are 2x input and 1.5x output. Reasoning tokens bill as output. Supersedes the 2026-07-28 entry."

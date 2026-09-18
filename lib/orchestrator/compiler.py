@@ -282,6 +282,7 @@ def build_schema_guidance(adapter: str = "opencode") -> str:
     impl_invoke = defaults.get("implement_invoke", "")
     review_invoke = defaults.get("review_invoke", "")
     archive_invoke = defaults.get("archive_invoke", "")
+    acceptance_invoke = defaults.get("acceptance_invoke", "")
     return (
         "## Expected TOML manifest shape\n"
         "\n"
@@ -298,6 +299,7 @@ def build_schema_guidance(adapter: str = "opencode") -> str:
         f"| implement_invoke | string | ``{impl_invoke}`` | direct implement command |\n"
         f"| review_invoke | string | ``{review_invoke}`` | direct review command |\n"
         f"| archive_invoke | string | ``{archive_invoke}`` | direct archive command |\n"
+        f"| acceptance_invoke | string | ``{acceptance_invoke}`` | supervised acceptance-review command (empty on adapters without an acceptance stage; the stage fails closed) |\n"
         "| timeout_minutes | float | ``90`` | per-change stage timeout |\n"
         "| max_rounds | int | ``5`` | implement-review loop ceiling |\n"
         "| no_progress_limit | int | ``2`` | consecutive no-progress rounds before failing |\n"
@@ -324,6 +326,7 @@ def build_schema_guidance(adapter: str = "opencode") -> str:
         "| phase | int | ``None`` | phase number (e.g. 1, 2, 3) |\n"
         "| depends_on | list[str] | ``[]`` | ids of changes that must complete first |\n"
         "| pause_before | bool | ``false`` | wait for ``opsx-plan approve`` before running |\n"
+        "| pause_before_human_only | bool | ``true`` when gated, else ``false`` | approval authority for a gate: absent on a gated change resolves human-only; ``false`` delegates approval to the supervised job's policy-bound authority; ``true`` without ``pause_before = true`` is invalid |\n"
         "| enabled | bool | ``true`` | set ``false`` to defer a change |\n"
         "| timeout_minutes | float | plan-level timeout | per-change stage timeout override |\n"
         "| create_invoke | string | ``\"\"`` | per-change authoring command override |\n"
@@ -360,6 +363,7 @@ def build_schema_guidance(adapter: str = "opencode") -> str:
         f"implement_invoke = \"{_escape_toml_value(defaults['implement_invoke'])}\"\n"
         f"review_invoke = \"{_escape_toml_value(defaults['review_invoke'])}\"\n"
         f"archive_invoke = \"{_escape_toml_value(defaults['archive_invoke'])}\"\n"
+        f"acceptance_invoke = \"{_escape_toml_value(acceptance_invoke)}\"\n"
         "```\n"
     )
 
@@ -419,7 +423,12 @@ def build_compile_prompt(source_content: str, source_path: Path,
         "dependency edge. Deferred wording means `enabled = false`.\n"
         "6. **Preserve manual gates:** `pause_before = true` for any change "
         "that introduces a proposed capability (marked with `(proposed` "
-        "in the source) or has an explicit gate note.\n"
+        "in the source) or has an explicit gate note. A gated change defaults "
+        "to human-only approval; emit `pause_before_human_only = false` only "
+        "when the source explicitly delegates the gate to the supervised "
+        "job's policy-bound authority. Never emit "
+        "`pause_before_human_only = true` without `pause_before = true` on "
+        "the same change.\n"
         "7. **Preserve phase numbers** as `phase` fields on each change.\n"
         "8. **Every change id must be unique** and every `depends_on` id "
         "must reference another change in the manifest.\n"

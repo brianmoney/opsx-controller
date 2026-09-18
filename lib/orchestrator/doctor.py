@@ -63,6 +63,196 @@ def _check_model_identifier_syntax(repo: Path, adapter: str) -> tuple[bool, str,
     )
 
 
+def _supervised_role_rows(resolved, allowlist) -> list[tuple[str, str]]:
+    """Return ``(role, detail)`` rows for the supervisor and dispatch roles.
+
+    The frontier ``supervisor`` is reported first and separately: it is
+    resolved like any optional role but is exempt from allowlist membership
+    (and classified budget-counted). Only the supervised dispatch roles are
+    checked against the effective allowlist.
+    """
+    from lib.supervisor.model_policy import SUPERVISOR_ROLE, SUPERVISED_DISPATCH_ROLES
+
+    members = set(allowlist.models)
+    rows: list[tuple[str, str]] = []
+    supervisor = resolved.get(SUPERVISOR_ROLE)
+    if supervisor is None or not supervisor.model:
+        rows.append((SUPERVISOR_ROLE, "unconfigured (allowlist-exempt)"))
+    else:
+        rows.append(
+            (
+                SUPERVISOR_ROLE,
+                f"configured '{supervisor.model}' (allowlist-exempt, budget-counted)",
+            )
+        )
+    for role in SUPERVISED_DISPATCH_ROLES:
+        entry = resolved.get(role)
+        if entry is None or not entry.model:
+            rows.append((role, "unconfigured"))
+        elif not allowlist.configured:
+            rows.append((role, f"configured '{entry.model}' (allowlist absent)"))
+        elif entry.model in members:
+            rows.append((role, f"member '{entry.model}'"))
+        else:
+            rows.append((role, f"configured '{entry.model}' (not a member)"))
+    return rows
+
+
+def _check_supervised_models(repo: Path, adapter: str) -> tuple[bool, str, str]:
+    """Report the supervised model configuration as informational output.
+
+    This check never fails on unconfigured supervised roles: the roles are
+    optional by definition and a legacy configuration must stay green. A
+    malformed ``[allowlist]`` table is a named configuration error, not an
+    absent allowlist, and is surfaced as a failure. A role-resolution error is
+    already reported by :func:`_check_model_resolution` and is repeated as a
+    pass here.
+    """
+    label = "Supervised model configuration is reported"
+    try:
+        from lib.models.resolver import ModelConfigError
+        from lib.models.resolver import resolve as resolve_models
+        from lib.models.resolver import resolve_allowlist
+    except Exception as exc:  # pragma: no cover - deployment failure path
+        return (False, label, f"supervised model policy module unavailable: {exc}")
+
+    try:
+        resolved = resolve_models(adapter, repo=repo)
+    except ModelConfigError:
+        # Role resolution failure (e.g. malformed TOML) is already reported by
+        # the model resolution check; nothing new to add here.
+        return (True, label, "")
+
+    try:
+        allowlist = resolve_allowlist(repo)
+    except ModelConfigError as exc:
+        # A present-but-malformed [allowlist] table is a named configuration
+        # error; surface it rather than reporting a green supervised section.
+        return (False, label, f"invalid model allowlist configuration: {exc}")
+
+    if allowlist.configured:
+        entries = ", ".join(allowlist.models) if allowlist.models else "(empty)"
+        lines = [f"allowlist ({allowlist.source}): {entries}"]
+    else:
+        lines = ["allowlist: absent"]
+    lines.extend(f"{role}: {detail}" for role, detail in _supervised_role_rows(resolved, allowlist))
+    return (True, label, "; ".join(lines))
+
+
+_DEFAULT_PROVIDER_BY_ADAPTER: dict[str, str] = {"claude-code": "anthropic"}
+
+
+def _split_model_identifier(model: str, adapter: str) -> tuple[str, str] | None:
+    """Return ``(provider, model_id)`` for a pricing lookup, or ``None``.
+
+    Provider-prefixed identifiers are split on the first ``/``. A bare
+    identifier is paired with the adapter's default provider when one is
+    known, so the claude-code adapter's unprefixed roles can be looked up.
+    """
+    value = model.strip()
+    if not value:
+        return None
+    if "/" in value:
+        provider, model_id = value.split("/", 1)
+        provider = provider.strip()
+        model_id = model_id.strip()
+        if provider and model_id:
+            return provider, model_id
+        return None
+    default_provider = _DEFAULT_PROVIDER_BY_ADAPTER.get(adapter)
+    if default_provider:
+        return default_provider, value
+    return None
+
+
+def _pricing_rows(repo: Path, adapter: str) -> list[tuple[str, str, bool]]:
+    """Return ``(role, model, resolves)`` rows for every configured role.
+
+    A ``ModelConfigError`` from role resolution propagates unchanged so the
+    caller can treat it as already reported by the model-resolution check.
+    """
+    from lib.models.resolver import resolve as resolve_models
+    from lib.models.types import ALL_ROLES
+    from lib.pricing import PricingCatalog, UnresolvedPrice
+
+    resolved = resolve_models(adapter, repo=repo)
+    catalog = PricingCatalog()
+    rows: list[tuple[str, str, bool]] = []
+    for role in ALL_ROLES:
+        entry = resolved.get(role)
+        if entry is None or not entry.model:
+            continue
+        parsed = _split_model_identifier(entry.model, adapter)
+        if parsed is None:
+            rows.append((role, entry.model, False))
+            continue
+        provider, model_id = parsed
+        result = catalog.resolve(provider, model_id)
+        rows.append((role, entry.model, not isinstance(result, UnresolvedPrice)))
+    return rows
+
+
+def _check_model_pricing_resolution(repo: Path, adapter: str) -> tuple[bool, str, str]:
+    """Check that every configured role model resolves in the pricing catalog."""
+    label = "Model pricing resolves for configured roles"
+    try:
+        from lib.models.resolver import ModelConfigError
+    except Exception as exc:  # pragma: no cover - deployment failure path
+        return (False, label, f"model resolver module unavailable: {exc}")
+    try:
+        rows = _pricing_rows(repo, adapter)
+    except ModelConfigError:
+        return (True, label, "")
+    except Exception as exc:
+        return (False, label, f"pricing resolution failed: {exc}")
+    unresolved = [f"{role} '{model}'" for role, model, resolves in rows if not resolves]
+    if unresolved:
+        return (
+            False,
+            label,
+            "no pricing for " + "; ".join(unresolved)
+            + "; add real entries to lib/pricing/catalog.toml",
+        )
+    return (True, label, "")
+
+
+def _print_model_pricing_detail(repo: Path, adapter: str) -> None:
+    """Print each configured role's pricing coverage under its check line."""
+    try:
+        rows = _pricing_rows(repo, adapter)
+    except Exception:
+        return
+    if not rows:
+        print("      (no configured roles)")
+        return
+    for role, model, resolves in rows:
+        status = "resolved" if resolves else "UNRESOLVED"
+        print(f"      {role:<24} {status:<10} {model}")
+
+
+def _print_supervised_model_detail(repo: Path, adapter: str) -> None:
+    """Print the supervised-model section under its doctor check line."""
+    try:
+        from lib.models.resolver import resolve as resolve_models
+        from lib.models.resolver import resolve_allowlist
+        from lib.supervisor.model_policy import SUPERVISOR_ROLE, SUPERVISED_DISPATCH_ROLES
+    except Exception:
+        return
+    try:
+        resolved = resolve_models(adapter, repo=repo)
+        allowlist = resolve_allowlist(repo)
+    except Exception:
+        return
+
+    if allowlist.configured:
+        entries = ", ".join(allowlist.models) if allowlist.models else "(empty)"
+        print(f"      allowlist: {entries}  [{allowlist.source}]")
+    else:
+        print("      allowlist: (absent)")
+    for role, detail in _supervised_role_rows(resolved, allowlist):
+        print(f"      {role:<24} {detail}")
+
+
 def _print_model_resolution_detail(repo: Path, adapter: str) -> None:
     """Print each role's resolved model and source under the model check line."""
     try:

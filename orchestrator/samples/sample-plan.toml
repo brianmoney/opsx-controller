@@ -65,6 +65,7 @@ id = "integrate-payment-gateway-v2"
 phase = 3
 depends_on = ["add-input-validation", "add-discount-code-verification"]
 pause_before = true  # talks to a real payment processor — human review gate
+pause_before_human_only = false  # delegated: policy-bound authority may release
 enabled = true
 timeout_minutes = 120
 create_max_attempts = 2

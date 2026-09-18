@@ -17,6 +17,9 @@ from pathlib import Path
 
 from lib.orchestrator import base, groundtruth, planref
 from lib.orchestrator import state as state_mod
+from lib.orchestrator import supervision as supervision_mod
+from lib.supervisor import broker as broker_mod
+from lib.supervisor import lock as lock_mod
 
 # Populated by the entrypoint immediately after import (design D3).
 def _entry():
@@ -42,6 +45,38 @@ def cmd_run_one(args: argparse.Namespace) -> int:
     """
     repo = Path(args.repo).resolve()
     change_id = args.change
+    registered = False
+
+    # `opsx-run` and `opsx-plan run-one` both dispatch here. A registered
+    # supervised job permits dispatch only from the supervised execution; an
+    # ordinary CLI dispatch is refused with the named mediation error before any
+    # repository inspection, lock, or state mutation. An unregistered worktree
+    # keeps the legacy path.
+    registration = None
+    try:
+        registration = supervision_mod.require_supervised_authorization(repo)
+    except broker_mod.BrokerError as exc:
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    if registration is not None:
+        registered = True
+        try:
+            if not broker_mod.is_dispatchable(
+                registration.ledger, registration.job_id, change_id
+            ):
+                resolution = broker_mod.resolve_gate(
+                    registration.ledger, registration.job_id, change_id
+                )
+                print(
+                    f"error: {change_id} is not dispatchable: {resolution.reason}",
+                    file=sys.stderr,
+                )
+                return 2
+        except broker_mod.BrokerError as exc:
+            print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
+        finally:
+            registration.close()
 
     cdir = groundtruth.change_dir(repo, change_id)
     if not cdir.is_dir():
@@ -56,6 +91,40 @@ def cmd_run_one(args: argparse.Namespace) -> int:
         return 2
 
     cfg = _entry().build_single_change_config(repo, change_id)
+    if registered:
+        try:
+            plan_path = planref.resolve_plan(repo, None)
+            cfg["_manifest_path"] = str(
+                planref._resolve_plan_path(repo, plan_path)
+            )
+        except base.PlanError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    # Both `opsx-run` and `opsx-plan run-one` dispatch here, so the lock lives
+    # in this shared handler; wrapping only one name would leave the other
+    # alias unserialized. Acquire after config resolution and before the first
+    # state mutation, releasing on every exit path.
+    try:
+        with lock_mod.acquire(
+            repo,
+            owner=f"opsx-run {change_id}",
+            owner_kind="ordinary",
+        ):
+            return _cmd_run_one_body(args, repo, change_id, cfg)
+    except lock_mod.SupervisedOwnershipError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except lock_mod.LockContentionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except lock_mod.LockReleaseError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+def _cmd_run_one_body(
+    args: argparse.Namespace, repo: Path, change_id: str, cfg: dict
+) -> int:
     state = state_mod.load_state(repo, cfg["name"])
     signal.signal(signal.SIGINT, _entry().handle_sigint)
 

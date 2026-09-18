@@ -45,7 +45,9 @@ tax fix and the validation layer — it ships its own self-contained checks.
 Swap in the v2 payment gateway client, replacing the deprecated v1 client.
 This is the first change that exercises both the validation layer and the
 discount verification together. Pause here for human review: this change
-talks to a real payment processor.
+talks to a real payment processor. Its gate is delegated
+(`pause_before_human_only = false`): the supervised job's policy-bound
+authority may release it once the plan runs under supervision.
 
 **Depends on:** `add-input-validation`, `add-discount-code-verification`
 

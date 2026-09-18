@@ -2,6 +2,7 @@
 
 ## Purpose
 TBD - created by archiving change 2026-07-05-define-plan-run-telemetry-schema. Update Purpose after archive.
+
 ## Requirements
 
 ### Requirement: Report and dashboard can target a single-change run by change id
@@ -1551,3 +1552,235 @@ result or detecting worker/provider failure markers.
   marker and the worker returns valid JSON
 - **THEN** the controller does not treat the metadata text as a provider
   failure
+
+### Requirement: Telemetry records carry an additive role dimension while preserving the legacy schema
+
+Telemetry records SHALL carry an optional top-level `role` field naming the
+model role whose usage the record represents (for example `supervisor`,
+`implementer`, `reviewer`, `archiver`, `supervised_author`,
+`acceptance_reviewer`, `fixer`, `verifier`, or `implementer_escalation`).
+The field SHALL be additive: every pre-existing telemetry field SHALL keep
+its current name, type, and semantics, and the telemetry schema version
+SHALL remain readable by existing consumers without migration.
+
+A record without a `role` field SHALL remain valid and SHALL be interpreted
+by new consumers exactly as before; writing a `role` field SHALL NOT change
+how existing consumers read the record.
+
+The role dimension SHALL be recorded for supervised dispatches, including
+create-stage, retry, and escalation calls, so budget accounting and
+per-role telemetry can attribute every supervised model call to its role.
+
+#### Scenario: A supervised dispatch records its role
+
+- **WHEN** a telemetry record is written for a supervised dispatch,
+  including a `supervised_author` create, a retry, or an
+  `implementer_escalation` dispatch
+- **THEN** the record carries the dispatching role in the `role` field
+  alongside the unchanged legacy fields
+
+#### Scenario: A legacy record without a role remains valid
+
+- **WHEN** a consumer reads a telemetry record written before the role
+  dimension existed
+- **THEN** the record is accepted and interpreted exactly as before, with the
+  role treated as absent rather than an error
+
+#### Scenario: Existing consumers are unaffected
+
+- **WHEN** an existing consumer that predates the `role` field reads a record
+  that carries one
+- **THEN** every legacy field is present with unchanged semantics and the
+  consumer's behavior is unchanged
+
+### Requirement: Core metrics are collected before report aggregation
+
+An explicit core-metrics collection step SHALL exist that assembles the
+budget-relevant metric set — per-role token usage, estimated cost, and
+execution duration, plus job-level totals — from telemetry and supervisor
+ledger records. Report and dashboard aggregation SHALL consume collected
+core metrics rather than re-deriving budget-relevant figures independently.
+
+Collection SHALL be read-only: it SHALL NOT mutate telemetry records,
+execution state, or ledger records. Collection SHALL run before report or
+dashboard aggregation so the reported figures and the budget accounting
+reflect the same underlying records.
+
+#### Scenario: Collection precedes report aggregation
+
+- **WHEN** a report or dashboard is produced for a plan with supervised
+  activity
+- **THEN** the core-metrics collection step has assembled the per-role and
+  job-level metric set first, and the aggregation consumes that collected
+  set
+
+#### Scenario: Collection is read-only
+
+- **WHEN** core metrics are collected
+- **THEN** no telemetry record, execution state, or ledger record is created,
+  modified, or deleted
+
+### Requirement: Supervisor-family role usage is excluded from the legacy model leaderboard projection
+
+Records whose `role` names a supervisor-family role — `supervisor`,
+`supervised_author`, `acceptance_reviewer`, `fixer`, or `verifier` — SHALL
+be excluded from the legacy per-change model leaderboard projection. The
+exclusion SHALL be applied to the leaderboard's input stream and SHALL NOT
+change the leaderboard's grouping, attribution, or placeholder semantics,
+which remain governed by their existing requirements.
+
+Supervisor-family usage SHALL remain visible in per-role telemetry and core
+metrics; only the legacy model leaderboard projection excludes it.
+
+The exclusion SHALL NOT alter leaderboard entries for changes with no
+supervisor-family records: their model-combination triples and aggregate
+values SHALL be computed exactly as before.
+
+#### Scenario: Supervisor-role usage does not pollute the leaderboard
+
+- **WHEN** a run's telemetry includes records with supervisor-family roles
+- **THEN** those records do not contribute model identities, tokens, cost, or
+  change counts to any legacy model leaderboard entry
+
+#### Scenario: Legacy leaderboard entries are unchanged
+
+- **WHEN** the leaderboard is computed for changes whose telemetry contains
+  no supervisor-family roles
+- **THEN** their model-combination triples and aggregate values are identical
+  to the pre-existing computation
+
+#### Scenario: Excluded usage remains visible elsewhere
+
+- **WHEN** supervisor-family records are excluded from the leaderboard input
+- **THEN** the same records still appear in per-role telemetry views and in
+  the collected core metrics
+
+### Requirement: `report` includes a read-only supervision projection
+
+`opsx-plan report` SHALL include a supervision projection for a plan with a
+registered supervised job, in both human-readable and `--json` output. The
+`--json` output SHALL expose a `supervision` object carrying job progress,
+actions, incidents, evidence, observed usage, waits, budget limitations,
+steering request acknowledgements, and the cost-per-correct-completion
+definition. Building the projection SHALL NOT mutate the ledger, telemetry,
+or execution state, and SHALL NOT change the existing `report` keys or their
+semantics. A plan with no registered supervised job SHALL produce output with
+no supervision section.
+
+#### Scenario: Report JSON carries the supervision projection
+
+- **WHEN** `opsx-plan report --json` runs for a plan with a registered supervised job
+- **THEN** the JSON includes a `supervision` object with the job, action, incident, evidence, usage, wait, budget-limit, and steering acknowledgement fields
+
+#### Scenario: Existing report output is unchanged without a supervised job
+
+- **WHEN** `opsx-plan report` runs for a plan with no registered supervised job
+- **THEN** its output and JSON keys are identical to the pre-existing behavior
+
+#### Scenario: Report projection is non-mutating
+
+- **WHEN** `opsx-plan report` builds the supervision projection
+- **THEN** the ledger, telemetry records, and JSON execution state are unchanged
+
+### Requirement: The dashboard includes a supervision section for supervised plans
+
+The `opsx-plan dashboard` SHALL render a supervision section when the plan has
+a registered supervised job, presenting job progress, incidents, waits,
+budget limitations, and steering state alongside the existing sections,
+without altering the existing sections for plans with no registered job.
+
+#### Scenario: Dashboard renders the supervision section
+
+- **WHEN** `opsx-plan dashboard` runs for a plan with a registered supervised job
+- **THEN** the generated HTML contains a supervision section with the job, incident, wait, budget, and steering state
+
+#### Scenario: Dashboard is unchanged without a supervised job
+
+- **WHEN** `opsx-plan dashboard` runs for a plan with no registered supervised job
+- **THEN** its section set and output are identical to the pre-existing behavior
+
+### Requirement: The supervision field models and limitations are documented
+
+The operator documentation SHALL describe the supervision projection's JSON
+field models and their limitations, including that it is a read-only
+projection of the ledger, the meaning and linkage of supervision identifiers
+versus `run_id`, the distinction between reserved, reconciled, and retained
+usage, and the stated limitations of cost-per-correct-completion.
+
+#### Scenario: Documentation covers the projection field models
+
+- **WHEN** an operator reads the monitoring documentation
+- **THEN** it describes the supervision field models, identifier linkage, usage states, and the metric limitations
+
+### Requirement: Watchdog classification and reconstitution events are exposed as read-only observation state
+
+The system SHALL expose, for a registered supervised job, the watchdog's
+current classification, its separate liveness, progress, and deadline signals,
+its restart-attempt state, and its recent reconstitution events as read-only
+observation state. Building this observation state SHALL NOT mutate the
+ledger, the JSON execution state, or the watchdog's records, and SHALL NOT
+require the worktree execution lock or a live service. A plan with no
+registered supervised job SHALL expose no watchdog state.
+
+#### Scenario: Watchdog state is readable read-only
+
+- **WHEN** the observation state is built for a supervised job after watchdog
+  ticks have run
+- **THEN** it reports the current classification, the three separate signals,
+  the restart-attempt state, and the recent reconstitution events, and the
+  ledger and JSON execution state are unchanged
+
+#### Scenario: No registered job exposes no watchdog state
+
+- **WHEN** the observation state is built for a plan with no registered
+  supervised job
+- **THEN** it exposes no watchdog state and existing output is unchanged
+
+### Requirement: Watchdog observation does not alter legacy telemetry or the model leaderboard
+
+Recording and exposing watchdog observation state SHALL NOT change the legacy
+telemetry schema or the meaning of existing telemetry fields, and no
+watchdog or supervisor-family entry SHALL appear in the legacy per-change model
+leaderboard. Watchdog observation state SHALL be kept distinct from per-change
+model usage.
+
+#### Scenario: The legacy telemetry schema is unchanged
+
+- **WHEN** watchdog state is recorded and exposed
+- **THEN** the existing telemetry records and their fields are unchanged
+
+#### Scenario: Watchdog entries stay out of the leaderboard
+
+- **WHEN** the legacy model leaderboard is projected for a plan with watchdog
+  activity
+- **THEN** no watchdog or supervisor-family entry appears in it
+
+### Requirement: The supervision projection reflects durable state after interruption and restart
+
+The read-only supervision projection SHALL reflect the durable ledger and
+authority state after an interrupted execution, a process restart, or an
+`opsx-plan reset`, rather than any stale in-memory or pre-interruption state. A
+job killed during an action SHALL be projected as its reconciled durable state —
+including an unreconciled uncertain action, an open human wait, reserved or
+retained usage, or a bounded incident — and SHALL NOT be projected as
+completed.
+
+#### Scenario: A killed job projects its reconciled state
+
+- **WHEN** a supervised job is killed at the result or verification checkpoint
+  and a fresh service projects it
+- **THEN** `opsx-plan status` and `opsx-plan report` show the reconciled durable
+  state, including any uncertain action, wait, or incident, and do not report
+  completion
+
+#### Scenario: A restart during a human wait projects the wait
+
+- **WHEN** a service restart occurs while a human wait is recorded
+- **THEN** the supervision projection reports the open human wait rather than
+  completion or progress
+
+#### Scenario: Reset does not erase the projection of retained state
+
+- **WHEN** `opsx-plan reset` runs for a registered supervised job
+- **THEN** the projection still reports the durable reservations and incident
+  attempts that survive the reset

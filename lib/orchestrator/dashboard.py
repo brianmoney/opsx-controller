@@ -11,7 +11,7 @@ import os
 import sys
 from pathlib import Path
 
-from lib.orchestrator import base, planref, report
+from lib.orchestrator import base, cost as cost_mod, planref, report
 
 def _html_escape(s: str) -> str:
     """Escape text for safe HTML embedding."""
@@ -158,6 +158,12 @@ header h1 {
     font-size: 0.85rem;
     color: var(--blue);
     margin-top: 4px;
+}
+
+.reprice-notice {
+    font-size: 0.85rem;
+    color: var(--blue);
+    margin-bottom: 16px;
 }
 
 main {
@@ -771,6 +777,105 @@ def _render_timeline_html(records: list[dict]) -> str:
     return "\n".join(parts)
 
 
+def _render_supervision_html(supervision: dict | None) -> str:
+    """Render the supervision section for a registered supervised job.
+
+    Every operator-facing value is escaped; the section is only emitted for a
+    registered job, so the no-job dashboard HTML is unchanged.
+    """
+    if not supervision:
+        return ""
+    parts: list[str] = []
+    parts.append('<section class="supervision">')
+    parts.append("<h2>Supervision</h2>")
+    policy = supervision.get("policy", {}) or {}
+    budgets = supervision.get("budget_posture", {}).get("budgets", {}) or {}
+    consumption = supervision.get("budget_posture", {}).get("consumption", {}) or {}
+    parts.append("<table><tbody>")
+    rows = [
+        ("Job", f"{supervision.get('job_id')} ({supervision.get('state')})"),
+        ("Run", str(supervision.get("run_id") or "—")),
+        ("Policy revision", str(policy.get("revision"))),
+        (
+            "Budget",
+            f"total_cost_usd={budgets.get('total_cost_usd')} "
+            f"charged_cost_usd={consumption.get('cost_usd')} "
+            f"elapsed_minutes={consumption.get('elapsed_minutes')}",
+        ),
+    ]
+    for label, value in rows:
+        parts.append(
+            f"<tr><th>{_html_escape(label)}</th>"
+            f"<td>{_html_escape(value)}</td></tr>"
+        )
+    parts.append("</tbody></table>")
+
+    waits = [
+        wait for wait in supervision.get("waits", []) if wait.get("state") == "open"
+    ]
+    if waits:
+        parts.append("<h3>Open waits</h3><ul>")
+        for wait in waits:
+            parts.append(
+                "<li>"
+                f"[{_html_escape(str(wait.get('kind')))}] "
+                f"{_html_escape(str(wait.get('checkpoint')))}"
+                "</li>"
+            )
+        parts.append("</ul>")
+
+    incidents = supervision.get("recent_incidents", [])
+    if incidents:
+        parts.append("<h3>Recent incidents</h3><ul>")
+        for incident in incidents:
+            parts.append(
+                "<li>"
+                f"{_html_escape(str(incident.get('id')))} "
+                f"{_html_escape(str(incident.get('kind')))} "
+                f"[{_html_escape(str(incident.get('state')))}]: "
+                f"{_html_escape(str(incident.get('summary')))}"
+                "</li>"
+            )
+        parts.append("</ul>")
+
+    steering = supervision.get("steering_requests", [])
+    if steering:
+        parts.append("<h3>Steering requests</h3><ul>")
+        for request in steering:
+            acked = str(request.get("ack_state"))
+            boundary = request.get("ack_boundary")
+            if boundary:
+                acked += f" at {boundary}"
+            parts.append(
+                "<li>"
+                f"{_html_escape(str(request.get('request_id')))} "
+                f"[{_html_escape(acked)}]"
+                "</li>"
+            )
+        parts.append("</ul>")
+
+    metric = (supervision.get("metrics", {}) or {}).get(
+        "cost_per_correct_completion"
+    )
+    if metric:
+        value = metric.get("value")
+        rendered = "—" if value is None else f"${value:.4f}"
+        parts.append(
+            "<h3>Cost per correct completion</h3>"
+            f"<p>{_html_escape(rendered)} — "
+            f"{_html_escape(str(metric.get('definition')))}</p>"
+        )
+        limitations = metric.get("limitations", [])
+        if limitations:
+            parts.append("<ul>")
+            for limitation in limitations:
+                parts.append(f"<li>{_html_escape(str(limitation))}</li>")
+            parts.append("</ul>")
+
+    parts.append("</section>")
+    return "\n".join(parts)
+
+
 def _render_warnings_html(warnings: list[str]) -> str:
     """Render the warnings section."""
     if not warnings:
@@ -793,6 +898,8 @@ def _render_dashboard_html(
     change_id: str | None = None,
     timeline_records: list[dict] | None = None,
     filters: dict | None = None,
+    reprice_info: dict | None = None,
+    supervision: dict | None = None,
 ) -> str:
     """Render the complete HTML dashboard as a self-contained document."""
     if filters is None:
@@ -819,6 +926,13 @@ def _render_dashboard_html(
         f"<header><h1>opsx-plan Dashboard: "
         f"{_html_escape(plan_name)}</h1></header>"
     )
+    if reprice_info is not None:
+        version = _html_escape(str(reprice_info.get("version") or "unknown"))
+        parts.append(
+            '<p class="reprice-notice">Repriced: costs recomputed from '
+            "telemetry usage against pricing catalog "
+            f"v{version}</p>"
+        )
     parts.append("<main>")
 
     # 1. Plan Summary Header
@@ -842,6 +956,11 @@ def _render_dashboard_html(
     # 7. Stage Timeline
     parts.append(_render_timeline_html(timeline_records))
 
+    # 8. Supervision (only when a supervised job is registered)
+    supervision_html = _render_supervision_html(supervision)
+    if supervision_html:
+        parts.append(supervision_html)
+
     # Warnings
     if result.warnings:
         parts.append(_render_warnings_html(result.warnings))
@@ -855,7 +974,7 @@ def _render_dashboard_html(
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
     """opsx-plan dashboard <plan> [--output <path>] [--run-id <id>]
-       [--change <id>] [--for-change <id>]"""
+       [--change <id>] [--for-change <id>] [--reprice]"""
     repo = Path(args.repo).resolve()
     for_change_plan = report._resolve_for_change_plan(
         repo, getattr(args, "for_change", None), args.plan,
@@ -869,6 +988,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         _read_telemetry,
         _select_run,
         aggregate,
+        filter_leaderboard_records,
     )
 
     for_change = getattr(args, "for_change", None)
@@ -880,8 +1000,23 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         plan_name = cfg["name"]
     run_id = args.run_id if args.run_id else None
 
+    reprice_requested = bool(getattr(args, "reprice", False))
+    reprice_info: dict | None = None
+    record_transform = None
+    if reprice_requested:
+        reprice_info = {"version": None}
+
+        def record_transform(record):
+            updated = cost_mod.reprice_record(record, repo=repo)
+            if reprice_info["version"] is None:
+                reprice_info["version"] = (
+                    updated.get("cost", {}).get("pricing_catalog_version")
+                )
+            return updated
+
     try:
-        result = aggregate(repo, plan_name, run_id)
+        result = aggregate(repo, plan_name, run_id,
+                           record_transform=record_transform)
     except AggregationError as exc:
         print(f"dashboard error: {exc}", file=sys.stderr)
         return 2
@@ -904,6 +1039,8 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     # -- Gather timeline records ----------------------------------------------
     records, _ = _read_telemetry(repo, plan_name)
     selected_records, selected_run, _ = _select_run(records, run_id)
+    if record_transform is not None:
+        selected_records = [record_transform(r) for r in selected_records]
 
     # -- Apply --change filter ------------------------------------------------
     if args.change:
@@ -923,7 +1060,9 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         cm_list, _ = _change_aggregation(
             state_for_lb, change_records, plan_name, [],
         )
-        result.model_leaderboard = _build_leaderboard(cm_list, change_records)
+        result.model_leaderboard = _build_leaderboard(
+            cm_list, filter_leaderboard_records(change_records)
+        )
 
         # Narrow timeline to this change
         timeline_records = change_records
@@ -931,6 +1070,12 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         timeline_records = selected_records
 
     # -- Render and write HTML ------------------------------------------------
+    # Imported lazily so importing this module never pulls in the supervisor
+    # authority/endpoint boundary.
+    from lib.orchestrator import supervision as supervision_mod
+    supervision = supervision_mod.project_registered_job(
+        repo, plan_name=plan_name
+    )
     html = _render_dashboard_html(
         result,
         plan_name,
@@ -938,6 +1083,8 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         change_id=args.change,
         timeline_records=timeline_records,
         filters=filters,
+        reprice_info=reprice_info,
+        supervision=supervision,
     )
 
     # Atomic write

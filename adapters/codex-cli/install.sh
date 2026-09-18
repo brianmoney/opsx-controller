@@ -142,6 +142,7 @@ install_global() {
     "Installed plan-authoring reference to $agents_root/opsx-controller/plan-authoring.md"
   do_verify
   verify_plan_authoring_reference "$agents_root/opsx-controller"
+  verify_supervision_service_packaging "$HOME/.local/lib/opsx-controller" "$ROOT_DIR"
 }
 
 install_project() {
@@ -174,6 +175,7 @@ install_project() {
     "Updated $project_dir/.codex/.gitignore"
   do_verify
   verify_plan_authoring_reference "$agents_root/opsx-controller"
+  verify_supervision_service_packaging "$project_dir/.opsx-controller" "$ROOT_DIR"
 }
 
 install_plugin() {
