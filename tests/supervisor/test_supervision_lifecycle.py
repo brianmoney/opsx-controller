@@ -482,7 +482,7 @@ class EndpointLifecycleTests(LifecycleTestCase):
 
     def test_operator_and_worker_tables_stay_disjoint(self) -> None:
         self.assertTrue(endpoints.handler_tables_are_disjoint())
-        for verb in ("pause", "drain", "resume", "cancel"):
+        for verb in ("pause", "drain", "resume", "cancel", "approve", "accept"):
             self.assertIn(verb, endpoints.OPERATOR_HANDLERS)
 
 

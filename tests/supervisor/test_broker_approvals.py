@@ -262,7 +262,7 @@ class BrokerTestCase(unittest.TestCase):
                 recorded = broker.record_acceptance(
                     self.ledger, job_id, principal=principal, change_ids=change_ids
                 )
-                return {"approved": [r.change_id for r in recorded]}
+                return {"accepted": [r.change_id for r in recorded]}
             if verb == "reset_change":
                 recorded = [
                     broker.reset_change(
@@ -480,6 +480,9 @@ class EndpointProjectionTests(BrokerTestCase):
     def _json_approvals(self) -> list[str]:
         return state_mod.load_state(self.repo, self.cfg["name"])["approvals"]
 
+    def _json_change_record(self, change_id: str) -> dict:
+        return state_mod.load_state(self.repo, self.cfg["name"])["changes"][change_id]
+
     def _serve(self, job_id: int, request: dict, *, endpoint_kind: str) -> tuple[bool, str]:
         import threading
 
@@ -523,6 +526,27 @@ class EndpointProjectionTests(BrokerTestCase):
         self.assertEqual(self.ledger.receipt_high_water(job_id), 1)
         # The projection followed broker state without any caller callback.
         self.assertEqual(self._json_approvals(), ["gated-human"])
+        self.assertEqual(self._projection_calls, [(self.ledger, job_id)])
+
+    def test_operator_endpoint_accept_regenerates_projection(self) -> None:
+        job_id = self.register()
+        ok, detail = self._serve(
+            job_id,
+            {"verb": "accept", "change_ids": ["gated-human"]},
+            endpoint_kind=endpoints.ENDPOINT_OPERATOR,
+        )
+        self.assertTrue(ok, detail)
+        self.assertEqual(
+            [row["kind"] for row in self.ledger.receipts_for_change(
+                job_id, "gated-human")],
+            ["acceptance"],
+        )
+        # The persisted JSON projection records the acceptance flag itself.
+        self.assertTrue(
+            self._json_change_record("gated-human")["accepted"],
+            "acceptance receipt must mark the change accepted in the projection",
+        )
+        # The projection followed broker state without any caller callback.
         self.assertEqual(self._projection_calls, [(self.ledger, job_id)])
 
     def test_worker_endpoint_delegated_release_regenerates_projection(self) -> None:

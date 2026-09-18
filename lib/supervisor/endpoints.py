@@ -217,6 +217,22 @@ def _operator_approve(request: Mapping[str, Any], credentials: PeerCredentials) 
     }
 
 
+def _operator_accept(request: Mapping[str, Any], credentials: PeerCredentials) -> dict[str, Any]:
+    ledger, job_id = _broker_ledger(request)
+    _require_mutable_job(ledger, job_id)
+    principal = _principal_for(credentials, broker_module.OPERATOR)
+    recorded = broker_module.record_acceptance(
+        ledger, job_id, principal=principal,
+        change_ids=_requested_change_ids(request),
+    )
+    return {
+        "verb": "accept",
+        "operator_uid": credentials.uid,
+        "accepted": [receipt.change_id for receipt in recorded],
+        "receipts": [receipt.as_dict() for receipt in recorded],
+    }
+
+
 def _operator_reset_change(
     request: Mapping[str, Any], credentials: PeerCredentials
 ) -> dict[str, Any]:
@@ -917,6 +933,7 @@ def _worker_heartbeat(
 OPERATOR_HANDLERS: Mapping[str, Callable[..., Any]] = MappingProxyType(
     {
         "approve": _operator_approve,
+        "accept": _operator_accept,
         "reset_change": _operator_reset_change,
         "revise_policy": _operator_revise_policy,
         "enable": _operator_enable,

@@ -3514,3 +3514,27 @@ who has not enabled supervision.
   not been enabled
 - **THEN** the service is reported as not enabled or unconfigured, and the
   doctor check does not fail
+
+### Requirement: The operator endpoint exposes acceptance as a durable receipt
+
+The operator endpoint SHALL expose an `accept` verb. A request on that verb
+SHALL be authenticated by the operator's OS peer credentials and SHALL record
+one acceptance receipt per named change of the registered job in a single
+durable transaction, bound to the change's current material revision, after
+which the JSON projection SHALL be regenerated from broker state. The verb
+SHALL NOT be reachable from the worker-actions endpoint.
+
+#### Scenario: Operator accepts a change over the endpoint
+
+- **GIVEN** a registered job with a change that needs an operator acceptance
+  receipt
+- **WHEN** the operator invokes the `accept` verb on the operator endpoint
+- **THEN** one durable acceptance receipt is recorded for the change
+- **AND** the JSON projection reflects the acceptance receipt
+
+#### Scenario: The worker endpoint cannot accept
+
+- **GIVEN** the worker-actions endpoint's fixed verb surface
+- **WHEN** a worker process invokes the `accept` verb on it
+- **THEN** the request is refused because the verb is not exposed by that
+  endpoint
