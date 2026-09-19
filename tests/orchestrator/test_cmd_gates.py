@@ -528,3 +528,62 @@ class BatchGateAndResetCommandTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
         self.assertEqual(state["changes"]["test-change"]["status"], "pending")
+
+    def test_reset_refuses_done_change_without_force(self) -> None:
+        """A done change is archived; reset requires --force."""
+        plan = self._plan_with_gated_changes()
+        self._activate_plan(str(plan.relative_to(self.repo)))
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
+        self.opsx_plan.state_mod.set_status(
+            state, "no-gate", self.opsx_plan.base.DONE, "already done"
+        )
+        self.opsx_plan.state_mod.save_state(self.repo, "test-plan", state)
+
+        stderr = io.StringIO()
+        args = argparse.Namespace(
+            repo=str(self.repo), plan=None, change=["no-gate"], failed=False,
+        )
+        with mock.patch("sys.stderr", stderr):
+            rc = self.opsx_plan.cmd_gates.cmd_reset(args)
+
+        self.assertEqual(rc, 2)
+        self.assertIn("refusing to reset done", stderr.getvalue())
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
+        self.assertEqual(state["changes"]["no-gate"]["status"], self.opsx_plan.base.DONE)
+
+    def test_reset_force_resets_done_change(self) -> None:
+        plan = self._plan_with_gated_changes()
+        self._activate_plan(str(plan.relative_to(self.repo)))
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
+        self.opsx_plan.state_mod.set_status(
+            state, "no-gate", self.opsx_plan.base.DONE, "already done"
+        )
+        self.opsx_plan.state_mod.save_state(self.repo, "test-plan", state)
+
+        args = argparse.Namespace(
+            repo=str(self.repo), plan=None, change=["no-gate"], failed=False,
+            force=True,
+        )
+        rc = self.opsx_plan.cmd_gates.cmd_reset(args)
+
+        self.assertEqual(rc, 0)
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
+        self.assertEqual(state["changes"]["no-gate"]["status"], self.opsx_plan.base.PENDING)
+
+    def test_reset_non_done_change_needs_no_force(self) -> None:
+        plan = self._plan_with_gated_changes()
+        self._activate_plan(str(plan.relative_to(self.repo)))
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
+        self.opsx_plan.state_mod.set_status(
+            state, "gated-a", self.opsx_plan.base.FAILED, "test failure"
+        )
+        self.opsx_plan.state_mod.save_state(self.repo, "test-plan", state)
+
+        args = argparse.Namespace(
+            repo=str(self.repo), plan=None, change=["gated-a"], failed=False,
+        )
+        rc = self.opsx_plan.cmd_gates.cmd_reset(args)
+
+        self.assertEqual(rc, 0)
+        state = self.opsx_plan.state_mod.load_state(self.repo, "test-plan")
+        self.assertEqual(state["changes"]["gated-a"]["status"], self.opsx_plan.base.PENDING)

@@ -34,6 +34,7 @@ import sys
 import types
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 # Resolve bundled runtime modules before considering the host repository.
@@ -250,6 +251,7 @@ def build_single_change_config(repo: Path, change_id: str) -> dict:
         "invalid_output_retries": 2,
         "skip_warning": False,
         "skip_suggestion": False,
+        "reuse_fix_sessions": False,
         "notify_cmd": "",
         "plan_doc": "",
         "create_invoke": "",
@@ -331,6 +333,7 @@ def render_single_change_manifest(cfg: dict) -> str:
     lines.append(f"review_created = {_toml_bool(cfg.get('review_created', False))}")
     lines.append(f"skip_warning = {_toml_bool(cfg.get('skip_warning', False))}")
     lines.append(f"skip_suggestion = {_toml_bool(cfg.get('skip_suggestion', False))}")
+    lines.append(f"reuse_fix_sessions = {_toml_bool(cfg.get('reuse_fix_sessions', False))}")
 
     # fast_checks.
     fast_checks = cfg.get("fast_checks", [])
@@ -437,6 +440,7 @@ def _compare_configs(
         "invalid_output_retries",
         "fast_checks", "check_timeout_minutes", "require_clean_tracked",
         "skip_warning", "skip_suggestion",
+        "reuse_fix_sessions",
         "notify_cmd", "plan_doc", "create_invoke",
         "create_timeout_minutes", "create_max_attempts",
         "review_created", "created_check", "git_delivery",
@@ -1285,6 +1289,125 @@ def _expand_invoke_token(token: str) -> tuple[str | None, str]:
     return expanded, ""
 
 
+def _iso_to_epoch_ms(iso_ts: str) -> int | None:
+    """Convert an ISO-8601 timestamp (``base.utcnow``) to epoch milliseconds."""
+    try:
+        return int(datetime.fromisoformat(iso_ts).timestamp() * 1000)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fix_round_session_id(cfg: dict, state: dict, cid: str) -> str | None:
+    """Return the implement session to resume for a FIX round, if any.
+
+    Reuse is opt-in (``reuse_fix_sessions``), OpenCode-only, and applies only
+    to implement rounds that carry a corrective handoff (``latest_fix_prompt``
+    set by a prior incomplete implement or a failed review). Every other
+    dispatch stays cold.
+    """
+    if not bool(cfg.get("reuse_fix_sessions", False)):
+        return None
+    if cfg.get("adapter") != "opencode":
+        return None
+    r = state_mod.rec(state, cid)
+    if r.get("phase") != "implement" or not r.get("latest_fix_prompt"):
+        return None
+    sessions = r.get("worker_sessions")
+    if not isinstance(sessions, dict):
+        return None
+    session_id = sessions.get("implement")
+    return session_id if isinstance(session_id, str) and session_id else None
+
+
+def capture_opencode_session_id(
+    repo: Path,
+    since_iso: str,
+    *,
+    runner=None,
+) -> str | None:
+    """Capture the OpenCode session created for a just-finished dispatch.
+
+    Lists the **global** OpenCode session registry, keeps entries whose
+    ``directory`` is this repo and whose ``created`` epoch-ms is at or after
+    the dispatch start (``since_iso``, seconds precision), and returns the
+    newest such id. Every failure — spawn, non-zero exit, unparseable JSON —
+    is non-fatal: the caller records nothing and the next dispatch runs cold.
+    """
+    run = runner or subprocess.run
+    try:
+        proc = run(
+            ["opencode", "session", "list", "--format", "json", "-n", "5"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if getattr(proc, "returncode", 1) != 0:
+            return None
+        payload = json.loads(getattr(proc, "stdout", "") or "")
+    except Exception as exc:  # capture must never fail a stage
+        base.log(f"warning: could not capture opencode session: {exc}")
+        return None
+    if not isinstance(payload, list):
+        return None
+    since_ms = _iso_to_epoch_ms(since_iso)
+    if since_ms is None:
+        return None
+    repo_str = os.path.normpath(str(repo))
+    newest_id = ""
+    newest_created = -1
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        directory = entry.get("directory")
+        if not isinstance(directory, str):
+            continue
+        if os.path.normpath(directory) != repo_str:
+            continue
+        created = entry.get("created")
+        if not isinstance(created, int) or created < since_ms:
+            continue
+        if created > newest_created:
+            newest_created = created
+            newest_id = str(entry.get("id", ""))
+    return newest_id or None
+
+
+def _capture_implement_session(
+    repo: Path, cfg: dict, state: dict, cid: str, since_iso: str
+) -> None:
+    """Best-effort capture of the implement dispatch's session id into state."""
+    if not bool(cfg.get("reuse_fix_sessions", False)):
+        return
+    if cfg.get("adapter") != "opencode":
+        return
+    session_id = capture_opencode_session_id(repo, since_iso)
+    if not session_id:
+        return
+    r = state_mod.rec(state, cid)
+    sessions = r.setdefault("worker_sessions", {})
+    if not isinstance(sessions, dict):
+        sessions = {}
+        r["worker_sessions"] = sessions
+    sessions["implement"] = session_id
+
+
+def _clear_worker_session(state: dict, cid: str, stage: str) -> None:
+    """Forget a stored worker session so the next dispatch runs cold."""
+    r = state_mod.rec(state, cid)
+    sessions = r.setdefault("worker_sessions", {})
+    if isinstance(sessions, dict):
+        sessions.pop(stage, None)
+
+
+def _log_records_session_not_found(log_path: Path) -> bool:
+    """True when a stage log carries OpenCode's bogus-session-id diagnostic."""
+    try:
+        return "Session not found" in Path(log_path).read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+
 def invoke_direct_stage(
     repo: Path,
     cfg: dict,
@@ -1292,6 +1415,8 @@ def invoke_direct_stage(
     stage: str,
     round_num: int,
     input_block: str,
+    *,
+    session_id: str | None = None,
 ) -> tuple[str, Path]:
     tokens = shlex.split(cfg[f"{stage}_invoke"])
     expanded_tokens: list[str] = []
@@ -1321,6 +1446,12 @@ def invoke_direct_stage(
             continue
         cmd.append(token)
 
+    # Resume an existing OpenCode session for a warm fix round. The caller
+    # only passes a session id for an OpenCode implement dispatch; the guard
+    # here keeps a misdirected caller from injecting the flag into another
+    # stage or adapter.
+    if session_id and stage == "implement" and cfg.get("adapter") == "opencode":
+        cmd += ["--session", session_id]
     cmd = cmd + [input_block]
     log_path = next_stage_log_path(repo, cid, stage, round_num)
     timeout_s = cfg["changes"][cid]["timeout_minutes"] * 60
@@ -4349,6 +4480,11 @@ def _run_direct_change_loop_inner(
         envelope: dict | None = None
         recovered_stage = False
         recovery_rerouted = False
+        # Opt-in warm fix rounds: resume the implement worker's prior OpenCode
+        # session. ``session_fallback`` bounds the fail-open redispatch to one
+        # cold attempt when a stored id no longer exists.
+        reuse_session_id = _fix_round_session_id(cfg, state, cid)
+        session_fallback_used = False
         while True:
             # ---- supervised budget pre-dispatch gate ----
             # Reserve before any dispatch side effect. A reserve that cannot
@@ -4464,8 +4600,15 @@ def _run_direct_change_loop_inner(
                     )
 
             try:
+                # Only pass ``session_id`` when a session is actually being
+                # reused, so the default (key off) dispatch call is byte-for-
+                # byte the same as before this feature existed.
+                invoke_kwargs = (
+                    {"session_id": reuse_session_id} if reuse_session_id else {}
+                )
                 outcome, log_path = invoke_direct_stage(
-                    repo, cfg, cid, stage, round_num, attempt_input
+                    repo, cfg, cid, stage, round_num, attempt_input,
+                    **invoke_kwargs,
                 )
             except BaseException:
                 if supervised_gate is not None:
@@ -4476,6 +4619,36 @@ def _run_direct_change_loop_inner(
 
             # ---- restore os.environ after subprocess invocation ----
             _restore_usage_sidecar()
+
+            # Fail-open on a stale reused session: OpenCode exits 1 with
+            # "Session not found" before any model call, so clear the stored
+            # id and redispatch once cold rather than failing the stage.
+            if (
+                reuse_session_id
+                and not session_fallback_used
+                and _log_records_session_not_found(log_path)
+            ):
+                base.log(
+                    f"  {stage} round {round_num}: session "
+                    f"{reuse_session_id} not found; retrying without --session"
+                )
+                _clear_worker_session(state, cid, "implement")
+                reuse_session_id = None
+                session_fallback_used = True
+                _arm_usage_sidecar()
+                try:
+                    outcome, log_path = invoke_direct_stage(
+                        repo, cfg, cid, stage, round_num, attempt_input
+                    )
+                except BaseException:
+                    if supervised_gate is not None:
+                        _load_journal_dispatch().mark_active_uncertain(
+                            f"{stage} dispatch raised before its outcome was "
+                            "confirmed"
+                        )
+                    raise
+                _restore_usage_sidecar()
+
             record_stage_log(state, cid, stage, round_num, outcome, log_path)
 
             # 3.2 Capture ended_at, compute duration, determine telemetry status
@@ -4537,6 +4710,12 @@ def _run_direct_change_loop_inner(
 
             payload, parse_why, envelope = parse_stage_json(log_path)
             if payload is not None:
+                if stage == "implement":
+                    # Record the session this successful implement dispatch
+                    # created so a later FIX round can continue it. Non-fatal.
+                    _capture_implement_session(
+                        repo, cfg, state, cid, started_at
+                    )
                 break
             if _is_retriable_invalid_output(parse_why) and invalid_attempt < invalid_retries_max:
                 invalid_attempt += 1
@@ -5722,6 +5901,13 @@ def main() -> int:
     p_reset.add_argument(
         "--failed", action="store_true",
         help="reset all failed changes to pending",
+    )
+    p_reset.add_argument(
+        "--force", action="store_true",
+        help=(
+            "reset even a done change (re-runs implement/review cold against "
+            "the archived copy)"
+        ),
     )
     p_reset.set_defaults(fn=cmd_gates.cmd_reset)
 

@@ -25,6 +25,9 @@ invalid_output_retries = 2
 require_clean_tracked = true
 skip_warning = false
 skip_suggestion = false
+# Opt-in token savings: continue the implement worker's OpenCode session on
+# fix rounds (opencode adapter only). Defaults to false.
+# reuse_fix_sessions = false
 fast_checks = [
   "openspec validate --all",
 ]

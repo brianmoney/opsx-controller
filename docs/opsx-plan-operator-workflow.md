@@ -261,6 +261,24 @@ The plan manifest is a TOML file with a `[plan]` table and one or more
 | `fix_invoke` | string | adapter default (`""` on adapters without the stage) | Supervised fixer command used by the acceptance `fix` route |
 | `verify_invoke` | string | adapter default (`""` on adapters without the stage) | Supervised verifier command used by the acceptance `fix` route |
 
+#### Warm fix rounds: `reuse_fix_sessions`
+
+`reuse_fix_sessions` (bool, default `false`) is an opt-in token-saving mode
+for the **opencode** adapter. When enabled, the controller captures the
+OpenCode session id of each successful implement dispatch and, on a later
+implement **fix** round (a round dispatched with a corrective
+`latest_fix_prompt`), continues that session with `opencode run --session
+<id>`. The fix worker starts warm with the prior round's context instead of
+re-reading the change from scratch.
+
+The capture is best-effort and never fails a stage: a failed `opencode
+session list` call simply records nothing and the next dispatch runs cold.
+If a stored session no longer exists (`Session not found`), the controller
+discards the id and redispatches the round once without `--session`, so a
+stale id costs one extra cold launch rather than failing the change. The key
+is a no-op for non-opencode adapters and does nothing when left at its
+default.
+
 ### `[[changes]]` entry fields
 
 | Key | Type | Default | Description |
@@ -703,6 +721,10 @@ The `accept` command re-verifies that the created artifacts pass the
 Resets a failed change to pending for a retry. Resetting clears the change's
 entire state record (rounds, review results, archive state, history) to factory
 defaults and sets `max_rounds` from the current plan config.
+
+A change whose status is `done` is refused: it has already been archived, so
+resetting it would re-run implement/review **cold** against the archived copy
+rather than repairing live work. Pass `--force` to reset it anyway.
 
 ```bash
 # Reset a single change
@@ -1841,6 +1863,7 @@ receipt.
 ```
 opsx-plan reset [plan.toml] <change-id> [<change-id>...]
 opsx-plan reset --failed
+opsx-plan reset --force <change-id>
 ```
 Reset failed changes to pending. Accepts phase prefixes. In a registered
 supervised job a reset is a durable broker transaction through the operator
@@ -1941,6 +1964,7 @@ Equivalent to `opsx-plan run-one`.
 | `--all` | `approve` | Approve all changes awaiting approval |
 | `--all` | `accept` | Accept all changes awaiting acceptance |
 | `--failed` | `reset` | Reset all failed changes to pending |
+| `--force` | `reset` | Reset even a `done` change (re-runs it cold against the archived copy) |
 
 ### Broker refusal errors
 

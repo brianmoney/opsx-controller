@@ -81,6 +81,9 @@ def load_plan(path: Path, repo: Path | None = None) -> dict:
         ),
         "skip_warning": bool(plan.get("skip_warning", False)),
         "skip_suggestion": bool(plan.get("skip_suggestion", False)),
+        # Opt-in: continue a change's implement-phase worker session on FIX
+        # rounds instead of paying for a cold start every round.
+        "reuse_fix_sessions": bool(plan.get("reuse_fix_sessions", False)),
         # --- run-event notifications ---
         "notify_cmd": plan.get("notify_cmd", "").strip() if plan.get("notify_cmd") else "",
         # --- create stage (the /opsx-ff automation) ---

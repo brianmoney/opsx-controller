@@ -186,6 +186,11 @@ class DetectionFixtureTests(unittest.TestCase):
         kwargs.setdefault("trusted_location_check", lambda path: None)
         kwargs.setdefault("store_stat", lambda path: _store_stat())
         kwargs.setdefault("ancestor_stat", _trusted_ancestor)
+        # Pin the ACL probe to "no extended ACL": the default backend reads
+        # the real store-ancestor ACLs, whose inspectability depends on this
+        # host's provisioning state. Tests that exercise ACL handling inject
+        # their own ``acl_reader`` and override this default.
+        kwargs.setdefault("acl_reader", lambda path: None)
         return authority.detect_backend(**kwargs)
 
     def test_supported_host_is_available(self) -> None:
