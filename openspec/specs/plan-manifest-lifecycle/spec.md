@@ -337,3 +337,24 @@ surface a blocker rather than complete.
 - **WHEN** a restart reconstructs a job whose human wait is still open
 - **THEN** the wait remains open until a durable receipt releases it and the job
   is not marked complete in the meantime
+
+### Requirement: The plan loader resolves and serializes `reuse_fix_sessions`
+
+The plan loader SHALL accept an optional boolean `reuse_fix_sessions` key in the `[plan]` table. When the key is absent the resolved value SHALL be `false`; when set, the loader SHALL resolve it to a boolean and carry it in the loaded configuration.
+
+Derived single-change manifests SHALL preserve the resolved value through the existing serialize-and-round-trip verification path, so a regenerated manifest cannot silently drop or alter the flag.
+
+#### Scenario: Legacy manifest loading is unchanged
+
+- **WHEN** a plan manifest does not set `reuse_fix_sessions`
+- **THEN** the loaded configuration resolves `reuse_fix_sessions` to `false` and every previously existing field loads exactly as before
+
+#### Scenario: Enabled value survives loading
+
+- **WHEN** a manifest sets `reuse_fix_sessions = true`
+- **THEN** the loaded configuration carries `reuse_fix_sessions = true`
+
+#### Scenario: Derived manifests round-trip the key
+
+- **WHEN** a derived single-change manifest is generated
+- **THEN** the serialized manifest states `reuse_fix_sessions` explicitly and the round-trip verification preserves the resolved value

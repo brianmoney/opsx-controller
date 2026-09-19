@@ -422,3 +422,32 @@ behave exactly as before.
   create stage worker, or any run executes without supervision
 - **THEN** dispatch uses the existing direct-dispatch path and existing
   agents with no behavioral change
+
+### Requirement: Warm fix rounds reuse the implement worker's OpenCode session
+
+When `reuse_fix_sessions` is enabled for an OpenCode-backed plan, the orchestrator SHALL capture the OpenCode session id created by a successful implement dispatch into the change's state at `worker_sessions.implement`, and SHALL dispatch a later implement round that carries a corrective handoff (`latest_fix_prompt` set) with `--session <id>`, so the fix round continues the prior session instead of starting cold.
+
+Capture SHALL be best-effort and SHALL NOT fail a stage when the session registry cannot be read. When a reused session no longer exists, the orchestrator SHALL clear the stored id and redispatch that round once without `--session` rather than failing the stage.
+
+When `reuse_fix_sessions` is absent or false, or the plan's adapter is not `opencode`, dispatch SHALL be byte-identical to the behavior before this key existed.
+
+#### Scenario: Fix round resumes the prior implement session
+
+- **GIVEN** an OpenCode plan enables `reuse_fix_sessions` and a successful implement dispatch recorded `worker_sessions.implement`
+- **WHEN** the change is dispatched again as an implement fix round with `latest_fix_prompt` set
+- **THEN** the dispatched command includes `--session` with the recorded id
+
+#### Scenario: Session capture failure does not fail the stage
+
+- **WHEN** the OpenCode session registry cannot be read after a successful implement dispatch
+- **THEN** no session id is recorded, the stage remains successful, and the next dispatch runs without `--session`
+
+#### Scenario: Stale session fails open to one cold redispatch
+
+- **WHEN** a fix round dispatched with `--session` logs `Session not found`
+- **THEN** the orchestrator clears the stored session id and redispatches that round once without `--session`
+
+#### Scenario: Default-off dispatch is unchanged
+
+- **WHEN** `reuse_fix_sessions` is false or absent, or the plan uses a non-OpenCode adapter
+- **THEN** implement dispatch adds no `--session` argument and behaves exactly as before the key existed
