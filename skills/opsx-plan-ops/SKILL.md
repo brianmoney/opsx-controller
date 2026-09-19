@@ -65,6 +65,9 @@ config, plan content, or operator process).
 
 ## Launch discipline
 
+For the full step-by-step operator procedure, see
+`docs/opsx-autopilot-runbook.md`.
+
 `opsx-plan run` is a foreground, serial process: if it is a background job of
 an agent shell, a shell timeout or cleanup kills the whole process group —
 including the controller mid-stage. For anything past a quick

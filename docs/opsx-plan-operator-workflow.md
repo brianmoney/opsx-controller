@@ -789,6 +789,8 @@ for the full contract.
 
 ## Autopilot (unattended runs)
 
+For a step-by-step procedure see `docs/opsx-autopilot-runbook.md`.
+
 `opsx-plan autopilot` is the supported way to run a plan unattended. It is a
 long-lived wrapper that repeatedly invokes `opsx-plan run` in a loop, reacts to
 each failure, and pauses at `pause_before` gates instead of waiting on a

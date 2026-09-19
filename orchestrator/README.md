@@ -238,6 +238,8 @@ archive failures, and unknown classes escalate immediately, and it announces
 Run it under the `opsx-autopilot.service` systemd user unit (installed
 disabled); see the [operator workflow guide](../docs/opsx-plan-operator-workflow.md#autopilot-unattended-runs)
 for flags, config keys, escalation digests, and the restart-after-fix flow.
+For a step-by-step procedure see
+[`docs/opsx-autopilot-runbook.md`](../docs/opsx-autopilot-runbook.md).
 
 ## Plan manifest
 

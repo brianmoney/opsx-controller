@@ -101,6 +101,9 @@ install_orchestrator() {
   install -m 0644 \
     "$repo_root/systemd/opsx-autopilot.service.d/plan.conf.in" \
     "$runtime_dir/systemd/opsx-autopilot.service.d/plan.conf.in"
+  install -m 0644 \
+    "$repo_root/docs/opsx-autopilot-runbook.md" \
+    "$runtime_dir/docs/opsx-autopilot-runbook.md"
 
   install -m 0755 \
     "$repo_root/orchestrator/opsx-plan.py" \
@@ -120,6 +123,7 @@ install_orchestrator() {
     "Installed supervision service provisioning document to $runtime_dir/docs/opsx-supervision-service.md" \
     "Installed autopilot service template to $runtime_dir/systemd/opsx-autopilot.service.in" \
     "Installed autopilot plan drop-in template to $runtime_dir/systemd/opsx-autopilot.service.d/plan.conf.in" \
+    "Installed autopilot runbook to $runtime_dir/docs/opsx-autopilot-runbook.md" \
     "Installed opsx-plan to $dest_dir/opsx-plan" \
     "Installed opsx-run to $dest_dir/opsx-run" \
     "Installed opsx-watch-plan to $dest_dir/opsx-watch-plan"
