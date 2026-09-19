@@ -18,3 +18,8 @@
 [Service]
 WorkingDirectory=${OPSX_AUTOPILOT_REPO}
 Environment=OPSX_PLAN=${OPSX_AUTOPILOT_PLAN}
+
+# Systemd user managers do not inherit your shell PATH. If the OpenSpec CLI,
+# the adapter client, or node live outside the system directories, extend PATH
+# here (adjust to your install), e.g.:
+#   Environment=PATH=%h/.npm-global/bin:%h/.opencode/bin:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

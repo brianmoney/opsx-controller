@@ -29,7 +29,10 @@ loginctl show-user "$USER" -p Linger
 opsx-plan status openspec/plans/my-plan.toml
 ```
 
-`opsx-plan` must resolve on `PATH` (`~/.local/bin/opsx-plan`).
+`opsx-plan` must resolve on `PATH` (`~/.local/bin/opsx-plan`). These checks run
+in your shell, which has your full `PATH`; the unit runs with the systemd user
+manager's bare `PATH` instead, so also verify the toolchain requirement in
+step 3.
 
 ## 2. One-time notification setup
 
@@ -75,6 +78,18 @@ envsubst '${OPSX_AUTOPILOT_REPO} ${OPSX_AUTOPILOT_PLAN}' \
 systemctl --user daemon-reload
 systemctl --user enable opsx-autopilot
 ```
+
+Systemd user units get a bare `PATH` (`/usr/local/bin`, `/usr/bin`, ...), not
+your shell's. If `openspec`, your adapter client (e.g. `opencode`), or node
+live under `$HOME` — check with `which openspec opencode node` — add a PATH
+line to `plan.conf` and `daemon-reload` again:
+
+```ini
+Environment=PATH=%h/.npm-global/bin:%h/.opencode/bin:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+```
+
+Without it the unit exits 2 on preflight with "OpenSpec CLI not found
+repo-locally or on PATH", and `Restart=on-failure` retry-loops it.
 
 `enable` starts nothing; the unit stays down until you `start` it (step 6).
 To use the repository's active-plan pointer instead of pinning a manifest,
@@ -210,6 +225,7 @@ systemctl --user daemon-reload
 |---|---|---|
 | Unit won't start | `journalctl --user -u opsx-autopilot -e`; verify `WorkingDirectory` / `OPSX_PLAN` rendered in `plan.conf` | Correct `plan.conf`, `daemon-reload`, `start` |
 | `StartLimitBurst` tripped (5 starts / 600s) | `systemctl --user status opsx-autopilot` | `systemctl --user reset-failed opsx-autopilot` then `start` |
+| Unit exits 2, journal says "OpenSpec CLI not found repo-locally or on PATH" | Systemd user `PATH` lacks your toolchain dirs (`which openspec opencode node`) | Add `Environment=PATH=...` to `plan.conf` (step 3), `daemon-reload`, `start`; `reset-failed` if the retry loop tripped |
 | No pushes | Topic unset in `autopilot.toml` / `OPSX_AUTOPILOT_NTFY_TOPIC`; digests still in `.opsx-plan/escalations.jsonl` | Set the topic; test with `curl -d test ntfy.sh/<topic>` |
 | `worktree ... execution lock is already held ...; refusing to proceed` | A hand-run `opsx-plan run` / `reset` is racing the unit | Don't hand-run mutating commands while the unit is up (`approve` / `status` are safe); stop the unit first |
 | Config changes not taking effect | Running unit still has the old config | Restart the unit; CLI flags override the file, env overrides the topic |
