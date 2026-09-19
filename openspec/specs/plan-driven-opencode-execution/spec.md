@@ -129,14 +129,6 @@ The orchestrator SHALL NOT treat worker exit code or prose output alone as succe
 - **WHEN** the archive worker claims success but the change directory still exists or no archive commit is reachable
 - **THEN** `opsx-plan` does not mark the change done and records the archive as failed or unverifiable
 
-### Requirement: `/opsx-drive` remains available for manual single-change control
-
-This change SHALL remove `/opsx-drive` from the `opsx-plan` execution path, but SHALL keep the manual `/opsx-drive <change-id>` controller surface available for operators who want to drive one change outside a plan run.
-
-#### Scenario: Manual `/opsx-drive` use remains supported
-- **WHEN** an operator manually invokes `/opsx-drive <change-id>` after this change lands
-- **THEN** the single-change controller path still exists even though `opsx-plan` no longer calls it during plan execution
-
 ### Requirement: Single-change runner executes without a plan manifest
 
 The OpenCode adapter SHALL provide an `opsx-run <change-id>` command surface that starts or resumes the direct implement, review, and archive worker loop for exactly one existing accepted OpenSpec change without requiring a plan TOML manifest.
