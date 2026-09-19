@@ -886,6 +886,21 @@ touch .opsx-plan/veto/<change-id>
 Approving manually during the window short-circuits the wait. A vetoed gate
 is not auto-approved; handle it yourself and restart the unit once resolved.
 
+### Accepting orchestrator-created changes
+
+With `review_created = true`, changes the controller creates park in
+`awaiting_acceptance`. Autopilot sends an `opsx-plan accept: <change-id>`
+notification and waits — acceptance is operator-only, so there is no deadline
+and no auto-accept. Review `openspec/changes/<change-id>/`, then:
+
+```bash
+opsx-plan accept <change-id>
+```
+
+Autopilot notices the recorded acceptance and continues by itself; no unit
+restart is needed. A `--once` pass announces the state and exits instead of
+waiting.
+
 ### Escalation and recovery
 
 On an escalated failure autopilot appends a digest to

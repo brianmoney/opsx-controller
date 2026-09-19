@@ -233,8 +233,10 @@ unattended work, replacing the old `setsid nohup` launch discipline. It
 classifies each failed change: transient failures (`subagent_output_invalid`,
 timeouts) get a bounded, spaced auto-reset, while billing/quota, permission
 rejections, `finding_recurrence_exceeded`, `max_rounds_reached`, `no_progress`,
-archive failures, and unknown classes escalate immediately, and it announces
-`pause_before` gates that are auto-approved after a veto window unless vetoed.
+archive failures, and unknown classes escalate immediately; it announces
+`pause_before` gates that are auto-approved after a veto window unless vetoed,
+and it waits for `opsx-plan accept` on orchestrator-created changes awaiting
+acceptance.
 Run it under the `opsx-autopilot.service` systemd user unit (installed
 disabled); see the [operator workflow guide](../docs/opsx-plan-operator-workflow.md#autopilot-unattended-runs)
 for flags, config keys, escalation digests, and the restart-after-fix flow.

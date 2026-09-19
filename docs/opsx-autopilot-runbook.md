@@ -101,7 +101,8 @@ remove the `Environment=OPSX_PLAN=` line from `plan.conf` (then
 Manifest guidance for unattended runs:
 
 - `review_created = true` — the controller assesses authored changes; keep it
-  on.
+  on. Each orchestrator-created change then parks at an acceptance gate until
+  you `opsx-plan accept <change-id>` (step 7).
 - `pause_before = true` — think before using it. Each gate is a notification
   plus a veto window, then auto-approval (step 7).
 - `require_clean_tracked = true` — refuse to start on a dirty tracked tree.
@@ -157,6 +158,11 @@ tail -f .opsx-plan/autopilot-events.jsonl   # structured autopilot events
   ```
 
   A veto escalates the change as `human_veto` and stops the unit.
+- **Acceptance prompt** (title `opsx-plan accept: <change-id>`) — an
+  orchestrator-created change needs review before it is implemented. Review
+  `openspec/changes/<change-id>/`, then run `opsx-plan accept <change-id>`;
+  autopilot resumes on its own. There is no auto-accept and no unit restart
+  (a `--once` pass announces and exits instead of waiting).
 - **Escalation push** (title `opsx-plan escalate: <class>`, high priority) —
   follow the playbook below.
 - **Completion push** (title `opsx-plan complete: <plan>`) — the unit exits 0

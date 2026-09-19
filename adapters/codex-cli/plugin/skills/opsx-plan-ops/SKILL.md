@@ -96,6 +96,10 @@ What autopilot does in your stead (full detail in
 - **`pause_before` gates**: autopilot notifies, waits a veto window (default
   30 min), then auto-approves. Veto by creating `.opsx-plan/veto/<change-id>`
   during the window; approving manually short-circuits the wait.
+- **Acceptance gates**: an orchestrator-created change (`review_created = true`)
+  is announced (`opsx-plan accept: <change-id>`) and autopilot waits — no
+  auto-accept — until `opsx-plan accept <change-id>` records your acceptance;
+  it then resumes by itself.
 - **Permanent classes** (billing/quota, permission rejections,
   `finding_recurrence_exceeded`, `max_rounds_reached`, `no_progress`, archive
   failures, unknown) escalate immediately — never auto-retried.
