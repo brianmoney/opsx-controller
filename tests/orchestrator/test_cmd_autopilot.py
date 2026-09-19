@@ -326,6 +326,54 @@ class ApprovalWindowTests(AutopilotHarness):
 
 
 # ---------------------------------------------------------------------------
+# Acceptance of orchestrator-created changes
+# ---------------------------------------------------------------------------
+class AcceptanceWaitTests(AutopilotHarness):
+    def test_acceptance_waits_until_operator_accepts(self) -> None:
+        engine = FakeEngine(
+            [document(change(status="awaiting_acceptance", reason="created and verified")),
+             document(change(status="done"))]
+        )
+        harness = self
+
+        class AcceptOnFirstSleep(FakeClock):
+            def sleep(self, seconds: float) -> None:
+                super().sleep(seconds)
+                harness.write_record(accepted=True)
+
+        rc, _ = self.run_autopilot(engine, clock=AcceptOnFirstSleep(), poll=30)
+        self.assertEqual(rc, 0)
+        self.assertEqual(engine.run_count, 2)
+        self.assertIn("acceptance_wait", self.event_names())
+        self.assertIn("accepted", self.event_names())
+        self.assertIn("plan_complete", self.event_names())
+        self.assertEqual(self.escalations, [])
+        self.assertEqual(engine.approve_count, 0)
+
+    def test_acceptance_once_announces_and_exits(self) -> None:
+        engine = FakeEngine(
+            [document(change(status="awaiting_acceptance", reason="created and verified"))]
+        )
+        rc, _ = self.run_autopilot(engine, once=True, poll=30)
+        self.assertEqual(rc, 0)
+        self.assertEqual(engine.run_count, 1)
+        self.assertIn("acceptance_wait", self.event_names())
+        self.assertNotIn("accepted", self.event_names())
+        self.assertEqual(self.escalations, [])
+
+    def test_acceptance_already_accepted_does_not_block(self) -> None:
+        self.write_record(accepted=True)
+        engine = FakeEngine(
+            [document(change(status="awaiting_acceptance")),
+             document(change(status="done"))]
+        )
+        rc, _ = self.run_autopilot(engine, poll=30)
+        self.assertEqual(rc, 0)
+        self.assertIn("accepted", self.event_names())
+        self.assertIn("plan_complete", self.event_names())
+
+
+# ---------------------------------------------------------------------------
 # Failure classification
 # ---------------------------------------------------------------------------
 class FailureClassificationTests(AutopilotHarness):

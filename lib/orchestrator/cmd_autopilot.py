@@ -7,6 +7,8 @@ handle on the operator's behalf:
 
 * gated changes get a bounded veto window and are auto-approved when the
   operator does not veto;
+* orchestrator-created changes awaiting acceptance are announced and waited
+  on; acceptance is operator-only, so there is no auto-accept;
 * a transient worker failure (invalid output / stage timeout) gets a bounded
   number of auto-resets, persisted across process restarts;
 * every other actionable failure escalates once (ntfy + JSONL) and stops.
@@ -473,6 +475,14 @@ class Autopilot:
         if awaiting:
             return {"kind": "awaiting", "awaiting": awaiting}
 
+        awaiting_acceptance = [
+            (c.get("id"), c.get("reason", ""))
+            for c in changes
+            if c.get("status") == "awaiting_acceptance"
+        ]
+        if awaiting_acceptance:
+            return {"kind": "acceptance", "awaiting": awaiting_acceptance}
+
         failed = [
             c.get("id") for c in changes if c.get("status") == base.FAILED
         ]
@@ -554,6 +564,36 @@ class Autopilot:
             return 2
         self._event("auto_approve", change_id=cid)
         return None
+
+    def _handle_acceptance(self, cid: str, reason: str) -> int | None:
+        """Announce one awaiting-acceptance change and wait for the operator.
+
+        Acceptance of an orchestrator-created change is operator-only — unlike
+        a ``pause_before`` gate there is no time-boxed auto-approval — so this
+        wait has no deadline; it ends when the state records the operator's
+        ``opsx-plan accept``. In ``--once`` mode the pass announces and exits
+        instead of blocking.
+        """
+        self._event("acceptance_wait", change_id=cid, reason=reason)
+        self._push_ntfy(
+            title=f"opsx-plan accept: {cid}",
+            body=(
+                f"plan: {self.plan_name}\n"
+                f"change: {cid}\n"
+                f"reason: {reason or 'awaiting acceptance'}\n"
+                "orchestrator-created change needs operator review; "
+                "autopilot is waiting\n"
+                f"accept with: opsx-plan accept {cid}"
+            ),
+            tags="eyes,opsx",
+        )
+        if self.once:
+            return 0
+        while True:
+            if self._load_record(cid).get("accepted"):
+                self._event("accepted", change_id=cid)
+                return None
+            self._sleep(float(self.options["poll_seconds"]))
 
     def _load_record(self, cid: str) -> dict:
         state = state_mod.load_state(self.repo, self.plan_name)
@@ -746,6 +786,15 @@ class Autopilot:
             if kind == "awaiting":
                 for cid, reason in outcome["awaiting"]:
                     code = self._handle_approval(cid, reason)
+                    if code is not None:
+                        return code
+                if self.once:
+                    return 0
+                continue
+
+            if kind == "acceptance":
+                for cid, reason in outcome["awaiting"]:
+                    code = self._handle_acceptance(cid, reason)
                     if code is not None:
                         return code
                 if self.once:
