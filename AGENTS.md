@@ -84,7 +84,11 @@ running an individual adapter installer directly (e.g.
 Any global installer now deploys the shared `opsx-plan` and `opsx-run`
 executables (via `scripts/install-orchestrator.sh`), so a maintainer only
 needs to rerun one installer — the installed runtime location is the same
-regardless of which adapter deployed it.
+regardless of which adapter deployed it. The same deploy covers the shipped
+systemd **user** unit template `opsx-autopilot.service` (plus its drop-in
+convention) as installed-but-disabled data. Enabling that unit
+(`systemctl --user enable opsx-autopilot`) is a **separate operator step**:
+the installer only copies files and never runs `systemctl` or enables a unit.
 
 The orchestrator's implementation is split between the entrypoint
 (`orchestrator/opsx-plan.py`) and the installed `lib/orchestrator/` runtime

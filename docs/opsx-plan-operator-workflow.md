@@ -36,7 +36,9 @@ opsx-plan doctor
 # 4. Dry-run to review the DAG and gate config
 opsx-plan run --dry-run
 
-# 5. Run the plan (interruptible; state persists, resume by re-running)
+# 5. Run the plan (interruptible; state persists, resume by re-running).
+#    For unattended/long-running work use the autopilot wrapper instead — see
+#    "Autopilot (unattended runs)".
 opsx-plan run
 
 # 6. Monitor progress
@@ -763,6 +765,125 @@ for the full contract.
 
 ---
 
+## Autopilot (unattended runs)
+
+`opsx-plan autopilot` is the supported way to run a plan unattended. It is a
+long-lived wrapper that repeatedly invokes `opsx-plan run` in a loop, reacts to
+each failure, and pauses at `pause_before` gates instead of waiting on a
+terminal that may not exist. Run it under the shipped systemd **user** unit
+`opsx-autopilot.service`; it replaces the old `setsid nohup opsx-plan run`
+launch discipline. The orchestrator engine itself remains a foreground, serial
+process — autopilot is the supervision around it, not a second executor.
+
+```bash
+opsx-plan autopilot [--plan X] \
+  [--veto-window-minutes N] [--max-auto-resets N] \
+  [--reset-spacing-seconds N] [--poll-seconds N] [--once]
+```
+
+- `--plan X` — plan manifest to drive (otherwise the active-plan pointer /
+  `OPSX_PLAN` is used, same resolution as `run`).
+- `--veto-window-minutes N` — how long to wait for a veto before
+  auto-approving a `pause_before` gate (default `30`).
+- `--max-auto-resets N` — cap on automatic resets per failure signature
+  (default `2`).
+- `--reset-spacing-seconds N` — minimum spacing between automatic resets of
+  the same signature (default `300`).
+- `--poll-seconds N` — loop poll interval in seconds (built-in default).
+- `--once` — run one pass and exit, without looping.
+
+### Failure classification
+
+Autopilot classifies each failed change from the state file and either resets
+it under a bound or escalates immediately. The classifier mirrors the triage
+table in `skills/opsx-plan-ops/SKILL.md`:
+
+| Class | Examples | Autopilot action |
+|---|---|---|
+| Transient | `subagent_output_invalid`, worker timeouts | Bounded auto-reset — at most `max_auto_resets` (default 2) per failure signature, at least `reset_spacing_seconds` (default 300s) apart |
+| Billing / quota | provider billing or quota exhaustion | Escalate immediately; never auto-retried |
+| Permission | permission/tool rejections | Escalate immediately; never auto-retried |
+| `finding_recurrence_exceeded` | the same review finding recurs past the limit | Escalate immediately; never auto-retried |
+| `max_rounds_reached` | review rounds exhausted | Escalate immediately; never auto-retried |
+| `no_progress` | no-progress ceiling reached | Escalate immediately; never auto-retried |
+| Archive failure | `archive_spec_update_failed`, `modified requirement header not found` | Escalate immediately; never auto-retried |
+| Unknown | anything the classifier cannot place | Escalate immediately; never auto-retried |
+
+Failure signatures (and their reset counts/spacing) are persisted in
+`.opsx-plan/autopilot-state.json`, so a count survives an `opsx-plan reset`
+and a hand-run restart.
+
+### Configuration
+
+Autopilot reads `~/.config/opsx-controller/autopilot.toml`:
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `ntfy_topic` | string | none | ntfy.sh topic for escalation pushes. Unset ⇒ pushes are skipped (file digests are still written) |
+| `veto_window_minutes` | int | `30` | Veto window before auto-approving a `pause_before` gate |
+| `max_auto_resets` | int | `2` | Auto-reset cap per failure signature |
+| `reset_spacing_seconds` | int | `300` | Minimum spacing between auto-resets of the same signature |
+| `poll_seconds` | int | built-in default | Loop poll interval |
+
+Precedence: CLI flags override the config file; the
+`OPSX_AUTOPILOT_NTFY_TOPIC` environment variable overrides `ntfy_topic`.
+Without a topic (from either source), pushes are skipped but the escalation
+digest file is still appended.
+
+### Unit management
+
+The unit template is installed disabled. Enable and start it once; the
+operator-owned drop-in (`plan.conf`) sets `WorkingDirectory` and `OPSX_PLAN`
+for the plan to drive.
+
+```bash
+systemctl --user enable opsx-autopilot     # opt in (starts nothing)
+systemctl --user start  opsx-autopilot     # start / restart after a fix
+systemctl --user status opsx-autopilot     # state, last exit, recent log
+systemctl --user stop   opsx-autopilot     # stop cleanly
+journalctl --user -u opsx-autopilot -f     # follow decisions and output
+```
+
+The unit uses `Restart=on-failure`, `RestartSec=30`, and `StartLimitBurst=5`
+per 600s. A crash is retried; a clean escalation exit is not (see below).
+
+### Vetoing a gate
+
+When autopilot reaches a `pause_before` change it sends a notification, then
+waits `veto_window_minutes` before auto-approving. To veto the auto-approval,
+create the marker file during the window:
+
+```bash
+mkdir -p .opsx-plan/veto
+touch .opsx-plan/veto/<change-id>
+```
+
+Approving manually during the window short-circuits the wait. A vetoed gate
+is not auto-approved; handle it yourself and restart the unit once resolved.
+
+### Escalation and recovery
+
+On an escalated failure autopilot appends a digest to
+`.opsx-plan/escalations.jsonl`, sends an ntfy.sh push (when a topic is
+configured), logs the decision to `.opsx-plan/autopilot-events.jsonl`, then
+exits 0. Because the exit is clean, the unit stays **down** rather than
+restart-looping.
+
+Each escalation digest records: change id, failure class, `last_result`,
+reason, findings loci, attempt count, stage log path, and suggested action.
+
+To recover:
+
+1. Read the newest digest in `.opsx-plan/escalations.jsonl` and the referenced
+   stage log; fix the root cause at its layer.
+2. Commit any uncommitted worker output (a subsequent run refuses a dirty
+   tracked tree).
+3. If the change is still failed, `opsx-plan reset <change-id>`.
+4. `systemctl --user start opsx-autopilot` — restart after the fix; watch the
+   first stage transition before walking away.
+
+---
+
 ## Monitoring
 
 ### Status
@@ -1155,6 +1276,10 @@ All orchestrator state lives at `.opsx-plan/` in the host project root:
 - `telemetry/<plan>.jsonl` — telemetry records (JSON Lines)
 - `usage/<plan>/<change>/` — OpenCode plugin usage sidecar files
 - `dashboards/` — generated HTML dashboard files
+- `autopilot-state.json` — autopilot failure signatures and auto-reset counts
+- `veto/<change-id>` — operator veto markers for `pause_before` windows
+- `escalations.jsonl` — escalation digests (one JSON object per line)
+- `autopilot-events.jsonl` — autopilot decision log
 
 Add `.opsx-plan/` to the host project's `.gitignore`. The orchestrator creates
 a `.gitignore` in `.opsx-plan/` containing `*` to prevent accidental commits.
@@ -1167,7 +1292,8 @@ The orchestrator is designed for safe interruption:
 - **Kill / crash**: On the next `opsx-plan run`, the `reconcile` step recovers
   a `running` status to `pending`.
 - **Resume**: Re-run the same `opsx-plan run` command. The orchestrator resumes
-  from the persisted phase, round, and fix prompt.
+  from the persisted phase, round, and fix prompt. For unattended runs,
+  autopilot owns this restart loop — see "Autopilot (unattended runs)".
 
 ### Retention and cleanup
 

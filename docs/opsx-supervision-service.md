@@ -1,3 +1,8 @@
+> **Dormant as of 2026-09-19.** The supervision stack is stopped and disabled,
+> and its separate service/worker principals are unprovisioned for new work.
+> Day-to-day unattended operation is superseded by `opsx-plan autopilot`; this
+> document is retained as design reference only.
+
 # Provisioning the opsx supervision service
 
 This document is the manual provisioning contract for the Linux supervision

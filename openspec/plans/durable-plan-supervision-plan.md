@@ -1,11 +1,14 @@
 ---
 title: Durable Plan Supervision
 doc_type: implementation-plan
-status: proposed
-updated: 2026-09-12
+status: completed
+updated: 2026-09-19
 ---
 
 # Durable Plan Supervision
+
+*Operations note: the supervision stack is dormant as of 2026-09-19; unattended
+operation is handled by `opsx-plan autopilot`.*
 
 ## Purpose
 

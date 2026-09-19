@@ -84,9 +84,9 @@ except ModuleNotFoundError as exc:  # pragma: no cover
 
 try:
     from lib.orchestrator import (
-        base, compiler, cmd_archive_plan, cmd_doctor, cmd_gates, cmd_logs,
-        cmd_models, cmd_run_one, cmd_status, cmd_supervise, cmd_use, dashboard,
-        delivery, doctor, groundtruth, logs, planref, report,
+        base, compiler, cmd_archive_plan, cmd_autopilot, cmd_doctor, cmd_gates,
+        cmd_logs, cmd_models, cmd_run_one, cmd_status, cmd_supervise, cmd_use,
+        dashboard, delivery, doctor, groundtruth, logs, planref, report,
         supervision_service, telemetry,
     )
     from lib.orchestrator import cost as cost_mod
@@ -5661,6 +5661,32 @@ def main() -> int:
                             "(the repo has no openspec/config.yaml; dispatch may "
                             "fail when workers cannot find their prompt files)")
     p_run.set_defaults(fn=cmd_run)
+
+    p_autopilot = sub.add_parser(
+        "autopilot", help="unattended wrapper: run, handle gates, resume failures"
+    )
+    p_autopilot.add_argument("--plan", default=None, help="path to plan TOML")
+    p_autopilot.add_argument(
+        "--veto-window-minutes", type=float, default=None,
+        help="minutes to wait for a veto before auto-approving a gate",
+    )
+    p_autopilot.add_argument(
+        "--max-auto-resets", type=int, default=None,
+        help="bounded auto-resets per transient-failure signature",
+    )
+    p_autopilot.add_argument(
+        "--reset-spacing-seconds", type=float, default=None,
+        help="minimum seconds between auto-resets of one signature",
+    )
+    p_autopilot.add_argument(
+        "--poll-seconds", type=float, default=None,
+        help="veto-window poll interval",
+    )
+    p_autopilot.add_argument(
+        "--once", action="store_true",
+        help="single pass (preflight, one run, classify, act) then exit",
+    )
+    p_autopilot.set_defaults(fn=cmd_autopilot.cmd_autopilot)
 
     p_status = sub.add_parser("status", help="reconcile and show plan status")
     p_status.add_argument("plan", nargs="?", default=None, help="path to plan TOML")

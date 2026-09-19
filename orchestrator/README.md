@@ -226,6 +226,19 @@ Per-stage logs live at `.opsx-plan/logs/<change>.<stage>.r<round>.*.log`, and
 compatibility worker-state snapshots used as phase inputs live under
 `.opsx-plan/workers/`. Add `.opsx-plan/` to the host project's `.gitignore`.
 
+### Unattended execution (autopilot)
+
+`opsx-plan autopilot` wraps `opsx-plan run` in a supervised loop for
+unattended work, replacing the old `setsid nohup` launch discipline. It
+classifies each failed change: transient failures (`subagent_output_invalid`,
+timeouts) get a bounded, spaced auto-reset, while billing/quota, permission
+rejections, `finding_recurrence_exceeded`, `max_rounds_reached`, `no_progress`,
+archive failures, and unknown classes escalate immediately, and it announces
+`pause_before` gates that are auto-approved after a veto window unless vetoed.
+Run it under the `opsx-autopilot.service` systemd user unit (installed
+disabled); see the [operator workflow guide](../docs/opsx-plan-operator-workflow.md#autopilot-unattended-runs)
+for flags, config keys, escalation digests, and the restart-after-fix flow.
+
 ## Plan manifest
 
 See `orchestrator/samples/sample-plan.toml` for a canonical example. Per-change fields: `id` (required), `depends_on`,
@@ -356,6 +369,12 @@ mode, and the archive commit per change keeps each step independently
 revertable. If you later want parallel independent branches, run them in
 separate `git worktree` checkouts with a merge step gated on `fast_checks` —
 that belongs above this script, not inside it.
+
+The engine itself stays a foreground serial process; unattended operation is
+handled by the `opsx-plan autopilot` wrapper, which loops `opsx-plan run`,
+bounds auto-resets for transient failures, gates `pause_before` changes behind
+a veto window, and escalates everything it will not retry. See
+"Unattended execution (autopilot)" above.
 
 ## Source layout
 

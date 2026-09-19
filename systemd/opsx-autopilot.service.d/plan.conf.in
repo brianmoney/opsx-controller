@@ -1,0 +1,20 @@
+# opsx-autopilot.service.d/plan.conf.in — versioned drop-in template that
+# binds opsx-autopilot.service to one plan.
+#
+# This file is installed DATA alongside opsx-autopilot.service.in; it is never
+# written into a service-manager directory by the installer. Render the
+# placeholders (for example with `envsubst`), copy the result to
+# ~/.config/systemd/user/opsx-autopilot.service.d/plan.conf, then
+# `systemctl --user daemon-reload`.
+#
+# Placeholders:
+#   ${OPSX_AUTOPILOT_REPO}
+#       Absolute path to the plan repository; the child engine runs here.
+#   ${OPSX_AUTOPILOT_PLAN}
+#       Repo-relative or absolute path to the plan TOML. OPSX_PLAN is the
+#       same resolution knob the `opsx-plan` CLI documents; leave the line out
+#       to fall back to the repository's active-plan pointer.
+
+[Service]
+WorkingDirectory=${OPSX_AUTOPILOT_REPO}
+Environment=OPSX_PLAN=${OPSX_AUTOPILOT_PLAN}

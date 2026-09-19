@@ -90,6 +90,18 @@ install_orchestrator() {
     "$repo_root/docs/opsx-supervision-service.md" \
     "$runtime_dir/docs/opsx-supervision-service.md"
 
+  # Autopilot packaging: the versioned systemd user unit template and its
+  # plan-binding drop-in are installed DISABLED DATA, exactly like the
+  # supervision service template above. No unit is written to a
+  # service-manager directory and no unit is enabled or started here.
+  install -m 0644 \
+    "$repo_root/systemd/opsx-autopilot.service.in" \
+    "$runtime_dir/systemd/opsx-autopilot.service.in"
+  mkdir -p "$runtime_dir/systemd/opsx-autopilot.service.d"
+  install -m 0644 \
+    "$repo_root/systemd/opsx-autopilot.service.d/plan.conf.in" \
+    "$runtime_dir/systemd/opsx-autopilot.service.d/plan.conf.in"
+
   install -m 0755 \
     "$repo_root/orchestrator/opsx-plan.py" \
     "$dest_dir/opsx-plan"
@@ -106,6 +118,8 @@ install_orchestrator() {
     "Installed plan-authoring reference to $runtime_dir/plan-authoring.md" \
     "Installed supervision service template to $runtime_dir/systemd/opsx-supervise.service.in" \
     "Installed supervision service provisioning document to $runtime_dir/docs/opsx-supervision-service.md" \
+    "Installed autopilot service template to $runtime_dir/systemd/opsx-autopilot.service.in" \
+    "Installed autopilot plan drop-in template to $runtime_dir/systemd/opsx-autopilot.service.d/plan.conf.in" \
     "Installed opsx-plan to $dest_dir/opsx-plan" \
     "Installed opsx-run to $dest_dir/opsx-run" \
     "Installed opsx-watch-plan to $dest_dir/opsx-watch-plan"

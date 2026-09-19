@@ -42,6 +42,11 @@ config, plan content, or operator process).
   with `output invalid: expected a final JSON object line`.
   `invalid_output_retries` (default 2) re-runs the stage with a
   `RETRY_CORRECTION` hint before failing the change.
+- **Unattended runs** are owned by the `opsx-plan autopilot` wrapper, a
+  systemd user unit — not by a foreground shell. Autopilot loops
+  `opsx-plan run`, auto-resets transient failures, gates `pause_before`
+  changes behind a veto window, and escalates everything else. See
+  `docs/opsx-plan-operator-workflow.md` → "Autopilot (unattended runs)".
 
 ## Pre-flight (before every `opsx-plan run`)
 
@@ -60,19 +65,45 @@ config, plan content, or operator process).
 
 ## Launch discipline
 
-The controller is a long-running parent process. If launched as a background
-job of an agent shell, a shell timeout or cleanup kills the whole process
-group — including the controller mid-stage.
+`opsx-plan run` is a foreground, serial process: if it is a background job of
+an agent shell, a shell timeout or cleanup kills the whole process group —
+including the controller mid-stage. For anything past a quick
+`--max-changes 1` smoke run, do **not** hand-roll `setsid nohup`. Launch
+unattended work through the **autopilot wrapper**, which supervises
+`opsx-plan run` in a loop from a systemd user unit.
 
 ```bash
-setsid nohup opsx-plan run > /tmp/opsx-plan-run.out 2>&1 < /dev/null & disown
+# One-time: enable the unit. A drop-in (plan.conf) sets WorkingDirectory and
+# OPSX_PLAN; the template ships installed-but-disabled.
+systemctl --user enable opsx-autopilot
+systemctl --user start  opsx-autopilot
+
+# Watch it
+systemctl --user status opsx-autopilot
+journalctl --user -u opsx-autopilot -f
 ```
 
-Verify survival from a *separate* command:
-`ps aux | grep "opsx-plan run" | grep -v grep`. Monitor with
-`opsx-plan status` and the run output file. Worker logs stream into
-`.opsx-plan/logs/`; `opsx-plan logs` selects the most relevant one (and can
-`--follow` an in-progress run).
+What autopilot does in your stead (full detail in
+`docs/opsx-plan-operator-workflow.md` → "Autopilot (unattended runs)"):
+
+- **Transient failures** (`subagent_output_invalid`, timeouts) get a bounded
+  auto-reset — default 2 per failure signature, at least 300s apart.
+  Signatures persist in `.opsx-plan/autopilot-state.json`, so they survive
+  `opsx-plan reset`.
+- **`pause_before` gates**: autopilot notifies, waits a veto window (default
+  30 min), then auto-approves. Veto by creating `.opsx-plan/veto/<change-id>`
+  during the window; approving manually short-circuits the wait.
+- **Permanent classes** (billing/quota, permission rejections,
+  `finding_recurrence_exceeded`, `max_rounds_reached`, `no_progress`, archive
+  failures, unknown) escalate immediately — never auto-retried.
+
+Escalation appends a digest to `.opsx-plan/escalations.jsonl` (change id,
+class, `last_result`, reason, finding loci, attempt count, stage log path,
+suggested action), sends an ntfy push, exits 0, and leaves the unit **down**
+until you fix and restart it. Every decision is logged to
+`.opsx-plan/autopilot-events.jsonl`. Monitor with `opsx-plan status` and the
+journal; worker logs still stream into `.opsx-plan/logs/`, and
+`opsx-plan logs --follow` selects the in-progress one.
 
 ## Triage: symptom → cause → action
 
@@ -83,8 +114,12 @@ Verify survival from a *separate* command:
 | Review quality is oddly shallow, or `variant` looks ignored | Silent variant downgrade: the configured variant is not a valid label for the pinned model, so the client falls back to default | `opsx-plan models show` prints resolved variants with their source; the client's own session records show the *actual* variant used | Set `<role>_variant` in `~/.config/opsx-controller/models.toml` to a valid label for the pinned model, reinstall the adapter, re-run |
 | Archive fails: `modified requirement header not found` / `archive_spec_update_failed` | Delta spec MODIFIED header doesn't match the canonical spec verbatim — a requirement's name is its identity; the implementer renamed it while extending the body | `grep -n "^### Requirement"` in `openspec/changes/<change>/specs/<cap>/spec.md` vs `openspec/specs/<cap>/spec.md` | Fix the **delta**, never the canonical spec, to resolve the mismatch. This is a semantic decision — use the trusted-model pattern below |
 | Run refuses to start / stops immediately | Dirty tracked tree, or `pause_before` gate awaiting approval | `git status --short`; `opsx-plan status` | Commit wip work; `opsx-plan approve <change-id>` for gated changes |
-| Run died mid-stage with no error | Controller process killed (shell timeout, laptop sleep, OOM) | `ps` shows no `opsx-plan run`; last log ends mid-stage | Relaunch with setsid discipline. Completed stage work in the log is not reused — the stage re-runs; a no-op implement with all tasks done is cheap |
+| Run died mid-stage with no error | Controller process killed (shell timeout, laptop sleep, OOM) | `ps` shows no `opsx-plan run`; last log ends mid-stage | Under autopilot the unit restarts it (`Restart=on-failure`); a manual run dead-ends. Completed stage work in the log is not reused — the stage re-runs; a no-op implement with all tasks done is cheap |
 | Change loops review-fail rounds with the same finding | Recurring defect; escalation may engage after `escalate_after_review_fails` rounds | `PRIOR_FINDING_LOCI` in the worker input header of each review log | Check `finding_recurrence_limit` semantics; consider `opsx-plan reset` and manual intervention on the finding's locus |
+
+Autopilot's failure classifier mirrors this table: the transient rows (worker
+output contract misses and provider errors) get a bounded auto-reset;
+everything else escalates rather than being retried.
 
 ## Trusted model + deterministic context (for semantic fixes)
 
@@ -115,8 +150,10 @@ status.
    re-enters the implement phase. A reset change with all tasks complete
    re-runs implement as a fast no-op, then review, then archive. This is
    normal, not a loop.
-4. Relaunch with setsid discipline; watch the first stage transition before
-   walking away.
+4. Restart autopilot and watch the first stage transition before walking away:
+   `systemctl --user start opsx-autopilot`. (An unattended run that escalated
+   left the unit down on purpose — autopilot never retries a permanent class;
+   see the "Launch discipline" section.)
 5. After `done`, the plan stops at the next `pause_before` change — that is
    the checkpoint to review diffs before approving.
 
