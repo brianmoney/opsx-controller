@@ -259,3 +259,16 @@ The adapter SHALL preserve the full core contract without modification:
 
 - **WHEN** reviewer returns `finding_counts: {critical:0, warning:0, note:1}`
 - **THEN** the controller treats this as a review failure and loops back to implement
+
+### Requirement: Codex plans require the direct stage invokes
+
+The `codex-cli` adapter SHALL NOT define or install a legacy `invoke` or
+`max_attempts` plan default. A Codex plan that does not provide the complete
+direct stage invoke configuration SHALL fail closed with guidance naming
+`implement_invoke`, `review_invoke`, and `archive_invoke`, and SHALL NOT
+dispatch a legacy command.
+
+#### Scenario: Codex plan does not fall back to legacy drive mode
+
+- **WHEN** a Codex plan omits any of the three direct stage invoke keys
+- **THEN** the orchestrator refuses the plan and names all three required keys without dispatching a legacy command
