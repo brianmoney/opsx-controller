@@ -13,9 +13,10 @@
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now opsx-autopilot
 #
-# The unit exits 0 on a clean plan completion and on every escalation, so
-# systemd's Restart=on-failure leaves it down after an escalation until the
-# operator fixes the cause and starts it again.
+# The unit exits 0 on a clean plan completion and on change-level escalations,
+# so systemd's Restart=on-failure leaves it down until the operator fixes the
+# cause and starts it again. Environment-class escalations exit 2 and are
+# retried by Restart=on-failure until StartLimitBurst trips.
 #
 # Configuration:
 #   * Plan selection is carried by the drop-in's Environment=OPSX_PLAN (or the

@@ -869,7 +869,8 @@ journalctl --user -u opsx-autopilot -f     # follow decisions and output
 ```
 
 The unit uses `Restart=on-failure`, `RestartSec=30`, and `StartLimitBurst=5`
-per 600s. A crash is retried; a clean escalation exit is not (see below).
+per 600s. A crash (and an `environment`-class escalation, which exits 2) is
+retried; a clean change-level escalation exit is not (see below).
 
 ### Vetoing a gate
 
@@ -890,8 +891,9 @@ is not auto-approved; handle it yourself and restart the unit once resolved.
 On an escalated failure autopilot appends a digest to
 `.opsx-plan/escalations.jsonl`, sends an ntfy.sh push (when a topic is
 configured), logs the decision to `.opsx-plan/autopilot-events.jsonl`, then
-exits 0. Because the exit is clean, the unit stays **down** rather than
-restart-looping.
+exits 0 for change-level classes; because the exit is clean, the unit stays
+**down** rather than restart-looping. The exception is `environment`, which
+exits 2 and is retried by `Restart=on-failure` until `StartLimitBurst` trips.
 
 Each escalation digest records: change id, failure class, `last_result`,
 reason, findings loci, attempt count, stage log path, and suggested action.

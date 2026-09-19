@@ -102,8 +102,9 @@ What autopilot does in your stead (full detail in
 
 Escalation appends a digest to `.opsx-plan/escalations.jsonl` (change id,
 class, `last_result`, reason, finding loci, attempt count, stage log path,
-suggested action), sends an ntfy push, exits 0, and leaves the unit **down**
-until you fix and restart it. Every decision is logged to
+suggested action), sends an ntfy push, and leaves the unit **down** until you
+fix and restart it (change-level classes exit 0; `environment` exits 2 and is
+retried until `StartLimitBurst` trips). Every decision is logged to
 `.opsx-plan/autopilot-events.jsonl`. Monitor with `opsx-plan status` and the
 journal; worker logs still stream into `.opsx-plan/logs/`, and
 `opsx-plan logs --follow` selects the in-progress one.

@@ -20,6 +20,11 @@ bash install.sh --global --verify
 # "Failed to connect to bus").
 systemctl --user status
 
+# Unattended operation needs the user manager to survive logout; must print
+# "Linger=yes" (enable once with `sudo loginctl enable-linger "$USER"`).
+# Without lingering the unit dies with your session.
+loginctl show-user "$USER" -p Linger
+
 # The plan manifest exists and loads.
 opsx-plan status openspec/plans/my-plan.toml
 ```
@@ -58,10 +63,13 @@ mkdir -p "$UNIT_DIR"
 cp "$RUNTIME/systemd/opsx-autopilot.service.in" \
    "$HOME/.config/systemd/user/opsx-autopilot.service"
 
-# Drop-in: substitute the two placeholders.
+# Drop-in: substitute the two placeholders (envsubst ships with gettext).
+# Scope the variable list so only the placeholders are expanded, not the
+# template's comment text.
 export OPSX_AUTOPILOT_REPO="$PWD"                      # absolute repo path
 export OPSX_AUTOPILOT_PLAN="openspec/plans/my-plan.toml"
-envsubst < "$RUNTIME/systemd/opsx-autopilot.service.d/plan.conf.in" \
+envsubst '${OPSX_AUTOPILOT_REPO} ${OPSX_AUTOPILOT_PLAN}' \
+  < "$RUNTIME/systemd/opsx-autopilot.service.d/plan.conf.in" \
   > "$UNIT_DIR/plan.conf"
 
 systemctl --user daemon-reload
@@ -97,14 +105,19 @@ git status --short          # must be clean for require_clean_tracked
 opsx-plan status            # know pending / failed / gated changes
 opsx-plan doctor            # models resolve, client on PATH, plan loads
 
-# Single-pass smoke from the repo:
-opsx-plan autopilot --once
+# Single-pass smoke from the repo. With no --plan the active plan is used;
+# against an already-complete plan this only emits a completion push. To
+# exercise one real pass, target a plan with pending work and shorten the
+# gate window:
+opsx-plan autopilot --once --plan openspec/plans/my-plan.toml \
+  --veto-window-minutes 2 --poll-seconds 10
 ```
 
 A healthy pass: clean preflight, the engine advances (or completes) pending
 changes, the command exits 0, and no new line is appended to
 `.opsx-plan/escalations.jsonl`. A `--once` pass can run as long as one
-`opsx-plan run`, and waits out a `pause_before` veto window if it reaches one.
+`opsx-plan run`, and waits out a `pause_before` veto window if it reaches one
+(auto-approving at the end; the next pass does the actual work).
 
 ## 6. Launch + monitor
 
@@ -154,6 +167,8 @@ Record fields: `ts`, `plan`, `change_id`, `class`, `last_result`, `reason`,
 | `archive_failed`, `archive_invalid` | Fix the DELTA, never the canonical spec |
 | `environment` | Clean tracked tree / stale execution lock |
 | `human_veto` | You vetoed the gate; resolve it by hand |
+| `no_forward_progress` | Autopilot's own guard (3 quick passes, identical statuses); inspect `opsx-plan status` and the stage logs |
+| `unknown` | Inspect the `log_path` stage log; the classifier could not place the failure |
 
 Then restart:
 
@@ -161,9 +176,13 @@ Then restart:
 systemctl --user start opsx-autopilot
 ```
 
-The unit stays down after an escalation **by design**: autopilot exits 0 and
-the unit uses `Restart=on-failure`, so systemd does not restart it. Restarting
-is always your explicit act.
+Change-level escalations exit 0, so the unit's `Restart=on-failure` leaves it
+**down** and restarting is always your explicit act. `environment` escalations
+are the exception: autopilot exits 2 (invalid `status --json`, engine exit 2, a
+failed `approve`/`reset` subprocess), so systemd retries under `RestartSec=30`
+until `StartLimitBurst` (5 starts / 600s) trips and the unit lands in
+`failed`; clear that with `systemctl --user reset-failed opsx-autopilot`
+before starting it.
 
 ## 9. Stopping / switching plans / teardown
 
