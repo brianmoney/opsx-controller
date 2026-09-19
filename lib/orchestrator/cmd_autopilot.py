@@ -429,9 +429,26 @@ class Autopilot:
             capture=True,
             timeout=_STATUS_TIMEOUT_SECONDS,
         )
+        return self._parse_status_stdout(proc.stdout)
+
+    @staticmethod
+    def _parse_status_stdout(stdout: object) -> dict | None:
+        """Parse the JSON document out of ``status --json`` stdout.
+
+        The child CLI logs plan-resolution banners ("using plan from
+        OPSX_PLAN: ...", "using active plan: ...") to stdout ahead of the
+        document, so skip to the first JSON object instead of requiring
+        stdout to begin with ``{``.  ``raw_decode`` also tolerates trailing
+        text; anything without a JSON object is a parse failure.
+        """
+        if not isinstance(stdout, str):
+            return None
+        start = stdout.find("{")
+        if start < 0:
+            return None
         try:
-            document = json.loads(proc.stdout or "")
-        except (TypeError, json.JSONDecodeError):
+            document, _ = json.JSONDecoder().raw_decode(stdout[start:])
+        except json.JSONDecodeError:
             return None
         return document if isinstance(document, dict) else None
 

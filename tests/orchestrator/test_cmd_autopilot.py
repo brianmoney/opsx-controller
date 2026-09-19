@@ -266,6 +266,16 @@ class CompletionAndBudgetTests(AutopilotHarness):
         self.assertEqual(rc, 0)
         self.assertEqual(engine.run_count, 1)
 
+    def test_resolution_banner_before_json_is_tolerated(self) -> None:
+        banner = "[opsx-plan 00:00:00] using plan from OPSX_PLAN: plan.toml\n"
+        engine = FakeEngine(
+            [], status_raw=banner + json.dumps(document(change(status="done")))
+        )
+        rc, _ = self.run_autopilot(engine)
+        self.assertEqual(rc, 0)
+        self.assertIn("plan_complete", self.event_names())
+        self.assertEqual(self.escalations, [])
+
 
 # ---------------------------------------------------------------------------
 # Approval / veto window
@@ -538,6 +548,18 @@ class NoProgressAndEnvironmentTests(AutopilotHarness):
         rc, _ = self.run_autopilot(engine)
         self.assertEqual(rc, 2)
         self.assertEqual([e["class"] for e in self.escalations], ["environment"])
+
+    def test_status_trailing_text_after_json_is_tolerated(self) -> None:
+        engine = FakeEngine(
+            [],
+            status_raw=(
+                json.dumps(document(change(status="done")))
+                + "\n[opsx-plan 00:00:00] trailing notice\n"
+            ),
+        )
+        rc, _ = self.run_autopilot(engine)
+        self.assertEqual(rc, 0)
+        self.assertIn("plan_complete", self.event_names())
 
 
 # ---------------------------------------------------------------------------
