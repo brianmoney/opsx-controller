@@ -465,6 +465,23 @@ def _cmd_reset_body(args: argparse.Namespace, repo: Path, cfg: dict) -> int:
     changes = resolve_changes(cfg, args.change)
     if changes is None:
         return 2
+    # A done change is archived; resetting it re-runs implement/review cold
+    # against the archived copy rather than repairing the live change. Make
+    # that explicit so a typo cannot silently relaunch finished work.
+    if not bool(getattr(args, "force", False)):
+        done = [
+            cid for cid in changes
+            if state_mod.rec(state, cid).get("status") == base.DONE
+        ]
+        if done:
+            print(
+                "error: refusing to reset done change(s): "
+                f"{', '.join(done)}; resetting a done change re-runs "
+                "implement/review cold against the archived copy. "
+                "Pass --force to override.",
+                file=sys.stderr,
+            )
+            return 2
     for cid in changes:
         state["changes"][cid] = state_mod.new_change_record()
         state["changes"][cid]["max_rounds"] = cfg["max_rounds"]

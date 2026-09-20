@@ -1142,3 +1142,252 @@ the read-only reconstitution-event surface.
 - **THEN** it covers the watchdog loop, the signals and classifications, boot
   reconciliation, quiescence-gated reconstitution, restart bounds, human-wait
   handling, and the reconstitution-event surface
+
+### Requirement: `opsx-plan autopilot` drives a plan unattended
+
+The orchestrator SHALL provide an `opsx-plan autopilot` subcommand that repeatedly invokes `opsx-plan run` for a resolved plan and reacts to the resulting plan state, so a plan can be driven without a foreground operator at a terminal.
+
+`autopilot` SHALL accept `--plan <path>`, `--veto-window-minutes <N>`, `--max-auto-resets <N>`, `--reset-spacing-seconds <N>`, `--poll-seconds <N>`, and `--once`. When `--plan` is omitted, plan resolution SHALL use the same precedence as the other operator commands. `--once` SHALL perform a single pass and exit without looping.
+
+Autopilot SHALL NOT edit plan execution state directly: it SHALL drive the engine only through the `opsx-plan` executable.
+
+When the engine pauses a change on a budget limit, autopilot SHALL notify and stop rather than looping indefinitely. Autopilot SHALL also stop with an escalation when the loop makes no forward progress: three consecutive quick passes that leave every change's status unchanged are treated as no forward progress rather than retried forever.
+
+#### Scenario: Autopilot loops the run engine to plan completion
+
+- **WHEN** an operator runs `opsx-plan autopilot` for a plan with pending work and no gate or failure
+- **THEN** autopilot invokes `opsx-plan run`, observes the resulting state, and keeps invoking the engine until every change is done or skipped before exiting 0
+
+#### Scenario: Single-pass mode runs once and exits
+
+- **WHEN** an operator runs `opsx-plan autopilot --once`
+- **THEN** autopilot performs one pass, handles any gate or failure it reaches, and exits without starting another pass
+
+#### Scenario: A budget pause stops the loop
+
+- **WHEN** the engine pauses a change on a spend or time budget limit
+- **THEN** autopilot notifies the configured topic and stops rather than invoking the engine again
+
+#### Scenario: No forward progress escalates
+
+- **WHEN** three consecutive quick passes leave every change's status unchanged
+- **THEN** autopilot escalates as no forward progress and exits instead of retrying
+
+### Requirement: Autopilot auto-resets bounded transient worker failures
+
+When an `opsx-plan run` invoked by autopilot leaves a change failed with a transient worker failure — invalid subagent output or a stage timeout — autopilot SHALL reset that change and continue the loop instead of escalating immediately.
+
+Auto-reset SHALL be bounded per failure signature. Autopilot SHALL persist each signature's reset count and last-attempt time in `.opsx-plan/autopilot-state.json`, SHALL NOT exceed `max_auto_resets` resets (default 2) for one signature, and SHALL NOT reset the same signature twice within `reset_spacing_seconds` (default 300). The persisted counts SHALL survive an `opsx-plan reset` and a restart of the autopilot process.
+
+When a transient signature's bound is reached, autopilot SHALL escalate it as `transient_exhausted` and SHALL NOT reset it again.
+
+#### Scenario: Transient failure is reset within the bound
+
+- **GIVEN** a change failed with `subagent_output_invalid` and its signature has fewer than `max_auto_resets` recorded resets
+- **WHEN** autopilot handles the failure
+- **THEN** it invokes `opsx-plan reset` for that change, records the attempt against the signature, and continues the loop
+
+#### Scenario: Reset counts survive an engine reset
+
+- **GIVEN** autopilot has recorded two resets for a failure signature in `.opsx-plan/autopilot-state.json`
+- **WHEN** the change is reset again through `opsx-plan reset` and the autopilot process restarts on the same plan
+- **THEN** the recorded resets are still counted and the next transient failure of that signature is bounded by them
+
+#### Scenario: Exhausted transient bound escalates
+
+- **WHEN** a transient failure's signature has already reached `max_auto_resets` recorded resets
+- **THEN** autopilot escalates the change as `transient_exhausted` and does not reset it again
+
+### Requirement: Autopilot escalates non-transient failures without retrying
+
+Autopilot SHALL classify a failed change that is not a bounded transient failure as requiring a human and SHALL escalate it instead of resetting it. Escalated classes SHALL include permanent provider failures (billing or quota exhaustion), permission rejections, `finding_recurrence_exceeded`, `max_rounds_reached`, `no_progress`, archive failures, and any unrecognized failure.
+
+#### Scenario: Provider billing exhaustion escalates immediately
+
+- **WHEN** a failed change's reason or stage log names a provider billing or quota exhaustion
+- **THEN** autopilot escalates the change as `permanent_provider` and does not reset it
+
+#### Scenario: Review budget exhaustion escalates immediately
+
+- **WHEN** a failed change's `last_result` is `finding_recurrence_exceeded`, `max_rounds_reached`, or `no_progress`
+- **THEN** autopilot escalates the change and does not reset it
+
+#### Scenario: Archive failure escalates immediately
+
+- **WHEN** a failed change's archive status is failed or its reason names a post-archive failure
+- **THEN** autopilot escalates the change as `archive_failed` and does not reset it
+
+#### Scenario: Unknown failure escalates immediately
+
+- **WHEN** a failed change cannot be classified as a bounded transient or a named needs-human class
+- **THEN** autopilot escalates the change as `unknown` and does not reset it
+
+### Requirement: Autopilot gives `pause_before` gates a notification and veto window
+
+When `opsx-plan run` leaves a change awaiting approval, autopilot SHALL notify the configured ntfy topic and give the operator a veto window of `veto_window_minutes` (default 30) before auto-approving the gate.
+
+During the window autopilot SHALL auto-approve only after the window elapses; it SHALL stop and escalate the change as `human_veto` when a veto marker file exists at `.opsx-plan/veto/<change-id>`; and it SHALL continue without auto-approving when an out-of-band `opsx-plan approve` records the approval.
+
+#### Scenario: Gate auto-approves after the veto window
+
+- **WHEN** autopilot reaches an awaiting-approval change and no veto marker or manual approval appears within `veto_window_minutes`
+- **THEN** it invokes `opsx-plan approve` for the change and continues the loop
+
+#### Scenario: Veto marker stops the gate
+
+- **WHEN** `.opsx-plan/veto/<change-id>` exists during the change's veto window
+- **THEN** autopilot escalates the change as `human_veto` and does not auto-approve it
+
+#### Scenario: Manual approval short-circuits the wait
+
+- **WHEN** an operator runs `opsx-plan approve <change-id>` during the veto window and the approval appears in plan state
+- **THEN** autopilot continues the loop without waiting out the remaining window and without auto-approving again
+
+### Requirement: Autopilot escalation records a digest and stays down
+
+On escalation, autopilot SHALL append a digest to `.opsx-plan/escalations.jsonl` recording the plan, change id, failure class, `last_result`, reason, findings loci, attempt count, stage log path, and a suggested action. When an ntfy topic is configured it SHALL send a high-priority push, and it SHALL record the decision in its event log.
+
+An escalation for a change that needs human attention SHALL exit 0, so that a unit configured with `Restart=on-failure` stays down for the operator rather than restart-looping.
+
+An environment-class failure that prevents the loop from operating SHALL exit 2 rather than 0, so it is distinguishable from a human-attention escalation.
+
+#### Scenario: Escalation writes a digest and exits clean
+
+- **WHEN** autopilot escalates a failed change or a vetoed gate
+- **THEN** it appends a digest to `.opsx-plan/escalations.jsonl`, sends an ntfy push when a topic is configured, records the decision, and exits 0
+
+#### Scenario: Environment failure exits 2
+
+- **WHEN** autopilot cannot obtain a valid plan status or the engine fails for an environment reason
+- **THEN** autopilot records the escalation and exits 2 instead of 0
+
+### Requirement: Autopilot records its decisions in a durable event log
+
+Autopilot SHALL append a structured record of its loop decisions to `.opsx-plan/autopilot-events.jsonl`, including run start and exit, gate waits, vetoes and auto-approvals, auto-resets, escalations, and plan completion.
+
+#### Scenario: Decisions are recorded as structured events
+
+- **WHEN** autopilot runs a loop iteration
+- **THEN** `.opsx-plan/autopilot-events.jsonl` gains a JSON record for each run boundary, gate wait, reset, veto, escalation, or completion action autopilot takes
+
+### Requirement: Autopilot configuration resolves file, environment, and CLI overrides
+
+Autopilot SHALL read its optional configuration from `~/.config/opsx-controller/autopilot.toml` with keys `ntfy_topic`, `veto_window_minutes`, `max_auto_resets`, `reset_spacing_seconds`, and `poll_seconds`.
+
+When no source supplies a value, autopilot SHALL use its built-in defaults (`veto_window_minutes` 30, `max_auto_resets` 2, `reset_spacing_seconds` 300, and its built-in poll interval). The `OPSX_AUTOPILOT_NTFY_TOPIC` environment variable SHALL override the file's `ntfy_topic`, and explicit CLI flags SHALL override the config file.
+
+An unreadable or malformed config file SHALL be treated as absent rather than aborting the loop.
+
+#### Scenario: Config file values take effect
+
+- **WHEN** `~/.config/opsx-controller/autopilot.toml` sets `max_auto_resets = 1` and no CLI flag or environment variable overrides it
+- **THEN** autopilot bounds transient resets at one per signature
+
+#### Scenario: Environment overrides the notification topic
+
+- **WHEN** the config file sets `ntfy_topic` and `OPSX_AUTOPILOT_NTFY_TOPIC` is also set
+- **THEN** autopilot pushes to the environment variable's topic
+
+#### Scenario: CLI flag overrides the config file
+
+- **WHEN** the config file sets `veto_window_minutes` and the operator passes `--veto-window-minutes` on the command line
+- **THEN** autopilot uses the CLI value for the veto window
+
+#### Scenario: Malformed config does not abort
+
+- **WHEN** `~/.config/opsx-controller/autopilot.toml` is unreadable or malformed
+- **THEN** autopilot proceeds with its defaults and notifications disabled unless a topic is otherwise provided
+
+### Requirement: Autopilot notification failures never stop the run loop
+
+An ntfy push is best-effort. If a push cannot be delivered, autopilot SHALL record the failure and continue; it SHALL NOT fail a stage, abort the loop, or change its exit code because a notification could not be sent.
+
+#### Scenario: Undeliverable push does not stop autopilot
+
+- **WHEN** an ntfy push fails or times out during an escalation or a gate wait
+- **THEN** autopilot records the notification failure and continues its normal loop and exit behavior
+
+### Requirement: `opsx-plan reset` requires `--force` to reset a done change
+
+On the unregistered legacy path, `opsx-plan reset` SHALL refuse to reset a change whose status is done unless the operator passes `--force`. The refusal SHALL name the affected done change, state that resetting re-runs implement and review cold against the archived copy, and exit non-zero without changing plan state.
+
+The reset command SHALL accept a `--force` flag that overrides the guard. Non-done changes SHALL reset without `--force`, and the broker-mediated reset path for registered supervised jobs SHALL be unaffected.
+
+#### Scenario: Done change is refused without force
+
+- **WHEN** an operator runs `opsx-plan reset <change-id>` for a change whose status is done and does not pass `--force`
+- **THEN** the command exits non-zero, names the done change, explains the re-run consequence, and leaves plan state unchanged
+
+#### Scenario: Force overrides the done guard
+
+- **WHEN** an operator runs `opsx-plan reset --force <change-id>` for a done change on the legacy path
+- **THEN** the change is reset to pending
+
+#### Scenario: Non-done changes need no force
+
+- **WHEN** an operator runs `opsx-plan reset <change-id>` for a change that is not done
+- **THEN** the change is reset without requiring `--force`
+
+### Requirement: Repository documentation describes the direct-dispatch-only execution model
+
+The repository's operator-facing and reference documentation SHALL describe
+direct dispatch as the only plan-run execution model. It SHALL state that a
+plan missing any of `implement_invoke`, `review_invoke`, or `archive_invoke`
+fails closed at load time with an error naming the required keys. It SHALL NOT
+present a legacy drive or nested-controller execution mode as an available
+workflow.
+
+#### Scenario: Documentation states the fail-closed requirement
+
+- **WHEN** a reader consults the operator workflow or orchestrator reference
+  for how a plan run is dispatched
+- **THEN** the documentation states that all three stage invokes are required,
+  that a plan missing any of them fails closed at load time, and that there is
+  no fallback execution path
+
+#### Scenario: Documentation offers no legacy execution mode
+
+- **WHEN** the repository's live documentation is searched for a legacy drive
+  or nested-controller plan-run workflow
+- **THEN** no document presents one as available, and any historical mention
+  explicitly states that the path was removed
+
+### Requirement: Documentation states adapter support for compile and plan-run
+
+The repository documentation SHALL state which adapters `opsx-plan compile`
+supports and that Codex CLI plan-run (`opsx-run` / a full stage-invoke plan) is
+unsupported on that adapter. It SHALL NOT instruct operators to enable Codex
+CLI execution by hand-writing stage invokes.
+
+#### Scenario: Codex CLI plan-run is documented as unsupported
+
+- **WHEN** a reader checks whether the Codex CLI adapter can drive a plan run
+- **THEN** the documentation states that plan compilation and single-change
+  `opsx-run` are unsupported for Codex CLI and names the supported adapters
+
+#### Scenario: No hand-written opt-in is taught
+
+- **WHEN** the repository documentation describes Codex CLI plan execution
+- **THEN** it does not direct the reader to hand-write stage invokes to enable
+  it
+
+### Requirement: Repository documentation teaches no deleted surface or retired key
+
+Live repository documentation SHALL NOT describe a deleted controller surface
+(`opsx-drive`, `opsx-author`, `opsx-verify-auto`, `opsx-archive-no-prompt`, or
+the nested-controller agent) or the retired `invoke` and `max_attempts`
+manifest keys as available. Manifest schema documentation SHALL list only the
+current configuration keys.
+
+#### Scenario: Deleted surfaces are absent from live documentation
+
+- **WHEN** the repository's README, `docs/`, `core/`, `skills/`, `plugins/`,
+  and root `AGENTS.md` are searched for deleted controller surfaces
+- **THEN** no document teaches one as a supported workflow, and any historical
+  note is marked as removed or archived
+
+#### Scenario: Retired keys are absent from manifest documentation
+
+- **WHEN** a reader consults a manifest schema table
+- **THEN** it lists the current direct-dispatch keys and does not present the
+  retired `invoke` or `max_attempts` keys as valid configuration

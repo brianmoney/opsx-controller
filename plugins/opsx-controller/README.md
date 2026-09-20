@@ -23,16 +23,17 @@ Plugin contents:
 - `agents/opsx-archiver.md`: archive phase agent
 - `agents/opsx-plan-author.md`: implementation-plan authoring agent
 
-This plugin packages the Claude Code adapter's plan-level authoring surface
-and phase agents. Per-change operations (`implement`, `review`, `archive`)
-are handled through the orchestrator's direct dispatch path; the plugin's
-agents are invoked by `opsx-plan` via its configured stage invokes, not
-directly by the user.
+This plugin packages the Claude Code adapter's plan-level orchestration surface
+and its implement/review/archive phase agents. Plan documents are authored
+against the shared client-neutral reference `core/plan-authoring.md`. Per-change
+propose, apply, archive, and verify work goes through upstream OpenSpec; the
+plugin's phase agents are invoked by `opsx-plan` through its configured direct
+stage invokes, not directly by the user.
 
 Compilation note:
 
 - `/opsx-controller:opsx-plan` authors the markdown plan document in Claude
-  Code.
+  Code, following the shared reference `core/plan-authoring.md`.
 - `opsx-plan compile --adapter claude-code` compiles the markdown into a TOML
   manifest using Claude Code.  This requires a `controller` model resolved for
   the `claude-code` adapter.

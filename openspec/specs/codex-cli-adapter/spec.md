@@ -152,14 +152,17 @@ The archiver agent SHALL:
 
 The adapter SHALL provide an install script at `install.sh` supporting three
 modes:
-- `--global`: copies the `opsx-plan` skill, supported skills, agents, and
-  support files to the global Codex locations.
-- `--project <path>`: copies the `opsx-plan` skill, supported skills, agents,
-  and support files to the project Codex locations and creates or updates
+- `--global`: removes any previously deployed `opsx-drive` skill directory,
+  then copies the `opsx-plan` skill, supported skills, agents, and support
+  files to the global Codex locations.
+- `--project <path>`: removes any previously deployed `opsx-drive` skill
+  directory, then copies the `opsx-plan` skill, supported skills, agents, and
+  support files to the project Codex locations and creates or updates
   `.codex/.gitignore` to ignore `opsx-controller/*.json`.
-- `--plugin`: creates a plugin bundle directory structure with
+- `--plugin`: removes any stale `opsx-drive` skill from a regenerated plugin
+  bundle, then creates a plugin bundle directory structure with
   `.codex-plugin/plugin.json` and copies the `opsx-plan` skill, supported
-  agents, and skills.
+  agents, and skills without an `opsx-drive` path.
 
 The installed Codex plan-authoring skill SHALL read
 `plan-authoring.md` from the project controller support directory first and
@@ -174,20 +177,24 @@ provided.
 #### Scenario: Global install includes plan authoring
 
 - **WHEN** a user runs `bash install.sh --global` from the adapter directory
-- **THEN** the installed Codex support files include the `opsx-plan` skill and
-  the shared plan-authoring reference path is discoverable
+- **THEN** any previously deployed `$HOME/.agents/skills/opsx-drive/`
+  directory is removed, the installed Codex support files include the
+  `opsx-plan` skill, and the shared plan-authoring reference path is
+  discoverable
 
 #### Scenario: Project install includes plan authoring
 
 - **WHEN** a user runs `bash install.sh --project /path/to/project`
-- **THEN** the project receives the `opsx-plan` skill and support files that
-  make the project-level reference the first lookup location
+- **THEN** any previously deployed
+  `/path/to/project/.agents/skills/opsx-drive/` directory is removed, and the
+  project receives the `opsx-plan` skill and support files that make the
+  project-level reference the first lookup location
 
 #### Scenario: Plugin install packages plan authoring
 
 - **WHEN** a user runs `bash install.sh --plugin`
-- **THEN** the self-contained plugin includes the `opsx-plan` skill and no
-  plan-run entrypoint is advertised for Codex
+- **THEN** the self-contained plugin includes the `opsx-plan` skill, contains
+  no `opsx-drive` path, and no plan-run entrypoint is advertised for Codex
 
 #### Scenario: No compile adapter is configured
 
@@ -252,3 +259,16 @@ The adapter SHALL preserve the full core contract without modification:
 
 - **WHEN** reviewer returns `finding_counts: {critical:0, warning:0, note:1}`
 - **THEN** the controller treats this as a review failure and loops back to implement
+
+### Requirement: Codex plans require the direct stage invokes
+
+The `codex-cli` adapter SHALL NOT define or install a legacy `invoke` or
+`max_attempts` plan default. A Codex plan that does not provide the complete
+direct stage invoke configuration SHALL fail closed with guidance naming
+`implement_invoke`, `review_invoke`, and `archive_invoke`, and SHALL NOT
+dispatch a legacy command.
+
+#### Scenario: Codex plan does not fall back to legacy drive mode
+
+- **WHEN** a Codex plan omits any of the three direct stage invoke keys
+- **THEN** the orchestrator refuses the plan and names all three required keys without dispatching a legacy command

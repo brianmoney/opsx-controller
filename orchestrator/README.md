@@ -12,10 +12,17 @@
 1. **create** — if `openspec/changes/<id>` does not exist, invoke your change
    authoring command (e.g. `/opsx-ff ... create a change for {change}`) and
    verify the result independently
-2. **implement / review / archive** — for OpenCode-backed runs, dispatch the
-   fixed `opsx-implementer`, `opsx-reviewer`, and `opsx-archiver` workers as
-   separate one-shot subprocesses, with `opsx-plan` owning phase state,
-   retries, recovery, and verification
+2. **implement / review / archive** — dispatch the fixed `opsx-implementer`,
+   `opsx-reviewer`, and `opsx-archiver` workers as separate one-shot
+   subprocesses through the plan's direct stage invokes, with `opsx-plan`
+   owning phase state, retries, recovery, and verification
+
+Direct dispatch is the only execution model. There is no legacy drive or
+nested-controller path: a plan missing any of `implement_invoke`,
+`review_invoke`, or `archive_invoke` fails at load time with a `PlanError`
+naming all three required keys. `ADAPTER_DEFAULTS` supplies all three invokes
+for `opencode`, `claude-code`, and `dsh`; `codex-cli` defines none, so Codex
+CLI plan-run is unsupported.
 
 The orchestrator is deliberately a deterministic script, not an agent. All
 LLM judgment stays inside `/opsx-ff` and the configured implement/review/archive
@@ -103,9 +110,10 @@ forgot to state, and place judgment gates such as phase exit reviews — add
 those `pause_before = true` entries yourself. Always review the DAG
 (`run --dry-run`) before an unattended run.
 
-If you author plan docs with a frontier model, telling it to follow this
-convention (backticked slugs in `Depends on:`, explicit `(proposed` capability
-markers) makes its output directly compilable.
+For plan-document authoring, follow the shared client-neutral reference at
+`core/plan-authoring.md`: it carries the full compile convention (backticked
+slugs in `Depends on:`, explicit `(proposed` capability markers, and the rest)
+that makes a markdown plan compile cleanly.
 
 ## Plan placement and archival
 
@@ -173,6 +181,11 @@ same defaults as plan-level execution (`max_rounds=5`, `no_progress_limit=2`,
 The change must already exist at `openspec/changes/<change-id>/` with
 `proposal.md` and `tasks.md` authored — `opsx-run` does not create changes.
 
+`opsx-run` is pinned to the OpenCode adapter: `run-one` has no `--adapter` flag.
+To run a single change under `claude-code` or `dsh`, write a one-change manifest
+with the matching `adapter` and use `opsx-plan run`. Codex CLI plan-run is
+unsupported — the adapter defines no stage invokes.
+
 Durable state is persisted to `.opsx-plan/run-<change-id>.state.json`, and stage
 logs go to `.opsx-plan/logs/`. Interrupted runs can be resumed by re-invoking
 the same `opsx-run <change-id>` command. Each run also writes a derived
@@ -226,6 +239,23 @@ Per-stage logs live at `.opsx-plan/logs/<change>.<stage>.r<round>.*.log`, and
 compatibility worker-state snapshots used as phase inputs live under
 `.opsx-plan/workers/`. Add `.opsx-plan/` to the host project's `.gitignore`.
 
+### Unattended execution (autopilot)
+
+`opsx-plan autopilot` wraps `opsx-plan run` in a supervised loop for
+unattended work, replacing the old `setsid nohup` launch discipline. It
+classifies each failed change: transient failures (`subagent_output_invalid`,
+timeouts) get a bounded, spaced auto-reset, while billing/quota, permission
+rejections, `finding_recurrence_exceeded`, `max_rounds_reached`, `no_progress`,
+archive failures, and unknown classes escalate immediately; it announces
+`pause_before` gates that are auto-approved after a veto window unless vetoed,
+and it waits for `opsx-plan accept` on orchestrator-created changes awaiting
+acceptance.
+Run it under the `opsx-autopilot.service` systemd user unit (installed
+disabled); see the [operator workflow guide](../docs/opsx-plan-operator-workflow.md#autopilot-unattended-runs)
+for flags, config keys, escalation digests, and the restart-after-fix flow.
+For a step-by-step procedure see
+[`docs/opsx-autopilot-runbook.md`](../docs/opsx-autopilot-runbook.md).
+
 ## Plan manifest
 
 See `orchestrator/samples/sample-plan.toml` for a canonical example. Per-change fields: `id` (required), `depends_on`,
@@ -276,7 +306,7 @@ state file.
 
 ## Retry and failure policy
 
-- For OpenCode-backed runs, `opsx-plan` owns the implement-review-archive loop
+- For direct-dispatch runs, `opsx-plan` owns the implement-review-archive loop
   directly. It persists the active phase, round, latest fix prompt,
   no-progress streak, review verdict, archive result, and tracked log path in
   the plan state file and resumes from that state on the next run.
@@ -312,7 +342,7 @@ Defaults (override with `implement_invoke` / `review_invoke` /
 |---|---|---|
 | `opencode` | `opencode run --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL" --variant "$OPSX_IMPLEMENTER_VARIANT"`, and similarly for reviewer/archiver | `.opsx-plan/<plan>.state.json` |
 | `claude-code` | `claude -p --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL" --permission-mode bypassPermissions --output-format json`, and similarly for reviewer/archiver | `.opsx-plan/<plan>.state.json` |
-| `codex-cli` | Direct dispatch not available by default — `codex-cli` has no default stage invokes and a codex-cli plan missing explicit `implement_invoke` / `review_invoke` / `archive_invoke` keys fails at load time with a `PlanError` naming all three required keys. An operator can opt into direct dispatch by hand-writing all three invokes in `[plan]`. | `.opsx-plan/<plan>.state.json` |
+| `codex-cli` | Plan-run is unsupported. `codex-cli` defines no default stage invokes, so a codex-cli plan that relies on adapter defaults fails at load time with a `PlanError` naming all three required keys. Use `opencode`, `claude-code`, or `dsh` for plan runs. | `.opsx-plan/<plan>.state.json` |
 | `dsh` | `opsx-dsh-worker --role implementer` (and similarly `--role reviewer` / `--role archiver`) — a shim composes the installed role instructions with the worker input into one headless dsh prompt | plan bookkeeping `.opsx-plan/<plan>.state.json`; per-change state `.opsx-controller/<change>.json` |
 
 The `dsh` invokes resolve their model at exec time inside the shim: the
@@ -356,6 +386,12 @@ mode, and the archive commit per change keeps each step independently
 revertable. If you later want parallel independent branches, run them in
 separate `git worktree` checkouts with a merge step gated on `fast_checks` —
 that belongs above this script, not inside it.
+
+The engine itself stays a foreground serial process; unattended operation is
+handled by the `opsx-plan autopilot` wrapper, which loops `opsx-plan run`,
+bounds auto-resets for transient failures, gates `pause_before` changes behind
+a veto window, and escalates everything it will not retry. See
+"Unattended execution (autopilot)" above.
 
 ## Source layout
 

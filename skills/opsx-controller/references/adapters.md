@@ -10,16 +10,17 @@ all set, regardless of adapter. A plan missing any of the three stage invokes
 fails at load time with a `PlanError`; there is no fallback execution path.
 
 For manual single-change control outside a plan run, use
-`opsx-run <change-id>` (equivalently `opsx-plan run-one <change-id>`)
-on OpenCode and Claude Code — it drives the same implement-review-archive loop
-with no manifest required. Codex CLI and dsh do not support single-change
-`opsx-run`.
+`opsx-run <change-id>` (equivalently `opsx-plan run-one <change-id>`); it is
+pinned to the OpenCode adapter and drives the same implement-review-archive loop
+with no manifest required. Claude Code and dsh run a single change through a
+one-change plan manifest with the matching `adapter` and `opsx-plan run`, and
+Codex CLI plan-run is unsupported.
 
 | Adapter | Direct dispatch defaults | Usage/model source |
 |---|---|---|
 | `opencode` | Supported (`ADAPTER_DEFAULTS`) | OpenCode plugin sidecar (`opencode_plugin`), plus worker JSON and log metadata |
 | `claude-code` | Supported (`ADAPTER_DEFAULTS`) | Claude Code result envelope (`claude_result_json`), plus worker JSON and log metadata |
-| `codex-cli` | Reachable by configuration, but has no `ADAPTER_DEFAULTS` invokes and is unvalidated — an operator must hand-write all three stage invokes in `[plan]` | Worker JSON and log metadata only (no dedicated envelope/sidecar source) |
+| `codex-cli` | Unsupported. `codex-cli` ships no `ADAPTER_DEFAULTS` invokes, so a plan that relies on adapter defaults fails closed at load time with a `PlanError` naming all three required keys. | Worker JSON and log metadata only (no dedicated envelope/sidecar source) |
 | `dsh` | Supported (`ADAPTER_DEFAULTS` dispatch `opsx-dsh-worker --role <stage>`) | Worker JSON and log metadata only (no dedicated envelope/sidecar source) |
 
 Worker JSON parsed from the stage's own one-line JSON result always takes

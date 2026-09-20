@@ -1,0 +1,41 @@
+# opsx-autopilot.service.in — versioned systemd USER unit template for the
+# opsx-controller autopilot unattended runner.
+#
+# This file is installed DATA. Installing it neither enables nor starts
+# anything: no unit is written into any service-manager directory and the plan
+# repository is untouched. The unit is deployed disabled and stays inert until
+# an operator renders this template, applies the drop-in in
+# opsx-autopilot.service.d/, and enables it themselves.
+#
+# Render the ${...} placeholders in the drop-in (for example with `envsubst`),
+# copy both files into ~/.config/systemd/user/, then:
+#
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now opsx-autopilot
+#
+# The unit exits 0 on a clean plan completion and on change-level escalations,
+# so systemd's Restart=on-failure leaves it down until the operator fixes the
+# cause and starts it again. Environment-class escalations exit 2 and are
+# retried by Restart=on-failure until StartLimitBurst trips.
+#
+# Configuration:
+#   * Plan selection is carried by the drop-in's Environment=OPSX_PLAN (or the
+#     repository's active-plan pointer when the drop-in omits it).
+#   * ntfy topic and timing come from ~/.config/opsx-controller/autopilot.toml
+#     for the user the user manager runs as.
+
+[Unit]
+Description=opsx-controller autopilot unattended plan runner
+After=network-online.target
+# Bound restart thrash: at most 5 starts per 10 minutes, then stay down.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/opsx-plan autopilot
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

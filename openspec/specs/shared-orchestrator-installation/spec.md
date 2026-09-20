@@ -195,3 +195,21 @@ stale and SHALL direct the operator to rerun an installer.
 
 - **WHEN** an operator runs `opsx-plan doctor` with no supervised roles and no allowlist configured
 - **THEN** the installation is reported exactly as before, with the supervised roles shown as unconfigured rather than as an error
+
+### Requirement: Global installs deploy the disabled autopilot service packaging
+
+Every global adapter installer and the universal installer SHALL deploy the autopilot packaging into the installed runtime tree: the versioned systemd user unit template `opsx-autopilot.service.in`, its plan-binding drop-in template `opsx-autopilot.service.d/plan.conf.in`, and the autopilot runbook document.
+
+These artifacts SHALL be installed as data only. The installer SHALL NOT write a unit into any service-manager directory, SHALL NOT enable, start, or activate the unit, and SHALL NOT alter the plan repository; the unit stays inert until an operator renders the templates and enables it.
+
+The unit template SHALL specify `Restart=on-failure` with a bounded start limit of five starts per 600 seconds.
+
+#### Scenario: Global install provides the disabled autopilot unit artifacts
+
+- **WHEN** an operator runs any adapter's global installer or the universal installer
+- **THEN** the autopilot unit template and its plan drop-in template are installed in the runtime tree, and the unit is neither enabled nor started
+
+#### Scenario: Global install provides the autopilot runbook
+
+- **WHEN** an operator runs any adapter's global installer or the universal installer
+- **THEN** `~/.local/lib/opsx-controller/docs/opsx-autopilot-runbook.md` contains the current repository runbook

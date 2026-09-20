@@ -1,5 +1,11 @@
 # durable-plan-supervision Specification
 
+> **Dormant as of 2026-09-19.** The supervision stack is stopped and disabled
+> and its separate service/worker principals are unprovisioned for new work;
+> day-to-day unattended operation is handled by `opsx-plan autopilot`. This
+> capability remains implemented and valid when provisioned, and this
+> specification is retained as the living contract.
+
 ## Purpose
 
 Durable, versioned supervision storage for plan execution: a schema-versioned

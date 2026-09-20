@@ -25,7 +25,9 @@ The orchestrator SHALL apply the same plan-owned round control, retry budgets, n
 The Claude Code adapter SHALL NOT ship or install the superseded `opsx-drive`
 skill. Reinstalling globally or into a project SHALL remove a previously
 deployed `opsx-drive` skill directory while preserving supported skills,
-agents, and plan-level support files.
+agents, and plan-level support files. The Claude plugin bundle SHALL likewise
+contain no `opsx-drive` skill path, so a packaged install cannot reintroduce
+the removed surface.
 
 #### Scenario: Global reinstall removes the legacy skill
 
@@ -40,6 +42,12 @@ agents, and plan-level support files.
   containing a previously deployed `opsx-drive` skill
 - **THEN** that skill directory is removed and supported project surfaces are
   installed
+
+#### Scenario: Packaged plugin bundle excludes the legacy skill
+
+- **WHEN** the Claude plugin bundle for `opsx-controller` is inspected
+- **THEN** it contains no `opsx-drive` skill directory and advertises only the
+  supported plan-level and worker surfaces
 
 ### Requirement: The `claude-code` adapter supplies direct stage invoke defaults
 

@@ -12,8 +12,12 @@ dependency order in your head.
 tool of your choice, or by hand. `opsx-plan` compiles it into a dependency
 graph, authors each change, and loops implement → review until a review comes
 back with zero findings, then archives it — verifying against ground truth at
-every step and failing closed when anything is ambiguous. It works the same way
-whether the underlying agent is Claude Code, OpenCode, or Codex CLI.
+every step and failing closed when anything is ambiguous. Plan runs use direct
+dispatch: OpenCode, Claude Code, and dsh each ship the stage invokes that drive
+the loop, while Codex CLI plan-run is unsupported. `opsx-plan compile` supports
+OpenCode and Claude Code. A plan missing any of `implement_invoke`,
+`review_invoke`, or `archive_invoke` fails closed at load time, naming the keys
+it needs — there is no fallback execution path.
 
 ```bash
 $EDITOR openspec/plans/my-plan.md                                          # you write this
@@ -55,8 +59,8 @@ The run below drove 10 changes to completion in one session, unattended:
   change that stops making progress stops the run instead of guessing.
 - **Resumable.** State is durable per change. Interrupt a run and re-run it;
   it picks up where it left off.
-- **Client-portable.** The same contract runs on three coding agents, so
-  switching clients does not mean rewriting the workflow.
+- **Client-portable.** The same controller contract runs on multiple coding
+  clients, so switching clients does not mean rewriting the workflow.
 - **Measurable.** Every stage emits telemetry, so you can compare model
   combinations on rounds, duration, first-pass rate, and cost.
 
@@ -134,9 +138,11 @@ stdlib-only.
 > orchestrator to `~/.local/bin/`.**  `opsx-plan compile` supports `--adapter
 > opencode` (the default) and `--adapter claude-code`.  Every adapter's global
 > installer deploys `opsx-plan` and `opsx-run` to `~/.local/bin/` via a shared
-> installer helper.  `opsx-run` is supported on OpenCode and Claude Code only;
-> Codex CLI and dsh have no default stage invokes and cannot drive
-> single-change `opsx-run` without a hand-written plan manifest.
+> installer helper.  `opsx-run` (single-change `run-one`) is pinned to
+> OpenCode; Claude Code and dsh run one authored change through a plan manifest
+> with `opsx-plan run`.  Codex CLI plan-run is unsupported — the adapter defines
+> no default stage invokes, so a codex-cli plan that relies on adapter defaults
+> fails closed at load time, naming the keys it needs.
 > See [docs/adapters.md](docs/adapters.md#choosing-an-adapter).
 
 **1. Clone and configure models.**
@@ -217,7 +223,7 @@ already-authored change, skip the plan manifest entirely with
 | [Operator Workflow](docs/opsx-plan-operator-workflow.md) | The full operator loop: activation, `doctor`, budgets, manual gates, logs, notifications, branch/PR delivery |
 | [Plan-Authoring Reference](core/plan-authoring.md) | How to write compilable markdown implementation plans for `opsx-plan compile` |
 | [Adapter Reference](docs/adapters.md) | Per-client install and packaging for OpenCode, Claude Code, Codex CLI, and dsh |
-| [Orchestrator Reference](orchestrator/README.md) | Manifest schema, execution model, retry policy, adapter invocation |
+| [Orchestrator Reference](orchestrator/README.md) | Manifest schema, execution model, retry policy, adapter support |
 | [Model Efficiency Workflow](core/model-efficiency-workflow.md) | Benchmarking model choices with telemetry, reports, and dashboards |
 | [Controller Contract](core/controller-contract.md) | Lifecycle, phase order, stop conditions |
 | [State Schema](core/state-schema.md) | Durable state expectations and resume behavior |

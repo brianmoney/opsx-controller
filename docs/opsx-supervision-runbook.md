@@ -1,3 +1,8 @@
+> **Dormant as of 2026-09-19.** The supervision stack is stopped and disabled,
+> and its separate service/worker principals are unprovisioned for new work.
+> Day-to-day unattended operation is superseded by `opsx-plan autopilot`; this
+> document is retained as design reference only.
+
 # opsx-plan supervision runbook
 
 Practical, end-to-end operating procedure for the `opsx-plan` supervised

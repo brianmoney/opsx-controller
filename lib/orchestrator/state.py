@@ -106,6 +106,7 @@ def new_change_record() -> dict:
         "max_rounds": 5,
         "no_progress_streak": 0,
         "latest_fix_prompt": "",
+        "worker_sessions": {},
         "last_result": "",
         "task_counts": {"complete": 0, "total": 0},
         "manual_tasks_pending": [],

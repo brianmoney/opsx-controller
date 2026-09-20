@@ -2,7 +2,9 @@
 
 `opsx-controller` ships one adapter per coding client. Each adapter maps the
 same three phases — implement, review, archive — onto that client's packaging
-model, so the core controller semantics stay identical.
+model, so the core controller semantics stay identical. Plan compilation and
+plan-run support vary by adapter, and direct dispatch is the only plan-run
+execution model.
 
 - [Choosing an adapter](#choosing-an-adapter)
 - [Model configuration](#model-configuration)
@@ -15,26 +17,29 @@ model, so the core controller semantics stay identical.
 
 ## Choosing an adapter
 
-All four adapters drive the same loop. They differ in what gets installed and
-in the plan compilation and authoring capabilities that vary by adapter:
+All four adapters install the same controller surfaces. They differ in what
+gets installed and in the plan compilation and plan-run capabilities that vary
+by adapter:
 
 | | OpenCode | Claude Code | Codex CLI | dsh |
 |---|---|---|---|---|
-| implement / review / archive loop (plan-level) | yes | yes | opt-in (hand-written stage invokes) | yes |
+| implement / review / archive loop (plan-level) | yes | yes | no (plan-run unsupported) | yes |
 | `opsx-plan` + `opsx-run` on `PATH` | installed to `~/.local/bin` | installed to `~/.local/bin` | installed to `~/.local/bin` | installed to `~/.local/bin` |
 | single-change `opsx-run` | yes | no (OpenCode-pinned) | no (OpenCode-pinned) | no (OpenCode-pinned) |
 | `opsx-plan compile` (markdown plan → TOML) | yes (OpenCode controller model) | yes (Claude Code controller model) | needs OpenCode or Claude Code | needs OpenCode or Claude Code |
-| plan authoring skill (`/opsx-plan`) | yes | yes | — | — |
+| plan authoring skill (`/opsx-plan`) | yes | yes | yes | — |
 
 All four adapters install `opsx-plan` and `opsx-run` to `~/.local/bin/`
 via the shared installer helper. The Codex CLI and dsh adapters do not support
-plan compilation (`opsx-plan compile`) or single-change `opsx-run`, but their
-global installers still deploy the orchestrator executables — use
-`opsx-plan` from `PATH` as you would with any other adapter.
+plan compilation (`opsx-plan compile`), but their global installers still
+deploy the orchestrator executables — use `opsx-plan` from `PATH` as you would
+with any other adapter.
 Single-change `opsx-run` is OpenCode-pinned: `run-one` has no `--adapter` flag
-and always uses the OpenCode adapter. Claude Code, Codex CLI, and dsh operators
-run single changes via a hand-written plan manifest with `adapter = "claude-code"`
-and `opsx-plan run` instead.
+and always uses the OpenCode adapter. Claude Code and dsh operators run a single
+change via a one-change plan manifest with the matching `adapter` and
+`opsx-plan run` instead. Codex CLI plan-run is unsupported — the adapter defines
+no default stage invokes, so a codex-cli plan that relies on adapter defaults
+fails closed at load time naming all three required keys.
 
 `opsx-plan compile` supports OpenCode (the default) and Claude Code (via
 `--adapter claude-code`). Each requires a `controller` model resolved for
@@ -76,6 +81,9 @@ What it contains:
 - `adapters/opencode/agents/opsx-reviewer.md`: strict reviewer agent
 - `adapters/opencode/agents/opsx-archiver.md`: non-interactive archiver agent
 - `adapters/opencode/support/opsx-controller-state-README.md`: state contract
+- deployed `plan-authoring.md` reference (copied from `core/plan-authoring.md`)
+  at `~/.config/opencode/opsx-controller/plan-authoring.md` (global) or
+  `<project>/.opencode/opsx-controller/plan-authoring.md` (project)
 - `adapters/opencode/templates/project/`: host-project setup snippets
 - `adapters/opencode/install.sh`: OpenCode installer
 
@@ -130,6 +138,9 @@ What it contains:
 - `adapters/claude-code/agents/opsx-plan-author.md`: implementation-plan
   authoring agent
 - `adapters/claude-code/support/opsx-controller-state-README.md`: state contract
+- deployed `plan-authoring.md` reference (copied from `core/plan-authoring.md`)
+  at `~/.claude/opsx-controller/plan-authoring.md` (global) or
+  `<project>/.claude/opsx-controller/plan-authoring.md` (project)
 - `adapters/claude-code/templates/project/`: host-project setup snippets
 - `adapters/claude-code/install.sh`: Claude Code installer
 
@@ -180,6 +191,9 @@ What it contains:
 - `adapters/codex-cli/agents/opsx-reviewer.toml`: strict review phase agent
 - `adapters/codex-cli/agents/opsx-archiver.toml`: archive phase agent
 - `adapters/codex-cli/support/opsx-controller-state-README.md`: state contract
+- deployed `plan-authoring.md` reference (copied from `core/plan-authoring.md`)
+  at `~/.codex/opsx-controller/plan-authoring.md` (global) or
+  `<project>/.codex/opsx-controller/plan-authoring.md` (project)
 - `adapters/codex-cli/templates/project/`: host-project setup snippets
 - `adapters/codex-cli/install.sh`: Codex CLI installer
 - `adapters/codex-cli/plugin/`: marketplace plugin bundle
@@ -198,6 +212,13 @@ Install:
 bash adapters/codex-cli/install.sh --global
 bash adapters/codex-cli/install.sh --project /path/to/project
 ```
+
+Plan-run is unsupported on this adapter. `codex-cli` defines no default
+`implement_invoke` / `review_invoke` / `archive_invoke`, so a `codex-cli` plan
+that relies on adapter defaults fails closed at load time with a `PlanError`
+naming all three required keys. Compile the markdown through `--adapter
+opencode` or `--adapter claude-code`, then drive the loop on an adapter that
+supports plan-run.
 
 Project install behavior:
 
@@ -233,6 +254,9 @@ What it contains:
 - `adapters/dsh/agents/opsx-archiver.md`: non-interactive archive phase role
   instructions
 - `adapters/dsh/support/opsx-controller-state-README.md`: state contract
+- deployed `plan-authoring.md` reference (copied from `core/plan-authoring.md`)
+  at `~/.config/opsx-controller/dsh/plan-authoring.md` (global) or
+  `<project>/.opsx-controller/dsh/plan-authoring.md` (project)
 - `adapters/dsh/templates/project/AGENTS.snippet.md`: host-project setup
   snippet
 - `adapters/dsh/install.sh`: dsh installer
@@ -398,17 +422,19 @@ It is a guidance package, not a full cross-client automated installer.
 
 ## Deprecation notes
 
-`/opsx-drive` (the legacy nested-controller single-change path, available per-adapter
-as `/opsx-drive`, `/opsx-controller:opsx-drive`, or `$opsx-drive`) is
-**removed**. Direct dispatch has been the only execution path since the stage
-invokes were introduced; the nested-controller path is no longer available.
+> **Historical.** The legacy `/opsx-drive` command and its nested-controller
+> single-change path (once shipped per-adapter as `/opsx-drive`,
+> `/opsx-controller:opsx-drive`, or `$opsx-drive`) have been **removed**. They
+> are recorded here only so an operator who remembers the old surface knows
+> what happened to it: no adapter ships it any longer, and direct dispatch has
+> been the only execution path since the stage invokes were introduced.
 
 Use `opsx-run <change-id>` (equivalently `opsx-plan run-one <change-id>`) for
 single-change execution: it is OpenCode-pinned (`run-one` has no `--adapter`
 flag) and drives the implement/review/archive loop with the same retry,
-no-progress, and archive-verification gates. Claude Code, Codex CLI, and dsh
-users run single changes via a plan manifest with `adapter = "claude-code"` and
-`opsx-plan run`.
+no-progress, and archive-verification gates. Claude Code and dsh users run a
+single change via a one-change plan manifest with the matching `adapter` and
+`opsx-plan run`; Codex CLI plan-run is unsupported.
 
 ## Adding another adapter
 

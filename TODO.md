@@ -87,3 +87,41 @@ request path separately.
   response extraction
 - `tests/orchestrator/test_opsx_plan.py` — OpenCode JSONL parsing and malformed
   output retry tests
+
+## Secure remote approval channel for autopilot gates
+
+Autopilot's ntfy.sh integration is send-only. Gate, acceptance, and escalation
+pushes carry no ntfy `Actions` header and the wrapper never subscribes to the
+topic, so the only approval paths are local (`opsx-plan approve`,
+`opsx-plan accept`, `.opsx-plan/veto/<change-id>`). ntfy.sh topics are also
+unguessable-but-unauthenticated shared secrets: anyone who learns the topic can
+read pushes or forge one, so a phone-based approval flow is both unavailable
+and unsafe as-is. An operator away from the terminal can receive alerts but
+cannot act on them.
+
+Goal: an authenticated, remote-capable channel for responding to `pause_before`
+gates and orchestrator-created acceptance prompts (including vetoes).
+
+Candidates: reuse the dormant broker-mediated approval path from
+`durable-plan-supervision` (the operator-authority boundary is already
+specified there) as the action backend, paired with an authenticated transport
+— self-hosted ntfy with access tokens plus `Actions` HTTP buttons hitting the
+broker endpoint, or a bot on Matrix/Telegram/Slack. A reply-by-message variant
+(subscribe to `https://ntfy.sh/<topic>/json`, parse `approve <cid>` commands)
+is the simplest transport but carries the same auth gap. Any action endpoint
+needs authenticity and replay protection: possession of a topic must never
+imply approval authority.
+
+### Places needing change
+
+- `lib/orchestrator/cmd_autopilot.py` — `_push_ntfy()` adds the `Actions`
+  header for gate/acceptance pushes; decision point for a subscribe/command
+  loop
+- `lib/orchestrator/supervision_service.py`, `lib/orchestrator/journal_dispatch.py`
+  — dormant broker-mediated approval path to reuse for authenticated actions
+- `lib/orchestrator/cmd_gates.py` — `approve`/`accept`/veto entry points the
+  broker would front
+- `docs/opsx-autopilot-runbook.md`, `docs/opsx-plan-operator-workflow.md` —
+  document the chosen channel, auth model, and fallback
+- `openspec/specs/durable-plan-supervision/` — extend the operator-authority
+  requirements with the channel's threat model

@@ -27,14 +27,18 @@ Current adapters:
 
 ## Upstream / Controller boundary
 
-Upstream OpenSpec provides per-change operations (`openspec propose`, `openspec
-apply`, `openspec archive`, `openspec validate`) — these are the single-change
-primitives that `opsx-controller` invokes through each adapter's client-specific
-commands (`/opsx-apply`, `/opsx:apply`, etc.). The controller sits above
-OpenSpec: it drives the implement-review-archive loop, persists durable per-change
-state, and enforces the strict review gate. For plan-level orchestration across
-multiple changes, `opsx-plan` compiles a markdown plan into a TOML dependency DAG
-and sequences changes through this per-change loop.
+Upstream OpenSpec provides the per-change operations — propose, apply, archive,
+and verify — through each client's upstream commands (`/opsx-apply`,
+`/opsx:apply`, etc.). Those operations are how a single change is authored and
+maintained; they are not a controller-owned per-change workflow.
+
+The controller sits above OpenSpec and owns plan-level orchestration. `opsx-plan`
+compiles a markdown plan into a TOML dependency DAG and sequences each change
+through the direct implement-review-archive loop, persisting durable per-change
+state and enforcing the strict review gate. Direct dispatch is the only plan-run
+execution model: a plan missing any of `implement_invoke`, `review_invoke`, or
+`archive_invoke` fails closed at load time naming the required keys. Plan
+documents are authored against the shared `plan-authoring.md` reference above.
 
 ## Operator Workflow
 

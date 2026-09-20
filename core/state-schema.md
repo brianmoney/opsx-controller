@@ -16,6 +16,7 @@ Recommended minimum fields:
   "max_rounds": 5,
   "no_progress_streak": 0,
   "latest_fix_prompt": "",
+  "worker_sessions": {},
   "last_result": "",
   "task_counts": {"complete": 0, "total": 0},
   "tracked_change_files": [],
