@@ -131,7 +131,9 @@ objection and removes the `command not found` wall entirely.
 - Changing the controller contract, phase protocol, or state schema.
 - Codex CLI feature parity beyond installation. `ADAPTER_DEFAULTS` has no
   `implement_invoke` / `review_invoke` / `archive_invoke` entries for
-  `codex-cli`. A plan missing any of the three stage invokes fails at load
-  time with a `PlanError`; Codex CLI single-change `opsx-run` is unsupported
-  without a hand-written plan manifest.
+  `codex-cli`, so Codex CLI plan-run (`opsx-run` or a full stage-invoke plan)
+  is unsupported. A `codex-cli` plan that relies on adapter defaults is missing
+  all three stage invokes and fails at load time with a `PlanError` naming all
+  three required keys. Compile and drive plans through `opencode` or
+  `claude-code`.
 - Removing OpenSpec as a prerequisite of the target repository.

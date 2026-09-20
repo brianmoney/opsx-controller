@@ -1327,3 +1327,67 @@ The reset command SHALL accept a `--force` flag that overrides the guard. Non-do
 
 - **WHEN** an operator runs `opsx-plan reset <change-id>` for a change that is not done
 - **THEN** the change is reset without requiring `--force`
+
+### Requirement: Repository documentation describes the direct-dispatch-only execution model
+
+The repository's operator-facing and reference documentation SHALL describe
+direct dispatch as the only plan-run execution model. It SHALL state that a
+plan missing any of `implement_invoke`, `review_invoke`, or `archive_invoke`
+fails closed at load time with an error naming the required keys. It SHALL NOT
+present a legacy drive or nested-controller execution mode as an available
+workflow.
+
+#### Scenario: Documentation states the fail-closed requirement
+
+- **WHEN** a reader consults the operator workflow or orchestrator reference
+  for how a plan run is dispatched
+- **THEN** the documentation states that all three stage invokes are required,
+  that a plan missing any of them fails closed at load time, and that there is
+  no fallback execution path
+
+#### Scenario: Documentation offers no legacy execution mode
+
+- **WHEN** the repository's live documentation is searched for a legacy drive
+  or nested-controller plan-run workflow
+- **THEN** no document presents one as available, and any historical mention
+  explicitly states that the path was removed
+
+### Requirement: Documentation states adapter support for compile and plan-run
+
+The repository documentation SHALL state which adapters `opsx-plan compile`
+supports and that Codex CLI plan-run (`opsx-run` / a full stage-invoke plan) is
+unsupported on that adapter. It SHALL NOT instruct operators to enable Codex
+CLI execution by hand-writing stage invokes.
+
+#### Scenario: Codex CLI plan-run is documented as unsupported
+
+- **WHEN** a reader checks whether the Codex CLI adapter can drive a plan run
+- **THEN** the documentation states that plan compilation and single-change
+  `opsx-run` are unsupported for Codex CLI and names the supported adapters
+
+#### Scenario: No hand-written opt-in is taught
+
+- **WHEN** the repository documentation describes Codex CLI plan execution
+- **THEN** it does not direct the reader to hand-write stage invokes to enable
+  it
+
+### Requirement: Repository documentation teaches no deleted surface or retired key
+
+Live repository documentation SHALL NOT describe a deleted controller surface
+(`opsx-drive`, `opsx-author`, `opsx-verify-auto`, `opsx-archive-no-prompt`, or
+the nested-controller agent) or the retired `invoke` and `max_attempts`
+manifest keys as available. Manifest schema documentation SHALL list only the
+current configuration keys.
+
+#### Scenario: Deleted surfaces are absent from live documentation
+
+- **WHEN** the repository's README, `docs/`, `core/`, `skills/`, `plugins/`,
+  and root `AGENTS.md` are searched for deleted controller surfaces
+- **THEN** no document teaches one as a supported workflow, and any historical
+  note is marked as removed or archived
+
+#### Scenario: Retired keys are absent from manifest documentation
+
+- **WHEN** a reader consults a manifest schema table
+- **THEN** it lists the current direct-dispatch keys and does not present the
+  retired `invoke` or `max_attempts` keys as valid configuration

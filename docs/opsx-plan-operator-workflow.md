@@ -305,20 +305,22 @@ default.
 **Constraint:** `create_pull_request = true` requires `enabled = true`. Setting
 `create_pull_request` without `enabled` is a plan-load error.
 
-### Direct dispatch is adapter-neutral
+### Direct dispatch is the only execution model
 
 A plan takes the direct implement-review-archive path — bounded per-stage
 worker subprocesses, plan-owned round control, stage logs under
 `.opsx-plan/logs/`, and telemetry — whenever all three of `implement_invoke`,
-`review_invoke`, and `archive_invoke` resolve to a non-empty command. This is
-a configuration test only; it does not depend on which `adapter` is
-configured. A plan missing one or more of the three stage invokes fails at
-load time with a `PlanError` naming all three keys (`implement_invoke`,
-`review_invoke`, `archive_invoke`) — there is no fallback execution path.
+`review_invoke`, and `archive_invoke` resolve to a non-empty command. For the
+supported plan-run adapters — `opencode`, `claude-code`, and `dsh` — this is a
+configuration test over the resolved stage invokes rather than a check of
+adapter identity. A plan missing one or more of the three stage invokes fails
+at load time with a `PlanError` naming all three keys (`implement_invoke`,
+`review_invoke`, `archive_invoke`) — there is no fallback execution path and no
+legacy drive or nested-controller mode.
 
-`ADAPTER_DEFAULTS` supplies all three stage invokes for both `opencode` and
-`claude-code`, so plans using either adapter take the direct path with no
-manifest changes. The `claude-code` defaults are:
+`ADAPTER_DEFAULTS` supplies all three stage invokes for `opencode`,
+`claude-code`, and `dsh`, so plans using those adapters take the direct path
+with no manifest changes. The `claude-code` defaults are:
 
 ```
 implement_invoke = claude -p --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL" --permission-mode bypassPermissions --output-format json
@@ -332,14 +334,18 @@ still bounded by each worker agent's own `tools:` frontmatter (installed at
 `~/.claude/agents/` or `<project>/.claude/agents/`), the same place OpenCode
 bounds tool scope via its `permission:` block.
 
-`codex-cli` has no `implement_invoke`/`review_invoke`/`archive_invoke`
-defaults. Because the gate is configuration-driven, an operator can still
-opt `codex-cli` (or any adapter) into direct dispatch by hand-writing all
-three invokes in `[plan]` — this is reachable but unvalidated.
+`codex-cli` defines no stage invokes, and it is not a supported plan-run
+adapter: Codex CLI plan execution is unsupported regardless of any hand-written
+stage invokes. A `codex-cli` plan that relies on adapter defaults fails closed
+at load time with a `PlanError` naming all three required keys
+(`implement_invoke`, `review_invoke`, `archive_invoke`), and supplying the keys
+by hand does not make Codex CLI a supported plan-run target. Compile the
+markdown through `--adapter opencode` or `--adapter claude-code`, then drive the
+loop on an adapter that supports plan-run.
 
-Any stage invoke may be overridden per-plan by setting the corresponding key
-in `[plan]`; overriding one stage leaves the other two on their adapter
-defaults.
+For a supported plan-run adapter, any stage invoke may be overridden per-plan
+by setting the corresponding key in `[plan]`; overriding one stage leaves the
+other two on their adapter defaults.
 
 #### Environment variable expansion in stage invokes
 

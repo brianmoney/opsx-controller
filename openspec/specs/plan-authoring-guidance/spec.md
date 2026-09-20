@@ -3,7 +3,9 @@
 ## Purpose
 Provide a single client-neutral, discoverable contract for writing compilable
 and appropriately scoped OpenSpec implementation plans across all adapters.
+
 ## Requirements
+
 ### Requirement: The reference defines the plan-authoring contract
 
 The project SHALL provide a client-neutral reference that documents the
@@ -127,3 +129,27 @@ in an unattended run is an authoring defect.
   must perform by hand
 - **THEN** the reference identifies this as an authoring defect that fails
   the run before archive
+
+### Requirement: Repository documentation points plan authoring at the shared reference
+
+Every repository document, skill package, or plugin README that describes
+writing plan documents SHALL direct readers to the client-neutral
+`core/plan-authoring.md` reference rather than restating the compile
+convention or omitting the authoring path. Repository documentation SHALL
+describe plan-level orchestration (`opsx-plan` / `opsx-run`) and SHALL route
+per-change propose, apply, archive, and verify work to upstream OpenSpec rather
+than teaching a controller-owned per-change workflow.
+
+#### Scenario: Authoring documentation points at the reference
+
+- **WHEN** a reader consults a repository document that covers plan authoring
+- **THEN** it points at `core/plan-authoring.md` as the source of the
+  convention
+
+#### Scenario: Division of labor is documented
+
+- **WHEN** a reader consults the controller documentation for how per-change
+  work is performed
+- **THEN** the documentation directs them to upstream OpenSpec commands and
+  skills for propose, apply, archive, and verify, and reserves `opsx-plan` /
+  `opsx-run` for plan-level orchestration and the supported single-change loop

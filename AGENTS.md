@@ -17,6 +17,14 @@ client-neutral reference is `core/plan-authoring.md`. Plan-authoring agents
 and operators should follow that document; adapter-specific surfaces should
 point to it rather than restating authoring rules.
 
+The execution model is direct dispatch only: `opsx-plan` sequences a compiled
+plan and dispatches the implement, review, and archive workers through the
+plan's stage invokes, and a plan missing any of `implement_invoke`,
+`review_invoke`, or `archive_invoke` fails closed at load time. Plan-level
+orchestration (`opsx-plan` / `opsx-run`) is the controller's scope; per-change
+propose, apply, archive, and verify work belongs to upstream OpenSpec commands
+and skills, not to a controller-owned per-change workflow.
+
 ## Delegation: sub-agents are the default
 
 Operators run expensive models in this repo, so primary-agent tokens and

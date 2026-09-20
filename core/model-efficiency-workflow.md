@@ -118,7 +118,7 @@ unsupervised runs.
 
 | Role | Env var exported at plan load | Agent role |
 |---|---|---|
-| `controller` | `OPSX_CONTROLLER_MODEL` | plan‑drive orchestrator (`opsx-plan compile`) |
+| `controller` | `OPSX_CONTROLLER_MODEL` | plan-level orchestrator (`opsx-plan compile`) |
 | `implementer` | `OPSX_IMPLEMENTER_MODEL` | implement phase |
 | `reviewer` | `OPSX_REVIEWER_MODEL` | review phase |
 | `archiver` | `OPSX_ARCHIVER_MODEL` | archive phase |
@@ -253,6 +253,9 @@ model choice rather than to different work.
   of a benchmarking cycle. Record the version in your run notes.
 
 ### Practical guidance for a comparison run
+
+Author the comparison plan against the shared client-neutral reference at
+`core/plan-authoring.md`, which carries the compile convention.
 
 ```bash
 # 1. Author a plan once (the "comparison plan")

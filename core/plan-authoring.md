@@ -240,8 +240,11 @@ opsx-controller provides plan-level orchestration commands:
 
 - **`opsx-plan`** — compile, run, report on multi-change plans. The CLI
   entrypoint, installed to `~/.local/bin/opsx-plan`.
-- **`opsx-run`** — manual single-change controller loop (OpenCode and Claude
-  Code only; not supported on Codex CLI or dsh).
+- **`opsx-run`** — manual single-change controller loop (OpenCode only: the
+  `run-one` path is pinned to the OpenCode adapter and has no `--adapter` flag;
+  Claude Code and dsh run a single change through a one-change plan manifest
+  instead). Codex CLI plan-run is unsupported — the adapter defines no stage
+  invokes.
 - **`opsx-watch-plan`** — live stage-log follower.
 
 ### Rule
@@ -377,7 +380,7 @@ Before reporting the plan document as complete:
 
 2. **Compile self-check.** When `opsx-plan` is available on PATH:
    ```bash
-   opsx-plan compile <doc> -o /tmp/opsx-author-selfcheck.toml --force
+   opsx-plan compile <doc> -o /tmp/opsx-plan-selfcheck.toml --force
    ```
    Verify the compile succeeds and produces the expected changes. Fix any
    missing dependencies or malformed structure and re-run until clean.

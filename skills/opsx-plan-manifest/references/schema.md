@@ -4,6 +4,11 @@ Current as of controller commit `562962b` (July 2026). If the installed
 controller looks newer, re-derive rather than trusting this file — see
 [Re-deriving from source](#re-deriving-from-source).
 
+Authoring the markdown plan document that `opsx-plan compile` consumes is
+covered by the shared client-neutral reference `core/plan-authoring.md`. This
+schema covers the TOML manifest half and lists only the keys the current loader
+reads; keys retired with the legacy drive mode are not valid configuration.
+
 ## Contents
 
 - [Re-deriving from source](#re-deriving-from-source)
@@ -114,10 +119,10 @@ implement-review-archive path with no manifest changes:
   "$OPSX_{IMPLEMENTER,REVIEWER,ARCHIVER}_MODEL" --permission-mode
   bypassPermissions --output-format json`
 
-`codex-cli` defines no stage invokes. A plan missing one or more of the
-three stage invokes fails at load time with a `PlanError` naming all three
-required keys — there is no fallback execution path. An operator can opt
-`codex-cli` into direct dispatch by hand-writing all three invokes in `[plan]`.
+`codex-cli` defines no default stage invokes, so Codex CLI plan-run is
+unsupported. A `codex-cli` plan that relies on adapter defaults fails at load
+time with a `PlanError` naming all three required keys — there is no fallback
+execution path.
 
 `dsh` defines stage invokes that dispatch the installed shim
 (`opsx-dsh-worker --role implementer`, `--role reviewer`, `--role archiver`),

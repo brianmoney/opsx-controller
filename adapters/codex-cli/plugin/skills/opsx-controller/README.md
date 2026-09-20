@@ -13,9 +13,12 @@ SKILL_BASE_URL="https://github.com/brianmoney/opsx-controller/tree/main" \
 Contents:
 
 - `SKILL.md`: main skill entrypoint covering plan-level orchestration and the
-  per-change controller loop
+  supported single-change loop
 - `references/`: self-contained controller contract, adapter notes, state schema,
   and phase protocol
+
+Per-change propose, apply, archive, and verify work belongs to upstream
+OpenSpec; this package covers the plan-level orchestration around it.
 
 For authoring compilable markdown implementation plans, see the shared reference
 at `core/plan-authoring.md` in the source repository. This package is
