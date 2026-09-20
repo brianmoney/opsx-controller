@@ -1566,6 +1566,56 @@ def run_logged_command(
         raise
 
 
+def _incomplete_round_action(
+    repo: Path, cfg: dict, state: dict, cid: str, r: dict, remaining: list[str]
+) -> str:
+    """Schedule the next implement round for a round that left automatable
+    tasks unchecked, or fail the change on an exhausted round budget.
+
+    Shared by the partial-``implemented`` path and a progress-making
+    ``blocked`` round: both are the ordinary multi-round case, so the
+    controller re-enters implement with a corrective prompt naming the tasks
+    rather than treating the round as terminal.
+    """
+    task_ids = ", ".join(remaining)
+    task_locus = f"openspec/changes/{cid}/tasks.md"
+    r["latest_fix_prompt"] = (
+        f"CHANGE: {cid}\n"
+        f"FINDINGS:\n"
+        f"- [critical] {task_locus}: these automatable tasks are still "
+        f"unchecked: {task_ids}\n"
+        f"  → complete them and mark each task line complete in tasks.md\n"
+        f"CORRECTIVE GUIDANCE: Finish the remaining automatable work for "
+        f"the change and check each task in {task_locus} "
+        f"(- [ ] → - [x]). Tasks whose line ends in (manual) are "
+        f"operator-only and may stay unchecked.\n"
+        f"VERIFY: reread {task_locus} and confirm every non-(manual) task "
+        f"is checked before reporting implemented."
+    )
+    append_history(
+        state,
+        cid,
+        {
+            "round": r["round"],
+            "phase": "implement",
+            "status": "incomplete",
+            "summary": f"implemented with automatable tasks remaining: {task_ids}",
+            "remaining_tasks": remaining,
+        },
+    )
+    if r["round"] >= r["max_rounds"]:
+        r["last_result"] = "max_rounds_reached"
+        reason = f"implement retry budget exhausted; automatable tasks still unchecked: {task_ids}"
+        state_mod.set_status(state, cid, base.FAILED, reason)
+        _try_notify(cfg, "change_failed", reason, change_id=cid)
+        return "stop"
+    r["last_result"] = "implement_incomplete"
+    r["round"] += 1
+    r["phase"] = "implement"
+    state_mod.set_status(state, cid, base.PENDING, f"automatable tasks remaining: {task_ids}")
+    return "continue"
+
+
 def apply_implement_result(
     repo: Path,
     cfg: dict,
@@ -1578,6 +1628,7 @@ def apply_implement_result(
     if status == "blocked":
         r["last_result"] = "implement_blocked"
         state_mod.update_task_counts(repo, state, cid)
+        progress = bool(payload.get("progress_made"))
         append_history(
             state,
             cid,
@@ -1587,8 +1638,18 @@ def apply_implement_result(
                 "status": "blocked",
                 "summary": payload.get("summary", "implement blocked"),
                 "reason": payload.get("reason", "implement blocked"),
+                "progress_made": progress,
             },
         )
+        if progress:
+            # A blocked round that made real progress is the ordinary
+            # multi-round case, not a dead end: re-enter implement with the
+            # corrective prompt while the round budget lasts. Only a
+            # progress-less block (or an exhausted budget) is terminal.
+            r["no_progress_streak"] = 0
+            remaining = state_mod.remaining_automatable_tasks(repo, cid)
+            if remaining:
+                return _incomplete_round_action(repo, cfg, state, cid, r, remaining)
         state_mod.set_status(state, cid, base.FAILED, payload.get("reason", "implement blocked"))
         _try_notify(cfg, "change_failed", payload.get("summary", "change blocked"), change_id=cid)
         return "stop"
@@ -1646,51 +1707,16 @@ def apply_implement_result(
         state_mod.set_status(state, cid, base.FAILED, "no progress ceiling reached")
         _try_notify(cfg, "change_failed", "no progress ceiling reached", change_id=cid)
         return "stop"
-    # Completeness gate: `implemented` means every automatable task is
-    # checked in the tasks file (ground truth, not the worker's advisory
-    # remaining_tasks). Unchecked automatable tasks re-enter implement with a
-    # controller-generated corrective prompt naming them, consuming the
-    # change's normal round budget; only when every remaining task is manual
-    # does the change advance to review.
+    # Completeness gate: a round only advances to review when every
+    # automatable task is checked in the tasks file (ground truth, not the
+    # worker's advisory remaining_tasks). Unchecked automatable tasks re-enter
+    # implement with a controller-generated corrective prompt naming them,
+    # consuming the change's normal round budget; only when every remaining
+    # task is manual does the change advance to review. A progress-making
+    # `blocked` round takes the same path (see the blocked branch above).
     remaining = state_mod.remaining_automatable_tasks(repo, cid)
     if remaining:
-        task_ids = ", ".join(remaining)
-        task_locus = f"openspec/changes/{cid}/tasks.md"
-        r["latest_fix_prompt"] = (
-            f"CHANGE: {cid}\n"
-            f"FINDINGS:\n"
-            f"- [critical] {task_locus}: these automatable tasks are still "
-            f"unchecked: {task_ids}\n"
-            f"  → complete them and mark each task line complete in tasks.md\n"
-            f"CORRECTIVE GUIDANCE: Finish the remaining automatable work for "
-            f"the change and check each task in {task_locus} "
-            f"(- [ ] → - [x]). Tasks whose line ends in (manual) are "
-            f"operator-only and may stay unchecked.\n"
-            f"VERIFY: reread {task_locus} and confirm every non-(manual) task "
-            f"is checked before reporting implemented."
-        )
-        append_history(
-            state,
-            cid,
-            {
-                "round": r["round"],
-                "phase": "implement",
-                "status": "incomplete",
-                "summary": f"implemented with automatable tasks remaining: {task_ids}",
-                "remaining_tasks": remaining,
-            },
-        )
-        if r["round"] >= r["max_rounds"]:
-            r["last_result"] = "max_rounds_reached"
-            reason = f"implement retry budget exhausted; automatable tasks still unchecked: {task_ids}"
-            state_mod.set_status(state, cid, base.FAILED, reason)
-            _try_notify(cfg, "change_failed", reason, change_id=cid)
-            return "stop"
-        r["last_result"] = "implement_incomplete"
-        r["round"] += 1
-        r["phase"] = "implement"
-        state_mod.set_status(state, cid, base.PENDING, f"automatable tasks remaining: {task_ids}")
-        return "continue"
+        return _incomplete_round_action(repo, cfg, state, cid, r, remaining)
     r["phase"] = "review"
     state_mod.set_status(state, cid, base.PENDING, payload.get("summary", "implementation complete"))
     return "continue"

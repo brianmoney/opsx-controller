@@ -63,8 +63,13 @@ class ImplementerRoleInstructionTests(unittest.TestCase):
             self.text,
         )
         self.assertIn(
-            "status=implemented requires every non-(manual) task in the "
-            "change tasks file to be checked",
+            "status=implemented does not require every automatable task to be "
+            "checked this round",
+            self.text,
+        )
+        self.assertIn(
+            "Report status=blocked only for a hard blocker that stops further "
+            "progress entirely",
             self.text,
         )
 
