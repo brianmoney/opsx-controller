@@ -49,10 +49,17 @@ Manual-task rule:
 
 - A task line whose text ends with the marker `(manual)` is an operator-only
   task and MAY remain unchecked.
-- `status=implemented` requires every non-`(manual)` task in the change tasks
-  file to be checked; if an automatable task cannot be completed this round,
-  report `status=blocked` with a reason naming the task instead of returning
-  `implemented` with it unchecked.
+- `status=implemented` does not require every automatable task to be checked
+  this round. Report it for any round that completed its planned work, even
+  when automatable tasks remain: the controller detects unchecked tasks in the
+  tasks file and re-enters implement with a corrective prompt naming them,
+  consuming the change's normal round budget. Never mark a task complete
+  unless its work is actually done.
+- Report `status=blocked` only for a hard blocker that stops further progress
+  entirely (a handoff conflicting with the live artifacts, an unclear
+  requirement needing an operator decision, or an unworkable environment
+  failure); name the blocker in the reason. Never use `blocked` merely because
+  the remaining automatable work does not fit in one round.
 
 Guardrails:
 

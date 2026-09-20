@@ -4191,6 +4191,109 @@ class RunEventNotificationTests(unittest.TestCase):
         self.assertEqual(len(failed_events), 1, f"expected 1 change_failed, got {self._notification_calls}")
         self.assertEqual(failed_events[0][1], self.cid)
 
+    def test_blocked_with_progress_loops_another_implement_round(self) -> None:
+        """A progress-making `blocked` round is the ordinary multi-round case:
+        the controller re-enters implement with a corrective prompt instead of
+        failing the change (terminal blocked stays reserved for no progress or
+        an exhausted budget)."""
+        self._patch_notify()
+        tasks = self.repo / "openspec" / "changes" / self.cid / "tasks.md"
+        tasks.write_text(
+            "## 1. Tasks\n\n- [x] 1.1 Example task\n- [ ] 1.2 Example task\n",
+            encoding="utf-8",
+        )
+        payload = {
+            "status": "blocked",
+            "change": self.cid,
+            "round": 1,
+            "reason": "remaining automatable work does not fit in one round",
+            "progress_made": True,
+            "completed_tasks": ["1.1"],
+            "remaining_tasks": ["1.2"],
+            "task_counts": {"complete": 1, "total": 2},
+            "files_touched": [],
+            "known_change_files": [],
+            "summary": "partial round completed 1.1",
+        }
+
+        result = self.opsx_plan.apply_implement_result(
+            self.repo, self.cfg, self.state, self.cid, payload
+        )
+
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
+        self.assertEqual(result, "continue")
+        self.assertEqual(record["round"], 2)
+        self.assertEqual(record["phase"], "implement")
+        self.assertEqual(record["last_result"], "implement_incomplete")
+        self.assertEqual(record["no_progress_streak"], 0)
+        self.assertIn("1.2", record["latest_fix_prompt"])
+        implement_history = [
+            h["status"] for h in record["history"] if h.get("phase") == "implement"
+        ]
+        self.assertEqual(implement_history, ["blocked", "incomplete"])
+        self.assertEqual(
+            [c for c in self._notification_calls if c[0] == "change_failed"], []
+        )
+
+    def test_blocked_with_progress_at_round_budget_stops(self) -> None:
+        self._patch_notify()
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
+        record["round"] = self.cfg["max_rounds"]
+        payload = {
+            "status": "blocked",
+            "change": self.cid,
+            "round": self.cfg["max_rounds"],
+            "reason": "remaining work does not fit in one round",
+            "progress_made": True,
+            "completed_tasks": [],
+            "remaining_tasks": ["1.1", "1.2"],
+            "task_counts": {"complete": 0, "total": 2},
+            "files_touched": [],
+            "known_change_files": [],
+            "summary": "partial round",
+        }
+
+        result = self.opsx_plan.apply_implement_result(
+            self.repo, self.cfg, self.state, self.cid, payload
+        )
+
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
+        self.assertEqual(result, "stop")
+        self.assertEqual(record["last_result"], "max_rounds_reached")
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
+
+    def test_blocked_with_progress_and_no_remaining_tasks_still_stops(self) -> None:
+        """Ground truth is tasks.md: a blocked round with every automatable
+        task checked has nothing to continue toward, so it stays terminal."""
+        self._patch_notify()
+        tasks = self.repo / "openspec" / "changes" / self.cid / "tasks.md"
+        tasks.write_text(
+            "## 1. Tasks\n\n- [x] 1.1 Example task\n- [x] 1.2 Example task\n",
+            encoding="utf-8",
+        )
+        payload = {
+            "status": "blocked",
+            "change": self.cid,
+            "round": 1,
+            "reason": "handoff conflicts with live artifacts",
+            "progress_made": True,
+            "completed_tasks": ["1.1", "1.2"],
+            "remaining_tasks": [],
+            "task_counts": {"complete": 2, "total": 2},
+            "files_touched": [],
+            "known_change_files": [],
+            "summary": "round blocked on a conflicting handoff",
+        }
+
+        result = self.opsx_plan.apply_implement_result(
+            self.repo, self.cfg, self.state, self.cid, payload
+        )
+
+        record = self.opsx_plan.state_mod.rec(self.state, self.cid)
+        self.assertEqual(result, "stop")
+        self.assertEqual(record["last_result"], "implement_blocked")
+        self.assertEqual(record["status"], self.opsx_plan.base.FAILED)
+
     def test_notify_emitted_on_change_failed_spawn_error(self) -> None:
         self._patch_notify()
 
