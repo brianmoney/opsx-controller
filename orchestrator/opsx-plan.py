@@ -85,7 +85,8 @@ except ModuleNotFoundError as exc:  # pragma: no cover
 
 try:
     from lib.orchestrator import (
-        base, compiler, cmd_archive_plan, cmd_autopilot, cmd_doctor, cmd_gates,
+        base, compiler, cmd_archive_plan, cmd_autopilot,
+        cmd_autopilot_install, cmd_doctor, cmd_gates,
         cmd_logs, cmd_models, cmd_run_one, cmd_status, cmd_supervise, cmd_use,
         dashboard, delivery, doctor, groundtruth, logs, planref, report,
         supervision_service, telemetry,
@@ -5766,6 +5767,17 @@ def cmd_compile(args: argparse.Namespace) -> int:
 
 
 
+def _cmd_autopilot_dispatch(args) -> int:
+    """Route ``opsx-plan autopilot [run|install]`` to its handler.
+
+    The bare ``autopilot`` action keeps the unattended loop behavior; the
+    ``install`` action binds the systemd user unit to a repo and plan.
+    """
+    if getattr(args, "action", "run") == "install":
+        return cmd_autopilot_install.cmd_autopilot_install(args)
+    return cmd_autopilot.cmd_autopilot(args)
+
+
 def main() -> int:
     # Executable-name dispatch: opsx-run <change-id> [--repo <path>]
     exe_name = os.path.basename(sys.argv[0])
@@ -5842,7 +5854,14 @@ def main() -> int:
     p_run.set_defaults(fn=cmd_run)
 
     p_autopilot = sub.add_parser(
-        "autopilot", help="unattended wrapper: run, handle gates, resume failures"
+        "autopilot",
+        help="unattended wrapper: run, handle gates, resume failures; "
+             "`install` binds the systemd user unit",
+    )
+    p_autopilot.add_argument(
+        "action", nargs="?", choices=("run", "install"), default="run",
+        help="`run` the unattended loop (default) or `install` the systemd "
+             "user unit and plan drop-in binding",
     )
     p_autopilot.add_argument("--plan", default=None, help="path to plan TOML")
     p_autopilot.add_argument(
@@ -5865,7 +5884,20 @@ def main() -> int:
         "--once", action="store_true",
         help="single pass (preflight, one run, classify, act) then exit",
     )
-    p_autopilot.set_defaults(fn=cmd_autopilot.cmd_autopilot)
+    p_autopilot.add_argument(
+        "--unit-name", default=None,
+        help="unit name for `autopilot install` (default: opsx-autopilot)",
+    )
+    p_autopilot.add_argument(
+        "--print", action="store_true", dest="print_only",
+        help="`autopilot install`: render the unit and drop-in to stdout "
+             "without writing files or invoking systemctl",
+    )
+    p_autopilot.add_argument(
+        "--no-enable", action="store_true",
+        help="`autopilot install`: write the files but do not enable the unit",
+    )
+    p_autopilot.set_defaults(fn=_cmd_autopilot_dispatch)
 
     p_status = sub.add_parser("status", help="reconcile and show plan status")
     p_status.add_argument("plan", nargs="?", default=None, help="path to plan TOML")

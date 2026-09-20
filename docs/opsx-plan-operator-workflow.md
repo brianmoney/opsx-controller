@@ -806,13 +806,24 @@ launch discipline. The orchestrator engine itself remains a foreground, serial
 process — autopilot is the supervision around it, not a second executor.
 
 ```bash
-opsx-plan autopilot [--plan X] \
+opsx-plan autopilot [run] [--plan X] \
   [--veto-window-minutes N] [--max-auto-resets N] \
   [--reset-spacing-seconds N] [--poll-seconds N] [--once]
+
+# Bind the systemd user unit to a repository and plan (one-time).
+opsx-plan autopilot install [--plan X] [--unit-name NAME] [--print] [--no-enable]
 ```
 
 - `--plan X` — plan manifest to drive (otherwise the active-plan pointer /
   `OPSX_PLAN` is used, same resolution as `run`).
+- `install` — render the installed unit and plan drop-in templates into
+  `~/.config/systemd/user/`, embed an `Environment=PATH=` line derived from the
+  invoking environment (the directories providing `openspec`, the adapter
+  client, and node, then the systemd default directories), then run
+  `systemctl --user daemon-reload` and `enable`. It never `start`s the unit and
+  is idempotent. `--unit-name NAME` (default `opsx-autopilot`) writes an
+  alternate binding; `--print` renders both files to stdout without writing or
+  invoking `systemctl`; `--no-enable` skips the enable step.
 - `--veto-window-minutes N` — how long to wait for a veto before
   auto-approving a `pause_before` gate (default `30`).
 - `--max-auto-resets N` — cap on automatic resets per failure signature
@@ -862,12 +873,13 @@ digest file is still appended.
 
 ### Unit management
 
-The unit template is installed disabled. Enable and start it once; the
-operator-owned drop-in (`plan.conf`) sets `WorkingDirectory` and `OPSX_PLAN`
-for the plan to drive.
+The unit template is installed disabled. Bind it to a repository and plan with
+`opsx-plan autopilot install`, which writes the unit and the operator-owned
+drop-in (`plan.conf`, setting `WorkingDirectory`, `OPSX_PLAN`, and the toolchain
+`PATH`) and enables it. Then start it once.
 
 ```bash
-systemctl --user enable opsx-autopilot     # opt in (starts nothing)
+opsx-plan autopilot install --plan openspec/plans/my-plan.toml  # bind + enable
 systemctl --user start  opsx-autopilot     # start / restart after a fix
 systemctl --user status opsx-autopilot     # state, last exit, recent log
 systemctl --user stop   opsx-autopilot     # stop cleanly

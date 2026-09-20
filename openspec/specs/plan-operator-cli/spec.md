@@ -1391,3 +1391,63 @@ current configuration keys.
 - **WHEN** a reader consults a manifest schema table
 - **THEN** it lists the current direct-dispatch keys and does not present the
   retired `invoke` or `max_attempts` keys as valid configuration
+
+### Requirement: `opsx-plan autopilot install` binds the unit to a repository and plan
+
+The orchestrator SHALL provide an `opsx-plan autopilot install` subcommand that
+renders the autopilot systemd user unit and its plan-binding drop-in for a
+resolved repository and plan, so operators and agents do not hand-render
+templates, substitute placeholders, or reconstruct the toolchain `PATH`.
+
+`install` SHALL resolve the plan with the same precedence as the other operator
+commands (explicit `--plan`, `OPSX_PLAN`, active-plan pointer) and the
+repository with the standard `--repo`/cwd rule. It SHALL accept `--unit-name
+<name>` (default `opsx-autopilot`) and `--print`. It SHALL read the installed
+unit and drop-in templates from the installed runtime tree, SHALL write the
+rendered unit and drop-in under `~/.config/systemd/user/`, SHALL include an
+`Environment=PATH=` line that makes the OpenSpec CLI, the adapter client, and
+node resolvable under the systemd user manager, and SHALL be idempotent:
+rendering the same repository and plan twice SHALL produce byte-identical
+files. `install` SHALL enable the unit by default and SHALL NOT start it.
+
+`--print` SHALL write the rendered unit and drop-in to stdout, SHALL NOT modify
+the filesystem, and SHALL NOT invoke `systemctl`. On any resolution, render, or
+`systemctl` failure, `install` SHALL exit nonzero with a diagnostic on stderr.
+
+#### Scenario: Install renders the unit and drop-in for a resolved plan
+
+- **WHEN** an operator runs `opsx-plan autopilot install` for a repository and plan
+- **THEN** `~/.config/systemd/user/opsx-autopilot.service` and
+  `~/.config/systemd/user/opsx-autopilot.service.d/plan.conf` are written with
+  `WorkingDirectory` for that repository, `Environment=OPSX_PLAN` for that
+  plan, and an `Environment=PATH=` line that makes the toolchain resolvable
+
+#### Scenario: Re-running install is idempotent
+
+- **WHEN** `opsx-plan autopilot install` runs twice for the same repository and
+  plan
+- **THEN** the second run rewrites byte-identical content and exits 0
+
+#### Scenario: Dry run writes nothing
+
+- **WHEN** `opsx-plan autopilot install --print` runs
+- **THEN** the rendered unit and drop-in are written to stdout, no file under
+  `~/.config/systemd/user/` is created or modified, and `systemctl` is not
+  invoked
+
+#### Scenario: Install enables but never starts the unit
+
+- **WHEN** `opsx-plan autopilot install` completes successfully
+- **THEN** the unit is enabled and its systemd state is not `active`
+
+#### Scenario: Alternate unit name does not touch the default binding
+
+- **WHEN** `opsx-plan autopilot install --unit-name opsx-autopilot-kf` runs
+- **THEN** the rendered files are named for `opsx-autopilot-kf` and any existing
+  files for the default unit name are left unchanged
+
+#### Scenario: Unresolvable plan fails closed
+
+- **WHEN** no plan can be resolved from the explicit argument, `OPSX_PLAN`, or
+  the active-plan pointer
+- **THEN** `install` exits nonzero with a diagnostic and writes no files
