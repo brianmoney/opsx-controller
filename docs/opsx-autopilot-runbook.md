@@ -54,8 +54,40 @@ source, pushes are skipped but escalation digests are still written to
 
 ## 3. One-time unit setup
 
-Render the installed-data templates into the user unit directory. The
-installed data lives at `~/.local/lib/opsx-controller/systemd/`.
+Bind the installed unit template to this repository and plan with one command,
+run from the plan repository (`--repo <path>` overrides the cwd):
+
+```bash
+opsx-plan autopilot install --plan openspec/plans/my-plan.toml
+
+# Preview exactly what will be written, touching nothing:
+opsx-plan autopilot install --plan openspec/plans/my-plan.toml --print
+```
+
+`install` resolves the plan with the same precedence as `run` (explicit
+`--plan`, `OPSX_PLAN`, active-plan pointer), reads the installed-data templates
+from `~/.local/lib/opsx-controller/systemd/`, and writes
+`~/.config/systemd/user/opsx-autopilot.service` plus
+`~/.config/systemd/user/opsx-autopilot.service.d/plan.conf`. It derives an
+`Environment=PATH=` line from your shell's toolchain — the directories
+providing `openspec`, the adapter client (e.g. `opencode`), and node, followed
+by the systemd default directories — so the unit's bare `PATH` stays complete.
+It then runs `systemctl --user daemon-reload` and `enable`, and re-running it is
+idempotent (the managed files are rewritten with a generated header).
+It never `start`s the unit. `--unit-name <name>` writes an alternate binding
+(for example a per-repo unit) without touching the default one, and
+`--no-enable` writes the files without enabling.
+
+`enable` starts nothing; the unit stays down until you `start` it (step 6).
+To use the repository's active-plan pointer instead of pinning a manifest,
+remove the `Environment=OPSX_PLAN=` line from `plan.conf` (then
+`daemon-reload`) and select the plan with `opsx-plan use <plan.toml>`.
+
+<details>
+<summary>Manual rendering fallback (when <code>opsx-plan autopilot install</code> is unavailable)</summary>
+
+Render the installed-data templates by hand. The installed data lives at
+`~/.local/lib/opsx-controller/systemd/`.
 
 ```bash
 RUNTIME="$HOME/.local/lib/opsx-controller"
@@ -89,12 +121,10 @@ Environment=PATH=%h/.npm-global/bin:%h/.opencode/bin:%h/.local/bin:/usr/local/sb
 ```
 
 Without it the unit exits 2 on preflight with "OpenSpec CLI not found
-repo-locally or on PATH", and `Restart=on-failure` retry-loops it.
+repo-locally or on PATH", and `Restart=on-failure` retry-loops it. (The
+`opsx-plan autopilot install` command above derives this line for you.)
 
-`enable` starts nothing; the unit stays down until you `start` it (step 6).
-To use the repository's active-plan pointer instead of pinning a manifest,
-remove the `Environment=OPSX_PLAN=` line from `plan.conf` (then
-`daemon-reload`) and select the plan with `opsx-plan use <plan.toml>`.
+</details>
 
 ## 4. Per-plan preparation
 
@@ -211,9 +241,10 @@ before starting it.
 # Stop (in-flight work is interrupted; a re-start resumes from state).
 systemctl --user stop opsx-autopilot
 
-# Switch plans: re-render plan.conf with the new OPSX_AUTOPILOT_PLAN
-# (repeat step 3), or select the plan via the active-plan pointer.
-systemctl --user daemon-reload
+# Switch plans: re-bind with the new plan
+# (opsx-plan autopilot install --plan <new.toml>), or select the plan via the
+# active-plan pointer.
+opsx-plan autopilot install --plan openspec/plans/other-plan.toml
 systemctl --user start opsx-autopilot
 
 # Full teardown.
@@ -231,7 +262,7 @@ systemctl --user daemon-reload
 |---|---|---|
 | Unit won't start | `journalctl --user -u opsx-autopilot -e`; verify `WorkingDirectory` / `OPSX_PLAN` rendered in `plan.conf` | Correct `plan.conf`, `daemon-reload`, `start` |
 | `StartLimitBurst` tripped (5 starts / 600s) | `systemctl --user status opsx-autopilot` | `systemctl --user reset-failed opsx-autopilot` then `start` |
-| Unit exits 2, journal says "OpenSpec CLI not found repo-locally or on PATH" | Systemd user `PATH` lacks your toolchain dirs (`which openspec opencode node`) | Add `Environment=PATH=...` to `plan.conf` (step 3), `daemon-reload`, `start`; `reset-failed` if the retry loop tripped |
+| Unit exits 2, journal says "OpenSpec CLI not found repo-locally or on PATH" | Systemd user `PATH` lacks your toolchain dirs (`which openspec opencode node`) | Re-run `opsx-plan autopilot install` (it derives `Environment=PATH=`, step 3), then `start`; `reset-failed` if the retry loop tripped |
 | No pushes | Topic unset in `autopilot.toml` / `OPSX_AUTOPILOT_NTFY_TOPIC`; digests still in `.opsx-plan/escalations.jsonl` | Set the topic; test with `curl -d test ntfy.sh/<topic>` |
 | `worktree ... execution lock is already held ...; refusing to proceed` | A hand-run `opsx-plan run` / `reset` is racing the unit | Don't hand-run mutating commands while the unit is up (`approve` / `status` are safe); stop the unit first |
 | Config changes not taking effect | Running unit still has the old config | Restart the unit; CLI flags override the file, env overrides the topic |

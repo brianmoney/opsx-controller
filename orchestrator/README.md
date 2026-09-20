@@ -251,7 +251,13 @@ archive failures, and unknown classes escalate immediately; it announces
 and it waits for `opsx-plan accept` on orchestrator-created changes awaiting
 acceptance.
 Run it under the `opsx-autopilot.service` systemd user unit (installed
-disabled); see the [operator workflow guide](../docs/opsx-plan-operator-workflow.md#autopilot-unattended-runs)
+disabled). Bind that unit to a repository and plan with
+`opsx-plan autopilot install [--plan X] [--unit-name NAME] [--print]
+[--no-enable]`: it renders the installed unit template and the plan drop-in into
+`~/.config/systemd/user/`, embeds an `Environment=PATH=` line derived from the
+invoking environment, runs `daemon-reload` and `enable`, and never `start`s the
+unit; re-running it is idempotent. `--print` previews both files without
+writing. See the [operator workflow guide](../docs/opsx-plan-operator-workflow.md#autopilot-unattended-runs)
 for flags, config keys, escalation digests, and the restart-after-fix flow.
 For a step-by-step procedure see
 [`docs/opsx-autopilot-runbook.md`](../docs/opsx-autopilot-runbook.md).

@@ -76,9 +76,11 @@ unattended work through the **autopilot wrapper**, which supervises
 `opsx-plan run` in a loop from a systemd user unit.
 
 ```bash
-# One-time: enable the unit. A drop-in (plan.conf) sets WorkingDirectory and
-# OPSX_PLAN; the template ships installed-but-disabled.
-systemctl --user enable opsx-autopilot
+# One-time: bind the unit to this repo + plan and enable it. The install
+# command renders the installed unit template and plan drop-in (WorkingDirectory,
+# OPSX_PLAN, and a derived toolchain PATH) under ~/.config/systemd/user/, runs
+# daemon-reload, enables, and never starts. --print previews without writing.
+opsx-plan autopilot install --plan openspec/plans/my-plan.toml
 systemctl --user start  opsx-autopilot
 
 # Watch it
