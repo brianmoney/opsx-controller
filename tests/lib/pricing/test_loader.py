@@ -578,6 +578,8 @@ class ShippedCatalogCoverageTests(unittest.TestCase):
             ("moonshotai", "kimi-k3"),
             ("openai", "gpt-5.6-terra"),
             ("openai", "gpt-5.6-luna"),
+            ("openai", "gpt-6-sol"),
+            ("openai", "gpt-6-luna"),
         ]:
             with self.subTest(provider=provider, model_id=model_id):
                 result = catalog.resolve(provider, model_id)
@@ -590,6 +592,8 @@ class ShippedCatalogCoverageTests(unittest.TestCase):
             ("moonshotai", "kimi-k3"),
             ("openai", "gpt-5.6-terra"),
             ("openai", "gpt-5.6-luna"),
+            ("openai", "gpt-6-sol"),
+            ("openai", "gpt-6-luna"),
         ]:
             with self.subTest(provider=provider, model_id=model_id):
                 result = catalog.resolve(provider, model_id)
