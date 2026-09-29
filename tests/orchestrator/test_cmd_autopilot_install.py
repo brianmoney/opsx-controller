@@ -71,7 +71,9 @@ def _unquote_systemd(raw: str) -> str:
     so a corrupted value fails the round-trip.
     """
     if not (raw.startswith('"') and raw.endswith('"') and len(raw) >= 2):
-        return raw
+        # Bare path directive: systemd still applies specifier expansion, so
+        # ``%%`` is the only escape to reverse.
+        return raw.replace("%%", "%")
     inner = raw[1:-1]
     out: list[str] = []
     i = 0
@@ -214,9 +216,11 @@ class RenderTests(InstallHarness):
         self.assertEqual(
             _dropin_value(dropin, "Environment=OPSX_PLAN"), self.resolved_plan
         )
-        # Values are double-quoted so systemd's parser strips the quotes rather
-        # than splitting on embedded whitespace or expanding `$`/`%`.
-        self.assertIn(f'WorkingDirectory="{self.repo}"', dropin)
+        # WorkingDirectory is bare: systemd keeps quotes literal in path
+        # directives.  Environment values are quoted so systemd's parser
+        # strips the quotes rather than splitting on embedded whitespace or
+        # expanding `$`/`%`.
+        self.assertIn(f"WorkingDirectory={self.repo}", dropin)
         self.assertIn(
             f'Environment=OPSX_PLAN="{self.resolved_plan}"', dropin
         )
@@ -239,6 +243,26 @@ class RenderTests(InstallHarness):
             dirs.index(str(self.node_dir.resolve())),
             dirs.index("/usr/local/sbin"),
         )
+
+    def test_symlinked_toolchain_launcher_keeps_launcher_directory(self) -> None:
+        # A symlinked launcher (npm global style) must contribute the symlink's
+        # own directory to PATH, not the resolved target's directory.
+        real = self.root / "toolchain" / "real-openspec"
+        real.mkdir(parents=True)
+        target = real / "openspec.js"
+        target.write_text("#!/bin/sh\n", encoding="utf-8")
+        link_dir = self.root / "toolchain" / "bin"
+        link_dir.mkdir()
+        link = link_dir / "openspec"
+        link.symlink_to(target)
+        self.which_map["openspec"] = str(link)
+
+        rc, _, err, _ = self.install()
+        self.assertEqual(rc, 0, err)
+        dropin = self.dropin_path().read_text(encoding="utf-8")
+        dirs = _dropin_value(dropin, "Environment=PATH").split(":")
+        self.assertIn(str(link_dir), dirs)
+        self.assertNotIn(str(real), dirs)
 
     def test_alternate_adapter_client_resolved(self) -> None:
         claude_dir = self.root / "toolchain" / "claude-bin"
@@ -367,14 +391,16 @@ class EscapeTests(InstallHarness):
         self.assertEqual(encoded, '"$$HOME 100%% \\"quoted\\" \\\\back\\\\"')
         self.assertEqual(_unquote_systemd(encoded), raw)
 
-    def test_working_directory_keeps_literal_dollar(self) -> None:
-        # WorkingDirectory is not subject to `$` expansion, so a literal `$`
-        # must survive un-doubled.
-        encoded = cmd_autopilot_install._quote_systemd_value(
-            "/repo/$cash", variable_expansion=False
+    def test_working_directory_is_rendered_bare(self) -> None:
+        # systemd keeps quotes literal in WorkingDirectory and drops the rest
+        # of the fragment when the directive fails, so the value must be bare.
+        # `$` survives un-doubled (paths get no variable expansion) and `%` is
+        # doubled against specifier expansion.
+        encoded = cmd_autopilot_install._encode_working_directory(
+            "/repo/$cash 100%"
         )
-        self.assertEqual(encoded, '"/repo/$cash"')
-        self.assertEqual(_unquote_systemd(encoded), "/repo/$cash")
+        self.assertEqual(encoded, "/repo/$cash 100%%")
+        self.assertEqual(_unquote_systemd(encoded), "/repo/$cash 100%")
 
     def test_whitespace_and_escapes_survive_render(self) -> None:
         repo = self.root / "re po$%"
@@ -406,8 +432,9 @@ class EscapeTests(InstallHarness):
             str(spaced_bin.resolve()),
             _dropin_value(dropin, "Environment=PATH").split(":"),
         )
-        # systemd would expand a bare `$`/`%`; the rendered lines must be the
-        # quoted, escaped form so the parsed value is the literal path.
+        # systemd expands `$`/`%` in Environment values and `%` in paths; the
+        # rendered lines must carry the escaped forms so the parsed values are
+        # the literal paths.
         self.assertIn("$$", dropin)
         self.assertIn("%%", dropin)
 

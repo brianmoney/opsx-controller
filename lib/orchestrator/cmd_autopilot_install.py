@@ -21,8 +21,10 @@ binding step for operators and agents:
 ``--print`` renders to stdout without touching the filesystem or invoking
 ``systemctl``.  All subprocess interaction goes through an injectable runner
 and all path roots are injectable so tests never touch a real user manager.
-systemd directive values (``WorkingDirectory``, ``Environment=``) are quoted
-and escaped so literal repository, plan, and ``PATH`` values survive parsing.
+``Environment=`` values are quoted and escaped so literal repository, plan,
+and ``PATH`` values survive parsing.  ``WorkingDirectory`` is rendered bare:
+systemd keeps quotes literal in path directives, so a quoted path fails the
+absolute-path check and drops the following ``Environment=`` lines with it.
 """
 
 from __future__ import annotations
@@ -135,7 +137,11 @@ def _toolchain_dirs(adapter: str, which_func) -> list[str]:
         found = which_func(name)
         if not found:
             continue
-        directory = str(Path(found).resolve().parent)
+        # Keep the directory that actually carries the launcher name: a
+        # symlinked entry (e.g. ~/.npm-global/bin/openspec -> the package's
+        # openspec.js) must contribute its own directory, not the resolved
+        # target's, or the unit PATH cannot find the command.
+        directory = str(Path(found).parent)
         if directory in dirs:
             continue
         if Path(directory).is_dir():
@@ -157,22 +163,33 @@ def derive_path(adapter: str, *, which_func=shutil.which) -> str:
     return ":".join(dirs)
 
 
-def _quote_systemd_value(value: str, *, variable_expansion: bool = True) -> str:
-    """Encode *value* as a double-quoted systemd directive argument.
+def _quote_systemd_value(value: str) -> str:
+    """Encode *value* as a double-quoted ``Environment=`` argument.
 
     systemd strips quotes after parsing, so a quoted value preserves embedded
     whitespace.  It also performs ``%`` specifier expansion everywhere and
-    ``$`` environment expansion in ``Environment=`` (and command-line)
-    assignments, so literal ``%`` and ``$`` must be doubled; backslashes and
-    double quotes are escaped for the quoted form.  Passing this encoder the
-    repository, plan, and ``PATH`` values keeps them byte-for-byte literal
-    once systemd has parsed the directive.
+    ``$`` environment expansion in ``Environment=`` assignments, so literal
+    ``%`` and ``$`` must be doubled; backslashes and double quotes are escaped
+    for the quoted form.  Passing this encoder the plan and ``PATH`` values
+    keeps them byte-for-byte literal once systemd has parsed the directive.
     """
     text = value.replace("\\", "\\\\").replace('"', '\\"')
-    text = text.replace("%", "%%")
-    if variable_expansion:
-        text = text.replace("$", "$$")
+    text = text.replace("%", "%%").replace("$", "$$")
     return f'"{text}"'
+
+
+def _encode_working_directory(value: str) -> str:
+    """Encode *value* for a ``WorkingDirectory=`` directive.
+
+    systemd does not strip quotes in path directives: a double-quoted value
+    keeps its quote characters, fails the absolute-path check, and (because a
+    failed directive aborts the rest of the fragment) silently drops the
+    following ``Environment=`` lines.  Paths are therefore rendered bare, with
+    ``%`` doubled because specifier expansion still applies.  ``$`` is not
+    expanded in ``WorkingDirectory=``, and embedded whitespace survives the
+    bare form.
+    """
+    return value.replace("%", "%%")
 
 
 def render_dropin(
@@ -189,8 +206,7 @@ def render_dropin(
     # WorkingDirectory is not subject to environment-variable expansion, but
     # specifier expansion still applies; Environment values expand both.
     body = body.replace(
-        "${OPSX_AUTOPILOT_REPO}",
-        _quote_systemd_value(str(repo), variable_expansion=False),
+        "${OPSX_AUTOPILOT_REPO}", _encode_working_directory(str(repo))
     )
     body = body.replace(
         "${OPSX_AUTOPILOT_PLAN}", _quote_systemd_value(plan)
