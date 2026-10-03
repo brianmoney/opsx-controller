@@ -45,7 +45,10 @@ Required workflow:
    - `<expanded-home>/.config/opencode/command/opsx-apply.md`
 4. If `.venv/bin/activate` exists at the repo root, activate it before running
    repo-local Python helpers, `pytest`, `ruff`, or `bash scripts/quality-gate.sh`.
-5. Run `openspec status --change "<change>" --json` and
+5. Use the repo-local OpenSpec CLI when the repository provides one
+   (`node_modules/.bin/openspec`; the controller resolves the same way);
+   otherwise use `openspec` from PATH. Run
+   `openspec status --change "<change>" --json` and
    `openspec instructions apply --change "<change>" --json`.
 6. Read `STATE_FILE` when it exists so you can trust the controller-owned cache
    contract and current round history.

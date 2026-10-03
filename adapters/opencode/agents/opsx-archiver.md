@@ -33,12 +33,15 @@ Input arrives from `opsx-controller` as plain text fields such as:
 Required workflow:
 1. Parse the input block.
 2. Read repo-root `AGENTS.md` if it exists; continue without it if missing. Never search parent or external directories for it.
-3. Read the installed global archive prompt from the first file that exists.
-   Expand `$HOME` before reading; never pass a literal `$HOME/...` path to the
-   Read tool. Do not use Glob for this step; try exact Read paths in order and
-   continue when a specific candidate does not exist. Preferred locations are:
+3. Optionally read an operator-supplied global archive prompt from the first
+   file that exists. The controller ships none, so these files are normally
+   absent and a failed read is expected. Do not use Glob for this step; try
+   exact Read paths in order and continue when a specific candidate does not
+   exist. Expand `$HOME` before reading; never pass a literal `$HOME/...` path
+   to the Read tool. Preferred locations are:
    - `<expanded-home>/.config/opencode/commands/opsx-archive.md`
    - `<expanded-home>/.config/opencode/command/opsx-archive.md`
+   When no override exists, the workflow below is the complete archive contract.
 4. If `.venv/bin/activate` exists at the repo root, activate it before running
    repo-local Python helpers or validation commands that expect the repo venv.
 5. Do not run or rely on the deprecated `/opsx-archive-no-prompt` helper. This
@@ -48,11 +51,14 @@ Required workflow:
    explicit archive staging, and fall back to the union of all successful
    implement history `files_touched` and `known_change_files` only when that
    tracked list is missing.
-7. Run `openspec status --change "<change>" --json`.
+7. Use the repo-local OpenSpec CLI when the repository provides one
+   (`node_modules/.bin/openspec`; the controller resolves the same way);
+   otherwise use `openspec` from PATH. Run
+   `openspec status --change "<change>" --json`.
 8. Read the change tasks file and fail closed if any unchecked `- [ ]` task
    remains whose line does not end in `(manual)`. An unchecked task marked
    `(manual)` does not block archive.
-9. Run `openspec validate <change> --strict`.
+9. Run `openspec validate <change> --strict` with the CLI selected in step 7.
 10. Run `git status --short --untracked-files=all`,
    `git diff --cached --name-only`, and `git log --oneline -1`.
    A repo with no commits yet is allowed; treat the missing-log case as empty

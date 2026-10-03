@@ -41,19 +41,25 @@ Input arrives from `opsx-controller` as plain text fields such as:
 Required workflow:
 1. Parse the input block.
 2. Read repo-root `AGENTS.md` if it exists; continue without it if missing. Never search parent or external directories for it.
-3. Read the installed global review and verify prompts from the first files that
-   exist. Expand `$HOME` before reading; never pass a literal `$HOME/...` path
-   to the Read tool. Do not use Glob for this step; try exact Read paths in
-   order and continue when a specific candidate does not exist. Preferred
-   locations are:
+3. Optionally read an operator-supplied global review or verify prompt from the
+   first file that exists. The controller ships none: the legacy `/opsx-review`
+   and `/opsx-verify-auto` command surfaces were removed, so these files are
+   normally absent and a failed read is expected. Do not use Glob for this
+   step; try exact Read paths in order and continue when a specific candidate
+   does not exist. Expand `$HOME` before reading; never pass a literal
+   `$HOME/...` path to the Read tool. Preferred locations are:
    - `<expanded-home>/.config/opencode/commands/opsx-review.md`
    - `<expanded-home>/.config/opencode/command/opsx-review.md`
    - `<expanded-home>/.config/opencode/commands/opsx-verify.md`
    - `<expanded-home>/.config/opencode/command/opsx-verify.md`
+   When no override exists, the workflow below is the complete review contract.
 4. If `.venv/bin/activate` exists at the repo root, activate it before running
    repo-local Python helpers, `pytest`, `ruff`, or other repository validation
    commands that expect the repo venv.
-5. Run `openspec status --change "<change>" --json` and
+5. Use the repo-local OpenSpec CLI when the repository provides one
+   (`node_modules/.bin/openspec`; the controller resolves the same way);
+   otherwise use `openspec` from PATH. Run
+   `openspec status --change "<change>" --json` and
    `openspec instructions apply --change "<change>" --json`.
 6. Read `STATE_FILE` when it exists.
 7. If `CONTEXT_CACHE_VALID=true` and `CONTEXT_CACHE_STATUS=ready`, trust the
@@ -63,7 +69,7 @@ Required workflow:
    including the tasks file, the relevant spec delta files, the touched
    implementation files, and any delta specs under `openspec/changes/<change>/specs/`
    that were not already included.
-9. Run `openspec validate <change> --strict`.
+9. Run `openspec validate <change> --strict` with the CLI selected in step 5.
 10. Review the current implementation against the artifacts and repo guidance.
 
 Classification rules:
