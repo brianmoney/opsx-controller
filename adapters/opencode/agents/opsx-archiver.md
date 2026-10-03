@@ -33,15 +33,9 @@ Input arrives from `opsx-controller` as plain text fields such as:
 Required workflow:
 1. Parse the input block.
 2. Read repo-root `AGENTS.md` if it exists; continue without it if missing. Never search parent or external directories for it.
-3. Optionally read an operator-supplied global archive prompt from the first
-   file that exists. The controller ships none, so these files are normally
-   absent and a failed read is expected. Do not use Glob for this step; try
-   exact Read paths in order and continue when a specific candidate does not
-   exist. Expand `$HOME` before reading; never pass a literal `$HOME/...` path
-   to the Read tool. Preferred locations are:
-   - `<expanded-home>/.config/opencode/commands/opsx-archive.md`
-   - `<expanded-home>/.config/opencode/command/opsx-archive.md`
-   When no override exists, the workflow below is the complete archive contract.
+3. Do not attempt to read a global archive prompt file: the controller ships
+   no archive command surface. The workflow below is the complete archive
+   contract.
 4. If `.venv/bin/activate` exists at the repo root, activate it before running
    repo-local Python helpers or validation commands that expect the repo venv.
 5. Do not run or rely on the deprecated `/opsx-archive-no-prompt` helper. This

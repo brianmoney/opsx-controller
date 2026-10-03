@@ -41,18 +41,10 @@ Input arrives from `opsx-controller` as plain text fields such as:
 Required workflow:
 1. Parse the input block.
 2. Read repo-root `AGENTS.md` if it exists; continue without it if missing. Never search parent or external directories for it.
-3. Optionally read an operator-supplied global review or verify prompt from the
-   first file that exists. The controller ships none: the legacy `/opsx-review`
-   and `/opsx-verify-auto` command surfaces were removed, so these files are
-   normally absent and a failed read is expected. Do not use Glob for this
-   step; try exact Read paths in order and continue when a specific candidate
-   does not exist. Expand `$HOME` before reading; never pass a literal
-   `$HOME/...` path to the Read tool. Preferred locations are:
-   - `<expanded-home>/.config/opencode/commands/opsx-review.md`
-   - `<expanded-home>/.config/opencode/command/opsx-review.md`
-   - `<expanded-home>/.config/opencode/commands/opsx-verify.md`
-   - `<expanded-home>/.config/opencode/command/opsx-verify.md`
-   When no override exists, the workflow below is the complete review contract.
+3. Do not attempt to read a global review or verify prompt file: the legacy
+   `/opsx-review` and `/opsx-verify-auto` command surfaces were removed and the
+   controller ships no replacement. The workflow below is the complete review
+   contract.
 4. If `.venv/bin/activate` exists at the repo root, activate it before running
    repo-local Python helpers, `pytest`, `ruff`, or other repository validation
    commands that expect the repo venv.

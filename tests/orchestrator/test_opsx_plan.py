@@ -2694,21 +2694,28 @@ class OpenCodeAgentModeTests(unittest.TestCase):
             "opsx-archiver.md",
         ):
             text = re.sub(r"\s+", " ", (self.AGENT_DIR / name).read_text(encoding="utf-8"))
-            self.assertRegex(
-                text,
-                r"Expand `\$\{?HOME\}?` before reading; never pass a literal `\$\{?HOME\}?/\.\.\.` path",
-                f"{name} must forbid literal $HOME Read paths",
-            )
             self.assertIn(
                 "If `.venv/bin/activate` exists at the repo root, activate it",
                 text,
                 f"{name} must remind the worker to activate the repo venv when present",
             )
-            self.assertIn(
-                "Do not use Glob for this step; try exact Read paths",
-                text,
-                f"{name} must avoid broad globbing for global prompt discovery",
-            )
+
+        # Only the implementer reads an optional prompt file (the apply prompt,
+        # project-local first); the review and archive contracts are fully
+        # embedded because their legacy command surfaces were removed.
+        implementer = re.sub(
+            r"\s+", " ", (self.AGENT_DIR / "opsx-implementer.md").read_text(encoding="utf-8")
+        )
+        self.assertRegex(
+            implementer,
+            r"Expand `\$\{?HOME\}?` before reading; never pass a literal `\$\{?HOME\}?/\.\.\.` path",
+            "opsx-implementer.md must forbid literal $HOME Read paths",
+        )
+        self.assertIn(
+            "Do not use Glob for this step; try exact Read paths",
+            implementer,
+            "opsx-implementer.md must avoid broad globbing for global prompt discovery",
+        )
 
         for name in ("opsx-reviewer.md", "opsx-archiver.md"):
             text = (self.AGENT_DIR / name).read_text(encoding="utf-8")
