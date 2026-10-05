@@ -322,6 +322,89 @@ class TaskClassificationTests(unittest.TestCase):
             {"complete": 1, "total": 2},
         )
 
+    def test_accepted_deferred_plain_followup_counts_only_active_checkboxes(self) -> None:
+        # An explicitly accepted, nonessential deferral is recorded as a plain
+        # (non-checkbox) follow-up entry that keeps the original task id and an
+        # acceptance reference. It must not become a synthetic task or a fake
+        # manual item, and it must not affect active-task counting.
+        self._write_tasks(
+            "add-thing",
+            "## 1\n\n"
+            "- [x] 1.1 Add the regression test\n"
+            "- [x] 1.2 Wire the parser into the gate\n"
+            "\n"
+            "Accepted deferral follow-up: 1.3 Export the audit log\n"
+            "  reason: requires live operator credentials\n"
+            "  impact: nonessential telemetry only\n"
+            "  follow-up: capture in a separate change\n"
+            "  acceptance: openspec/changes/add-thing/specs/state/spec.md\n",
+        )
+        tasks = state_mod.change_tasks(self.repo, "add-thing")
+        self.assertEqual([t["id"] for t in tasks], [
+            "1.1 Add the regression test",
+            "1.2 Wire the parser into the gate",
+        ])
+        self.assertEqual([t["done"] for t in tasks], [True, True])
+        self.assertEqual(
+            state_mod.change_task_counts(self.repo, "add-thing"),
+            {"complete": 2, "total": 2},
+        )
+        self.assertEqual(
+            state_mod.remaining_automatable_tasks(self.repo, "add-thing"), []
+        )
+        # The plain follow-up must not be surfaced as a pending manual task.
+        self.assertEqual(
+            state_mod.pending_manual_tasks(self.repo, "add-thing"), []
+        )
+
+    def test_unchecked_deferred_label_still_gates_with_plain_followup_present(self) -> None:
+        # Merely labelling an unchecked active automatable task "deferred" does
+        # not defer it: it stays unchecked and gates, even alongside a plain
+        # accepted follow-up entry.
+        self._write_tasks(
+            "add-thing",
+            "## 1\n\n"
+            "- [x] 1.1 Add the regression test\n"
+            "- [ ] 1.2 Deferred export of the audit log\n"
+            "\n"
+            "Accepted deferral follow-up: 1.3 Export the audit log\n"
+            "  reason: requires live operator credentials\n"
+            "  impact: nonessential telemetry only\n"
+            "  follow-up: capture in a separate change\n"
+            "  acceptance: openspec/changes/add-thing/specs/state/spec.md\n",
+        )
+        self.assertEqual(
+            state_mod.remaining_automatable_tasks(self.repo, "add-thing"),
+            ["1.2 Deferred export of the audit log"],
+        )
+        self.assertEqual(
+            state_mod.change_task_counts(self.repo, "add-thing"),
+            {"complete": 1, "total": 2},
+        )
+
+    def test_plain_followup_cannot_complete_unchecked_task_with_same_id(self) -> None:
+        # A plain follow-up that reuses an active task's id is still not a
+        # checkbox: it cannot establish completion of the unchecked task.
+        self._write_tasks(
+            "add-thing",
+            "## 1\n\n"
+            "- [ ] 1.2 Wire the parser into the gate\n"
+            "\n"
+            "Accepted deferral follow-up: 1.2 Wire the parser into the gate\n"
+            "  reason: blocked on upstream interface\n"
+            "  impact: nonessential for this change\n"
+            "  follow-up: track in a follow-up change\n"
+            "  acceptance: openspec/changes/add-thing/specs/state/spec.md\n",
+        )
+        self.assertEqual(
+            state_mod.remaining_automatable_tasks(self.repo, "add-thing"),
+            ["1.2 Wire the parser into the gate"],
+        )
+        self.assertEqual(
+            state_mod.change_task_counts(self.repo, "add-thing"),
+            {"complete": 0, "total": 1},
+        )
+
     def test_helpers_return_empty_when_tasks_missing(self) -> None:
         self.assertEqual(state_mod.change_tasks(self.repo, "missing"), [])
         self.assertEqual(state_mod.remaining_automatable_tasks(self.repo, "missing"), [])

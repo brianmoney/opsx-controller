@@ -41,6 +41,15 @@ normal round budget, and SHALL fail the change with a reason naming the
 remaining task ids when the budget is exhausted. When every remaining
 unchecked task is manual, the controller SHALL advance to review normally.
 
+An explicitly accepted deferral SHALL be reflected in the current agreed
+scope/specs and retained as an identified plain follow-up entry rather than an
+active task checkbox. The entry SHALL retain the requirement or task id, reason,
+impact, follow-up, and accepting agreement/scope reference. Such a scoped-out
+follow-up SHALL NOT count as an unchecked automatable task or force a retry
+solely because its work is unimplemented. Workers SHALL NOT invent acceptance,
+check deferred work as completed, or misuse `(manual)` to evade these gates.
+Any still-active unchecked automatable task SHALL continue to block advancement.
+
 #### Scenario: Implemented with automatable tasks remaining
 
 - **WHEN** implement returns `status=implemented` and unchecked automatable
@@ -61,6 +70,17 @@ unchecked task is manual, the controller SHALL advance to review normally.
   in the change's tasks file is marked manual
 - **THEN** the change advances to review in the same round
 
+#### Scenario: Accepted scoped-out follow-up does not consume a round
+
+- **WHEN** every active automatable task is checked and an explicitly accepted nonessential deferral is recorded as an identified plain follow-up with the current scope/specs reconciled
+- **THEN** the completeness gate advances to review without a retry for that follow-up
+- **AND** the deferred work is disclosed as unimplemented rather than counted as completed or manual
+
+#### Scenario: A deferral label does not waive an active task
+
+- **WHEN** an active automatable task remains unchecked even though its text or worker summary labels it deferred
+- **THEN** the task-completeness gate still prevents advancement
+
 ### Requirement: Reviewer enforces task completeness
 
 When the reviewer input reports fewer complete tasks than total tasks, the
@@ -69,6 +89,14 @@ reviewer SHALL inspect the change's tasks file and SHALL return
 citing the tasks file as locus. Unchecked tasks marked manual SHALL NOT
 produce findings on their own. A reviewer SHALL NOT return `verdict=pass`
 while unchecked automatable tasks remain.
+
+The reviewer SHALL assess unimplemented requirements by impact against the
+current agreed acceptance scope. A gap SHALL block acceptance when essential to
+that scope, correct operation of implemented features, or a required security or
+correctness guarantee. An explicitly accepted deferral outside those obligations
+SHALL be disclosed in the existing result summary or artifact references, not
+as a `critical`, `warning`, or `note` finding or corrective `fix_prompt`. A
+deferral label alone SHALL NOT establish acceptance or waive a task gate.
 
 #### Scenario: Incomplete automatable task fails review
 
@@ -82,6 +110,17 @@ while unchecked automatable tasks remain.
 - **WHEN** the reviewer input header reports `TASK_COUNTS: 8/9` and the one
   unchecked task is marked manual
 - **THEN** the unchecked task alone does not cause a failing verdict
+
+#### Scenario: Accepted deferral is disclosed without failing review
+
+- **WHEN** a nonessential requirement is explicitly accepted for deferral with reason, impact, follow-up, and acceptance reference and the current scope/specs/tasks reflect that agreement
+- **THEN** the reviewer discloses it without adding it to `finding_counts`, `findings`, or `fix_prompt`
+- **AND** the deferral alone does not force another implementation round
+
+#### Scenario: Required guarantees cannot be deferred by a worker label
+
+- **WHEN** the implementation lacks behavior essential to the agreed acceptance scope or a claimed security/correctness guarantee
+- **THEN** the reviewer records the missing accepted-scope behavior as a blocking finding even if the worker calls it deferred
 
 ### Requirement: Archiver exempts manual tasks and reports an operator checklist
 
@@ -105,21 +144,31 @@ whose retry outlook reflects that a content change is required.
   manual
 - **THEN** the archiver returns a blocked result naming the unchecked task
 
-### Requirement: Implementer reports implemented only when automatable work is complete
+### Requirement: Implementer reports verified round progress without self-certifying change completeness
 
-The implementer worker contract SHALL define `status=implemented` as
-requiring every automatable task in the change's tasks file to be checked.
-An implementer that cannot complete an automatable task SHALL report
-`status=blocked` with a reason instead of returning `implemented` with
-automatable tasks remaining. Manual tasks MAY be left unchecked without
-affecting the reported status.
+The implementer worker contract SHALL define `status=implemented` as reporting
+verified work completed in the current round, even when additional active
+automatable tasks remain. It SHALL report the true remaining tasks and counts
+and SHALL NOT check a task until its required work is implemented and supported
+by applicable evidence. The controller SHALL independently apply the existing
+task-completeness gate before advancing to review.
 
-#### Scenario: Automatable task cannot be completed
+The implementer SHALL report `status=blocked` with a reason when a hard blocker
+stops further progress, rather than merely because remaining work does not fit
+in one round. Manual tasks MAY remain unchecked. Explicitly accepted scoped-out
+deferrals SHALL be recorded as plain follow-ups and disclosed honestly; they
+SHALL NOT be represented as completed work.
 
-- **WHEN** an implement worker finishes its round with an automatable task
-  it could not complete
-- **THEN** it returns `status=blocked` naming the task rather than
-  `status=implemented` with the task in `remaining_tasks`
+#### Scenario: A round completes verified partial work
+
+- **WHEN** an implement worker completes and verifies its planned work for the round and further active automatable tasks remain
+- **THEN** it may return `status=implemented` with those tasks in `remaining_tasks` and accurate counts
+- **AND** the controller still prevents review advancement until active automatable work is complete
+
+#### Scenario: A hard blocker prevents further implementation
+
+- **WHEN** an unclear requirement, conflicting handoff, or unworkable environment stops further progress
+- **THEN** the implementer returns `status=blocked` naming that blocker
 
 #### Scenario: Manual task left pending
 

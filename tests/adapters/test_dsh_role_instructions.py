@@ -114,10 +114,14 @@ class ReviewerRoleInstructionTests(unittest.TestCase):
         self.assertIn("openspec validate <change> --strict", self.text)
 
     def test_finding_classification_rules(self) -> None:
-        self.assertIn("Count missing or materially incorrect work as critical.", self.text)
         self.assertIn(
-            "Count partial coverage, missing validation, missing tests, or "
-            "notable design drift as warning.",
+            "Count blocking omissions or materially incorrect behavior in the "
+            "accepted change scope as critical.",
+            self.text,
+        )
+        self.assertIn(
+            "Count partial coverage, missing tests, validation warnings, or "
+            "notable design drift that affect the accepted scope as warning.",
             self.text,
         )
         self.assertIn("Count minor notes and suggestions together as note.", self.text)
