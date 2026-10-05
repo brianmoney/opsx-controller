@@ -35,3 +35,18 @@ Archive phase:
 - archives the change and creates the archive commit only when the staged set is
   clean
 - returns either a success payload or blocked triage
+
+## Completion and deferral handoff
+
+Apply the evidence and impact rules in
+`controller-contract.md#evidence-based-completion-and-accepted-deferrals` in both
+phases. Keep requirement, execution-path, observation-source, and verification
+references in existing change artifacts. Summarize what was implemented,
+verified, and explicitly deferred in the existing result `summary`.
+
+An accepted deferral is reflected in the agreed scope/specs and retained as an
+identified plain follow-up outside the active task checkboxes. It does not
+produce another implementation round or a review finding solely because it is
+unimplemented. A worker's deferral label alone is not acceptance; active
+unchecked automatable tasks and unsupported required guarantees still block.
+No new JSON fields, phase statuses, or controller-state edits are needed.

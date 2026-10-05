@@ -23,6 +23,19 @@ commands required to demonstrate the correction.
 The reviewer SHALL return an empty `fix_prompt` only for a zero-finding passing
 verdict.
 
+Each blocking finding SHALL cite the violated accepted requirement and a
+concrete failing case with expected versus observed behavior. Its verification
+requirements SHALL address the failure mechanism, not merely task labels or
+implementer claims. Reviewers SHALL independently inspect the required
+execution path and observation producer, limiting synthetic fixtures and test
+doubles to the evidence scope they actually exercise.
+
+Explicitly accepted nonessential deferrals reflected in the current
+scope/specs/tasks SHALL be disclosed in the summary or artifact references,
+not in the corrective handoff, `findings`, or finding counts, including as
+`note`. A worker's deferral label SHALL NOT waive essential accepted-scope
+behavior, unsupported required guarantees, or active unchecked tasks.
+
 A review worker SHALL additionally return a machine-readable `findings` array
 carrying the same findings the prose handoff describes. Each entry SHALL
 provide its `severity`, a `locus` array, and a `statement` describing the
@@ -67,6 +80,11 @@ The prose `fix_prompt` SHALL remain the implementer's corrective input; the
 - **THEN** the `fix_prompt` still contains all four labeled sections and is
   what the next implementer receives as corrective scope
 
+#### Scenario: A blocking finding carries a concrete failure mechanism
+
+- **WHEN** tests pass by trusting supplied fixture assertions but the accepted requirement needs observations from a live execution path
+- **THEN** the reviewer cites that requirement, the false-green case, and verification that distinguishes the supplied assertions from actual producer observations
+
 ### Requirement: Retry implementers execute the reviewer corrective handoff
 An implementer receiving a non-empty `LATEST_FIX_PROMPT` SHALL treat every
 finding, corrective guideline, and verification requirement in that handoff as
@@ -75,6 +93,13 @@ the highest-priority scope for the retry round.
 If current change artifacts or live repository evidence make a requested
 correction contradictory or unsafe, the implementer SHALL return its existing
 blocked result instead of inventing an alternative requirement.
+
+A retry implementer SHALL correct the root cause and use appropriate focused
+verification, including a meaningful false-green regression where applicable.
+If the same critical recurs after a correction, the workers SHALL reassess why
+the earlier fix failed before another patch. The reviewer SHALL independently
+verify closure and retain the same locus for the same defect, explaining why
+the earlier correction was insufficient.
 
 #### Scenario: Fresh implementer receives a failed review handoff
 - **WHEN** a failed review advances a change from review to a new implementation
@@ -87,6 +112,12 @@ blocked result instead of inventing an alternative requirement.
   active change specification
 - **THEN** the implementer returns a blocked result identifying the conflict
   rather than guessing which requirement wins
+
+#### Scenario: A recurring critical requires root-cause reassessment
+
+- **WHEN** the same critical defect survives an implementation correction
+- **THEN** the next corrective handoff preserves its locus and explains the inadequate prior fix
+- **AND** the implementer reassesses the execution/evidence path and verifies the root-cause correction before claiming closure
 
 ### Requirement: Corrective handoffs persist across retry dispatch
 The controller SHALL persist a failed review's complete corrective handoff in

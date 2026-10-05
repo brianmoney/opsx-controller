@@ -195,6 +195,9 @@ The adapter SHALL provide an implementer instruction file at
 - Treat `LATEST_FIX_PROMPT` as highest-priority fix scope when non-empty
 - Implement the next required work, keeping edits minimal and in scope
 - Mark completed tasks in the change task file immediately
+- Require appropriate implementation evidence before checking a task; trace the requirement, execution path, observation source, and applicable verification with claims limited to the exercised scope
+- Assess unimplemented requirements by impact and disclose explicitly accepted deferrals with reason, impact, follow-up, and the accepting scope reference; reconcile accepted scope/specs/tasks without falsely checking work or misusing `(manual)`
+- Reassess the root cause of a recurring critical before another correction
 - Not commit, push, archive, rebase, or create branches
 - Return exactly one JSON object in the success or blocked format as the final response
 
@@ -222,7 +225,10 @@ The adapter SHALL provide a reviewer instruction file at
 - Run live OpenSpec status, instructions, and `openspec validate <change> --strict`
 - Trust cached context for stable background understanding when valid
 - Reread verification-critical artifacts for the active round
-- Classify findings: missing/incorrect work as `critical`, partial coverage/missing tests as `warning`, minor notes as `note`
+- Independently trace accepted requirements to actual execution paths and evidence; a passing fixture or implementer claim SHALL NOT establish a broader proof scope
+- Classify blocking omissions or materially incorrect accepted-scope behavior as `critical`, accepted-scope coverage/validation gaps as `warning`, and minor notes as `note`
+- Cite the violated requirement and a concrete failing case for each blocking finding, and independently verify prior-critical closure with a stable locus for the same recurring defect
+- Disclose accepted deferrals in the summary or existing artifact references without counting them as findings; essential accepted-scope behavior and required security/correctness guarantees remain blocking
 - Return `verdict=pass` only when all three counts are zero
 - Include a concise fix prompt when `verdict=fail`
 - Return exactly one JSON object as the final response
@@ -241,6 +247,17 @@ The adapter SHALL provide a reviewer instruction file at
 
 - **WHEN** implementation is materially incorrect or missing required work
 - **THEN** reviewer returns `verdict=fail` with `critical > 0` and a fix prompt
+
+#### Scenario: Accepted deferral does not force another round
+
+- **WHEN** a nonessential gap is explicitly accepted for deferral in the current scope/specs, its task is an identified plain follow-up, and all active automatable tasks and required guarantees are satisfied
+- **THEN** the reviewer discloses the reason, impact, follow-up, and acceptance reference without adding that deferral to `finding_counts`, `findings`, or `fix_prompt`
+- **AND** the missing deferred behavior alone does not prevent a passing review
+
+#### Scenario: Synthetic evidence cannot prove a required live path
+
+- **WHEN** an accepted requirement needs live execution but the implementation provides only scaffolding, caller assertions, or synthetic-only coverage
+- **THEN** the reviewer records the unsupported accepted-scope behavior as a blocking finding rather than inferring live proof from green tests
 
 ### Requirement: Archiver role instructions
 

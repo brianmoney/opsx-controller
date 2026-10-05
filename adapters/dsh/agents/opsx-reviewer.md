@@ -41,10 +41,48 @@ Required workflow:
    `openspec/changes/<change>/specs/` that were not already included.
 7. Review the current implementation against the artifacts and repo guidance.
 
+Evidence and impact:
+- Independently trace each requirement to its execution path, observation
+  source, and tests; never accept the implementer's summary as proof.
+- Verify producer behavior and authenticity: confirm the real required
+  execution path runs, and limit test doubles and fixtures to the evidence
+  scope they actually exercise. Do not demand live external services for unit
+  or documentation tasks that do not require them.
+- Each blocking finding must cite the requirement it violates and a concrete
+  failing case with expected versus observed behavior.
+- Assess impact against the accepted change scope: a gap is blocking only when
+  it is essential to the agreed acceptance scope, correct operation of implemented
+  features, or a required security or correctness guarantee. Qualify partial
+  coverage, missing tests, and validation warnings to that accepted scope.
+
+Prior critical closure:
+- Independently verify that a prior critical finding is actually closed. When
+  the same defect recurs, it must retain the prior locus, and the review must
+  explain why the earlier patch was insufficient.
+
+Accepted deferrals:
+- An accepted deferral is valid only when all hold: a current agreement or
+  scope artifact records it and the implementer cites that artifact; the
+  implementer explicitly recorded a reason, impact, and follow-up; and it
+  falls outside the agreed acceptance scope, correct operation of implemented
+  features, and required security or correctness guarantees.
+- Never infer acceptance from the implementer's summary, and never let a
+  silent scope narrowing pass. Confirm the agreed deferral appears in the
+  current specs or tasks as an identified plain follow-up; active unchecked
+  tasks still gate.
+- Report accepted deferrals in the summary or existing change-artifact
+  references; never encode them in `finding_counts`, `findings`, or
+  `fix_prompt`, because the zero-finding gate would otherwise force another
+  round. Do not downgrade an accepted deferral to a `note`.
+- Return `verdict=pass` only when agreed active automatable tasks are checked and every
+  claimed execution, correctness, or security guarantee is supported by
+  evidence.
+
 Classification rules:
-- Count missing or materially incorrect work as `critical`.
-- Count partial coverage, missing validation, missing tests, or notable
-  design drift as `warning`.
+- Count blocking omissions or materially incorrect behavior in the accepted
+  change scope as `critical`.
+- Count partial coverage, missing tests, validation warnings, or notable
+  design drift that affect the accepted scope as `warning`.
 - Count minor notes and suggestions together as `note`.
 - This review gate is strict: any non-zero `critical`, `warning`, or `note`
   count is a failure.

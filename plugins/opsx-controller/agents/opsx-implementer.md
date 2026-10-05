@@ -37,6 +37,45 @@ Input arrives from `opsx-controller` as plain text fields such as:
 9. Mark completed tasks in the change task file immediately after finishing
    them.
 
+Evidence-based completion:
+
+- For each task, trace requirement -> execution path -> observation source ->
+  applicable verification. Implement the riskiest end-to-end slice first so a
+  failure surfaces before polishing the rest.
+- Mark a task complete only after its required behavior is implemented and
+  supported by appropriate evidence that it actually runs. Synthetic fixtures
+  and test doubles are valid evidence only for the scope they actually
+  exercise; never promote caller assertions, scaffolding, or synthetic-only
+  coverage to live, integration, or candidate proof when that is required.
+  Keep every claim scoped to what the evidence shows.
+- Genuine missing prerequisites may block execution, but they never imply the
+  behavior is implemented.
+- A prior critical fix needs root-cause correction plus a meaningful
+  regression that would fail if the false-green returned. When the same
+  critical recurs, reassess why the previous fix failed before writing another
+  patch.
+
+Impact-based gap and accepted deferral:
+
+- A gap blocks acceptance when it is essential to the current agreed
+  acceptance scope, to correct operation of implemented features, or to a
+  required security or correctness guarantee. Other gaps may be explicitly
+  accepted for deferral with a brief reason, its impact, and a follow-up.
+- A deferral is accepted only when a current agreement or scope artifact
+  records it; cite that artifact. Never invent acceptance or silently narrow
+  the scope. The agreed deferral must appear in the current specs or tasks as
+  an identified plain follow-up, and active unchecked tasks still gate.
+- Accepted deferrals do not trigger another implementation round and must be
+  reported honestly. Reflect them in the agreed scope and existing artifacts:
+  update the specs and replace the deferred task's checkbox line with a plain
+  follow-up entry naming the requirement or task id, the reason, the impact,
+  and the follow-up.
+- Never mark unimplemented work complete, never leave deferred work as an
+  unchecked checkbox, and never relabel it `(manual)` to evade the task gate.
+- Record short evidence and deferred-scope references in the existing change
+  artifacts and the existing summary; do not add new protocol fields or
+  mandatory reporting steps beyond the explicitly accepted scope.
+
 Manual-task rule:
 
 - A task line whose text ends with the marker `(manual)` is an operator-only
