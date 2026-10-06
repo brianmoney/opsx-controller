@@ -4483,7 +4483,14 @@ def _run_direct_change_loop_inner(
                     "model": esc_model,
                 }
             else:
-                os.environ[impl_env_key] = base_model
+                if base_model:
+                    os.environ[impl_env_key] = base_model
+                else:
+                    # Never export an empty model id: an unset variable is the
+                    # "no model resolved" signal for callers that pass a cfg
+                    # without a resolved models entry, and an empty value
+                    # would defeat their fallback.
+                    os.environ.pop(impl_env_key, None)
                 if not r["escalation"]["active"]:
                     r["escalation"] = {
                         "active": False,
