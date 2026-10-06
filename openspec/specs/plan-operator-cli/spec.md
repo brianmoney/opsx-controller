@@ -1249,16 +1249,21 @@ On escalation, autopilot SHALL append a digest to `.opsx-plan/escalations.jsonl`
 
 An escalation for a change that needs human attention SHALL exit 0, so that a unit configured with `Restart=on-failure` stays down for the operator rather than restart-looping.
 
-An environment-class failure that prevents the loop from operating SHALL exit 2 rather than 0, so it is distinguishable from a human-attention escalation.
+A deterministic environment failure SHALL exit 0 after writing a durable pause marker, so that a unit configured with `Restart=on-failure` stays down until an operator resumes. A transient environment failure SHALL exit 2 so it remains retryable.
 
 #### Scenario: Escalation writes a digest and exits clean
 
 - **WHEN** autopilot escalates a failed change or a vetoed gate
 - **THEN** it appends a digest to `.opsx-plan/escalations.jsonl`, sends an ntfy push when a topic is configured, records the decision, and exits 0
 
+#### Scenario: Deterministic environment failure pauses and exits 0
+
+- **WHEN** autopilot cannot operate because of a deterministic environment failure such as a dirty tracked worktree or an unresolvable plan or executable
+- **THEN** it writes the pause marker, records one escalation, and exits 0 instead of 2
+
 #### Scenario: Environment failure exits 2
 
-- **WHEN** autopilot cannot obtain a valid plan status or the engine fails for an environment reason
+- **WHEN** autopilot cannot obtain a valid plan status or the engine fails for a transient environment reason such as execution-lock contention
 - **THEN** autopilot records the escalation and exits 2 instead of 0
 
 ### Requirement: Autopilot records its decisions in a durable event log
@@ -1451,3 +1456,58 @@ the filesystem, and SHALL NOT invoke `systemctl`. On any resolution, render, or
 - **WHEN** no plan can be resolved from the explicit argument, `OPSX_PLAN`, or
   the active-plan pointer
 - **THEN** `install` exits nonzero with a diagnostic and writes no files
+
+### Requirement: Autopilot classifies environment failures as deterministic or transient
+
+Autopilot SHALL classify every environment failure before choosing an exit code. Deterministic classes SHALL include a dirty tracked worktree, an unresolvable plan, a missing `opsx-plan` executable, and engine refusals whose reported reason names one of those conditions. Transient classes SHALL include execution-lock contention and engine exits 2 that do not match a known deterministic reason.
+
+Only known deterministic reasons SHALL pause; any unclassified environment failure SHALL retain the existing exit-2 retry behavior.
+
+#### Scenario: Dirty worktree is deterministic
+
+- **WHEN** autopilot preflight finds uncommitted tracked changes and `require_clean_tracked` is enabled
+- **THEN** the failure is classified deterministic and does not return 2
+
+#### Scenario: Lock contention is transient
+
+- **WHEN** the engine refuses because another live process holds the worktree execution lock
+- **THEN** the failure is classified transient, is escalated, and exits 2 so systemd may retry it
+
+#### Scenario: Unclassified engine exit 2 stays transient
+
+- **WHEN** the engine exits 2 for a reason that matches no known deterministic marker
+- **THEN** autopilot keeps the existing exit-2 behavior rather than pausing
+
+### Requirement: Deterministic environment failures pause durably until operator resume
+
+On a deterministic environment failure autopilot SHALL write `.opsx-plan/autopilot-paused.json` recording the failure class, reason, creation timestamp, and suggested action, SHALL append exactly one escalation digest and send at most one notification for the pause transition, and SHALL exit 0.
+
+Every subsequent autopilot start — including an explicit unit start and `--once` — SHALL check the marker before resolving the plan and SHALL exit 0 without appending another escalation while it is present.
+
+`opsx-plan autopilot status` SHALL report the pause state read-only. `opsx-plan autopilot resume` SHALL re-run the deterministic preflight checks and clear the marker only when they pass; when a check still fails it SHALL report the failing check and exit non-zero without clearing the marker.
+
+#### Scenario: Pause writes the marker once
+
+- **WHEN** a deterministic environment failure is detected
+- **THEN** the marker is written and exactly one escalation digest is appended
+
+#### Scenario: Paused unit stays down on restart attempts
+
+- **GIVEN** a pause marker exists
+- **WHEN** the unit is started again, whether by systemd or by an explicit `systemctl --user start`
+- **THEN** autopilot records a pause event, appends no new escalation, and exits 0
+
+#### Scenario: Resume clears a resolved pause
+
+- **WHEN** the operator fixes the environment and runs `opsx-plan autopilot resume`
+- **THEN** preflight passes, the marker is removed, and autopilot reports that the plan may be started again
+
+#### Scenario: Resume refuses an unresolved pause
+
+- **WHEN** the operator runs `opsx-plan autopilot resume` while the deterministic failure is still present
+- **THEN** the failing check is reported, the marker remains, and resume exits non-zero
+
+#### Scenario: Status reports pause details
+
+- **WHEN** an operator runs `opsx-plan autopilot status` while paused
+- **THEN** it prints the pause class, reason, timestamp, and suggested action without mutating state

@@ -1,0 +1,24 @@
+---
+description: Archives one OpenSpec change non-interactively after a clean review and returns a machine-readable outcome.
+mode: all
+hidden: true
+model: "{env:OPSX_ARCHIVER_MODEL}"
+variant: "{env:OPSX_ARCHIVER_VARIANT}"
+permission:
+  read: allow
+  edit: allow
+  glob: allow
+  grep: allow
+  bash: allow
+  external_directory:
+    "*": deny
+    "~/.config/opencode/**": allow
+    "~/.config/opencode/command/*": allow
+    "~/.config/opencode/commands/*": allow
+    "~/.config/opencode/opsx-controller/*": allow
+  task: deny
+  question: deny
+  skill: deny
+---
+
+{{phase_body}}

@@ -15,6 +15,11 @@ plus the shared plan-authoring reference for `opsx-plan compile`.
 - `plan-supervision.md`: client-neutral durable supervision contract — the
   supervisor ledger's record model, schema versioning, trusted-location rule,
   and journal-before-side-effects semantics
+- `phase-agents/{implementer,reviewer,archiver}.md`: the single authored,
+  client-neutral instruction body per phase. Adapters render their agent files
+  from these bodies plus thin `agent-templates/` wrappers via
+  `scripts/generate-phase-agents.py`; edit these bodies (then regenerate), never
+  the rendered adapter files.
 
 Current adapters:
 

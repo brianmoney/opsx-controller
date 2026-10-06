@@ -4483,7 +4483,14 @@ def _run_direct_change_loop_inner(
                     "model": esc_model,
                 }
             else:
-                os.environ[impl_env_key] = base_model
+                if base_model:
+                    os.environ[impl_env_key] = base_model
+                else:
+                    # Never export an empty model id: an unset variable is the
+                    # "no model resolved" signal for callers that pass a cfg
+                    # without a resolved models entry, and an empty value
+                    # would defeat their fallback.
+                    os.environ.pop(impl_env_key, None)
                 if not r["escalation"]["active"]:
                     r["escalation"] = {
                         "active": False,
@@ -5794,13 +5801,17 @@ def cmd_compile(args: argparse.Namespace) -> int:
 
 
 def _cmd_autopilot_dispatch(args) -> int:
-    """Route ``opsx-plan autopilot [run|install]`` to its handler.
+    """Route ``opsx-plan autopilot [run|install|status|resume]`` to its handler.
 
     The bare ``autopilot`` action keeps the unattended loop behavior; the
     ``install`` action binds the systemd user unit to a repo and plan.
     """
     if getattr(args, "action", "run") == "install":
         return cmd_autopilot_install.cmd_autopilot_install(args)
+    if getattr(args, "action", "run") == "status":
+        return cmd_autopilot.cmd_autopilot_status(args)
+    if getattr(args, "action", "run") == "resume":
+        return cmd_autopilot.cmd_autopilot_resume(args)
     return cmd_autopilot.cmd_autopilot(args)
 
 
@@ -5881,13 +5892,13 @@ def main() -> int:
 
     p_autopilot = sub.add_parser(
         "autopilot",
-        help="unattended wrapper: run, handle gates, resume failures; "
-             "`install` binds the systemd user unit",
+        help="unattended wrapper: run, install the user unit, inspect status, "
+             "or resume an environment pause",
     )
     p_autopilot.add_argument(
-        "action", nargs="?", choices=("run", "install"), default="run",
-        help="`run` the unattended loop (default) or `install` the systemd "
-             "user unit and plan drop-in binding",
+        "action", nargs="?", choices=("run", "install", "status", "resume"), default="run",
+        help="`run` the loop (default), `install` the unit, `status` read-only "
+             "pause details, or `resume` after fixing the environment",
     )
     p_autopilot.add_argument("--plan", default=None, help="path to plan TOML")
     p_autopilot.add_argument(

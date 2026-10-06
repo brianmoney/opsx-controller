@@ -1,0 +1,58 @@
+# issue-remediation — runnable manifest for the two-change remediation plan.
+# Graph: fix-autopilot-deterministic-pause (#33) -> add-phase-agent-generation
+# (#32). The changes are independent; phase 2 is serialized to keep review
+# bandwidth focused. Both OpenSpec changes are authored and validated
+# (`openspec validate <change> --strict`) before this run, so there is no
+# create stage.
+#
+# Issue #25 is verified/closed and intentionally absent from the graph.
+
+[plan]
+name = "issue-remediation"
+adapter = "opencode"
+state_file = ".opencode/opsx-controller/{change}.json"
+implement_invoke = 'opencode run --agent opsx-implementer --model "$OPSX_IMPLEMENTER_MODEL" --variant "$OPSX_IMPLEMENTER_VARIANT"'
+review_invoke = 'opencode run --agent opsx-reviewer --model "$OPSX_REVIEWER_MODEL" --variant "$OPSX_REVIEWER_VARIANT"'
+archive_invoke = 'opencode run --agent opsx-archiver --model "$OPSX_ARCHIVER_MODEL" --variant "$OPSX_ARCHIVER_VARIANT"'
+notify_cmd = ""
+plan_doc = "openspec/plans/issue-remediation-plan.md"
+timeout_minutes = 90
+max_rounds = 5
+no_progress_limit = 2
+require_clean_tracked = true
+escalate_after_review_fails = 0
+finding_recurrence_limit = 0
+invalid_output_retries = 2
+skip_warning = false
+skip_suggestion = false
+# Repo-canonical gate (AGENTS.md): both test suites plus OpenSpec validation.
+fast_checks = [
+  "python3 -m unittest discover -t . -s tests",
+  "node tests/opencode/test-opsx-usage-emitter.js",
+  "openspec validate --all --strict",
+]
+check_timeout_minutes = 15
+
+[plan.git_delivery]
+enabled = false
+branch = ""
+base_ref = ""
+create_pull_request = false
+
+# Phase 1: autopilot deterministic pause (issue #33). Contained bug fix with a
+# regression test; no human gate.
+[[changes]]
+id = "fix-autopilot-deterministic-pause"
+phase = 1
+enabled = true
+timeout_minutes = 120
+
+# Phase 2: canonical phase-agent generation (issue #32). First change in the
+# new `phase-agent-generation` capability — human gate before implementation.
+# No `depends_on`: independent of phase 1; serialized for review bandwidth.
+[[changes]]
+id = "add-phase-agent-generation"
+phase = 2
+enabled = true
+pause_before = true
+timeout_minutes = 150

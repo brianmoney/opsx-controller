@@ -15,6 +15,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -23,6 +24,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from lib.models import resolver
+from lib.models.types import ROLE_ENV
 from lib.supervisor import authority
 from lib.supervisor import broker as broker_mod
 from lib.supervisor import budgets
@@ -30,6 +33,35 @@ from lib.supervisor import endpoints
 from lib.supervisor import lifecycle
 from lib.supervisor import ledger
 from lib.supervisor import model_policy
+
+_USER_CONFIG_PATCH = None
+_MODEL_ENV_PATCH = None
+_MODEL_HOME: tempfile.TemporaryDirectory | None = None
+
+
+def setUpModule() -> None:
+    """Pin model resolution so registration never reads ambient config."""
+    global _USER_CONFIG_PATCH, _MODEL_ENV_PATCH, _MODEL_HOME
+    _MODEL_HOME = tempfile.TemporaryDirectory()
+    _USER_CONFIG_PATCH = mock.patch.object(
+        resolver, "USER_CONFIG_PATH", Path(_MODEL_HOME.name) / "models.toml"
+    )
+    _USER_CONFIG_PATCH.start()
+    _MODEL_ENV_PATCH = mock.patch.dict(
+        os.environ,
+        {env: f"test-provider/test-{role}" for role, env in ROLE_ENV.items()},
+    )
+    _MODEL_ENV_PATCH.start()
+
+
+def tearDownModule() -> None:
+    if _MODEL_ENV_PATCH is not None:
+        _MODEL_ENV_PATCH.stop()
+    if _USER_CONFIG_PATCH is not None:
+        _USER_CONFIG_PATCH.stop()
+    if _MODEL_HOME is not None:
+        _MODEL_HOME.cleanup()
+
 
 MANIFEST = (
     "[[changes]]\n"

@@ -9,6 +9,7 @@ minimal plan TOML so plan resolution exercises the real
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import subprocess
@@ -16,6 +17,7 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -105,6 +107,8 @@ class FakeEngine:
         reset_rc: int = 0,
         status_rc: int = 0,
         status_raw: str | None = None,
+        run_stdout: str = "",
+        run_stderr: str = "",
     ) -> None:
         self.status_docs = list(status_docs)
         self.run_rc = run_rc
@@ -112,6 +116,8 @@ class FakeEngine:
         self.reset_rc = reset_rc
         self.status_rc = status_rc
         self.status_raw = status_raw
+        self.run_stdout = run_stdout
+        self.run_stderr = run_stderr
         self.calls: list[list[str]] = []
         self.run_count = 0
         self.approve_count = 0
@@ -127,7 +133,7 @@ class FakeEngine:
         sub = cmd[1] if len(cmd) > 1 else ""
         if sub == "run":
             self.run_count += 1
-            return result(self.run_rc)
+            return result(self.run_rc, self.run_stdout, self.run_stderr)
         if sub == "status":
             if self.status_raw is not None:
                 return result(self.status_rc, self.status_raw)
@@ -226,6 +232,10 @@ class AutopilotHarness(unittest.TestCase):
         path = self.repo / ".opsx-plan" / "autopilot-state.json"
         return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
 
+    @property
+    def pause_path(self) -> Path:
+        return self.repo / ".opsx-plan" / "autopilot-paused.json"
+
 
 # ---------------------------------------------------------------------------
 # Completion, continuation, budget
@@ -323,6 +333,67 @@ class ApprovalWindowTests(AutopilotHarness):
         rc, _ = self.run_autopilot(engine, veto=1, poll=30)
         self.assertEqual(rc, 2)
         self.assertEqual([e["class"] for e in self.escalations], ["environment"])
+        self.assertFalse(self.pause_path.exists())
+
+    def test_lock_contention_stays_transient(self) -> None:
+        reason = "worktree /repo execution lock is already held by pid 123; refusing to proceed"
+        engine = FakeEngine(
+            [document(change(status="done"))], run_rc=2, run_stderr=reason,
+        )
+        rc, _ = self.run_autopilot(engine)
+        self.assertEqual(rc, 2)
+        self.assertFalse(self.pause_path.exists())
+        self.assertEqual(len(self.escalations), 1)
+        self.assertEqual(self.escalations[0]["reason"], reason)
+
+    def test_deterministic_engine_refusals_pause_before_status(self) -> None:
+        for reason in (
+            "[opsx-plan] tracked worktree is dirty; refusing to start a new stage",
+            "error: uncommitted archive changes; operator must commit them",
+            "error: cannot parse plan plan.toml: file missing",
+            "error: cannot locate the opsx-plan executable",
+        ):
+            with self.subTest(reason=reason):
+                cmd_autopilot._clear_pause(self.repo)
+                before = len(self.escalations)
+                engine = FakeEngine(
+                    [document(change(status="done"))], run_rc=2,
+                    run_stdout="engine banner\n", run_stderr=reason,
+                )
+                rc, _ = self.run_autopilot(engine)
+                self.assertEqual(rc, 0)
+                self.assertEqual(len(engine.calls), 1)
+                self.assertTrue(self.pause_path.exists())
+                self.assertEqual(self.escalations[-1]["reason"], reason)
+                self.assertEqual(len(self.escalations), before + 1)
+
+    def test_unknown_engine_diagnostic_stays_transient(self) -> None:
+        reason = "error: temporary service unavailable"
+        engine = FakeEngine([], run_rc=2, run_stderr=reason)
+        rc, _ = self.run_autopilot(engine)
+        self.assertEqual(rc, 2)
+        self.assertFalse(self.pause_path.exists())
+        self.assertEqual(self.escalations[0]["reason"], reason)
+
+    def test_real_engine_stream_is_captured_for_pause(self) -> None:
+        # Exercise the actual runner, not only caller-supplied diagnostics.
+        exe = self.repo / "fake-opsx-plan"
+        exe.write_text(
+            f"#!{sys.executable}\nimport sys\n"
+            "print('engine output', flush=True)\n"
+            "print('tracked worktree is dirty; refusing to start a new stage', file=sys.stderr)\n"
+            "sys.exit(2)\n",
+            encoding="utf-8",
+        )
+        exe.chmod(0o755)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = cmd_autopilot.cmd_autopilot(self.args(), executable=str(exe))
+        self.assertEqual(rc, 0)
+        self.assertIn("engine output", out.getvalue())
+        self.assertIn("tracked worktree is dirty", out.getvalue())
+        self.assertEqual(len(self.escalations), 1)
+        self.assertTrue(self.pause_path.exists())
 
 
 # ---------------------------------------------------------------------------
@@ -614,28 +685,215 @@ class NoProgressAndEnvironmentTests(AutopilotHarness):
 # Preflight
 # ---------------------------------------------------------------------------
 class PreflightTests(AutopilotHarness):
-    def test_dirty_tracked_tree_exits_two_before_running(self) -> None:
+    def test_dirty_tracked_tree_pauses_once_before_running(self) -> None:
         (self.repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
         engine = FakeEngine([document(change(status="done"))])
-        rc, _ = self.run_autopilot(engine)
-        self.assertEqual(rc, 2)
+        with mock.patch.dict(os.environ, {"OPSX_AUTOPILOT_NTFY_TOPIC": "topic"}), \
+                mock.patch.object(cmd_autopilot.urllib.request, "urlopen") as urlopen:
+            rc, _ = self.run_autopilot(engine)
+            marker_bytes = self.pause_path.read_bytes()
+            # Even an explicit second start with a broken plan must no-op.
+            with mock.patch.object(cmd_autopilot.planref, "resolve_plan") as resolve:
+                second_rc, _ = self.run_autopilot(engine, plan="missing.toml")
+                once_rc, _ = self.run_autopilot(engine, once=True)
+            resolve.assert_not_called()
+        self.assertEqual((rc, second_rc, once_rc), (0, 0, 0))
         self.assertEqual(engine.run_count, 0)
+        self.assertEqual(urlopen.call_count, 1)
+        self.assertEqual(len(self.escalations), 1)
+        self.assertEqual(self.event_names().count("escalate"), 1)
+        self.assertEqual(self.event_names().count("paused"), 2)
+        self.assertEqual(self.pause_path.read_bytes(), marker_bytes)
+        marker = json.loads(marker_bytes)
+        self.assertEqual(marker["class"], "deterministic")
+        self.assertIn("dirty", marker["reason"])
+        self.assertEqual(marker["created_at"], FakeClock()().isoformat())
+        self.assertIn("resume", marker["suggested_action"])
 
-    def test_unresolvable_executable_exits_two(self) -> None:
+    def test_unresolvable_executable_pauses(self) -> None:
         engine = FakeEngine([document(change(status="done"))])
         with mock.patch.object(cmd_autopilot, "_resolve_opsx_plan", return_value=None):
             rc = cmd_autopilot.cmd_autopilot(
                 self.args(), runner=engine, now_func=FakeClock(),
                 sleep_func=FakeClock().sleep, executable=None,
             )
-        self.assertEqual(rc, 2)
+        self.assertEqual(rc, 0)
         self.assertEqual(engine.run_count, 0)
+        self.assertTrue(self.pause_path.exists())
+        self.assertEqual(len(self.escalations), 1)
+        self.assertIn("executable", self.escalations[0]["reason"])
 
-    def test_missing_plan_exits_two(self) -> None:
+    def test_missing_plan_pauses(self) -> None:
         engine = FakeEngine([document(change(status="done"))])
         rc, _ = self.run_autopilot(engine, plan="no-such-plan.toml")
-        self.assertEqual(rc, 2)
+        self.assertEqual(rc, 0)
         self.assertEqual(engine.run_count, 0)
+        self.assertTrue(self.pause_path.exists())
+        self.assertEqual(len(self.escalations), 1)
+
+    def test_malformed_plan_pauses_and_second_start_noops(self) -> None:
+        self.plan.write_text("not valid TOML [", encoding="utf-8")
+        engine = FakeEngine([])
+        self.assertEqual(self.run_autopilot(engine)[0], 0)
+        self.assertTrue(self.pause_path.exists())
+        self.assertEqual(self.run_autopilot(engine, once=True)[0], 0)
+        self.assertEqual(len(self.escalations), 1)
+        self.assertEqual(engine.calls, [])
+
+    def test_marker_is_atomic_and_does_not_dirty_tracked_tree(self) -> None:
+        marker = {"class": "deterministic", "reason": "test", "created_at": "now", "suggested_action": "resume"}
+        with mock.patch.object(cmd_autopilot.os, "fsync", wraps=os.fsync) as fsync, \
+                mock.patch.object(cmd_autopilot.os, "replace", wraps=os.replace) as replace:
+            cmd_autopilot._write_pause(self.repo, marker)
+        fsync.assert_called_once()
+        replace.assert_called_once()
+        self.assertEqual(cmd_autopilot._load_pause(self.repo), marker)
+        self.assertFalse(self.pause_path.with_suffix(".tmp").exists())
+        self.assertTrue(cmd_autopilot.groundtruth.tracked_tree_clean(self.repo))
+        cmd_autopilot._clear_pause(self.repo)
+        self.assertIsNone(cmd_autopilot._load_pause(self.repo))
+
+    def test_malformed_marker_still_parks_run(self) -> None:
+        self.pause_path.parent.mkdir()
+        self.pause_path.write_text("not json", encoding="utf-8")
+        engine = FakeEngine([])
+        with mock.patch.object(cmd_autopilot.planref, "resolve_plan") as resolve:
+            rc, _ = self.run_autopilot(engine, once=True)
+        self.assertEqual(rc, 0)
+        resolve.assert_not_called()
+        self.assertEqual(self.escalations, [])
+        self.assertEqual(self.event_names(), ["paused"])
+
+    def test_unclassified_preflight_environment_error_retries(self) -> None:
+        engine = FakeEngine([])
+        with mock.patch.object(cmd_autopilot.groundtruth, "tracked_tree_clean", side_effect=OSError("git unavailable")):
+            rc, _ = self.run_autopilot(engine)
+        self.assertEqual(rc, 2)
+        self.assertFalse(self.pause_path.exists())
+        self.assertEqual(len(self.escalations), 1)
+        self.assertIn("git unavailable", self.escalations[0]["reason"])
+        self.assertEqual(engine.calls, [])
+
+
+class StatusAndResumeTests(AutopilotHarness):
+    def pause(self) -> None:
+        cmd_autopilot._write_pause(self.repo, {
+            "class": "deterministic", "reason": "tracked worktree is dirty",
+            "created_at": "2026-01-02T03:04:05Z", "suggested_action": "fix and resume",
+        })
+
+    def snapshot(self) -> dict:
+        return {
+            str(path.relative_to(self.repo)): path.read_bytes()
+            for path in (self.repo / ".opsx-plan").rglob("*") if path.is_file()
+        }
+
+    def test_status_is_read_only_and_shows_pause_and_recorded_state(self) -> None:
+        self.pause()
+        self.write_record(status="failed", reason="test failure")
+        before = self.snapshot()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = cmd_autopilot.cmd_autopilot_status(self.args())
+        self.assertEqual(rc, 0)
+        for text in ("autopilot: paused", "class: deterministic", "tracked worktree is dirty",
+                     "2026-01-02T03:04:05Z", "suggested_action: fix and resume",
+                     f"plan: {PLAN_NAME}", f"{CHANGE_ID}: failed", "test failure"):
+            self.assertIn(text, out.getvalue())
+        self.assertEqual(self.snapshot(), before)
+
+    def test_status_reports_pause_even_when_plan_is_malformed(self) -> None:
+        self.pause()
+        self.plan.write_text("[bad TOML", encoding="utf-8")
+        before = self.snapshot()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = cmd_autopilot.cmd_autopilot_status(self.args())
+        self.assertEqual(rc, 0)
+        self.assertIn("autopilot: paused", out.getvalue())
+        self.assertIn("plan status unavailable:", out.getvalue())
+        self.assertEqual(self.snapshot(), before)
+
+    def test_status_without_pause_does_not_create_state(self) -> None:
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = cmd_autopilot.cmd_autopilot_status(self.args())
+        self.assertEqual(rc, 0)
+        self.assertIn("autopilot: not paused", out.getvalue())
+        self.assertIn(f"{CHANGE_ID}: pending", out.getvalue())
+        self.assertFalse((self.repo / ".opsx-plan").exists())
+
+    def test_resume_refuses_dirty_then_clears_clean_without_engine_run(self) -> None:
+        self.pause()
+        (self.repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+        before = self.snapshot()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            rc = cmd_autopilot.cmd_autopilot_resume(self.args(), executable=EXE)
+        self.assertEqual(rc, 2)
+        self.assertIn("dirty", err.getvalue())
+        self.assertEqual(self.snapshot(), before)
+        git(self.repo, "checkout", "--", "tracked.txt")
+        with mock.patch.object(cmd_autopilot, "_subprocess_runner") as runner:
+            rc = cmd_autopilot.cmd_autopilot_resume(self.args(), executable=EXE)
+        self.assertEqual(rc, 0)
+        self.assertFalse(self.pause_path.exists())
+        self.assertEqual(self.event_names(), ["resumed"])
+        runner.assert_not_called()
+        self.assertEqual(self.escalations, [])
+
+    def test_resume_keeps_marker_when_plan_or_executable_unresolvable(self) -> None:
+        self.pause()
+        before = self.snapshot()
+        with redirect_stderr(io.StringIO()):
+            rc = cmd_autopilot.cmd_autopilot_resume(self.args(plan="missing.toml"), executable=EXE)
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.snapshot(), before)
+        with mock.patch.object(cmd_autopilot, "_resolve_opsx_plan", return_value=None), \
+                redirect_stderr(io.StringIO()):
+            rc = cmd_autopilot.cmd_autopilot_resume(self.args())
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_resume_respects_clean_tree_opt_out(self) -> None:
+        self.pause()
+        self.plan.write_text(self.plan.read_text().replace(
+            '[plan]\n', '[plan]\nrequire_clean_tracked = false\n'
+        ), encoding="utf-8")
+        (self.repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+        self.assertEqual(cmd_autopilot.cmd_autopilot_resume(self.args(), executable=EXE), 0)
+        self.assertFalse(self.pause_path.exists())
+
+    def test_cli_parser_and_dispatch_for_status_resume_and_paused_once(self) -> None:
+        self.pause()
+        script = Path(__file__).resolve().parents[2] / "orchestrator" / "opsx-plan.py"
+        command = [sys.executable, str(script), "--repo", str(self.repo), "autopilot"]
+        status = subprocess.run(
+            [*command, "status", "--plan", "plan.toml"], capture_output=True, text=True,
+        )
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertIn("autopilot: paused", status.stdout)
+        once = subprocess.run(
+            [*command, "--once", "--plan", "missing.toml"], capture_output=True, text=True,
+        )
+        self.assertEqual(once.returncode, 0, once.stderr)
+        self.assertTrue(self.pause_path.exists())
+        with mock.patch.dict(os.environ, {"PATH": ""}):
+            refused = subprocess.run(
+                [*command, "resume", "--plan", "plan.toml"], capture_output=True, text=True,
+            )
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertTrue(self.pause_path.exists())
+        # Supply a resolvable engine, but resume must never invoke it.
+        exe = self.repo / "opsx-plan"
+        exe.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+        exe.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": str(self.repo) + os.pathsep + os.environ.get("PATH", "")}):
+            resumed = subprocess.run(
+                [*command, "resume", "--plan", "plan.toml"], capture_output=True, text=True,
+            )
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertFalse(self.pause_path.exists())
 
 
 if __name__ == "__main__":
