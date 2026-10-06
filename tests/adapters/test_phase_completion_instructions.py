@@ -221,7 +221,21 @@ _CORE_CONTRACT = _ROOT / "core" / "controller-contract.md"
 _SKILL_CONTRACT = (
     _ROOT / "skills" / "opsx-controller" / "references" / "controller-contract.md"
 )
-_CODEX_BUNDLE_FILES = ("opsx-implementer.toml", "opsx-reviewer.toml")
+_CODEX_BUNDLE_FILES = (
+    "opsx-implementer.toml",
+    "opsx-reviewer.toml",
+    "opsx-archiver.toml",
+)
+
+_CLAUDE_PLUGIN_PHASES = ("implementer", "reviewer", "archiver")
+
+
+def _markdown_body(path: Path) -> str:
+    """Return the content after a leading YAML frontmatter block."""
+    text = path.read_text(encoding="utf-8")
+    if not text.startswith("---"):
+        return text
+    return text.split("---", 2)[2]
 
 
 def _policy_section_bytes(path: Path) -> bytes:
@@ -261,6 +275,32 @@ class CodexBundleParityTests(unittest.TestCase):
                     authored,
                     "generated Codex plugin copy differs from its authored "
                     "adapter source; awaiting bundle regeneration",
+                )
+
+
+class ClaudePluginParityTests(unittest.TestCase):
+    """The plugin agents share the generated Claude Code agent content.
+
+    Frontmatter differs (the plugin carries its own package description), so
+    parity is asserted on the body after the frontmatter block: both are
+    rendered from the same canonical body and client step.
+    """
+
+    def test_plugin_bodies_match_generated_claude_code_agents(self) -> None:
+        for phase in _CLAUDE_PLUGIN_PHASES:
+            with self.subTest(phase=phase):
+                adapter = _markdown_body(
+                    _ROOT / "adapters" / "claude-code" / "agents" / f"opsx-{phase}.md"
+                )
+                plugin = _markdown_body(
+                    _ROOT / "plugins" / "opsx-controller" / "agents" / f"opsx-{phase}.md"
+                )
+                self.assertTrue(adapter.strip())
+                self.assertEqual(
+                    plugin,
+                    adapter,
+                    "Claude plugin agent body drifted from the generated "
+                    "Claude Code agent; regenerate the phase agents",
                 )
 
 

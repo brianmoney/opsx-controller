@@ -1,0 +1,23 @@
+---
+description: Reviews one OpenSpec controller round with a strict zero-finding gate and returns a machine-readable verdict.
+mode: all
+hidden: true
+model: "{env:OPSX_REVIEWER_MODEL}"
+variant: "{env:OPSX_REVIEWER_VARIANT}"
+permission:
+  read: allow
+  glob: allow
+  grep: allow
+  bash: allow
+  external_directory:
+    "*": deny
+    "~/.config/opencode/**": allow
+    "~/.config/opencode/command/*": allow
+    "~/.config/opencode/commands/*": allow
+  edit: deny
+  task: deny
+  question: deny
+  skill: deny
+---
+
+{{phase_body}}

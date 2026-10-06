@@ -2798,30 +2798,36 @@ class ArchiverDeletionStagingTests(unittest.TestCase):
 
     # The step after the deletion-staging step enumerates what else to stage.
     # Each definition must reconcile that list with the deletion already
-    # staged, or its "only" reads as an instruction to exclude it. The wording
-    # differs per variant, so pin the exact clause per file. Renumbering the
-    # steps means updating these strings -- a stale cross-reference here is
-    # exactly the drift this assertion exists to catch.
+    # staged, or its "only" reads as an instruction to exclude it. Every
+    # archiver body is now generated from the same canonical body at
+    # core/phase-agents/archiver.md, so the pinned clause is shared and the
+    # step number is the canonical one. Renumbering the canonical body means
+    # updating this string -- a stale cross-reference here is exactly the
+    # drift this assertion exists to catch.
     STAGING_STEP_RECONCILES_DELETION = {
         "adapters/claude-code/agents/opsx-archiver.md": (
-            "and the change-directory deletion staged in step 13."
+            "Leave the change-directory deletion from step 12 staged; "
+            "do not unstage it."
         ),
         "adapters/opencode/agents/opsx-archiver.md": (
-            "Leave the change-directory deletion from step 15 staged; "
+            "Leave the change-directory deletion from step 12 staged; "
             "do not unstage it."
         ),
         "adapters/codex-cli/agents/opsx-archiver.toml": (
-            "and the change-directory deletion staged in step 12."
+            "Leave the change-directory deletion from step 12 staged; "
+            "do not unstage it."
         ),
         "adapters/codex-cli/plugin/agents/opsx-archiver.toml": (
-            "and the change-directory deletion staged in step 12."
+            "Leave the change-directory deletion from step 12 staged; "
+            "do not unstage it."
         ),
         "adapters/dsh/agents/opsx-archiver.md": (
             "Leave the change-directory deletion from step 12 staged; "
             "do not unstage it."
         ),
         "plugins/opsx-controller/agents/opsx-archiver.md": (
-            "Stage only the rest of the explicit archive set."
+            "Leave the change-directory deletion from step 12 staged; "
+            "do not unstage it."
         ),
     }
 

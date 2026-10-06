@@ -61,6 +61,19 @@ it.
 - OpenSpec: `openspec validate <change> --strict` for a single change, or
   `openspec validate --all`.
 
+## Phase-agent authoring and generation
+
+The implementer, reviewer, and archiver instruction bodies are authored once
+at `core/phase-agents/<phase>.md`. Adapter frontmatter, TOML keys, and
+client-specific steps live in `<distribution>/agent-templates/opsx-<phase>.*`
+templates, each with a single `{{phase_body}}` placeholder. Never hand-edit a
+rendered `adapters/*/agents/opsx-*` or `plugins/opsx-controller/agents/*` file:
+edit the canonical body or template and run
+`python3 scripts/generate-phase-agents.py`. Use
+`python3 scripts/generate-phase-agents.py --check` to detect drift;
+`tests/adapters/test_generated_phase_agents.py` fails when committed outputs
+are stale.
+
 ## Maintainer Notes: deploy after every change
 
 This section applies to the maintainer's own machine, after a change has

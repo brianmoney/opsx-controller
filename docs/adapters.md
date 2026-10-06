@@ -72,6 +72,32 @@ environment variables (for example from `.env`, kept as the legacy path — see
 `.env.example`). Installers and plan runs fail closed with guidance if no model
 resolves.
 
+## Phase-agent sources and generation
+
+The implementer, reviewer, and archiver instruction bodies are authored once,
+client-neutrally, under `core/phase-agents/{implementer,reviewer,archiver}.md`.
+Each distribution keeps a thin template (only its frontmatter/TOML keys and
+client-specific step text) under
+`<distribution>/agent-templates/opsx-<phase>.<ext>.tmpl`, with a single
+`{{phase_body}}` placeholder.
+
+`scripts/generate-phase-agents.py` renders every committed agent file from
+those inputs:
+
+- `adapters/{opencode,claude-code,codex-cli,dsh}/agents/opsx-<phase>.*`
+- `adapters/codex-cli/plugin/agents/opsx-<phase>.toml`
+- `plugins/opsx-controller/agents/opsx-<phase>.md`
+
+Regenerate after editing a canonical body or a template:
+
+```bash
+python3 scripts/generate-phase-agents.py          # write outputs
+python3 scripts/generate-phase-agents.py --check  # fail on drift
+```
+
+Generated files carry a header naming the generator and canonical source; edit
+the sources under `core/phase-agents/` and the templates, not the outputs.
+
 ## OpenCode adapter
 
 What it contains:
