@@ -172,6 +172,7 @@ systemctl --user start opsx-autopilot
 
 journalctl --user -u opsx-autopilot -f      # decisions and engine output
 opsx-plan status                            # per-change state
+opsx-plan autopilot status --plan openspec/plans/my-plan.toml  # read-only pause/state snapshot
 tail -f .opsx-plan/autopilot-events.jsonl   # structured autopilot events
 ```
 
@@ -216,24 +217,49 @@ Record fields: `ts`, `plan`, `change_id`, `class`, `last_result`, `reason`,
 | `permission` | Fix opencode permissions for the worker |
 | `finding_recurrence_exceeded`, `max_rounds_reached`, `no_progress` | Inspect `loci`; manual fix or trusted-model dispatch per the `opsx-plan-ops` skill |
 | `archive_failed`, `archive_invalid` | Fix the DELTA, never the canonical spec |
-| `environment` | Clean tracked tree / stale execution lock |
+| `deterministic` (environment pause) | Clean the tracked tree / commit archive output, fix plan resolution, or restore the `opsx-plan` executable; then run `autopilot resume` |
+| `environment` (transient/retryable) | Inspect execution-lock contention or unclassified engine/status/approve/reset errors |
 | `human_veto` | You vetoed the gate; resolve it by hand |
 | `no_forward_progress` | Autopilot's own guard (3 quick passes, identical statuses); inspect `opsx-plan status` and the stage logs |
 | `unknown` | Inspect the `log_path` stage log; the classifier could not place the failure |
 
-Then restart:
+For a deterministic environment failure, inspect the durable pause and recheck
+preflight after fixing its cause. Use the **same repo, plan selection, and PATH
+as the unit** (a drop-in's `OPSX_PLAN` is not automatically set in your shell):
+
+```bash
+opsx-plan autopilot status --plan openspec/plans/my-plan.toml
+opsx-plan autopilot resume --plan openspec/plans/my-plan.toml
+```
+
+`status` shows class, reason, creation time, suggested action, and recorded
+plan/change state without reconciling or writing it. Pause details remain
+available even if the plan cannot load. `resume` checks plan resolution,
+`require_clean_tracked`, and the child executable; it exits 2 and leaves the
+marker untouched if a check still fails. On success it clears
+`.opsx-plan/autopilot-paused.json` and exits 0, but does **not** start the unit.
+The marker is repository-wide: switching plans or starting the unit again
+(including `--once`) does not bypass it. Paused starts append only a `paused`
+event, not another digest or push. To debug without autopilot, run the engine
+directly with `opsx-plan run`.
+
+Then restart (also the normal recovery for a change-level escalation):
 
 ```bash
 systemctl --user start opsx-autopilot
 ```
 
-Change-level escalations exit 0, so the unit's `Restart=on-failure` leaves it
-**down** and restarting is always your explicit act. `environment` escalations
-are the exception: autopilot exits 2 (invalid `status --json`, engine exit 2, a
-failed `approve`/`reset` subprocess), so systemd retries under `RestartSec=30`
-until `StartLimitBurst` (5 starts / 600s) trips and the unit lands in
-`failed`; clear that with `systemctl --user reset-failed opsx-autopilot`
-before starting it.
+Change-level escalations and deterministic environment pauses exit 0, so
+`Restart=on-failure` leaves the unit **down** for the operator. A pause records
+exactly one digest and sends at most one push. Only known deterministic reasons
+pause: dirty tracked worktrees (including archive output), unresolvable plans,
+or a missing `opsx-plan` executable. Transient `environment` escalations still
+exit 2: execution-lock contention, unclassified engine exits 2, invalid
+`status --json`, or failed `approve`/`reset` subprocesses. Systemd retries them
+under `RestartSec=30` until `StartLimitBurst` (5 starts / 600s) trips. If that
+lands the unit in `failed`, clear it with
+`systemctl --user reset-failed opsx-autopilot` before starting it. Resetting
+systemd's failed state alone does not clear an autopilot pause.
 
 ## 9. Stopping / switching plans / teardown
 
@@ -261,6 +287,7 @@ systemctl --user daemon-reload
 | Symptom | Check | Fix |
 |---|---|---|
 | Unit won't start | `journalctl --user -u opsx-autopilot -e`; verify `WorkingDirectory` / `OPSX_PLAN` rendered in `plan.conf` | Correct `plan.conf`, `daemon-reload`, `start` |
+| Unit exits 0 immediately, even on explicit start or `--once` | `opsx-plan autopilot status --plan <unit-plan.toml>`; `.opsx-plan/autopilot-paused.json` | Fix the reported deterministic check, run `opsx-plan autopilot resume --plan <unit-plan.toml>` in the unit's repo/environment, then `start`; do not just delete the marker |
 | `StartLimitBurst` tripped (5 starts / 600s) | `systemctl --user status opsx-autopilot` | `systemctl --user reset-failed opsx-autopilot` then `start` |
 | Unit exits 2, journal says "OpenSpec CLI not found repo-locally or on PATH" | Systemd user `PATH` lacks your toolchain dirs (`which openspec opencode node`) | Re-run `opsx-plan autopilot install` (it derives `Environment=PATH=`, step 3), then `start`; `reset-failed` if the retry loop tripped |
 | No pushes | Topic unset in `autopilot.toml` / `OPSX_AUTOPILOT_NTFY_TOPIC`; digests still in `.opsx-plan/escalations.jsonl` | Set the topic; test with `curl -d test ntfy.sh/<topic>` |

@@ -36,6 +36,7 @@ import time
 import tomllib
 import urllib.parse
 import urllib.request
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -115,6 +116,10 @@ SUGGESTED_ACTIONS = {
     ),
     "human_veto": "operator vetoed gate approval",
     "environment": "clean tracked tree / stale execution lock",
+    "deterministic": (
+        "fix the reported environment check, then `opsx-plan autopilot resume` "
+        "with the unit's repo/plan selection and restart autopilot"
+    ),
     "no_forward_progress": (
         "engine made no progress across 3 passes; inspect status and logs"
     ),
@@ -140,7 +145,71 @@ _LOG_TAIL_LINES = 40
 _EVENTS_FILENAME = "autopilot-events.jsonl"
 _ESCALATIONS_FILENAME = "escalations.jsonl"
 _AP_STATE_FILENAME = "autopilot-state.json"
+_PAUSE_FILENAME = "autopilot-paused.json"
 _VETO_DIRNAME = "veto"
+
+_DETERMINISTIC_ENVIRONMENT_MARKERS = (
+    "tracked worktree is dirty",
+    "dirty tracked worktree",
+    "tracked files have uncommitted modifications",
+    "uncommitted archive changes",
+    "archive must commit or restore tracked changes",
+    "cannot parse plan ",
+    "no plan specified",
+    "active plan pointer references missing file:",
+    "plan not found:",
+    "cannot locate the opsx-plan executable",
+)
+
+
+def _classify_environment(surface: str, reason: str) -> tuple[str, str]:
+    """Only known operator-fixable surfaces pause; unknown failures retry."""
+    if surface in ("dirty_tree", "plan", "executable"):
+        return "deterministic", reason
+    for line in reversed(reason.splitlines()):
+        lower = line.lower()
+        if "execution lock is already held" in lower or "lock is held by another live process" in lower:
+            return "transient", line.strip()
+        if any(marker in lower for marker in _DETERMINISTIC_ENVIRONMENT_MARKERS):
+            return "deterministic", line.strip()
+    return "transient", reason
+
+
+def _load_pause(repo: Path) -> dict | None:
+    path = repo / ".opsx-plan" / _PAUSE_FILENAME
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and data:
+            return data
+    except (OSError, ValueError):
+        pass
+    # A damaged marker still parks the run; only a successful resume clears it.
+    return {
+        "class": "deterministic",
+        "reason": "pause marker is unreadable or malformed",
+        "created_at": "unknown",
+        "suggested_action": SUGGESTED_ACTIONS["deterministic"],
+    }
+
+
+def _write_pause(repo: Path, marker: dict) -> None:
+    path = repo / ".opsx-plan" / _PAUSE_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    gi = path.parent / ".gitignore"
+    if not gi.exists():
+        gi.write_text("*\n", encoding="utf-8")
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(marker, fh, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def _clear_pause(repo: Path) -> None:
+    (repo / ".opsx-plan" / _PAUSE_FILENAME).unlink(missing_ok=True)
 
 
 def _utcnow() -> datetime:
@@ -229,12 +298,25 @@ def _resolve_opsx_plan() -> str | None:
 
 
 def _subprocess_runner(cmd, *, cwd, capture, timeout):
-    """Default runner: wraps :func:`subprocess.run` with inherited output.
+    """Buffer control commands; stream engine output and retain a bounded tail.
 
-    ``capture=False`` (the ``run`` invocation) inherits the parent's
-    stdout/stderr so journald captures the engine's stream; ``capture=True``
-    (status/approve/reset) buffers output for parsing.
+    Merging the engine's streams avoids pipe deadlocks and preserves its
+    diagnostics for classification without buffering an entire long run.
     """
+    if not capture:
+        output = deque(maxlen=_LOG_TAIL_LINES)
+        with subprocess.Popen(
+            cmd, cwd=str(cwd), stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True,
+        ) as proc:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                print(line, end="", flush=True)
+                output.append(line[-_LOG_TAIL_BYTES:])
+            rc = proc.wait(timeout=timeout)
+        return subprocess.CompletedProcess(
+            cmd, rc, stdout="".join(output)[-_LOG_TAIL_BYTES:], stderr=""
+        )
     return subprocess.run(
         cmd,
         cwd=str(cwd),
@@ -288,6 +370,46 @@ class Autopilot:
         self.ap_state = self._load_ap_state()
         self._last_signature: tuple | None = None
         self._no_progress_streak = 0
+        self._run_output = ""
+
+    def _preflight(self) -> tuple[str, str] | None:
+        """Shared run/resume checks, with no engine invocation or state writes."""
+        try:
+            plan_src = planref.resolve_plan(self.repo, self.plan_arg)
+            self.cfg = planref.load_plan(
+                planref._resolve_plan_path(self.repo, plan_src), repo=self.repo
+            )
+            self.plan_name = self.cfg["name"]
+        except base.PlanError as exc:
+            return "plan", str(exc)
+        if self.cfg.get("require_clean_tracked"):
+            try:
+                clean = groundtruth.tracked_tree_clean(self.repo)
+            except (OSError, subprocess.SubprocessError) as exc:
+                return "environment", f"cannot check tracked worktree: {exc}"
+            if not clean:
+                return "dirty_tree", "tracked worktree is dirty; commit/stash then resume autopilot"
+        self.executable = self.executable or _resolve_opsx_plan()
+        if not self.executable:
+            return "executable", (
+                "cannot locate the opsx-plan executable; install the orchestrator "
+                "or ensure opsx-plan is on PATH"
+            )
+        return None
+
+    def _pause(self, reason: str) -> int:
+        if _load_pause(self.repo) is None:
+            _write_pause(self.repo, {
+                "class": "deterministic",
+                "reason": reason,
+                "created_at": self._now_iso(),
+                "suggested_action": SUGGESTED_ACTIONS["deterministic"],
+            })
+            self._escalate(None, "deterministic", {}, reason)
+        else:
+            self._event("paused", reason=reason)
+        print(f"autopilot paused: {reason}", file=sys.stderr)
+        return 0
 
     # -- injected-clock helpers ------------------------------------------
     def _now(self) -> datetime:
@@ -455,6 +577,11 @@ class Autopilot:
         return document if isinstance(document, dict) else None
 
     def _classify(self, run_rc: int) -> dict:
+        if run_rc == 2:
+            return {
+                "kind": "environment",
+                "reason": self._run_output.strip() or "opsx-plan run exited 2",
+            }
         document = self._status_document()
         if document is None:
             return {
@@ -488,9 +615,6 @@ class Autopilot:
         ]
         if failed:
             return {"kind": "failed", "failed": failed}
-
-        if run_rc == 2:
-            return {"kind": "environment", "reason": "opsx-plan run exited 2"}
 
         pendingish = [
             c for c in changes if c.get("status") in ("pending", "ready", "running")
@@ -758,6 +882,9 @@ class Autopilot:
     # -- main loop --------------------------------------------------------
     def _invoke_run(self) -> int:
         proc = self._invoke(["run", *self._plan_args()], capture=False, timeout=None)
+        self._run_output = "\n".join(
+            text for text in (proc.stdout, proc.stderr) if text
+        )[-_LOG_TAIL_BYTES:]
         return int(proc.returncode)
 
     def run(self) -> int:
@@ -811,7 +938,10 @@ class Autopilot:
                 continue
 
             if kind == "environment":
-                self._escalate(None, "environment", {}, outcome.get("reason", ""))
+                klass, reason = _classify_environment("engine", outcome.get("reason", ""))
+                if klass == "deterministic":
+                    return self._pause(reason)
+                self._escalate(None, "environment", {}, reason)
                 return 2
 
             if kind == "budget":
@@ -869,44 +999,80 @@ def cmd_autopilot(
     """
     repo = Path(args.repo).resolve()
 
-    try:
-        plan_src = planref.resolve_plan(repo, getattr(args, "plan", None))
-        cfg = planref.load_plan(planref._resolve_plan_path(repo, plan_src), repo=repo)
-    except base.PlanError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-
-    if cfg.get("require_clean_tracked") and not groundtruth.tracked_tree_clean(repo):
-        print(
-            "error: tracked worktree is dirty; commit/stash then re-run autopilot",
-            file=sys.stderr,
-        )
-        return 2
-
-    resolved_executable = executable or _resolve_opsx_plan()
-    if not resolved_executable:
-        print(
-            "error: cannot locate the opsx-plan executable; install the "
-            "orchestrator or ensure opsx-plan is on PATH",
-            file=sys.stderr,
-        )
-        return 2
-
     options = _resolve_options(args)
     autopilot = Autopilot(
         repo=repo,
         plan_arg=getattr(args, "plan", None),
-        plan_name=cfg["name"],
-        cfg=cfg,
+        plan_name=getattr(args, "plan", None) or "<unresolved>",
+        cfg={},
         options=options,
-        executable=resolved_executable,
+        executable=executable or "",
         runner=runner or _subprocess_runner,
         now_func=now_func or _utcnow,
         sleep_func=sleep_func or time.sleep,
         once=bool(getattr(args, "once", False)),
     )
+    marker = _load_pause(repo)
+    if marker is not None:
+        autopilot._event("paused", reason=marker.get("reason", ""))
+        print(f"autopilot paused: {marker.get('reason', '')}")
+        return 0
+    failure = autopilot._preflight()
+    if failure:
+        klass, reason = _classify_environment(*failure)
+        if klass == "deterministic":
+            return autopilot._pause(reason)
+        autopilot._escalate(None, "environment", {}, reason)
+        return 2
     try:
         return autopilot.run()
     except base.PlanError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        klass, reason = _classify_environment("engine", str(exc))
+        if klass == "deterministic":
+            return autopilot._pause(reason)
+        autopilot._escalate(None, "environment", {}, reason)
         return 2
+
+
+def cmd_autopilot_status(args: argparse.Namespace) -> int:
+    """Read-only pause details and recorded plan/change state (no reconciliation)."""
+    repo = Path(args.repo).resolve()
+    marker = _load_pause(repo)
+    print("autopilot: paused" if marker is not None else "autopilot: not paused")
+    if marker is not None:
+        for key in ("class", "reason", "created_at", "suggested_action"):
+            print(f"  {key}: {marker.get(key, '')}")
+    try:
+        plan_src = planref.resolve_plan(repo, getattr(args, "plan", None))
+        cfg = planref.load_plan(planref._resolve_plan_path(repo, plan_src), repo=repo)
+        state = state_mod.load_state(repo, cfg["name"])
+    except (base.PlanError, OSError, ValueError) as exc:
+        print(f"plan status unavailable: {exc}")
+        return 0
+    print(f"plan: {cfg['name']} (recorded state; not reconciled)")
+    for cid in cfg["order"]:
+        record = state.get("changes", {}).get(cid, {})
+        status = record.get("status", base.PENDING) if cfg["changes"][cid]["enabled"] else base.SKIPPED
+        reason = record.get("reason", "")
+        print(f"  {cid}: {status}" + (f" ({reason})" if reason else ""))
+    return 0
+
+
+def cmd_autopilot_resume(args: argparse.Namespace, *, executable: str | None = None) -> int:
+    """Recheck the selected environment, clear its pause, but do not start a run."""
+    repo = Path(args.repo).resolve()
+    autopilot = Autopilot(
+        repo=repo, plan_arg=getattr(args, "plan", None),
+        plan_name=getattr(args, "plan", None) or "<unresolved>", cfg={},
+        options=_resolve_options(args), executable=executable or "",
+        runner=_subprocess_runner,
+    )
+    failure = autopilot._preflight()
+    if failure:
+        print(f"error: cannot resume autopilot: {failure[1]}", file=sys.stderr)
+        return 2
+    _clear_pause(repo)
+    autopilot._event("resumed")
+    print("autopilot pause cleared; the plan may be started again")
+    return 0

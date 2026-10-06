@@ -13,10 +13,13 @@
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now opsx-autopilot
 #
-# The unit exits 0 on a clean plan completion and on change-level escalations,
-# so systemd's Restart=on-failure leaves it down until the operator fixes the
-# cause and starts it again. Environment-class escalations exit 2 and are
-# retried by Restart=on-failure until StartLimitBurst trips.
+# The unit exits 0 on plan completion, change-level escalations, and known
+# deterministic environment failures (dirty tracked tree, unresolvable plan
+# or opsx-plan executable). Deterministic failures write a durable pause marker;
+# even explicit starts no-op until `opsx-plan autopilot resume` passes preflight.
+# Restart=on-failure retries only crashes and transient environment failures
+# (exit 2, including execution-lock contention and unclassified engine errors),
+# bounded by StartLimitBurst. Fix the cause, resume if paused, then start again.
 #
 # Configuration:
 #   * Plan selection is carried by the drop-in's Environment=OPSX_PLAN (or the

@@ -812,6 +812,10 @@ opsx-plan autopilot [run] [--plan X] \
 
 # Bind the systemd user unit to a repository and plan (one-time).
 opsx-plan autopilot install [--plan X] [--unit-name NAME] [--print] [--no-enable]
+
+# Inspect a durable environment pause or recheck/clear it after a fix.
+opsx-plan autopilot status [--plan X]
+opsx-plan autopilot resume [--plan X]
 ```
 
 - `--plan X` — plan manifest to drive (otherwise the active-plan pointer /
@@ -832,6 +836,12 @@ opsx-plan autopilot install [--plan X] [--unit-name NAME] [--print] [--no-enable
   the same signature (default `300`).
 - `--poll-seconds N` — loop poll interval in seconds (built-in default).
 - `--once` — run one pass and exit, without looping.
+- `status` — read-only pause details (class, reason, creation time, suggested
+  action) plus a recorded plan/change-state snapshot; does not reconcile state.
+  Pause details are printed even when the plan cannot load.
+- `resume` — re-run plan, clean-tracked-tree, and executable preflight; clear
+  the repository-wide pause only when all checks pass (exit 0), otherwise report
+  the failing check and exit 2 without clearing it. Does not start a run or unit.
 
 ### Failure classification
 
@@ -849,6 +859,8 @@ table in `skills/opsx-plan-ops/SKILL.md`:
 | `no_progress` | no-progress ceiling reached | Escalate immediately; never auto-retried |
 | Archive failure | `archive_spec_update_failed`, `modified requirement header not found` | Escalate immediately; never auto-retried |
 | Unknown | anything the classifier cannot place | Escalate immediately; never auto-retried |
+| Deterministic environment | dirty tracked tree / uncommitted archive output, unresolvable plan, missing `opsx-plan` executable | Write a durable pause, escalate once, exit 0; operator must `autopilot resume` |
+| Transient environment | execution-lock contention, unclassified engine exit 2 / invalid status | Escalate and exit 2; systemd may retry |
 
 Failure signatures (and their reset counts/spacing) are persisted in
 `.opsx-plan/autopilot-state.json`, so a count survives an `opsx-plan reset`
@@ -887,8 +899,8 @@ journalctl --user -u opsx-autopilot -f     # follow decisions and output
 ```
 
 The unit uses `Restart=on-failure`, `RestartSec=30`, and `StartLimitBurst=5`
-per 600s. A crash (and an `environment`-class escalation, which exits 2) is
-retried; a clean change-level escalation exit is not (see below).
+per 600s. Crashes and transient `environment` escalations (exit 2) are retried;
+change-level escalations and deterministic environment pauses (exit 0) are not.
 
 ### Vetoing a gate
 
@@ -924,9 +936,15 @@ waiting.
 On an escalated failure autopilot appends a digest to
 `.opsx-plan/escalations.jsonl`, sends an ntfy.sh push (when a topic is
 configured), logs the decision to `.opsx-plan/autopilot-events.jsonl`, then
-exits 0 for change-level classes; because the exit is clean, the unit stays
-**down** rather than restart-looping. The exception is `environment`, which
-exits 2 and is retried by `Restart=on-failure` until `StartLimitBurst` trips.
+exits 0 for change-level classes and deterministic environment failures; the
+unit stays **down** rather than restart-looping. Deterministic failures also
+write `.opsx-plan/autopilot-paused.json` with `class`, `reason`, `created_at`,
+and `suggested_action`. The pause transition writes exactly one digest and
+sends at most one push. Later starts, including explicit unit starts and
+`--once`, check the marker **before** plan resolution and append only a
+`paused` event, exiting 0. Only known deterministic reasons pause; unclassified
+engine exits 2 and execution-lock contention remain transient `environment`
+escalations, retried until `StartLimitBurst` trips.
 
 Each escalation digest records: change id, failure class, `last_result`,
 reason, findings loci, attempt count, stage log path, and suggested action.
@@ -938,8 +956,17 @@ To recover:
 2. Commit any uncommitted worker output (a subsequent run refuses a dirty
    tracked tree).
 3. If the change is still failed, `opsx-plan reset <change-id>`.
-4. `systemctl --user start opsx-autopilot` — restart after the fix; watch the
-   first stage transition before walking away.
+4. Inspect `opsx-plan autopilot status [--plan X]`. If paused, run
+   `opsx-plan autopilot resume [--plan X]` using the **same repo/plan/PATH as the
+   unit**. A drop-in's `OPSX_PLAN` does not populate your shell; pass `--plan`
+   when needed. Resume clears only after preflight passes and does not start
+   the unit. Changing plans or resetting systemd's failure state alone does
+   not clear the repository-wide marker. Direct `opsx-plan run` remains
+   available for debugging.
+5. `systemctl --user start opsx-autopilot` — restart after the fix; watch the
+    first stage transition before walking away.
+   If transient retries tripped the start limit, first run
+   `systemctl --user reset-failed opsx-autopilot`.
 
 ---
 
@@ -1339,6 +1366,8 @@ All orchestrator state lives at `.opsx-plan/` in the host project root:
 - `veto/<change-id>` — operator veto markers for `pause_before` windows
 - `escalations.jsonl` — escalation digests (one JSON object per line)
 - `autopilot-events.jsonl` — autopilot decision log
+- `autopilot-paused.json` — durable deterministic environment pause; inspect
+  with `autopilot status`, clear only through successful `autopilot resume`
 
 Add `.opsx-plan/` to the host project's `.gitignore`. The orchestrator creates
 a `.gitignore` in `.opsx-plan/` containing `*` to prevent accidental commits.

@@ -250,6 +250,17 @@ archive failures, and unknown classes escalate immediately; it announces
 `pause_before` gates that are auto-approved after a veto window unless vetoed,
 and it waits for `opsx-plan accept` on orchestrator-created changes awaiting
 acceptance.
+Known deterministic environment failures (dirty tracked tree / uncommitted
+archive output, unresolvable plan, missing `opsx-plan` executable) write
+`.opsx-plan/autopilot-paused.json`, escalate once, and exit 0. Every later
+autopilot start, including `--once`, checks the marker before plan resolution
+and no-ops with no new escalation. `opsx-plan autopilot status [--plan X]`
+shows pause details plus recorded plan/change status read-only, even when the
+plan cannot load. After fixing the cause, `opsx-plan autopilot resume [--plan X]`
+rechecks preflight and clears the marker only on success; it does not start
+the unit. Use the unit's repo, plan selection, and PATH. Transient environment
+failures (execution-lock contention and unclassified engine exits 2) still
+exit 2 for systemd to retry; change-level escalations still exit 0.
 Run it under the `opsx-autopilot.service` systemd user unit (installed
 disabled). Bind that unit to a repository and plan with
 `opsx-plan autopilot install [--plan X] [--unit-name NAME] [--print]

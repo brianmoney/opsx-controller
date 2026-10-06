@@ -105,12 +105,25 @@ What autopilot does in your stead (full detail in
 - **Permanent classes** (billing/quota, permission rejections,
   `finding_recurrence_exceeded`, `max_rounds_reached`, `no_progress`, archive
   failures, unknown) escalate immediately — never auto-retried.
+- **Deterministic environment failures** (dirty tracked tree / uncommitted
+  archive output, unresolvable plan, missing `opsx-plan` executable) write
+  `.opsx-plan/autopilot-paused.json`, escalate once, and exit 0. Later starts,
+  including explicit unit starts and `--once`, no-op before plan resolution
+  with only a `paused` event. Only known deterministic reasons pause;
+  execution-lock contention and unclassified engine exits 2 stay transient.
 
 Escalation appends a digest to `.opsx-plan/escalations.jsonl` (change id,
 class, `last_result`, reason, finding loci, attempt count, stage log path,
 suggested action), sends an ntfy push, and leaves the unit **down** until you
-fix and restart it (change-level classes exit 0; `environment` exits 2 and is
-retried until `StartLimitBurst` trips). Every decision is logged to
+fix and restart it (change-level classes and deterministic environment pauses
+exit 0; transient `environment` exits 2 and is retried until `StartLimitBurst`
+trips). `opsx-plan autopilot status [--plan X]` is a read-only pause and recorded
+plan/change-state snapshot, even with a broken plan. A durable pause must be
+cleared with `opsx-plan autopilot resume [--plan X]`: it rechecks plan resolution,
+the clean-tracked requirement, and the executable; failure exits 2 with the
+marker intact, success clears it and exits 0 without starting the unit. Use the
+unit's repo/plan/PATH; changing plans or resetting systemd is not a bypass.
+Every decision is logged to
 `.opsx-plan/autopilot-events.jsonl`. Monitor with `opsx-plan status` and the
 journal; worker logs still stream into `.opsx-plan/logs/`, and
 `opsx-plan logs --follow` selects the in-progress one.
@@ -160,11 +173,15 @@ status.
    re-enters the implement phase. A reset change with all tasks complete
    re-runs implement as a fast no-op, then review, then archive. This is
    normal, not a loop.
-4. Restart autopilot and watch the first stage transition before walking away:
+4. `opsx-plan autopilot status [--plan X]` — if an environment pause is present,
+   run `opsx-plan autopilot resume [--plan X]` with the unit's repo/plan/PATH after
+   fixing it. Do not delete the marker to bypass preflight. If transient retries
+   hit systemd's start limit, also `systemctl --user reset-failed opsx-autopilot`.
+5. Restart autopilot and watch the first stage transition before walking away:
    `systemctl --user start opsx-autopilot`. (An unattended run that escalated
    left the unit down on purpose — autopilot never retries a permanent class;
    see the "Launch discipline" section.)
-5. After `done`, the plan stops at the next `pause_before` change — that is
+6. After `done`, the plan stops at the next `pause_before` change — that is
    the checkpoint to review diffs before approving.
 
 ## Forensics: adapter session records
