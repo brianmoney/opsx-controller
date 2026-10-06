@@ -163,6 +163,7 @@ class SupervisedGateTestCase(unittest.TestCase):
         self.manifest_path.write_text(self._manifest_content(), encoding="utf-8")
         self.cfg["_manifest_path"] = str(self.manifest_path)
         model_env = {
+            "OPSX_CONTROLLER_MODEL": "openai/gpt-4o",
             "OPSX_IMPLEMENTER_MODEL": "openai/gpt-4o",
             "OPSX_REVIEWER_MODEL": "openai/gpt-4o",
             "OPSX_ARCHIVER_MODEL": "openai/gpt-4o",
@@ -719,7 +720,13 @@ class DispatchPolicyRegressionTests(SupervisedGateTestCase):
         self.register_job()
         self.enable_gate_env()
         self.cfg["implement_invoke"] = "python3 worker.py"
-        os.environ.pop("OPSX_IMPLEMENTER_MODEL", None)
+        old_implementer = os.environ.pop("OPSX_IMPLEMENTER_MODEL", None)
+        if old_implementer is None:
+            self.addCleanup(os.environ.pop, "OPSX_IMPLEMENTER_MODEL", None)
+        else:
+            self.addCleanup(
+                os.environ.__setitem__, "OPSX_IMPLEMENTER_MODEL", old_implementer
+            )
         invoked: list[str] = []
         self.opsx_plan.invoke_direct_stage = lambda *a, **k: invoked.append("called")
         self.assertEqual(self.run_change(), "budget")
