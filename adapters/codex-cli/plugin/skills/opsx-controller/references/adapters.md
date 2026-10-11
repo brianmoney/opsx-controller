@@ -16,6 +16,17 @@ with no manifest required. Claude Code and dsh run a single change through a
 one-change plan manifest with the matching `adapter` and `opsx-plan run`, and
 Codex CLI plan-run is unsupported.
 
+The OpenCode and Claude Code adapters also ship `/opsx-ship <change-id>`: the
+interactive, model-orchestrated path that drives one already-authored change to
+conclusion in a single invocation (author missing artifacts, implement, verify,
+review, archive) and mandates sub-agent delegation for every unit of work. It
+owns no durable state, phase machine, or plan manifest and does not replace
+`opsx-plan`/`opsx-run`, which remain the deterministic controller entrypoints.
+The Codex CLI adapter ships the same skill but it fails closed as unsupported:
+Codex CLI spawns agents under the parent session's permission profile and its
+agent role configuration cannot override the sandbox, so it cannot dispatch a
+separately writable sub-agent beneath a read-only conductor.
+
 | Adapter | Direct dispatch defaults | Usage/model source |
 |---|---|---|
 | `opencode` | Supported (`ADAPTER_DEFAULTS`) | OpenCode plugin sidecar (`opencode_plugin`), plus worker JSON and log metadata |

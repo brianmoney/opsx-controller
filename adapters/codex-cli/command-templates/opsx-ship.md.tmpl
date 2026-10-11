@@ -1,0 +1,33 @@
+---
+description: Unsupported on Codex CLI — /opsx-ship needs a read-only conductor that can dispatch separately writable sub-agents, which Codex CLI cannot express; fails closed with a diagnostic.
+argument-hint: [change-id] [STEPS: ...] [RETRIES: n]
+disable-model-invocation: true
+---
+
+`/opsx-ship` is **unsupported on Codex CLI** and this skill fails closed.
+
+The conductor contract below requires two capabilities at once: a conductor
+pinned to an enforced read-only sandbox, and sub-agent dispatch that can write
+change artifacts and implementation files. Codex CLI cannot express both.
+Spawned agents run under the parent session's permission profile, and the
+supported agent role configuration cannot override sandbox or approval settings
+(`sandbox_mode`, `permission_profile`, `approval_policy`, and the other
+security-sensitive keys are not role-overridable). So a read-only conductor
+cannot grant a spawned worker write access, and a conductor that can spawn a
+writer necessarily holds that write capability itself. Codex CLI also cannot
+change a running session's sandbox from a skill, so this skill cannot fix the
+gap at runtime; a `[profiles.*]` entry cannot nest `[agents]` either, because
+multi-agent depth is a top-level `[agents]` key, not a profile key.
+
+Do not perform any work inline and do not weaken the conductor boundary to work
+around this. Stop immediately and report the capability failure with this
+diagnostic, naming the missing capability and the supported clients:
+
+`unsupported: Codex CLI cannot dispatch a separately writable sub-agent beneath
+a read-only conductor; run /opsx-ship on OpenCode or Claude Code.`
+
+Dispatch no sub-agent and report the command as unsupported on this client. The
+conductor contract below is retained for reference only and is not executed
+here.
+
+{{phase_body}}

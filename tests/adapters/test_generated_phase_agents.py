@@ -31,6 +31,17 @@ _TEMPLATE_DIRS = (
     "plugins/opsx-controller/agent-templates",
 )
 
+_COMMAND_TEMPLATE_DIRS = (
+    "adapters/opencode/command-templates",
+    "adapters/claude-code/command-templates",
+    "adapters/codex-cli/command-templates",
+    "plugins/opsx-controller/command-templates",
+)
+
+# Generated phase-agents (six distributions x three phases) plus the four
+# command surfaces rendered from core/commands/opsx-ship.md.
+_GENERATED_OUTPUT_COUNT = 22
+
 _MODEL_TOKENS = {
     "implementer": ("{env:OPSX_IMPLEMENTER_MODEL}", "{env:OPSX_IMPLEMENTER_VARIANT}"),
     "reviewer": ("{env:OPSX_REVIEWER_MODEL}", "{env:OPSX_REVIEWER_VARIANT}"),
@@ -55,8 +66,8 @@ class RenderParityTests(unittest.TestCase):
         rendered = self.generator.render_outputs(_ROOT)
         self.assertEqual(
             len(rendered),
-            18,
-            "expected 18 generated outputs (six distributions x three phases)",
+            _GENERATED_OUTPUT_COUNT,
+            "expected 22 generated outputs (18 phase agents + 4 command surfaces)",
         )
         for relative, expected in rendered.items():
             with self.subTest(output=relative):
@@ -70,7 +81,7 @@ class RenderParityTests(unittest.TestCase):
     def test_render_into_temporary_directory_is_byte_identical(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             written = self.generator.write_outputs(_ROOT, Path(tmp))
-            self.assertEqual(len(written), 18)
+            self.assertEqual(len(written), _GENERATED_OUTPUT_COUNT)
             for destination in written:
                 relative = destination.relative_to(tmp)
                 self.assertEqual(
@@ -93,7 +104,8 @@ class RenderParityTests(unittest.TestCase):
             root = Path(tmp)
             # Build a minimal tree the checker can re-render from.
             shutil.copytree(_ROOT / "core" / "phase-agents", root / "core" / "phase-agents")
-            for template_dir in _TEMPLATE_DIRS:
+            shutil.copytree(_ROOT / "core" / "commands", root / "core" / "commands")
+            for template_dir in _TEMPLATE_DIRS + _COMMAND_TEMPLATE_DIRS:
                 shutil.copytree(_ROOT / template_dir, root / template_dir)
             rendered = self.generator.render_outputs(_ROOT)
             for relative in rendered:

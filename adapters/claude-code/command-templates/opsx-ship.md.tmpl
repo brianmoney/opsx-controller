@@ -1,0 +1,8 @@
+---
+description: Drive exactly one OpenSpec change to conclusion with every unit of work delegated to a sub-agent; the conductor cannot edit, write, or run shell commands.
+argument-hint: [change-id] [STEPS: ...] [RETRIES: n]
+disable-model-invocation: true
+allowed-tools: Task, Read, Glob, Grep, TodoWrite
+---
+
+{{phase_body}}

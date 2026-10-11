@@ -20,6 +20,10 @@ plus the shared plan-authoring reference for `opsx-plan compile`.
   from these bodies plus thin `agent-templates/` wrappers via
   `scripts/generate-phase-agents.py`; edit these bodies (then regenerate), never
   the rendered adapter files.
+- `commands/opsx-ship.md`: the single authored, client-neutral `/opsx-ship`
+  conductor body. Adapters render their command surfaces (OpenCode command,
+  Claude Code and Codex skills, and the Claude plugin skill) from this body plus
+  thin `command-templates/` wrappers via `scripts/generate-phase-agents.py`.
 
 Current adapters:
 

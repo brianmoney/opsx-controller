@@ -13,11 +13,16 @@ Then invoke the plugin skills as:
 
 ```text
 /opsx-controller:opsx-plan <planning request>
+/opsx-controller:opsx-ship <change-id> [STEPS: ...]
 ```
 
 Plugin contents:
 
 - `skills/opsx-plan/SKILL.md`: implementation-plan authoring entrypoint
+- `skills/opsx-ship/SKILL.md`: one-change conclusion conductor (author,
+  implement, verify, review, archive) that delegates every unit of work to a
+  sub-agent and whose `allowed-tools` exclude the file-editing tools and grant
+  no `Bash` at all
 - `agents/opsx-implementer.md`: implementation phase agent
 - `agents/opsx-reviewer.md`: review phase agent
 - `agents/opsx-archiver.md`: archive phase agent
