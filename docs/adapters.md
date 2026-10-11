@@ -81,8 +81,8 @@ client-specific step text) under
 `<distribution>/agent-templates/opsx-<phase>.<ext>.tmpl`, with a single
 `{{phase_body}}` placeholder.
 
-`scripts/generate-phase-agents.py` renders every committed agent file from
-those inputs:
+`scripts/generate-phase-agents.py` renders every committed agent and
+command-surface file from those inputs. The agent outputs are:
 
 - `adapters/{opencode,claude-code,codex-cli,dsh}/agents/opsx-<phase>.*`
 - `adapters/codex-cli/plugin/agents/opsx-<phase>.toml`
@@ -98,11 +98,33 @@ python3 scripts/generate-phase-agents.py --check  # fail on drift
 Generated files carry a header naming the generator and canonical source; edit
 the sources under `core/phase-agents/` and the templates, not the outputs.
 
+The `/opsx-ship` command body is likewise authored once at
+`core/commands/opsx-ship.md` and rendered into four surfaces from thin
+`<distribution>/command-templates/opsx-ship.md.tmpl` templates that carry only
+client-specific frontmatter/preamble and a single `{{phase_body}}` placeholder:
+
+- `adapters/opencode/commands/opsx-ship.md`
+- `adapters/claude-code/skills/opsx-ship/SKILL.md`
+- `adapters/codex-cli/skills/opsx-ship/SKILL.md`
+- `plugins/opsx-controller/skills/opsx-ship/SKILL.md`
+
+`adapters/codex-cli/plugin/skills/opsx-ship/SKILL.md` is the bundle copy that
+`adapters/codex-cli/install.sh --plugin` regenerates from the Codex skill, and
+it must stay byte-identical to it. The same `--check` gate detects drift in
+every generated ship surface.
+
 ## OpenCode adapter
 
 What it contains:
 
 - `adapters/opencode/commands/opsx-plan.md`: plan-authoring slash command
+- `adapters/opencode/commands/opsx-ship.md`: `/opsx-ship` conductor command for
+  one change
+- `adapters/opencode/agents/opsx-ship.md`: `/opsx-ship` conductor agent
+  (`mode: primary`, `edit: deny`, `bash: deny`, `task: allow`). It has no shell
+  at all, so every shell command and `openspec` query is delegated to a
+  sub-agent; the conductor never runs a command whose arguments it cannot
+  validate.
 - `adapters/opencode/agents/opsx-implementer.md`: implementation round agent
 - `adapters/opencode/agents/opsx-reviewer.md`: strict reviewer agent
 - `adapters/opencode/agents/opsx-archiver.md`: non-interactive archiver agent
@@ -158,6 +180,11 @@ What it contains:
 
 - `adapters/claude-code/skills/opsx-plan/SKILL.md`: implementation-plan
   authoring skill
+- `adapters/claude-code/skills/opsx-ship/SKILL.md`: `/opsx-ship` conductor skill
+  whose `allowed-tools` are limited to `Task`, `Read`, `Glob`, `Grep`, and
+  `TodoWrite` — no `Edit`/`Write`/`MultiEdit` and no `Bash` at all, because
+  Claude Code prefix `Bash(...)` rules cannot exclude redirection, pipelines, or
+  chaining — so every unit of work, including shell inspection, is delegated
 - `adapters/claude-code/agents/opsx-implementer.md`: implementation phase agent
 - `adapters/claude-code/agents/opsx-reviewer.md`: strict review phase agent
 - `adapters/claude-code/agents/opsx-archiver.md`: archive phase agent
@@ -213,6 +240,12 @@ What it contains:
 
 - `adapters/codex-cli/skills/opsx-plan/SKILL.md`: plan-authoring skill with
   required YAML frontmatter
+- `adapters/codex-cli/skills/opsx-ship/SKILL.md`: the `/opsx-ship` conductor
+  skill, which fails closed as unsupported on Codex CLI. Codex spawns agents
+  under the parent session's permission profile and its agent roles cannot
+  override the sandbox, so it cannot dispatch a separately writable sub-agent
+  beneath a read-only conductor; the skill reports that capability gap instead
+  of doing the work inline
 - `adapters/codex-cli/agents/opsx-implementer.toml`: implementation phase agent
 - `adapters/codex-cli/agents/opsx-reviewer.toml`: strict review phase agent
 - `adapters/codex-cli/agents/opsx-archiver.toml`: archive phase agent
@@ -230,7 +263,15 @@ Requirements:
 - OpenSpec CLI available in the shell
 - a host project that already uses OpenSpec
 - repo guidance in `AGENTS.md`
-- Codex CLI configured with `agents.max_depth >= 1` for subagent dispatch
+- `/opsx-ship` is unsupported on Codex CLI. Codex cannot simultaneously run a
+  read-only conductor and dispatch a separately writable sub-agent: spawned
+  agents inherit the parent session's permission profile and the supported agent
+  role keys cannot override `sandbox_mode`, `permission_profile`, or
+  `approval_policy`. Multi-agent depth is a top-level `[agents]` key
+  (`[agents] max_depth`) and cannot be nested under a `[profiles.*]` entry. The
+  skill fails closed with a diagnostic naming this capability gap; run
+  `/opsx-ship` on OpenCode or Claude Code instead. `opsx-plan`/`opsx-run`
+  behavior is unchanged.
 
 Install:
 

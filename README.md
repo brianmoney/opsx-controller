@@ -216,6 +216,17 @@ Always review the DAG with `--dry-run` before an unattended run. For a single
 already-authored change, skip the plan manifest entirely with
 `opsx-run <change-id>`.
 
+### Driving a single change
+
+| Surface | Use it for |
+|---|---|
+| `/opsx-ship <change-id>` | Interactive, model-orchestrated path for one already-authored change: author any missing required artifacts, implement, verify, review, then archive — in one invocation, with every unit of work delegated to a sub-agent. Accepts an optional inline `STEPS:` block as the authoritative order; otherwise it uses the change's `tasks.md` order, and an optional `RETRIES: <n>` override for its in-memory retry budget (default `3`, max `10`). It discovers one OpenSpec store id and threads `--store` through the whole lifecycle. The conductor has no edit or shell capability and cannot inline-mutate; even read-only shell inspection is delegated. Operational on the OpenCode and Claude Code adapters; the Codex CLI adapter ships the skill but it fails closed as unsupported, because Codex cannot dispatch a separately writable sub-agent beneath a read-only conductor. |
+| `opsx-run <change-id>` | Deterministic single-change controller entrypoint (OpenCode-pinned): drives one change through the durable implement → review → archive loop with its own `max_rounds` budget, fail-closed gates, and persisted state. |
+| `opsx-plan` | Deterministic plan-level entrypoint: sequences a compiled plan's whole dependency graph. |
+
+`/opsx-ship` owns no durable state, phase machine, or plan manifest and does not
+change `opsx-plan` or `opsx-run`; those remain the controller entrypoints.
+
 ## Documentation
 
 | Guide | What it covers |

@@ -2667,5 +2667,82 @@ class UniversalProjectInstallTests(unittest.TestCase):
         self.assertNotIn("[install] claude-code", output)
 
 
+class ShipSurfaceInstallerTests(unittest.TestCase):
+    """Every supported client installs the new ``/opsx-ship`` surface.
+
+    Each test uses a temp HOME so the real environment is untouched.
+    """
+
+    def setUp(self) -> None:
+        self.home = tempfile.TemporaryDirectory()
+        self.env = {**_model_env(), "HOME": self.home.name}
+
+    def tearDown(self) -> None:
+        self.home.cleanup()
+
+    def test_opencode_global_installs_ship_command_and_agent(self) -> None:
+        _run_installer(_OPENCODE_INSTALLER, Path(self.home.name), self.env)
+        config = Path(self.home.name) / ".config" / "opencode"
+        command = config / "commands" / "opsx-ship.md"
+        agent = config / "agents" / "opsx-ship.md"
+        self.assertTrue(command.is_file(), f"ship command missing at {command}")
+        self.assertTrue(agent.is_file(), f"ship conductor agent missing at {agent}")
+        self.assertIn("agent: opsx-ship", command.read_text(encoding="utf-8"))
+        agent_text = agent.read_text(encoding="utf-8")
+        self.assertIn("edit: deny", agent_text)
+        self.assertIn("bash: deny", agent_text)
+        self.assertIn("task: allow", agent_text)
+        self.assertNotIn("bash: allow", agent_text)
+
+    def test_claude_global_installs_ship_skill(self) -> None:
+        _run_installer(_CLAUDE_INSTALLER, Path(self.home.name), self.env)
+        skill = (
+            Path(self.home.name) / ".claude" / "skills" / "opsx-ship" / "SKILL.md"
+        )
+        self.assertTrue(skill.is_file(), f"ship skill missing at {skill}")
+        text = skill.read_text(encoding="utf-8")
+        allowed_line = next(
+            line for line in text.splitlines() if "allowed-tools:" in line
+        )
+        allowed = {
+            entry.strip()
+            for entry in allowed_line.split("allowed-tools:", 1)[1].split(",")
+        }
+        self.assertIn("Task", allowed)
+        for tool in ("Edit", "Write", "MultiEdit"):
+            self.assertNotIn(tool, allowed)
+        self.assertNotIn("Bash", allowed)
+        self.assertNotIn("Bash", text)
+
+    def test_codex_global_installs_ship_skill(self) -> None:
+        _run_installer(_CODEX_INSTALLER, Path(self.home.name), self.env)
+        skill = (
+            Path(self.home.name) / ".agents" / "skills" / "opsx-ship" / "SKILL.md"
+        )
+        self.assertTrue(skill.is_file(), f"ship skill missing at {skill}")
+        text = skill.read_text(encoding="utf-8")
+        self.assertIn("unsupported on Codex CLI", text)
+        self.assertNotIn("agents.max_depth", text)
+        self.assertNotIn("opsx-ship-profile", text)
+
+    def test_codex_plugin_bundle_includes_ship_skill(self) -> None:
+        subprocess.run(
+            ["bash", str(_CODEX_INSTALLER), "--plugin"],
+            cwd=_REPO,
+            env={**os.environ, **self.env},
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        plugin_dir = _CODEX_INSTALLER.parent / "plugin"
+        bundled = plugin_dir / "skills" / "opsx-ship" / "SKILL.md"
+        self.assertTrue(bundled.is_file(), f"plugin ship skill missing at {bundled}")
+        self.assertEqual(
+            bundled.read_bytes(),
+            (_CODEX_INSTALLER.parent / "skills" / "opsx-ship" / "SKILL.md").read_bytes(),
+            "plugin bundle ship skill must match the adapter skill",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

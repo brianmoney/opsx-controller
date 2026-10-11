@@ -43,6 +43,15 @@ upstream OpenSpec.
 `opsx-run <change-id>` is the supported manual single-change loop; it is pinned
 to the OpenCode adapter.
 
+`/opsx-ship <change-id>` is the interactive, model-orchestrated path for one
+already-authored change: it sequences author → implement → verify → review →
+archive in a single invocation and mandates sub-agent delegation for every unit
+of work. It owns no durable state and does not replace `opsx-plan` or
+`opsx-run`, which remain the deterministic controller entrypoints. It is
+installed and operational on OpenCode and Claude Code; the Codex CLI surface
+fails closed as unsupported because that client cannot dispatch a separately
+writable sub-agent beneath a read-only conductor.
+
 **Per-change work (upstream OpenSpec):** for a single change, use the upstream
 OpenSpec commands and skills for propose, apply, archive, and verify. The
 controller does not replace them and does not own a per-change workflow.
