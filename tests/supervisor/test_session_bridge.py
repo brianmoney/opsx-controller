@@ -1563,7 +1563,7 @@ class _FakeHost:
             session=self.session,
             store_path=self.store_path,
             operator_allowed_uids=frozenset(),
-            service_allowed_uids=frozenset(),
+            worker_allowed_uids=frozenset(),
             operator_socket=Path("/tmp/op.sock"),
             worker_socket=Path("/tmp/wk.sock"),
         )

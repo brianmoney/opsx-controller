@@ -1,6 +1,6 @@
 ---
 name: opsx-supervision
-description:
+description: >-
   Briefs the supervised frontier primary on its bounded loop for one
   registered supervised job: read journaled evidence, choose a remedy or
   judgment, and invoke only the tracked service tool. Use when running as the

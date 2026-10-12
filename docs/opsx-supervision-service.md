@@ -167,6 +167,49 @@ Enabling is a separate, explicit operator action. Re-running an installer later
 replaces the template and this document but never enables, starts, or activates
 the service.
 
+## Endpoint principal and socket provisioning
+
+The service host accepts operator requests and worker-domain requests on two
+separate Unix sockets with disjoint verb surfaces. Both are authenticated by
+the kernel-reported peer uid (`SO_PEERCRED`); no environment-settable token or
+credential selects an endpoint. The following provisioning settings configure
+who the endpoints accept and how their sockets are reached:
+
+- `OPSX_SUPERVISOR_OPERATOR_PRINCIPAL` — the operator account whose uid the
+  operator endpoint accepts. The service host resolves it from this setting,
+  never from the identity the service process itself runs under: a unit
+  started as the service principal without this key set fails closed rather
+  than accepting the service uid as the operator. The name must exist on the
+  host and must be distinct from the service and worker principals. Interactive
+  trust-root commands that omit the key keep the legacy posture where the
+  invoking user is the operator.
+- `OPSX_SUPERVISOR_OPERATOR_GROUP` / `OPSX_SUPERVISOR_WORKER_GROUP` — named
+  socket groups. With no group the socket is owner-only (`0600`). With a group
+  the service-owned socket is `0660` with the configured group as its group
+  owner, so members can connect:
+  - `OPSX_SUPERVISOR_OPERATOR_GROUP` grants the provisioned operator connect
+    access to the operator socket. The group must not admit the worker
+    principal; the service refuses to start if it does, because the operator
+    surface must remain unreachable from the worker domain.
+  - `OPSX_SUPERVISOR_WORKER_GROUP` grants the worker-domain primary session
+    connect access to the worker-actions socket, which carries no operator
+    authority.
+  Peer-uid authentication remains authoritative: a group only makes the socket
+  reachable enough to attempt the kernel check, and membership never bypasses
+  the allowed-uid decision.
+- `OPSX_SUPERVISOR_OPERATOR_SOCKET` / `OPSX_SUPERVISOR_WORKER_SOCKET` —
+  explicit socket paths, which may place a socket outside the ledger home (for
+  example under the service principal's `$XDG_RUNTIME_DIR`). The socket's
+  parent directory is validated: it must be a service-owned (or root-owned)
+  directory that denies the worker principal a write, evaluated against the
+  POSIX ACL as well as the mode bits. Traversal is allowed so provisioned
+  group members can reach the socket; a world-writable or worker-writable
+  parent fails closed.
+
+A configured-but-missing group, an operator group that admits the worker, or an
+insecure socket parent is reported as `BrokerUnavailableError` at startup and
+no socket is bound.
+
 ## Verifying the deployment
 
 After any global install, `--verify` checks that the template and this document

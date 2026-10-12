@@ -82,6 +82,10 @@ STATUS_UNSUPPORTED = "unsupported"
 # absence is not an error; the defaults below are the documented baseline names.
 SERVICE_PRINCIPAL_ENV = "OPSX_SUPERVISOR_SERVICE_PRINCIPAL"
 WORKER_PRINCIPAL_ENV = "OPSX_SUPERVISOR_WORKER_PRINCIPAL"
+# The service host resolves the operator principal from provisioning
+# configuration. Without it the service must not fall back to the identity the
+# service process itself runs under (that would collapse the boundary).
+OPERATOR_PRINCIPAL_ENV = "OPSX_SUPERVISOR_OPERATOR_PRINCIPAL"
 # The store contract is a *file*. OPSX_SUPERVISOR_STATE_FILE names the
 # service-owned protected file the probe and detection inspect.
 STORE_FILE_ENV = "OPSX_SUPERVISOR_STATE_FILE"
@@ -315,15 +319,38 @@ def resolve_principal(
     return Principal(role=role, name=name, uid=lookup(name))
 
 
+def provisioned_operator_name(env: Mapping[str, str] | None = None) -> str | None:
+    """Return the explicitly provisioned operator principal name, or ``None``.
+
+    The service host resolves the operator identity from provisioning
+    configuration (``OPSX_SUPERVISOR_OPERATOR_PRINCIPAL``), never from the
+    identity the service process happens to run under. An interactive operator
+    running trust-root commands may omit the key; in that context the invoking
+    user *is* the operator, and callers fall back explicitly.
+    """
+    environment = os.environ if env is None else env
+    configured = (environment.get(OPERATOR_PRINCIPAL_ENV) or "").strip()
+    return configured or None
+
+
 def principal_set_from_environment(
     *,
     env: Mapping[str, str] | None = None,
     resolver: Callable[[str], int | None] | None = None,
     operator_name: str | None = None,
 ) -> PrincipalSet:
-    """Build the three-principal set from the environment and OS account facts."""
+    """Build the three-principal set from the environment and OS account facts.
+
+    Operator precedence: an explicit *operator_name* argument, then the
+    provisioned ``OPSX_SUPERVISOR_OPERATOR_PRINCIPAL`` name, then the invoking
+    user (the interactive trust-root posture).
+    """
     environment = os.environ if env is None else env
-    operator = operator_name or _current_user_name()
+    operator = (
+        operator_name
+        or provisioned_operator_name(environment)
+        or _current_user_name()
+    )
     service = environment.get(SERVICE_PRINCIPAL_ENV) or DEFAULT_SERVICE_PRINCIPAL
     worker = environment.get(WORKER_PRINCIPAL_ENV) or DEFAULT_WORKER_PRINCIPAL
     return PrincipalSet(
@@ -1609,6 +1636,7 @@ __all__ = [
     "CapabilityReport",
     "DEFAULT_SERVICE_PRINCIPAL",
     "DEFAULT_WORKER_PRINCIPAL",
+    "OPERATOR_PRINCIPAL_ENV",
     "Principal",
     "PrincipalSet",
     "PROBE_EXIT_DENIED",
@@ -1639,6 +1667,7 @@ __all__ = [
     "interpret_probe_exit",
     "parse_posix_acl_access",
     "principal_set_from_environment",
+    "provisioned_operator_name",
     "require_authority_backend",
     "resolve_principal",
     "run_activation_probe",

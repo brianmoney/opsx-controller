@@ -27,6 +27,7 @@ import re
 import selectors
 import shlex
 import socket
+import stat as stat_module
 import subprocess
 import time
 from dataclasses import dataclass
@@ -48,6 +49,15 @@ from lib.supervisor import watchdog as watchdog_mod
 
 ENV_STATE_FILE = "OPSX_SUPERVISOR_STATE_FILE"
 ENV_SERVER_COMMAND = "OPSX_SESSION_SERVER_COMMAND"
+
+# Provisioning configuration for cross-identity endpoint access. The operator
+# group admits the provisioned human operator to the operator socket; the
+# worker group admits the worker-domain primary session to the worker-actions
+# socket. Both are optional: with no pin the socket stays owner-only. The
+# kernel-reported peer uid remains the authoritative accept decision either
+# way; a group only makes the socket reachable enough to attempt the check.
+OPERATOR_GROUP_ENV = "OPSX_SUPERVISOR_OPERATOR_GROUP"
+WORKER_GROUP_ENV = "OPSX_SUPERVISOR_WORKER_GROUP"
 
 
 def state_file_configured() -> bool:
@@ -1154,37 +1164,62 @@ OPERATOR_SOCKET_ENV = broker_client.OPERATOR_SOCKET_ENV
 WORKER_SOCKET_ENV = broker_client.WORKER_SOCKET_ENV
 
 
-def service_socket_path(kind: str, store_path: Path) -> Path:
+def service_socket_path(
+    kind: str,
+    store_path: Path,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> Path:
     """Return the service-owned endpoint socket path for *kind*.
 
     An explicit socket env override wins (that is the provisioning/test
     contract the CLI client reads too); otherwise the socket lives beside the
     service-owned store so a worker cannot repoint it. The result is
-    canonicalized alongside the store.
+    canonicalized alongside the store. *env* is threaded through so
+    ``open_service_host(env=...)`` resolves the socket path from the mapping
+    it was given, not the ambient process environment.
     """
-    configured = broker_client.endpoint_socket_path(kind)
+    configured = broker_client.endpoint_socket_path(kind, env=env)
     if configured is not None:
         return configured
     name = "operator.sock" if kind == endpoints_mod.ENDPOINT_OPERATOR else "worker.sock"
     return store_path.parent / name
 
 
-def _allowed_uids_for(role: str, *, principal: Any = None) -> frozenset[int]:
+def _allowed_uids_for(
+    role: str,
+    *,
+    principal: Any = None,
+    env: Mapping[str, str] | None = None,
+) -> frozenset[int]:
     """Return the kernel uids the *role* endpoint accepts.
 
     The authenticated principal is resolved through
     :mod:`lib.supervisor.authority` (never a worker-selectable name); a
     missing, unresolvable principal fails closed with
     :class:`broker_mod.BrokerUnavailableError`, because an endpoint that
-    cannot name its allowed peer must not accept one.
+    cannot name its allowed peer must not accept one. *env* is the
+    provisioning environment mapping (defaults to ``os.environ``), so
+    ``open_service_host`` honors the mapping it was given.
     """
-    if principal is not None and principal.uid is not None:
+    environment = os.environ if env is None else env
+    if principal is not None:
+        if principal.uid is None:
+            raise broker_mod.BrokerUnavailableError(
+                f"the supplied {role} principal is not provisioned on this "
+                "host; refusing to accept unauthenticated broker requests"
+            )
         return frozenset({int(principal.uid)})
-    name = (
-        authority_mod.DEFAULT_SERVICE_PRINCIPAL
-        if role == "service"
-        else None
-    )
+    name = {
+        "service": (
+            environment.get(authority_mod.SERVICE_PRINCIPAL_ENV)
+            or authority_mod.DEFAULT_SERVICE_PRINCIPAL
+        ),
+        "worker": (
+            environment.get(authority_mod.WORKER_PRINCIPAL_ENV)
+            or authority_mod.DEFAULT_WORKER_PRINCIPAL
+        ),
+    }.get(role)
     if name is None:
         raise broker_mod.BrokerUnavailableError(
             f"no principal is provisioned for the {role} endpoint; refusing to "
@@ -1204,6 +1239,180 @@ def _allowed_uids_for(role: str, *, principal: Any = None) -> frozenset[int]:
     return frozenset({int(resolved.uid)})
 
 
+def _optional_worker_uids(
+    principal: Any = None, *, env: Mapping[str, str] | None = None
+) -> frozenset[int]:
+    """Return the provisioned worker principal's uid, or an empty set.
+
+    The worker-actions endpoint always accepts the service principal that
+    hosts it; the worker principal is added when it is provisioned, so the
+    worker-domain primary session can reach its own scoped verbs. An
+    unprovisioned worker is not an error here (no worker session exists), and
+    a test seam may supply the principal explicitly.
+    """
+    if principal is not None:
+        if principal.uid is None:
+            return frozenset()
+        return frozenset({int(principal.uid)})
+    environment = os.environ if env is None else env
+    name = (
+        environment.get(authority_mod.WORKER_PRINCIPAL_ENV)
+        or authority_mod.DEFAULT_WORKER_PRINCIPAL
+    )
+    try:
+        resolved = authority_mod.resolve_principal("worker", name)
+    except Exception:  # pragma: no cover - authority lookup failure
+        return frozenset()
+    if resolved.uid is None:
+        return frozenset()
+    return frozenset({int(resolved.uid)})
+
+
+def _worker_gids_for(
+    uid: int | None, *, name: str | None = None
+) -> tuple[int, ...]:
+    """Resolve the worker principal's primary and supplementary gids.
+
+    Best-effort: an unresolvable identity yields no gids rather than an error,
+    because the caller may be a test seam the OS cannot resolve. Production
+    resolves the provisioned worker name, so its group-class permissions are
+    part of the parent-directory write denial.
+    """
+    try:
+        import pwd
+    except ImportError:  # pragma: no cover - non-POSIX hosts
+        return ()
+    resolved_name = name
+    if resolved_name is None and uid is not None:
+        try:
+            resolved_name = pwd.getpwuid(int(uid)).pw_name
+        except (KeyError, OSError):  # pragma: no cover - depends on host state
+            return ()
+    if not resolved_name:
+        return ()
+    try:
+        gids = authority_mod._default_gid_resolver(resolved_name)
+    except Exception:  # pragma: no cover - authority lookup failure
+        return ()
+    return tuple(int(gid) for gid in gids)
+
+
+def _resolve_provisioned_group(name: str, *, role: str) -> int:
+    """Resolve a provisioned socket group name to its gid, or fail closed.
+
+    The group is provisioning configuration: a configured-but-missing group
+    means the documented provisioning is incomplete, so the endpoint refuses
+    to bind a socket the provisioned identity could never reach.
+    """
+    try:
+        import grp
+    except ImportError as exc:  # pragma: no cover - non-POSIX hosts
+        raise broker_mod.BrokerUnavailableError(
+            f"the {role} group {name!r} cannot be resolved on this platform: {exc}"
+        ) from exc
+    try:
+        return int(grp.getgrnam(name).gr_gid)
+    except KeyError as exc:
+        raise broker_mod.BrokerUnavailableError(
+            f"the provisioned {role} group {name!r} does not exist on this host; "
+            "complete the documented provisioning before starting the service"
+        ) from exc
+
+
+def _group_admits_principal(gid: int, *, name: str, uid: int | None) -> bool:
+    """True when group *gid* makes *name* a member (by name or primary gid).
+
+    Used to fail closed when the provisioned operator group accidentally
+    admits the worker principal: the operator socket must remain unreachable
+    by the worker, so a group that contains the worker is refused at startup
+    rather than silently widening the transport.
+    """
+    if uid is not None:
+        try:
+            import pwd
+            if int(pwd.getpwuid(int(uid)).pw_gid) == int(gid):
+                return True
+        except (ImportError, KeyError, OSError):  # pragma: no cover - host state
+            pass
+    try:
+        import grp
+        return name in grp.getgrgid(int(gid)).gr_mem
+    except (ImportError, KeyError, OSError):  # pragma: no cover - host state
+        return False
+
+
+def _provisioned_endpoint_gid(
+    env: Mapping[str, str], key: str, *, role: str
+) -> int | None:
+    """Resolve a provisioned endpoint socket group, or ``None`` when unset.
+
+    An explicit ``OPSX_SUPERVISOR_OPERATOR_GROUP`` /
+    ``OPSX_SUPERVISOR_WORKER_GROUP`` names the group whose members may connect
+    to that endpoint's socket; the group must exist. With no pin the socket
+    stays owner-only, which is the legacy single-identity posture.
+    """
+    configured = (env.get(key) or "").strip()
+    if not configured:
+        return None
+    return _resolve_provisioned_group(configured, role=role)
+
+
+def _socket_parent_reasons(
+    stat_result: os.stat_result,
+    *,
+    service_uid: int | None,
+    worker_uid: int | None,
+    worker_gids: Sequence[int] = (),
+    worker_denied_check: Any = None,
+    acl_reader: Any = None,
+    path: Path | None = None,
+) -> list[str]:
+    """Return why a socket's parent directory is not a secure service parent.
+
+    A socket may live outside the ledger home when its path is explicitly
+    provisioned (``OPSX_SUPERVISOR_OPERATOR_SOCKET`` /
+    ``OPSX_SUPERVISOR_WORKER_SOCKET``), but its parent must then still be
+    service-owned (or root) and deny the worker a write — evaluated against
+    the POSIX ACL as well as the mode bits — so the socket cannot be replaced
+    from the worker domain. Traversal is deliberately allowed: the parent may
+    grant search access to the provisioned group members that must reach the
+    socket. A world-writable parent is refused outright.
+    """
+    reasons: list[str] = []
+    mode = int(stat_result.st_mode)
+    if not stat_module.S_ISDIR(mode):
+        return ["it is not a directory"]
+    owner = int(stat_result.st_uid)
+    if service_uid is not None and owner not in (0, int(service_uid)):
+        reasons.append(
+            f"it is owned by uid {owner}, which is neither the root trust "
+            f"root nor the service principal uid {service_uid}"
+        )
+    if mode & 0o002:
+        reasons.append("it is world-writable")
+    if worker_uid is not None:
+        if worker_denied_check is not None:
+            denied = bool(worker_denied_check(stat_result))
+        else:
+            try:
+                denied = authority_mod.worker_write_denied(
+                    stat_result,
+                    worker_uid=int(worker_uid),
+                    worker_gids=list(worker_gids),
+                    acl_reader=acl_reader,
+                    path=path,
+                ).denied
+            except OSError as exc:
+                reasons.append(f"its extended ACL could not be inspected: {exc}")
+                denied = False
+        if not denied:
+            reasons.append(
+                f"it is writable by the worker principal uid {worker_uid}, "
+                "so the socket could be replaced"
+            )
+    return reasons
+
+
 @dataclass
 class ServiceEndpointHost:
     """Production host that serves authenticated broker endpoint requests.
@@ -1220,7 +1429,7 @@ class ServiceEndpointHost:
     session: ServiceSession
     store_path: Path
     operator_allowed_uids: frozenset[int]
-    service_allowed_uids: frozenset[int]
+    worker_allowed_uids: frozenset[int]
     operator_socket: Path
     worker_socket: Path
     primary_session: "PrimarySessionRuntime | None" = None
@@ -1231,6 +1440,14 @@ class ServiceEndpointHost:
     _watchdog_scanned: bool = False
     _last_watchdog_tick: float = 0.0
     watchdog_error: str | None = None
+    # Provisioning identity for socket-group and parent-directory validation.
+    # ``None`` means the corresponding principal is unknown (a direct test
+    # construction); the production bootstrap always resolves them.
+    operator_socket_gid: int | None = None
+    worker_socket_gid: int | None = None
+    service_uid: int | None = None
+    worker_uid: int | None = None
+    worker_gids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self._listeners is None:
@@ -1304,7 +1521,7 @@ class ServiceEndpointHost:
                 self.operator_allowed_uids, self.operator_socket
             ),
             endpoints_mod.ENDPOINT_WORKER: (
-                self.service_allowed_uids, self.worker_socket
+                self.worker_allowed_uids, self.worker_socket
             ),
         }
         allowed, _path = endpoints_map[kind]
@@ -1313,12 +1530,26 @@ class ServiceEndpointHost:
     def bind(self) -> "ServiceEndpointHost":
         """Bind and listen on both endpoint sockets.
 
-        A stale socket file is removed first; the socket is created with
-        restrictive permissions (owner-only) so a worker cannot connect by
-        filesystem permission even before its uid is rejected.
+        The socket's parent directory is validated first: it must be a
+        service-owned (or root-owned) directory that denies the worker
+        principal a write, so a socket placed outside the ledger home through
+        the explicit socket path parameters cannot be planted or replaced
+        from the worker domain. Traversal is allowed; a world-writable parent
+        fails closed. A stale socket file is then removed — an existing path
+        that is not a socket is refused rather than removed.
 
-        Every socket provisioning failure (creating, preparing, binding, or
-        listening) is translated to
+        With no provisioned group the socket is owner-only. When a provisioned
+        group is configured the socket is group-accessible with mode ``0660``:
+        the operator socket gets the operator group so the provisioned
+        operator can connect while the worker — not a member — cannot, and the
+        worker-actions socket gets the worker group so the worker-domain
+        primary session can reach its scoped verbs. The kernel-reported peer
+        uid remains the authoritative accept decision: the group only makes
+        the socket reachable enough to attempt the check, and no mode is ever
+        world-writable.
+
+        Every socket provisioning failure (preparing, validating, binding,
+        listening, or applying the provisioned group) is translated to
         :class:`broker_mod.BrokerUnavailableError`, the named fail-closed error
         the ``supervise serve`` contract promises: an unbindable endpoint must
         not escape as a raw ``OSError``. On failure the partially bound sockets
@@ -1326,14 +1557,52 @@ class ServiceEndpointHost:
         installed) is torn down before the error propagates, so a failed boot
         leaves no half-installed authority surface behind.
         """
-        for kind, path in (
-            (endpoints_mod.ENDPOINT_OPERATOR, self.operator_socket),
-            (endpoints_mod.ENDPOINT_WORKER, self.worker_socket),
-        ):
-            path = Path(path)
+        endpoints = (
+            (
+                endpoints_mod.ENDPOINT_OPERATOR,
+                Path(self.operator_socket),
+                self.operator_socket_gid,
+            ),
+            (
+                endpoints_mod.ENDPOINT_WORKER,
+                Path(self.worker_socket),
+                self.worker_socket_gid,
+            ),
+        )
+        for kind, path, gid in endpoints:
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                if path.exists():
+                parent_stat = os.stat(path.parent)
+                stale = path.exists() or path.is_symlink()
+                stale_is_socket = path.is_socket() if stale else False
+            except OSError as exc:
+                self.close()
+                raise broker_mod.BrokerUnavailableError(
+                    f"the {kind} endpoint socket {path} could not be prepared; "
+                    f"refusing to serve broker requests: {exc}"
+                ) from exc
+            reasons = _socket_parent_reasons(
+                parent_stat,
+                service_uid=self.service_uid,
+                worker_uid=self.worker_uid,
+                worker_gids=self.worker_gids,
+                path=path.parent,
+            )
+            if reasons:
+                self.close()
+                raise broker_mod.BrokerUnavailableError(
+                    f"the {kind} endpoint socket parent {path.parent} is not a "
+                    "secure service location; refusing to serve broker "
+                    "requests: " + "; ".join(reasons)
+                )
+            if stale and not stale_is_socket:
+                self.close()
+                raise broker_mod.BrokerUnavailableError(
+                    f"the {kind} endpoint socket path {path} exists and is not "
+                    "a socket; refusing to remove an unrecognized file"
+                )
+            try:
+                if stale:
                     path.unlink()
             except OSError as exc:
                 self.close()
@@ -1351,10 +1620,16 @@ class ServiceEndpointHost:
                 ) from exc
             try:
                 listener.bind(str(path))
-                try:
-                    os.chmod(path, 0o600)
-                except OSError:  # pragma: no cover - platform dependent
-                    pass
+                mode = 0o600
+                if gid is not None:
+                    os.chown(path, -1, int(gid))
+                    mode = 0o660
+                os.chmod(path, mode)
+                bound_mode = stat_module.S_IMODE(os.stat(path).st_mode)
+                if bound_mode & 0o007:
+                    raise OSError(
+                        f"socket mode {bound_mode:04o} grants world access"
+                    )
                 listener.listen(8)
             except OSError as exc:
                 try:
@@ -1378,7 +1653,11 @@ class ServiceEndpointHost:
         """Accept and dispatch at most one request, returning its result.
 
         Blocks up to *timeout* seconds for a connection; a timeout returns
-        ``None`` with nothing dispatched.
+        ``None`` with nothing dispatched. A rejected peer or a per-connection
+        transport fault (a disconnect, reset, or a response the vanished peer
+        cannot receive) is contained per connection: the bad peer is closed
+        and the caller may keep serving other requests. Authority and ledger
+        faults are deliberately not caught here and still fail closed.
         """
         if not self._listeners:
             raise broker_mod.BrokerUnavailableError(
@@ -1410,6 +1689,11 @@ class ServiceEndpointHost:
                 # A rejected peer is closed by the endpoint; surface it so the
                 # caller can decide whether the refusal is fatal.
                 return {"ok": False, "error": "PeerCredentialError", "message": str(exc)}
+            except (ConnectionError, TimeoutError) as exc:
+                # The peer vanished mid-request or could not receive its
+                # response; the connection is already being closed by the
+                # endpoint. Record the named failure and keep serving.
+                return {"ok": False, "error": type(exc).__name__, "message": str(exc)}
         return None
 
     def serve_forever(self, *, timeout: float = 1.0) -> None:
@@ -1488,7 +1772,9 @@ def open_service_host(
     job_id: int | None = None,
     operator_principal: Any = None,
     service_principal: Any = None,
+    worker_principal: Any = None,
     watchdog_redrive: Any = None,
+    env: Mapping[str, str] | None = None,
 ) -> ServiceEndpointHost:
     """Boot the production service host: session + projection writer + sockets.
 
@@ -1499,10 +1785,26 @@ def open_service_host(
     an unregistered worktree, or an unresolvable allowed principal fails
     closed before any socket is bound.
 
-    *operator_principal* / *service_principal* are test seams that override
-    the authority layer's resolved endpoints; production omits them and
-    resolves the operator and service principals from the OS.
+    The operator endpoint accepts only the operator principal, resolved from
+    the explicitly provisioned ``OPSX_SUPERVISOR_OPERATOR_PRINCIPAL`` (never
+    the identity the service process runs under), and the resolved operator
+    uid must be distinct from the service and worker uids. The worker-actions
+    endpoint accepts the service principal that hosts it plus the provisioned
+    worker principal, and never the operator.
+
+    The provisioned ``OPSX_SUPERVISOR_OPERATOR_GROUP`` /
+    ``OPSX_SUPERVISOR_WORKER_GROUP`` name endpoint socket groups. A configured
+    group that admits the worker principal on the operator socket, a
+    configured-but-missing group, or an insecure socket parent fails closed
+    before any socket is bound.
+
+    *operator_principal* / *service_principal* / *worker_principal* are test
+    seams that override the authority layer's resolved endpoints; production
+    omits them and resolves the operator, service, and worker principals from
+    the OS and the provisioning environment. *env* is the provisioning
+    environment seam (defaults to ``os.environ``).
     """
+    environment = os.environ if env is None else env
     session = open_service_session(repo, cfg, store_path=store_path, job_id=job_id)
     try:
         effective_store = Path(store_path) if store_path is not None else ledger_path(repo)
@@ -1510,12 +1812,46 @@ def open_service_host(
             raise broker_mod.BrokerUnavailableError(
                 "no service-owned supervision store is configured"
             )
-        operator_allowed = (
-            _allowed_uids_for("operator", principal=operator_principal)
-            if operator_principal is not None
-            else _operator_allowed_uids()
+        service_allowed = _allowed_uids_for(
+            "service", principal=service_principal, env=environment
         )
-        service_allowed = _allowed_uids_for("service", principal=service_principal)
+        service_uid = next(iter(service_allowed), None)
+        worker_uids = _optional_worker_uids(worker_principal, env=environment)
+        worker_uid = next(iter(worker_uids), None)
+        if service_uid is not None and worker_uid is not None and service_uid == worker_uid:
+            raise broker_mod.BrokerUnavailableError(
+                "the service and worker principals resolve to the same uid "
+                f"{service_uid}; a collapsed configuration cannot enforce the "
+                "endpoint boundary"
+            )
+        worker_allowed = service_allowed | worker_uids
+        operator_allowed = (
+            _allowed_uids_for(
+                "operator", principal=operator_principal, env=environment
+            )
+            if operator_principal is not None
+            else _operator_allowed_uids(
+                environment, service_uid=service_uid, worker_uid=worker_uid
+            )
+        )
+
+        operator_gid = _provisioned_endpoint_gid(
+            environment, OPERATOR_GROUP_ENV, role="operator"
+        )
+        worker_gid = _provisioned_endpoint_gid(
+            environment, WORKER_GROUP_ENV, role="worker"
+        )
+        if operator_gid is not None and worker_uid is not None:
+            worker_name = (
+                getattr(worker_principal, "name", None)
+                or _principal_name_for_uid(worker_uid)
+                or environment.get(authority_mod.WORKER_PRINCIPAL_ENV)
+                or authority_mod.DEFAULT_WORKER_PRINCIPAL
+            )
+            _assert_operator_group_excludes_worker(
+                operator_gid, name=worker_name, uid=worker_uid
+            )
+
         watchdog = watchdog_mod.Watchdog(
             session.ledger,
             repo=repo,
@@ -1526,30 +1862,110 @@ def open_service_host(
             session=session,
             store_path=effective_store,
             operator_allowed_uids=operator_allowed,
-            service_allowed_uids=service_allowed,
+            worker_allowed_uids=worker_allowed,
             operator_socket=service_socket_path(
-                endpoints_mod.ENDPOINT_OPERATOR, effective_store
+                endpoints_mod.ENDPOINT_OPERATOR, effective_store, env=environment
             ),
             worker_socket=service_socket_path(
-                endpoints_mod.ENDPOINT_WORKER, effective_store
+                endpoints_mod.ENDPOINT_WORKER, effective_store, env=environment
             ),
             watchdog=watchdog,
+            operator_socket_gid=operator_gid,
+            worker_socket_gid=worker_gid,
+            service_uid=service_uid,
+            worker_uid=worker_uid,
+            worker_gids=_worker_gids_for(
+                worker_uid, name=getattr(worker_principal, "name", None)
+            ),
         )
     except Exception:
         session.close()
         raise
 
 
-def _operator_allowed_uids() -> frozenset[int]:
-    """Return the operator principal's uid resolved from the OS authority layer."""
-    report = authority_mod.detect_backend()
-    principals = report.principals
-    if principals is None or principals.operator.uid is None:
+def _principal_name_for_uid(uid: int) -> str | None:
+    """Return the OS account name for *uid*, or ``None`` when unresolvable."""
+    try:
+        import pwd
+    except ImportError:  # pragma: no cover - non-POSIX hosts
+        return None
+    try:
+        return pwd.getpwuid(int(uid)).pw_name
+    except (KeyError, OSError):  # pragma: no cover - depends on host state
+        return None
+
+
+def _assert_operator_group_excludes_worker(
+    gid: int, *, name: str, uid: int
+) -> None:
+    """Fail closed when the operator socket group admits the worker principal.
+
+    The operator endpoint must remain unreachable from the worker domain, so a
+    provisioned operator group that contains the worker (by name or as the
+    worker's primary group) is a provisioning error rather than a widened
+    transport. The kernel peer-uid check would still reject the worker; this
+    check refuses to *publish* an operator socket the worker could connect to.
+    """
+    if _group_admits_principal(gid, name=name, uid=uid):
         raise broker_mod.BrokerUnavailableError(
-            "the operator principal is not provisioned on this host; refusing "
-            "to accept unauthenticated broker requests"
+            f"the provisioned operator group admits the worker principal "
+            f"{name!r}; the operator endpoint must remain unreachable by the "
+            "worker"
         )
-    return frozenset({int(principals.operator.uid)})
+
+
+def _operator_allowed_uids(
+    env: Mapping[str, str] | None = None,
+    *,
+    service_uid: int | None = None,
+    worker_uid: int | None = None,
+) -> frozenset[int]:
+    """Return the operator principal's uid from provisioning configuration.
+
+    The service host resolves the operator identity from the explicitly
+    provisioned ``OPSX_SUPERVISOR_OPERATOR_PRINCIPAL``, never from the identity
+    the service process happens to run under: a service principal must not be
+    accepted as the operator merely because it owns the endpoints. The
+    interactive fallback (the invoking user) applies only when the process is
+    *not* the service principal, which keeps the legacy single-user CLI
+    posture working. The resolved operator uid must be distinct from the
+    service and worker uids, so the operator peer allowlist never admits the
+    service or the worker.
+    """
+    environment = os.environ if env is None else env
+    name = authority_mod.provisioned_operator_name(environment)
+    if name is None:
+        service_name = (
+            environment.get(authority_mod.SERVICE_PRINCIPAL_ENV)
+            or authority_mod.DEFAULT_SERVICE_PRINCIPAL
+        )
+        if service_uid is None:
+            service_uid = authority_mod.resolve_principal("service", service_name).uid
+        if service_uid is not None and int(service_uid) == int(os.getuid()):
+            raise broker_mod.BrokerUnavailableError(
+                "no operator principal is provisioned; the service principal "
+                f"{service_name!r} is not accepted as the operator identity "
+                f"(set {authority_mod.OPERATOR_PRINCIPAL_ENV})"
+            )
+        name = authority_mod._current_user_name()
+    principal = authority_mod.resolve_principal("operator", name)
+    if principal.uid is None:
+        raise broker_mod.BrokerUnavailableError(
+            f"the provisioned operator principal {name!r} does not exist on "
+            "this host; refusing to accept unauthenticated broker requests"
+        )
+    collapsed = [
+        label
+        for label, uid in (("service", service_uid), ("worker", worker_uid))
+        if uid is not None and int(uid) == int(principal.uid)
+    ]
+    if collapsed:
+        raise broker_mod.BrokerUnavailableError(
+            f"the resolved operator principal {name!r} (uid {principal.uid}) is "
+            f"also the {'/'.join(collapsed)} principal; the operator endpoint "
+            "must accept only a distinct operator identity"
+        )
+    return frozenset({int(principal.uid)})
 
 
 # ---------------------------------------------------------------------------
@@ -2107,12 +2523,14 @@ class PrimarySessionRuntime:
 __all__ = [
     "ENV_SERVER_COMMAND",
     "ENV_STATE_FILE",
+    "OPERATOR_GROUP_ENV",
     "OPERATOR_SOCKET_ENV",
     "PrimarySessionRuntime",
     "Registration",
     "ServiceEndpointHost",
     "ServiceSession",
     "SessionServerProcess",
+    "WORKER_GROUP_ENV",
     "WORKER_SOCKET_ENV",
     "call_operator",
     "call_worker_actions",

@@ -91,7 +91,16 @@ def write_json_response(conn: Any, response: Mapping[str, Any]) -> None:
 def _read_line(conn: Any) -> str:
     chunks: list[bytes] = []
     while True:
-        chunk = conn.recv(4096)
+        try:
+            chunk = conn.recv(4096)
+        except OSError as exc:
+            # A reset, abort, or broken connection mid-request is a
+            # per-connection fault: name it as a refused peer rather than
+            # letting a raw socket error escape the serve loop.
+            raise broker_module.BrokerMediationError(
+                f"the endpoint connection failed before a complete request "
+                f"was read; the peer was not accepted: {exc}"
+            ) from exc
         if not chunk:
             break
         chunks.append(chunk)
@@ -104,12 +113,32 @@ def _read_line(conn: Any) -> str:
             "not accepted"
         )
     line, _, _ = raw.partition(b"\n")
-    return line.decode("utf-8")
+    try:
+        return line.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise endpoints_module.EndpointError(
+            f"request was not valid UTF-8: {exc}"
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
 # Server half (used by the supervised service and by tests)
 # ---------------------------------------------------------------------------
+
+
+def _write_response_best_effort(conn: Any, response: Mapping[str, Any]) -> bool:
+    """Write one response, reporting whether the peer received it.
+
+    A failed write (a broken pipe, a reset, or any other transport fault) is
+    not allowed to escape: the peer is gone, so there is nothing to record
+    and no connection to keep. The caller decides what the failure means for
+    its own durable state.
+    """
+    try:
+        write_json_response(conn, response)
+        return True
+    except OSError:
+        return False
 
 
 def serve_one(
@@ -125,6 +154,14 @@ def serve_one(
     ledger is never sent over the wire). Handler exceptions are
     serialized with their type name so the client can raise the matching named
     error; a rejected peer is closed with no response.
+
+    A malformed request (invalid JSON, invalid UTF-8, a non-object payload, or
+    an unexposed verb) is a per-connection client fault: it is answered with a
+    named ``EndpointError`` response where the peer can still receive one, and
+    the serve loop is never torn down by it. Transport faults on the refusal
+    path are contained the same way. An authority or ledger fault is *not*
+    contained: it is reported to the peer as a named error where possible and
+    still re-raised, so it cannot be silenced.
 
     A handler may return
     :class:`lib.supervisor.endpoints.DeferredDelivery`, whose durable
@@ -149,14 +186,18 @@ def serve_one(
             # A rejected peer is closed before any request is read; there is
             # no authenticated response to send.
             raise
+        except endpoints_module.EndpointError as exc:
+            # A malformed request is the bad peer's fault, not the service's:
+            # answer it where possible and keep serving other connections.
+            payload = {"ok": False, "error": "EndpointError", "message": str(exc)}
+            _write_response_best_effort(conn, payload)
+            return payload
         except broker_module.BrokerError as exc:
-            write_json_response(
-                conn,
-                {"ok": False, "error": type(exc).__name__, "message": str(exc)},
-            )
-            return {"ok": False, "error": type(exc).__name__, "message": str(exc)}
+            payload = {"ok": False, "error": type(exc).__name__, "message": str(exc)}
+            _write_response_best_effort(conn, payload)
+            return payload
         except Exception as exc:  # noqa: BLE001 - surfaced to the client as a named error
-            write_json_response(
+            _write_response_best_effort(
                 conn,
                 {"ok": False, "error": "LedgerError", "message": str(exc)},
             )
