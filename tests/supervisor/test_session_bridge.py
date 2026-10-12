@@ -54,6 +54,9 @@ class FakeOpencodeState:
         self.messages: dict[str, list[dict]] = {}
         self.status: dict[str, str] = {}
         self.prompt_calls: list[dict] = []
+        # Every accepted create body, so a contract test can assert the exact
+        # session-create model dialect the bridge put on the wire.
+        self.session_create_bodies: list[dict] = []
         self.requests: list[tuple[str, str]] = []
         self.aborts: list[str] = []
         self.drop_ack_once = False
@@ -144,6 +147,54 @@ def _prompt_text(body: dict) -> str:
     return " ".join(
         part.get("text", "") for part in parts if isinstance(part, dict)
     )
+
+
+def _nonempty_string(value) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _session_create_model_problem(body: dict) -> str | None:
+    """Return the session-create model-schema violation, or ``None``.
+
+    ``POST /session`` decodes its ``model`` object as ``{id, providerID,
+    variant?}`` (the real OpenCode 1.18.x schema): ``id`` names the model and
+    ``modelID`` is not a create-schema key, so a body in the prompt dialect is
+    refused with a 400 exactly as the real server refuses it.
+    """
+    if body.get("model") is None:
+        return None
+    model = body["model"]
+    if not isinstance(model, dict):
+        return "model must be an object"
+    if "modelID" in model:
+        return "session create model has no 'modelID'; expected 'id'"
+    if not _nonempty_string(model.get("id")):
+        return "session create model is missing its 'id'"
+    if not _nonempty_string(model.get("providerID")):
+        return "session create model is missing its 'providerID'"
+    if "variant" in model and not _nonempty_string(model.get("variant")):
+        return "session create model 'variant' must be a non-empty string"
+    return None
+
+
+def _prompt_model_problem(body: dict) -> str | None:
+    """Return the prompt model-schema violation, or ``None``.
+
+    The prompt dialect is ``{providerID, modelID}``; the create dialect's
+    ``id`` key is not part of it.
+    """
+    if body.get("model") is None:
+        return None
+    model = body["model"]
+    if not isinstance(model, dict):
+        return "model must be an object"
+    if "id" in model:
+        return "prompt model has no 'id'; expected 'modelID'"
+    if not _nonempty_string(model.get("providerID")):
+        return "prompt model is missing its 'providerID'"
+    if not _nonempty_string(model.get("modelID")):
+        return "prompt model is missing its 'modelID'"
+    return None
 
 
 def _complete_turn(state: FakeOpencodeState, session_id: str, user_id: str) -> None:
@@ -300,6 +351,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.state.requests.append(("POST", path))
         body = self._read_body()
         if path == "/session":
+            problem = _session_create_model_problem(body)
+            if problem is not None:
+                self._send(400, {"error": problem})
+                return
+            self.state.session_create_bodies.append(body)
             session_id = self.state.next_id("ses")
             session = {
                 "id": session_id,
@@ -319,6 +375,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, session)
             return
         if path.endswith("/prompt_async") and path.startswith("/session/"):
+            problem = _prompt_model_problem(body)
+            if problem is not None:
+                self._send(400, {"error": problem})
+                return
             session_id = path.split("/")[2]
             if session_id not in self.state.sessions:
                 self._send(404, {"error": "not found"})
@@ -734,6 +794,122 @@ class DocumentedApiTests(BridgeTestCase):
 # ---------------------------------------------------------------------------
 # Identity before prompt and lost-ack recovery
 # ---------------------------------------------------------------------------
+
+
+# The live supervisor pin for the email-plan supervision job: an exact concrete
+# provider/model. Its reasoning variant ("max") is carried by the installed
+# `opsx-supervisor` agent definition, not by the transport; the create dialect
+# renames the identity to `id`, and the prompt dialect keeps `modelID`.
+_LIVE_SUPERVISOR_MODEL = {"providerID": "moonshotai", "modelID": "kimi-k3"}
+
+
+class SessionCreateModelDialectTests(BridgeTestCase):
+    """The create call speaks the session-create model dialect; prompts do not.
+
+    The fake server enforces the real schemas: ``POST /session`` decodes
+    ``model`` as ``{id, providerID, variant?}`` and the prompt boundary keeps
+    ``{providerID, modelID}``. Forwarding the prompt dialect to create is a
+    400 on the fake exactly as it is on the real OpenCode 1.18.x server.
+    """
+
+    def test_create_session_renames_the_model_identity_to_the_create_dialect(
+        self,
+    ) -> None:
+        with FakeOpencodeServer() as server:
+            bridge = self.make_bridge(server)
+            session = bridge.create_session(
+                title="primary",
+                agent="opsx-supervisor",
+                model=_LIVE_SUPERVISOR_MODEL,
+            )
+        self.assertTrue(session.get("id"))
+        self.assertEqual(len(server.state.session_create_bodies), 1)
+        request_body = server.state.session_create_bodies[0]
+        self.assertEqual(request_body["agent"], "opsx-supervisor")
+        self.assertEqual(
+            request_body["model"],
+            {"id": "kimi-k3", "providerID": "moonshotai"},
+        )
+        self.assertNotIn("modelID", request_body["model"])
+
+    def test_create_session_carries_a_supplied_reasoning_variant(self) -> None:
+        model = dict(_LIVE_SUPERVISOR_MODEL, variant="max")
+        with FakeOpencodeServer() as server:
+            bridge = self.make_bridge(server)
+            bridge.create_session(title="primary", model=model)
+        self.assertEqual(
+            server.state.session_create_bodies[0]["model"],
+            {"id": "kimi-k3", "providerID": "moonshotai", "variant": "max"},
+        )
+
+    def test_prompt_keeps_the_prompt_model_dialect(self) -> None:
+        with FakeOpencodeServer() as server:
+            bridge = self.make_bridge(server)
+            session = bridge.create_session(
+                title="primary", model=_LIVE_SUPERVISOR_MODEL
+            )
+            bridge.prompt_async(
+                session["id"],
+                text="brief",
+                marker="req_dialect",
+                model=_LIVE_SUPERVISOR_MODEL,
+            )
+        prompt_body = server.state.prompt_calls[0]["body"]
+        self.assertEqual(
+            prompt_body["model"],
+            {"providerID": "moonshotai", "modelID": "kimi-k3"},
+        )
+        self.assertNotIn("id", prompt_body["model"])
+
+    def test_the_create_schema_assertion_refuses_the_prompt_dialect(self) -> None:
+        # A guard that the fake's schema enforcement is real: the untranslated
+        # internal dialect is a 400, so a regression that forwards it to create
+        # fails this suite instead of being served.
+        with FakeOpencodeServer() as server:
+            bridge = self.make_bridge(server)
+            response = bridge.transport.request(
+                "POST",
+                "/session",
+                body={"model": dict(_LIVE_SUPERVISOR_MODEL)},
+            )
+        self.assertEqual(response.status, 400)
+        self.assertIn("modelID", response.text)
+        self.assertEqual(server.state.session_create_bodies, [])
+
+    def test_journaled_create_sends_the_translated_pin_and_bound_agent(self) -> None:
+        policy = dict(self.policy)
+        policy["model_selection"] = {
+            "version": model_policy.MODEL_POLICY_VERSION,
+            "roles": {
+                role: "moonshotai/kimi-k3" for role in model_policy.POLICY_ROLES
+            },
+            "stages": dict(model_policy.STANDARD_STAGE_MAPPING),
+        }
+        with FakeOpencodeServer() as server:
+            bridge = self.make_bridge(server)
+            process_id = bridge_mod.serialize_process_identity(os.getpid())
+            journaled = bridge_mod.JournaledSessionBridge(
+                bridge,
+                self.ledger,
+                job_id=self.job_id,
+                run_id="run-1",
+                policy=policy,
+                process_id=process_id,
+                server_identity=process_id,
+                change_id="add-opencode-session-bridge",
+            )
+            session = journaled.create_session(
+                title="primary",
+                role=model_policy.SUPERVISOR_ROLE,
+                model=_LIVE_SUPERVISOR_MODEL,
+            )
+        self.assertTrue(session.get("id"))
+        request_body = server.state.session_create_bodies[0]
+        self.assertEqual(request_body["agent"], "opsx-supervisor")
+        self.assertEqual(
+            request_body["model"],
+            {"id": "kimi-k3", "providerID": "moonshotai"},
+        )
 
 
 class IdentityBeforePromptTests(BridgeTestCase):

@@ -450,7 +450,12 @@ def extract_marker(text: Any) -> str | None:
 
 
 def parse_model_identity(model: Any) -> dict[str, str] | None:
-    """Split a pinned ``provider/model`` identity into the server's shape."""
+    """Split a pinned ``provider/model`` identity into the bridge's shape.
+
+    The result is the internal (and prompt) ``{providerID, modelID}`` dialect;
+    the create call renames it to the create dialect through
+    :func:`_session_create_model_payload`.
+    """
     if not isinstance(model, str) or "/" not in model:
         return None
     provider, model_id = model.split("/", 1)
@@ -458,6 +463,30 @@ def parse_model_identity(model: Any) -> dict[str, str] | None:
     if not provider or not model_id:
         return None
     return {"providerID": provider, "modelID": model_id}
+
+
+def _session_create_model_payload(model: Mapping[str, Any]) -> dict[str, Any]:
+    """Translate the bridge's model identity to the session-create dialect.
+
+    The bridge and the prompt boundary speak ``{providerID, modelID}``
+    (:func:`parse_model_identity`). ``POST /session`` decodes its ``model``
+    object as ``{id, providerID, variant?}``: the identifier key is ``id`` and
+    the create schema has no ``modelID``, so forwarding the prompt dialect is a
+    request-decode failure rather than a created session. Renaming at the
+    create HTTP boundary keeps the prompt dialect authoritative for prompts; a
+    caller-supplied ``variant`` is carried through unchanged.
+    """
+    translated: dict[str, Any] = {}
+    provider = model.get("providerID")
+    if provider is not None:
+        translated["providerID"] = provider
+    model_id = model.get("modelID")
+    if model_id is not None:
+        translated["id"] = model_id
+    variant = model.get("variant")
+    if variant is not None:
+        translated["variant"] = variant
+    return translated
 
 
 def _text_parts(messages: Sequence[Any]) -> list[str]:
@@ -763,7 +792,9 @@ class SessionBridge:
         if agent:
             body["agent"] = agent
         if model:
-            body["model"] = dict(model)
+            # The create boundary speaks {id, providerID, variant?}; the
+            # internal (and prompt) dialect is {providerID, modelID}.
+            body["model"] = _session_create_model_payload(model)
         response = self._checked_request("create", body=body or None)
         if not response.ok:
             raise TransportError(
