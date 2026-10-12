@@ -796,11 +796,14 @@ class DocumentedApiTests(BridgeTestCase):
 # ---------------------------------------------------------------------------
 
 
-# The live supervisor pin for the email-plan supervision job: an exact concrete
-# provider/model. Its reasoning variant ("max") is carried by the installed
-# `opsx-supervisor` agent definition, not by the transport; the create dialect
-# renames the identity to `id`, and the prompt dialect keeps `modelID`.
-_LIVE_SUPERVISOR_MODEL = {"providerID": "moonshotai", "modelID": "kimi-k3"}
+# The configured supervisor binding for the supervised email-plan worktree,
+# resolved from its repo-local `.opsx-plan/models.toml` and matched by the
+# installed `opsx-supervisor` agent definition: an exact concrete
+# provider/model. Its reasoning variant ("max") is carried by the agent
+# definition, not by the transport; the create dialect renames the identity to
+# `id`, and the prompt dialect keeps `modelID`. Runtime variant application is
+# unverified pending a live session.
+_CONFIGURED_SUPERVISOR_MODEL = {"providerID": "moonshotai", "modelID": "kimi-k3"}
 
 
 class SessionCreateModelDialectTests(BridgeTestCase):
@@ -820,7 +823,7 @@ class SessionCreateModelDialectTests(BridgeTestCase):
             session = bridge.create_session(
                 title="primary",
                 agent="opsx-supervisor",
-                model=_LIVE_SUPERVISOR_MODEL,
+                model=_CONFIGURED_SUPERVISOR_MODEL,
             )
         self.assertTrue(session.get("id"))
         self.assertEqual(len(server.state.session_create_bodies), 1)
@@ -833,7 +836,7 @@ class SessionCreateModelDialectTests(BridgeTestCase):
         self.assertNotIn("modelID", request_body["model"])
 
     def test_create_session_carries_a_supplied_reasoning_variant(self) -> None:
-        model = dict(_LIVE_SUPERVISOR_MODEL, variant="max")
+        model = dict(_CONFIGURED_SUPERVISOR_MODEL, variant="max")
         with FakeOpencodeServer() as server:
             bridge = self.make_bridge(server)
             bridge.create_session(title="primary", model=model)
@@ -846,13 +849,13 @@ class SessionCreateModelDialectTests(BridgeTestCase):
         with FakeOpencodeServer() as server:
             bridge = self.make_bridge(server)
             session = bridge.create_session(
-                title="primary", model=_LIVE_SUPERVISOR_MODEL
+                title="primary", model=_CONFIGURED_SUPERVISOR_MODEL
             )
             bridge.prompt_async(
                 session["id"],
                 text="brief",
                 marker="req_dialect",
-                model=_LIVE_SUPERVISOR_MODEL,
+                model=_CONFIGURED_SUPERVISOR_MODEL,
             )
         prompt_body = server.state.prompt_calls[0]["body"]
         self.assertEqual(
@@ -870,7 +873,7 @@ class SessionCreateModelDialectTests(BridgeTestCase):
             response = bridge.transport.request(
                 "POST",
                 "/session",
-                body={"model": dict(_LIVE_SUPERVISOR_MODEL)},
+                body={"model": dict(_CONFIGURED_SUPERVISOR_MODEL)},
             )
         self.assertEqual(response.status, 400)
         self.assertIn("modelID", response.text)
@@ -901,7 +904,7 @@ class SessionCreateModelDialectTests(BridgeTestCase):
             session = journaled.create_session(
                 title="primary",
                 role=model_policy.SUPERVISOR_ROLE,
-                model=_LIVE_SUPERVISOR_MODEL,
+                model=_CONFIGURED_SUPERVISOR_MODEL,
             )
         self.assertTrue(session.get("id"))
         request_body = server.state.session_create_bodies[0]
