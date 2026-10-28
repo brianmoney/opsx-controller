@@ -121,10 +121,13 @@ What it contains:
 - `adapters/opencode/commands/opsx-ship.md`: `/opsx-ship` conductor command for
   one change
 - `adapters/opencode/agents/opsx-ship.md`: `/opsx-ship` conductor agent
-  (`mode: primary`, `edit: deny`, `bash: deny`, `task: allow`). It has no shell
-  at all, so every shell command and `openspec` query is delegated to a
-  sub-agent; the conductor never runs a command whose arguments it cannot
-  validate.
+  (`mode: primary`, `edit: deny`, `bash: deny`, `task: allow`, plus a `tools:`
+  denylist for Serena's file, memory, and configuration mutation tools). It has
+  no shell at all, so every shell command and `openspec` query is delegated to
+  a sub-agent; the conductor never runs a command whose arguments it cannot
+  validate. Serena remains enabled, and its read-only tools stay available. The
+  denylist is defense-in-depth: an MCP mutation tool left exposed elsewhere is
+  reported as a hardening note, not treated as a run-blocking defect.
 - `adapters/opencode/agents/opsx-implementer.md`: implementation round agent
 - `adapters/opencode/agents/opsx-reviewer.md`: strict reviewer agent
 - `adapters/opencode/agents/opsx-archiver.md`: non-interactive archiver agent

@@ -2,8 +2,9 @@
 
 Installs the OpenCode adapter into a temporary HOME (never the real
 environment) and asserts the installed conductor agent and command carry the
-delegation-enforcing capability contract: no file editing, no mutating shell,
-and the task facility allowed. Mirrors the temporary-HOME pattern in
+delegation-enforcing capability contract: no file editing (including
+MCP-provided file and memory mutation tools), no mutating shell, and the task
+facility allowed. Mirrors the temporary-HOME pattern in
 ``tests/supervisor/test_agent_contracts.py``.
 """
 
@@ -31,6 +32,47 @@ _MUTATING_COMMANDS = (
     "openspec store register*",
     "openspec store unregister*",
     "openspec store remove*",
+)
+
+# Every Serena tool that can write, insert, delete, rename, or otherwise
+# mutate files, memories, or Serena configuration. The first eleven are the
+# mutators exposed under the ``ide`` context; the rest are optional,
+# ``ide``-excluded, or backend-specific mutators that become exposed if
+# Serena's context or modes change. Read-only Serena tools are deliberately
+# absent and must stay available.
+_SERENA_MUTATION_TOOLS = (
+    "serena_replace_content",
+    "serena_replace_in_files",
+    "serena_replace_symbol_body",
+    "serena_insert_before_symbol",
+    "serena_insert_after_symbol",
+    "serena_rename_symbol",
+    "serena_safe_delete_symbol",
+    "serena_write_memory",
+    "serena_edit_memory",
+    "serena_delete_memory",
+    "serena_rename_memory",
+    "serena_create_text_file",
+    "serena_execute_shell_command",
+    "serena_delete_lines",
+    "serena_insert_at_line",
+    "serena_replace_lines",
+    "serena_onboarding",
+    "serena_activate_project",
+    "serena_remove_project",
+    "serena_jet_brains_debug",
+    "serena_jet_brains_inline_symbol",
+    "serena_jet_brains_move",
+    "serena_jet_brains_rename",
+    "serena_jet_brains_safe_delete",
+)
+
+# Read-only tools the conductor must retain.
+_READ_ONLY_SERENA_TOOLS = (
+    "serena_find_symbol",
+    "serena_search_for_pattern",
+    "serena_read_memory",
+    "serena_get_symbols_overview",
 )
 
 # Commands that escape a broad prefix allowlist: a writable option, shell
@@ -82,6 +124,32 @@ def _bash_allow_patterns(agent_text: str) -> list[str]:
     return patterns
 
 
+def _tool_denylist(agent_text: str) -> dict[str, str]:
+    """Return the agent frontmatter ``tools:`` block as name -> raw value.
+
+    Follows the same small line-scanner style as :func:`_bash_allow_patterns`:
+    indentation ends the block, blank lines and comments are skipped, and the
+    test stays stdlib-only instead of taking a PyYAML dependency.
+    """
+    tools_indent: int | None = None
+    entries: dict[str, str] = {}
+    for raw in agent_text.splitlines():
+        stripped = raw.strip()
+        if tools_indent is None:
+            if stripped == "tools:":
+                tools_indent = len(raw) - len(raw.lstrip(" "))
+            continue
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        if indent <= tools_indent:
+            break
+        if ":" in stripped:
+            name, _, value = stripped.partition(":")
+            entries[name.strip()] = value.strip().strip('"').strip("'")
+    return entries
+
+
 def _glob_matches(pattern: str, value: str) -> bool:
     """OpenCode whole-value shell glob: ``*`` any run, ``?`` one character."""
     if pattern.endswith(" *") and value == pattern[:-2]:
@@ -125,6 +193,55 @@ class ShipConductorContractTests(unittest.TestCase):
     def test_conductor_cannot_edit_files(self) -> None:
         text = (self.agents / "opsx-ship.md").read_text(encoding="utf-8")
         self.assertIn("edit: deny", text)
+
+    def test_conductor_disables_serena_mutation_tools(self) -> None:
+        text = (self.agents / "opsx-ship.md").read_text(encoding="utf-8")
+        denylist = _tool_denylist(text)
+        self.assertTrue(
+            _SERENA_MUTATION_TOOLS,
+            "the Serena mutation-tool regression list must not be empty",
+        )
+        self.assertTrue(
+            denylist,
+            "the conductor must declare a tools: denylist for MCP mutators",
+        )
+        missing = set(_SERENA_MUTATION_TOOLS) - set(denylist)
+        self.assertEqual(
+            missing,
+            set(),
+            f"conductor does not disable Serena mutation tools: {sorted(missing)}",
+        )
+        for tool in _SERENA_MUTATION_TOOLS:
+            with self.subTest(tool=tool):
+                self.assertEqual(
+                    denylist[tool],
+                    "false",
+                    f"{tool} must be disabled with false",
+                )
+        # Every entry in the block is a denial; the conductor never opts a
+        # tool back in through this surface.
+        self.assertEqual(set(denylist.values()), {"false"})
+        # A blanket serena_* denial would also remove read-only tools, so the
+        # denylist must stay explicit and must not touch the read-only set.
+        for tool in _READ_ONLY_SERENA_TOOLS:
+            with self.subTest(read_only_tool=tool):
+                self.assertNotIn(
+                    tool,
+                    denylist,
+                    f"{tool} is read-only and must remain available",
+                )
+
+    def test_conductor_does_not_refuse_over_mcp_mutation_exposure(self) -> None:
+        text = (self.agents / "opsx-ship.md").read_text(encoding="utf-8")
+        body = " ".join(text.split())
+        self.assertIn("not a reason to stop", body)
+        self.assertIn("delegate the work to a sub-agent instead", body)
+        self.assertIn("not a run-blocking defect", body)
+        self.assertNotIn(
+            "every file- or memory-mutating tool exposed by a connected MCP "
+            "server is disabled",
+            body,
+        )
 
     def test_conductor_allows_the_task_facility_and_questions(self) -> None:
         text = (self.agents / "opsx-ship.md").read_text(encoding="utf-8")

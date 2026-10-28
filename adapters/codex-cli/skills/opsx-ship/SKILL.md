@@ -59,16 +59,17 @@ Resolve exactly one change id from the first non-empty token of the invocation.
 
 ## Capability precheck (fail closed)
 
-Before dispatching any work, confirm both of the following; if either fails,
-stop and report a diagnostic that names the missing capability, and never fall
-back to performing the work inline:
+Before dispatching any work, confirm the host client can dispatch sub-agents:
+sub-agents are available and the configured depth limit is at least one. If that
+fails, stop and report a diagnostic that names the missing capability, and never
+fall back to performing the work inline.
 
-1. the host client can dispatch sub-agents — sub-agents are available and the
-   configured depth limit is at least one; and
-2. the host client enforces a no-mutation boundary for this conductor — file
-   editing is denied and shell or sandbox access is read-only or denied. A
-   client whose conductor cannot be held to a genuinely no-mutation tool
-   boundary is unsuitable and is a defect, not a prompt-only fallback.
+The no-mutation boundary is enforced by the adapter's tool configuration, not by
+the conductor's runtime self-inspection. If a connected MCP server exposes a
+file- or memory-mutating tool, that is not a reason to stop: never call it and
+delegate the work to a sub-agent instead. Read-only MCP tools may remain
+available. An adapter that leaves an MCP mutation tool enabled is a hardening
+gap to record as a note, not a run-blocking defect.
 
 ## Delegation mandate
 

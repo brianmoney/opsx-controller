@@ -105,6 +105,23 @@ class CanonicalBodyTests(unittest.TestCase):
         self.assertIn("**fresh** review", body)
         self.assertNotIn("Loop review → verify → implement", body)
 
+    def test_canonical_body_does_not_gate_on_mcp_mutation_exposure(self) -> None:
+        body = " ".join(_CANONICAL.read_text(encoding="utf-8").split())
+        for phrase in (
+            "can dispatch sub-agents",
+            "not a reason to stop",
+            "delegate the work to a sub-agent instead",
+            "not a run-blocking defect",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, body)
+        # Exposure of an MCP mutation tool must not be a fail-closed condition.
+        self.assertNotIn(
+            "every file- or memory-mutating tool exposed by a connected MCP "
+            "server is disabled",
+            body,
+        )
+
     def test_canonical_body_gates_archive_on_critical_only(self) -> None:
         body = " ".join(_CANONICAL.read_text(encoding="utf-8").split())
         for phrase in (
