@@ -120,10 +120,16 @@ post-authoring format gate and SHALL NOT treat it as evidence that tasks are
 complete. Task checkboxes SHALL remain the completion gate, with lines ending in
 `(manual)` exempt and surfaced to the operator as a checklist.
 
-The command SHALL require a fresh, clean review before archive. Any critical,
-warning, or note review finding SHALL loop back through implementation, then
+The command SHALL require a fresh review before archive. A `critical` review
+finding SHALL be blocking and SHALL loop back through implementation, then
 verification, then a **fresh** review — in that order — carrying the complete
 corrective handoff, and SHALL be bounded by an explicit finite retry budget.
+`warning` and `note` findings SHALL be advisory: they SHALL NOT block archive on
+their own, and the conductor SHALL record them in its final delegation ledger as
+the run's notes when it archives despite them. The conductor MAY spend a
+corrective round on an advisory finding it judges material, within the retry
+budget, but SHALL NOT be required to. A reviewer verdict of `fail` whose only
+findings are `warning` or `note` SHALL be treated as advisory.
 
 The retry budget SHALL be conductor-local and in-memory only, with a documented
 default of `3`, an optional inline `RETRIES: <n>` input that must be an integer
@@ -147,12 +153,22 @@ fails.
 
 #### Scenario: Review findings loop back with the handoff
 
-- **WHEN** the delegated reviewer returns a blocking finding and the retry counter is below the limit
+- **WHEN** the delegated reviewer returns a `critical` finding and the retry counter is below the limit
 - **THEN** the conductor increments the counter and dispatches implementation with the complete corrective handoff, then verification, then a fresh review
+
+#### Scenario: Advisory findings do not block archive
+
+- **WHEN** a fresh review returns only `warning` and `note` findings, even with a `fail` verdict, and the remaining gates pass
+- **THEN** the conductor archives the change and lists those findings as notes in its final delegation ledger
+
+#### Scenario: Advisory finding may be corrected at the conductor's discretion
+
+- **WHEN** a fresh review returns an advisory finding the conductor judges material and the retry counter is below the limit
+- **THEN** the conductor may dispatch one corrective round, consuming one retry unit, then verification and a fresh review
 
 #### Scenario: Retry budget is exhausted
 
-- **WHEN** a fresh review returns a blocking finding and the retry counter has reached the limit
+- **WHEN** a fresh review returns a blocking `critical` finding and the retry counter has reached the limit
 - **THEN** the conductor stops and emits the exhaustion report with the counter, the limit, the limit source, the remaining findings, and the unchecked tasks
 
 #### Scenario: Failed sync stops the archive

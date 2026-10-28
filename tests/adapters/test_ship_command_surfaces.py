@@ -105,6 +105,21 @@ class CanonicalBodyTests(unittest.TestCase):
         self.assertIn("**fresh** review", body)
         self.assertNotIn("Loop review → verify → implement", body)
 
+    def test_canonical_body_gates_archive_on_critical_only(self) -> None:
+        body = " ".join(_CANONICAL.read_text(encoding="utf-8").split())
+        for phrase in (
+            "A `critical` finding is blocking",
+            "`warning` and `note` findings are advisory",
+            "never block archive on their own",
+            "as advisory when its only findings are",
+            "run's notes",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, body)
+        # The old strict gate forced a corrective round for every severity.
+        self.assertNotIn("Any critical, warning, or note", body)
+        self.assertNotIn("Require a fresh, clean review", body)
+
 
 
 class SurfaceParityTests(unittest.TestCase):

@@ -114,15 +114,16 @@ conductor-local and held in memory only; it is never persisted.
 - **Maximum**: `10`. A parsed value above the maximum is clamped to `10`.
 - **Counter**: initialize `retry_count = 0` when the run starts.
 - **Accounting**: the first implementation round for the authored task scope
-  does not consume the budget. Each *corrective* implementation round dispatched
-  in response to blocking review findings consumes one unit: dispatch it only
-  while `retry_count < retry_limit`, and increment `retry_count` as part of that
+  does not consume the budget. Each *corrective* implementation round consumes
+  one unit whether it answers a blocking `critical` finding or an advisory
+  finding you chose to act on: dispatch it only while
+  `retry_count < retry_limit`, and increment `retry_count` as part of that
   dispatch.
-- **Exhaustion report**: when a fresh review returns any blocking finding and
-  `retry_count` has reached `retry_limit`, stop. Report the counter value, the
-  limit, whether the limit came from the default or the input, the remaining
-  findings, and the unchecked tasks — never continue silently and never widen
-  scope to escape the limit.
+- **Exhaustion report**: when a fresh review returns a blocking `critical`
+  finding and `retry_count` has reached `retry_limit`, stop. Report the counter
+  value, the limit, whether the limit came from the default or the input, the
+  remaining findings, and the unchecked tasks — never continue silently and
+  never widen scope to escape the limit.
 
 ## Gates (fail closed)
 
@@ -131,10 +132,16 @@ conductor-local and held in memory only; it is never persisted.
 - Task checkboxes are the completion gate. A task line whose text ends in
   `(manual)` is operator-only and may remain unchecked; surface every such line
   to the operator as a checklist.
-- Require a fresh, clean review before archive. Any critical, warning, or note
-  finding loops back to implementation as implement → verify → fresh review,
-  carrying the complete corrective handoff and bounded by the retry budget.
-  When the budget is exhausted, stop and emit the exhaustion report.
+- Require a fresh review before archive. A `critical` finding is blocking and
+  loops back to implementation as implement → verify → fresh review, carrying
+  the complete corrective handoff and bounded by the retry budget. `warning`
+  and `note` findings are advisory: they never block archive on their own.
+  Treat a reviewer `verdict` of `fail` as advisory when its only findings are
+  `warning` or `note`; gate archive on `critical == 0` plus the other gates.
+  You may spend a corrective round on an advisory finding you judge material,
+  within the retry budget, but you are never required to. When the budget is
+  exhausted with a blocking `critical` finding, stop and emit the exhaustion
+  report.
 - Require delta-spec synchronization to complete before the archive move. When
   a sync is partial or fails, stop without moving the change so the archive
   step can be retried in place.
@@ -153,9 +160,11 @@ Drive the loop strictly in this order: **implement → verify → review**.
   does not reuse the prior review's verdict. Only a fresh review may clear the
   findings.
 
-While blocking findings remain and the retry budget is not exhausted, repeat
-implement → verify → review. A stale verification or a stale review never
-advances a stage, and verification never substitutes for a fresh review.
+While blocking `critical` findings remain and the retry budget is not
+exhausted, repeat implement → verify → review. Advisory `warning` and `note`
+findings never force another round; archive proceeds with them recorded in the
+delegation ledger. A stale verification or a stale review never advances a
+stage, and verification never substitutes for a fresh review.
 
 ## Boundary
 
@@ -177,5 +186,7 @@ End with a delegation ledger:
 - every sub-agent dispatched, in order, with the lifecycle stage it served;
 - the gate outcome for each lifecycle stage (pass, fail, skipped, or stopped);
 - any `(manual)` checklist items surfaced to the operator;
+- the advisory `warning` and `note` findings from the final fresh review when
+  the run archived despite them, listed as the run's notes;
 - when the run stopped at a gate, the failed gate and the remaining findings
   and tasks, including the exhaustion report when the retry budget ran out.
