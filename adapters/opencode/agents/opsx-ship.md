@@ -1,6 +1,6 @@
 ---
 description: Conductor for /opsx-ship. Drives one OpenSpec change to conclusion by delegating every unit of work to a sub-agent; has no edit capability and no shell.
-mode: primary
+mode: all      # was: primary
 permission:
   read: allow
   glob: allow

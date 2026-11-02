@@ -183,11 +183,11 @@ class ShipConductorContractTests(unittest.TestCase):
         self.agents = Path(self.home.name) / ".config" / "opencode" / "agents"
         self.commands = Path(self.home.name) / ".config" / "opencode" / "commands"
 
-    def test_conductor_agent_is_installed_as_a_primary(self) -> None:
+    def test_conductor_agent_is_usable_as_primary_or_subagent(self) -> None:
         path = self.agents / "opsx-ship.md"
         self.assertTrue(path.is_file(), f"conductor agent missing at {path}")
         text = path.read_text(encoding="utf-8")
-        self.assertIn("mode: primary", text)
+        self.assertIn("mode: all", text)
         self.assertNotIn("{env:", text, "unsubstituted placeholder in conductor")
 
     def test_conductor_cannot_edit_files(self) -> None:
