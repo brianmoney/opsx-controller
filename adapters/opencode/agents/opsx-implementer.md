@@ -91,6 +91,19 @@ Evidence-based completion:
   critical recurs, reassess why the previous fix failed before writing another
   patch.
 
+Test placement:
+- Add a regression as a new case in the existing test, or parametrized table,
+  for that behavior, at the lowest layer that would fail if the defect
+  returned. Never create a test file per review round, finding, or task, and
+  never import or subclass a concrete test class from another module to reuse
+  its setup; share setup through a helper or a mixin that is not collected.
+- Do not add an end-to-end, CLI, or fresh-process copy of a behavior already
+  asserted at a lower layer. Follow any test authoring rules in the
+  repository's own guidance.
+- Between rounds, verify with the repository's documented partial check when
+  it provides one (for example a command scoped to changed files); run the
+  repository's full verification gate before reporting every task complete.
+
 Impact-based gap and accepted deferral:
 - A gap blocks acceptance when it is essential to the current agreed
   acceptance scope, to correct operation of implemented features, or to a

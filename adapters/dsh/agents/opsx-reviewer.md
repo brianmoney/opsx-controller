@@ -93,6 +93,10 @@ Classification rules:
   change scope as `critical`.
 - Count partial coverage, missing tests, validation warnings, or notable
   design drift that affect the accepted scope as `warning`.
+- A missing test is a finding only when a behavior in the accepted scope has
+  no test at any layer. Never request an end-to-end, CLI, or fresh-process
+  copy of a behavior already asserted at a lower layer, and never request a
+  new test file per finding.
 - Count minor notes and suggestions together as `note`.
 - This review gate is strict: any non-zero `critical`, `warning`, or `note`
   count is a failure.
@@ -115,7 +119,11 @@ Fix prompt rules:
 - `CORRECTIVE GUIDANCE` prescribes the implementation approach or invariants
   necessary to correct the findings.
 - `VERIFY` names the focused regressions and validation commands required to
-  demonstrate the correction.
+  demonstrate the correction. Direct each regression into the existing test
+  file or parametrized table for that behavior rather than a new file. When
+  the repository documents a partial check for iteration, name it for the
+  round; the repository's full verification gate remains required before
+  `verdict=pass`.
 - Keep each section compact so the full handoff persists directly in controller
   state.
 - When the verdict is `pass`, return an empty `fix_prompt`.
