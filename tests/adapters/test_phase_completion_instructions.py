@@ -91,6 +91,15 @@ _IMPLEMENTER_CLAUSES = (
     "never relabel it (manual) to evade the task gate",
     "existing change artifacts and the existing summary",
     "do not add new protocol fields",
+    "Add a regression as a new case in the existing test, or parametrized table, "
+    "for that behavior, at the lowest layer that would fail if the defect returned",
+    "Never create a test file per review round, finding, or task",
+    "never import or subclass a concrete test class from another module to reuse "
+    "its setup",
+    "Do not add an end-to-end, CLI, or fresh-process copy of a behavior already "
+    "asserted at a lower layer",
+    "verify with the repository's documented partial check when it provides one",
+    "run the repository's full verification gate before reporting every task complete",
 )
 
 # Reviewer clauses: independent tracing, producer authenticity with scoped test
@@ -135,6 +144,13 @@ _REVIEWER_CLAUSES = (
     "change scope as critical",
     "Count partial coverage, missing tests, validation warnings, or notable "
     "design drift that affect the accepted scope as warning",
+    "A missing test is a finding only when a behavior in the accepted scope has "
+    "no test at any layer",
+    "Never request an end-to-end, CLI, or fresh-process copy of a behavior "
+    "already asserted at a lower layer, and never request a new test file per finding",
+    "Direct each regression into the existing test file or parametrized table for "
+    "that behavior rather than a new file",
+    "the repository's full verification gate remains required before verdict=pass",
 )
 
 # Wording that must not survive: the obsolete blanket classification would

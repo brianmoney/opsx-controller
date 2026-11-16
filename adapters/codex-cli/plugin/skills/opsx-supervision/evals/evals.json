@@ -1,0 +1,83 @@
+{
+  "skill_name": "opsx-supervisor",
+  "evals": [
+    {
+      "id": 1,
+      "name": "note-only-strict-fail",
+      "prompt": "The independent reviewer returned a strict fail for the current stage, but every finding is severity note or warning with no concrete required impact. The current skip policy accepts note/warning-only strict fails. What is your disposition?",
+      "expected_output": "Accept the stage or record-only the findings under the current skip policy, reporting severities intact and not spending a source round or broad rerun on the notes.",
+      "files": [],
+      "expectations": [
+        "Disposition is accept or record-only, not fix-now",
+        "Reviewer severities are reported intact",
+        "No new source round or broad rerun is dispatched for cosmetic findings",
+        "No invented extra gate or budget is introduced"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "required-check-false-pass",
+      "prompt": "The reviewer marked the change PASS, but one required check in the acceptance list actually failed and a mandatory item is missing from the evidence. What do you do?",
+      "expected_output": "Block acceptance and dispatch a scoped fix-now correction; a PASS verdict does not override required-check failures, mandatory omissions, or unsupported claims.",
+      "files": [],
+      "expectations": [
+        "Acceptance is blocked despite the PASS verdict",
+        "Disposition is fix-now with a scoped correction",
+        "The required-check failure and mandatory omission are named",
+        "The correction stays on the critical path rather than a peripheral commit"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "cancellation-and-new-extension",
+      "prompt": "A stage hit its step limit and stopped in a red state. A later instruction extends the scope well beyond the originally reviewed area, and an earlier PASS exists for the smaller scope. How do you proceed?",
+      "expected_output": "Inspect actual Git/process state and preserve a patch before recovery; do not let the larger extension inherit the earlier PASS; reserve fresh attempt counts for the new scope.",
+      "files": [],
+      "expectations": [
+        "Partial red state is inspected and a patch is preserved before recovery",
+        "Only positively identified own task processes may be stopped; no broad kill or blind reset",
+        "The earlier PASS is not inherited by the extended scope",
+        "Fresh attempt counts are reserved before dispatching the extension"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "warmed-registry-and-permissive-sdk",
+      "prompt": "A default CLI check passed after an earlier doctor call in the same process, and a fake SDK object silently accepted unknown keyword arguments. Is the default path proven?",
+      "expected_output": "No. Probe the default CLI in a genuinely fresh process and pin the real installed method signatures, since installed entry-point metadata is not an initialized registry and the permissive fake hides real errors.",
+      "files": [],
+      "expectations": [
+        "Fresh-process probe is required before accepting the default path",
+        "The initialization must not depend on a prior doctor/readiness/qualify call",
+        "Real installed method signatures are pinned and read",
+        "The fake's acceptance of unknown kwargs is treated as hiding errors, not proof"
+      ]
+    },
+    {
+      "id": 5,
+      "name": "known-effects-unknown-reply-lost-answer",
+      "prompt": "A durable effect is known to have been applied, but no reply reference was captured, and the stored legacy result lost its substantive answer. Should you resend the instruction to recover the answer?",
+      "expected_output": "No. Keep the outcome uncertain; do not replay or resend an instruction echo or rerun known effects. Only a not-applied result or qualified idempotence permits replay; a correction uses honest lineage and preserves old uncertainty and audit.",
+      "files": [],
+      "expectations": [
+        "The applied-but-unverified outcome stays uncertain",
+        "No resend of an instruction echo and no rerun of known effects",
+        "A missing reply reference is not treated as proof of non-send or non-acceptance",
+        "Any follow-up preserves the original payload identity and audit trail"
+      ]
+    },
+    {
+      "id": 6,
+      "name": "context-limit-recovery-and-operator-boundary",
+      "prompt": "Your session is near its context limit with work remaining, no agent is currently running, and the next step appears to require an operator-only action that a previous attempt was refused. What do you do?",
+      "expected_output": "Record a compact checkpoint and hand off; do not sit in an unbounded thinking loop or claim progress; delegate the next concrete stage to a configured agent, and give the operator concise supported steps for the operator-only action instead of bypassing the refusal.",
+      "files": [],
+      "expectations": [
+        "A compact checkpoint/handoff is written with branch, revision, stage, counts and next action",
+        "No progress is claimed without evidence and no unbounded thinking loop occurs",
+        "The operator-only action is surfaced as supported operator steps",
+        "The refusal is not bypassed and no agent configuration is changed"
+      ]
+    }
+  ]
+}
