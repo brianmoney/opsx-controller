@@ -65,6 +65,219 @@ permissions:
   - action: shell
     resource: "git log --oneline*"
     effect: allow
+  # Common read-only inspection and validation commands. The broad ask above
+  # still covers anything not listed; the mutator denies below still win over
+  # these allows because OpenCode resolves the last matching rule.
+  - action: shell
+    resource: "git status *"
+    effect: allow
+  - action: shell
+    resource: "git rev-parse *"
+    effect: allow
+  - action: shell
+    resource: "git diff *"
+    effect: allow
+  - action: shell
+    resource: "git log *"
+    effect: allow
+  - action: shell
+    resource: "git show *"
+    effect: allow
+  - action: shell
+    resource: "git ls-files *"
+    effect: allow
+  - action: shell
+    resource: "git check-ignore *"
+    effect: allow
+  - action: shell
+    resource: "git merge-base *"
+    effect: allow
+  - action: shell
+    resource: "git rev-list *"
+    effect: allow
+  - action: shell
+    resource: "git cat-file *"
+    effect: allow
+  - action: shell
+    resource: "git grep *"
+    effect: allow
+  - action: shell
+    resource: "git branch --show-current"
+    effect: allow
+  - action: shell
+    resource: "git branch --list*"
+    effect: allow
+  - action: shell
+    resource: "git branch -vv"
+    effect: allow
+  - action: shell
+    resource: "git branch -a"
+    effect: allow
+  - action: shell
+    resource: "git worktree list*"
+    effect: allow
+  - action: shell
+    resource: "openspec validate *"
+    effect: allow
+  - action: shell
+    resource: "openspec status *"
+    effect: allow
+  - action: shell
+    resource: "openspec instructions *"
+    effect: allow
+  - action: shell
+    resource: "openspec show *"
+    effect: allow
+  - action: shell
+    resource: "openspec list *"
+    effect: allow
+  - action: shell
+    resource: "openspec diff *"
+    effect: allow
+  - action: shell
+    resource: "openspec view *"
+    effect: allow
+  - action: shell
+    resource: "./node_modules/.bin/openspec *"
+    effect: allow
+  - action: shell
+    resource: "grep *"
+    effect: allow
+  - action: shell
+    resource: "rg *"
+    effect: allow
+  - action: shell
+    resource: "head *"
+    effect: allow
+  - action: shell
+    resource: "tail *"
+    effect: allow
+  - action: shell
+    resource: "cat *"
+    effect: allow
+  - action: shell
+    resource: "wc *"
+    effect: allow
+  - action: shell
+    resource: "ls *"
+    effect: allow
+  - action: shell
+    resource: "find *"
+    effect: allow
+  - action: shell
+    resource: "stat *"
+    effect: allow
+  - action: shell
+    resource: "file *"
+    effect: allow
+  - action: shell
+    resource: "readlink *"
+    effect: allow
+  - action: shell
+    resource: "realpath *"
+    effect: allow
+  - action: shell
+    resource: "pwd *"
+    effect: allow
+  - action: shell
+    resource: "echo *"
+    effect: allow
+  - action: shell
+    resource: "printf *"
+    effect: allow
+  - action: shell
+    resource: "date *"
+    effect: allow
+  - action: shell
+    resource: "sha256sum *"
+    effect: allow
+  - action: shell
+    resource: "sort *"
+    effect: allow
+  - action: shell
+    resource: "uniq *"
+    effect: allow
+  - action: shell
+    resource: "cut *"
+    effect: allow
+  - action: shell
+    resource: "tr *"
+    effect: allow
+  - action: shell
+    resource: "sed -n *"
+    effect: allow
+  - action: shell
+    resource: "awk *"
+    effect: allow
+  - action: shell
+    resource: "diff *"
+    effect: allow
+  - action: shell
+    resource: "test *"
+    effect: allow
+  - action: shell
+    resource: "true *"
+    effect: allow
+  - action: shell
+    resource: "command *"
+    effect: allow
+  - action: shell
+    resource: "return *"
+    effect: allow
+  - action: shell
+    resource: "shift *"
+    effect: allow
+  - action: shell
+    resource: "set *"
+    effect: allow
+  - action: shell
+    resource: "exit *"
+    effect: allow
+  - action: shell
+    resource: "mkdir -p /tmp/opencode/*"
+    effect: allow
+  - action: shell
+    resource: "./.venv/bin/python -m pytest *"
+    effect: allow
+  - action: shell
+    resource: "python -m pytest *"
+    effect: allow
+  - action: shell
+    resource: "pytest *"
+    effect: allow
+  - action: shell
+    resource: "./.venv/bin/python -m unittest *"
+    effect: allow
+  - action: shell
+    resource: "python -m unittest *"
+    effect: allow
+  - action: shell
+    resource: "./.venv/bin/python -m knowledge_forge.review.openspec_semantic_duplicates *"
+    effect: allow
+  - action: shell
+    resource: "python -m knowledge_forge.review.openspec_semantic_duplicates *"
+    effect: allow
+  - action: shell
+    resource: "ruff check *"
+    effect: allow
+  - action: shell
+    resource: "ruff format --check *"
+    effect: allow
+  - action: shell
+    resource: "git diff --output*"
+    effect: deny
+  - action: shell
+    resource: "git log --output*"
+    effect: deny
+  - action: shell
+    resource: "./node_modules/.bin/openspec archive*"
+    effect: deny
+  - action: shell
+    resource: "./node_modules/.bin/openspec new*"
+    effect: deny
+  - action: shell
+    resource: "./node_modules/.bin/openspec store *"
+    effect: deny
   - action: shell
     resource: "git commit*"
     effect: deny
@@ -157,6 +370,12 @@ the missing field named. Do not review a guessed scope.
   the report; a writer-scoped review cannot clear the gate alone.
 
 ## Read the real artifact
+
+Run one read-only command at a time. Do not wrap inspections in a multi-command
+shell script: the harness evaluates each command separately, the prompts become
+noisy, and a compound script hides which command produced which result. When a
+gate needs a script, use the writer's retained log or ask the orchestrator to
+run it.
 
 Inspect:
 
