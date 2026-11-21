@@ -227,6 +227,14 @@ already-authored change, skip the plan manifest entirely with
 `/opsx-ship` owns no durable state, phase machine, or plan manifest and does not
 change `opsx-plan` or `opsx-run`; those remain the controller entrypoints.
 
+For a model-orchestrated **plan-level** path, select the `opsx-orchestrator`
+agent on OpenCode. It reads a markdown plan directly and drives each change in
+dependency order, delegating authoring to `opsx-change-writer`, implementation
+to `opsx-implementer`, fresh review to `opsx-review`, and archiving to
+`opsx-archiver`. The orchestrator holds no edit or shell capability. This is
+the interactive counterpart to the deterministic `opsx-plan` / `opsx-run`
+entrypoints, not a replacement for them.
+
 ## Documentation
 
 | Guide | What it covers |

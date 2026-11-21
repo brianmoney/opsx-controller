@@ -74,6 +74,28 @@ edit the canonical body or template and run
 `tests/adapters/test_generated_phase_agents.py` fails when committed outputs
 are stale.
 
+## Plan-level agent set (OpenCode)
+
+The hand-authored OpenCode agents `opsx-orchestrator`, `opsx-change-writer`, and
+`opsx-review` complement the controller-round
+`opsx-implementer`/`opsx-reviewer`/`opsx-archiver` set:
+
+- `opsx-orchestrator` is the plan-level conductor. It holds no shell or edit
+  capability and drives a markdown plan change-by-change, dispatching the change
+  writer, the implementer, a fresh reviewer, and the archiver.
+- `opsx-change-writer` authors or amends exactly one change's OpenSpec
+  artifacts. It does not implement source, archive, or commit.
+- `opsx-review` is the generic read-only reviewer with acceptance tiers and
+  findings dispositions. It carries no plan-specific paths or requirements.
+
+`opsx-implementer` carries both the original controller-round contract and a
+plan-orchestrator mode; the mode is selected from the input fields. Keep the
+controller-round contract intact when editing that canonical body.
+
+These three are OpenCode-only today. Port them to `core/phase-agents` and the
+other adapters once the shared contracts stabilize; do not hand-edit their
+installed copies under `~/.config/opencode/agents/`.
+
 ## Maintainer Notes: deploy after every change
 
 This section applies to the maintainer's own machine, after a change has

@@ -128,8 +128,22 @@ What it contains:
   validate. Serena remains enabled, and its read-only tools stay available. The
   denylist is defense-in-depth: an MCP mutation tool left exposed elsewhere is
   reported as a hardening note, not treated as a run-blocking defect.
-- `adapters/opencode/agents/opsx-implementer.md`: implementation round agent
-- `adapters/opencode/agents/opsx-reviewer.md`: strict reviewer agent
+- `adapters/opencode/agents/opsx-orchestrator.md`: plan-level conductor agent
+  (`mode: all`, `edit: deny`, `bash: deny`, `task: allow`). It reads a markdown
+  plan directly, drives changes in dependency order, and dispatches the change
+  writer, implementer, a fresh reviewer, and the archiver. It holds no durable
+  state of its own; the run ledger is maintained by delegated writers.
+- `adapters/opencode/agents/opsx-change-writer.md`: authors or amends exactly
+  one change's OpenSpec artifacts and runs the strict validation gate. It does
+  not implement source, archive, or commit.
+- `adapters/opencode/agents/opsx-review.md`: generic read-only reviewer with
+  acceptance tiers (`poc` / `phase` / `release`) and findings dispositions. It
+  is not tied to any one plan or repository.
+- `adapters/opencode/agents/opsx-implementer.md`: implementation agent. It
+  supports the controller-round contract and a plan-orchestrator mode selected
+  from its input fields.
+- `adapters/opencode/agents/opsx-reviewer.md`: strict controller-round reviewer
+  agent (distinct from the plan-level `opsx-review`)
 - `adapters/opencode/agents/opsx-archiver.md`: non-interactive archiver agent
 - `adapters/opencode/support/opsx-controller-state-README.md`: state contract
 - deployed `plan-authoring.md` reference (copied from `core/plan-authoring.md`)
