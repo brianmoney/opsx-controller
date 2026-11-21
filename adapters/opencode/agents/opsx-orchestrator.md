@@ -68,8 +68,10 @@ the run unsafe; otherwise apply the default and record it in the ledger.
 - **PLAN** (required): path to the markdown implementation plan. Accept a plan
   named in the invocation, or the single plan in `docs/plans/` when exactly one
   exists. If no plan can be resolved unambiguously, stop before dispatching.
-- **ACCEPTANCE** (default `poc`): `poc`, `phase`, or `release`. The tier controls
-  what may block; it never weakens truthfulness.
+- **ACCEPTANCE** (optional): `poc`, `phase`, or `release`. The tier controls
+  what may block; it never weakens truthfulness. Resolve it in this order:
+  the explicit invocation value, then the plan frontmatter's `acceptance`
+  field, then the default `poc`.
 - **CHANGES** (optional): comma-separated allowlist of change ids. When present,
   drive only those changes and report every planned change left untouched.
 - **BASE** (optional): git revision to use as the plan's source baseline. When
@@ -79,9 +81,13 @@ the run unsafe; otherwise apply the default and record it in the ledger.
 - **BUDGET** (optional): a wall-clock or per-phase dispatch budget. When absent,
   use the defaults in *Stopping conditions*.
 
-Do not infer a stronger acceptance tier than the operator supplied. A plan that
-says "release" but is invoked with `ACCEPTANCE: poc` is run as `poc`, and the
-final report must say so.
+Do not infer the tier from the plan title, `status`, phase count, or wording.
+A plan that declares `acceptance: release` but is invoked with
+`ACCEPTANCE: poc` is run as `poc`; record both values and the override in the
+ledger, and say so in the final report. An absent field is not an error for an
+existing plan; it resolves to `poc`. An invalid field value is a fail-closed
+preflight error. If the plan is a release-qualification plan, prefer fixing its
+frontmatter to `acceptance: release` over relying on an invocation override.
 
 ## Preflight
 
@@ -91,10 +97,17 @@ Dispatch one read-only `explore` scout before any writer. Require it to return:
 2. the current `HEAD`, branch, and worktree cleanliness;
 3. active and archived change ids under `openspec/changes/`;
 4. the OpenSpec schema and validation command for this repository;
-5. the plan's acceptance/success parameters and any explicit operator gates;
+5. the plan frontmatter's `acceptance` value, or that it is absent, and the
+   plan's acceptance/success parameters and any explicit operator gates;
 6. whether `opsx-plan` is on `PATH`, and if so, the result of
    `opsx-plan compile <plan> -o /tmp/<slug>-selfcheck.toml --force` as a
    **validation check only**. Do not make execution depend on the TOML.
+
+Resolve the acceptance tier before dispatching a writer: explicit invocation,
+then the plan's `acceptance` field, then `poc`. Record the resolved tier and
+its source (`invocation`, `plan`, or `default`) in the ledger. If the invocation
+overrides a different frontmatter value, record both and report the override.
+An invalid frontmatter value is a fail-closed preflight error.
 
 Stop if the plan, its dependency order, or the repository root is ambiguous.
 Do not dispatch an author or implementer against a guessed root.
@@ -276,7 +289,9 @@ requires an operator decision, not a silent extension.
 
 End with:
 
-- the plan path, acceptance tier, base revision, and run id;
+- the plan path, the resolved acceptance tier and its source (`invocation`,
+  `plan`, or `default`), any invocation/frontmatter override, the base
+  revision, and the run id;
 - each change: archived / delivered-unarchived / blocked / untouched, with its
   commit and PR if any;
 - gates proved, skipped, or unqualified;

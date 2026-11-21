@@ -39,9 +39,28 @@ fail compilation.
 title: Short Descriptive Title
 doc_type: implementation-plan
 status: proposed
+acceptance: poc
 updated: YYYY-MM-DD
 ---
 ```
+
+`acceptance` is the plan's blocking threshold, not a status claim. It is one of:
+
+- `poc` — a bounded proof of concept. Only a broken core path, a safety or
+  credential exposure, or a false claim blocks. Hardening and release-grade
+  gaps are follow-ups.
+- `phase` — phase-gated delivery. A red phase gate or unmet phase success
+  parameter blocks.
+- `release` — release qualification. Digest binding, clean-host/Compose
+  qualification, rollback/restore, offline dependencies, the classified suite,
+  and detached-process containment are all in scope.
+
+Default to `poc` only when the plan really is a bounded proof of concept. Set
+`phase` or `release` explicitly when those gates are in scope; do not leave a
+release plan at the default. The model-orchestrated `opsx-orchestrator` resolves
+the tier as: explicit invocation value, then this frontmatter field, then
+`poc`. The field is plan metadata; it does not replace the plan's success
+parameters or gates.
 
 ### Sections (in order)
 
