@@ -22,11 +22,78 @@ effort. Your value is judgment: deciding what happens next, writing precise
 worker instructions, adjudicating results, and holding the line on evidence.
 Execution is not your job when a configured agent can do it.
 
-This is the **operator-directed** counterpart to the restricted
-registered-service supervision flow. It grants no credentials and changes no
-permissions: it teaches how to run the workflow well, not what you are allowed
-to touch. A restricted service role does not gain operator powers because this
-skill loaded.
+This skill covers **two modes**. Read the one that matches the session you are
+actually running.
+
+| Mode | Trigger | Your capability |
+| --- | --- | --- |
+| Operator-directed (default) | You are the frontier session for an `opsx-plan` / OpenSpec effort | The full capability surface the host client granted you |
+| Restricted supervised | You are the primary session of one registered supervised job | Reading journaled evidence, plus the tracked service tool `opsx-supervise` |
+
+The operator-directed mode is the body of this skill. It grants no credentials
+and changes no permissions: it teaches how to run the workflow well, not what
+you are allowed to touch. A restricted service role does not gain operator
+powers because this skill loaded.
+
+## Restricted supervised mode: the bounded loop
+
+When you are the primary session of a registered supervised job, your reachable
+endpoint is the **restricted worker-actions endpoint only**. There is no
+operator credential or capability in your environment, and the `opsx-supervisor`
+agent definition enforces that: its shell permission allows only
+`opsx-supervise *`, and every other command is denied.
+
+Your inputs are a bounded briefing composed from durable state (job record and
+protected plan snapshot reference, active and unreconciled uncertain actions,
+budget and reservation state, incident history including failed remedies, and
+any pending gate) plus the journaled evidence for the job. The briefing — not
+the server-side transcript — is the context you reason from.
+
+The loop:
+
+1. **Read** the journaled evidence: action rows and their states (`intent`,
+   `dispatched`, `uncertain`, `reconciled`, `completed`, `failed`), the evidence
+   appended to them, incidents, and reservations. Treat an `uncertain` action as
+   blocking state: the job does not progress past it until recorded evidence
+   reconciles it.
+2. **Choose exactly one** of: a **remedy** for a known failure class, or a
+   **judgment** (accept, fix, or escalate).
+3. **Invoke the tracked service tool** to act on that choice.
+4. **Re-read** evidence. An unconfirmed outcome never becomes an assumption.
+
+`opsx-supervise` dispatches exactly these worker-actions verbs through the
+worker endpoint (each is journaled server-side before its effect):
+
+| Verb | Purpose |
+| --- | --- |
+| `request_action` | Read the bound job's actionable items: uncertain actions, steering receipts, delegated gate releases, at a high-water mark. |
+| `record_evidence` | Record evidence against an action of the bound job, optionally binding a reported session identity first. |
+| `report_status` | Report job/worker status. |
+| `heartbeat` | Report liveness. |
+| `release_delegated_gate` | Release a delegated gate for a change as the job's registered service identity. |
+| `report_violation` | Record a worker-detected policy violation (for example a refused shell bypass) as a durable incident. |
+| `choose_remedy` | Select a remedy for a known failure class. |
+
+An unknown verb, a verb from the operator surface (`approve`, `reset_change`,
+`revise_policy`, `enable`, `cancel`), or an action belonging to another job is
+refused. There is no operator verb available here. Every invocation must carry
+your supervised role, your observed concrete agent, and the job's registered
+service identity — an unidentified request is refused before it is framed, so
+never try to invoke the tool without them.
+
+In this mode also hold these lines:
+
+- **Never run arbitrary Bash.** Your shell permission allows only
+  `opsx-supervise *`. The worker roles' `bash` allows only the tracked shell
+  wrapper `opsx-worker-exec *`. A bypass attempt — reached through a model
+  client, an agent runner, or a script — is classified by the executable layer,
+  never executed, and surfaces as a durable `policy_violation` incident.
+- **Never dispatch a Task agent.** Your `task` permission is denied, which is
+  what makes delegation non-recursive by construction.
+- **Never edit files, and never commit, reset, or resume work yourself.**
+  Mechanical repair belongs to the `fixer`; you hold no standing write.
+- **Never treat a report as an outcome.** Only recorded evidence — and, for a
+  repair, only an independent `verifier` verdict — makes work consumable.
 
 ## What stays with you, what leaves
 

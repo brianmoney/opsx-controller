@@ -2694,6 +2694,28 @@ class ShipSurfaceInstallerTests(unittest.TestCase):
         self.assertIn("task: allow", agent_text)
         self.assertNotIn("bash: allow", agent_text)
 
+    def test_opencode_global_installs_handoff_gate_agents(self) -> None:
+        """The Phase Transition Gate agents must install with resolved models."""
+        _run_installer(_OPENCODE_INSTALLER, Path(self.home.name), self.env)
+        agents = Path(self.home.name) / ".config" / "opencode" / "agents"
+
+        auditor = agents / "opsx-integration-auditor.md"
+        hygiene = agents / "opsx-repo-hygiene.md"
+        self.assertTrue(auditor.is_file(), f"auditor agent missing at {auditor}")
+        self.assertTrue(hygiene.is_file(), f"hygiene agent missing at {hygiene}")
+
+        auditor_text = auditor.read_text(encoding="utf-8")
+        self.assertIn("edit: deny", auditor_text)
+        self.assertIn("task: deny", auditor_text)
+        self.assertIn("handoff_ready", auditor_text)
+        self.assertNotIn("{env:", auditor_text, "unsubstituted placeholder in auditor")
+
+        hygiene_text = hygiene.read_text(encoding="utf-8")
+        self.assertIn("edit: allow", hygiene_text)
+        self.assertIn("task: deny", hygiene_text)
+        self.assertIn("Do not invent scope", hygiene_text)
+        self.assertNotIn("{env:", hygiene_text, "unsubstituted placeholder in hygiene")
+
     def test_claude_global_installs_ship_skill(self) -> None:
         _run_installer(_CLAUDE_INSTALLER, Path(self.home.name), self.env)
         skill = (

@@ -7,6 +7,13 @@ Input arrives from `opsx-controller` as plain text fields such as:
 - `LATEST_FIX_PROMPT: <prompt or none>`
 - `TASK_COUNTS: <complete>/<total>`
 
+A plan-level orchestrator also supplies an explicit implementation scope:
+- `IMPLEMENTATION_PATHS: <newline- or comma-separated path list, or none>`
+
+When `IMPLEMENTATION_PATHS` is absent, fall back to the controller-owned
+`tracked_change_files` list in `STATE_FILE`, then to the union of all successful
+implement history `files_touched`, as described in step 3.
+
 Do not attempt to read a global archive prompt file: the controller ships no
 archive command surface. The workflow below is the complete archive contract.
 
@@ -37,6 +44,30 @@ Required workflow:
    A repo with no commits yet is allowed; treat the missing-log case as empty
    history, not as automatic failure.
 8. Determine the narrow explicit archive commit scope before mutating files.
+
+   **Implementation scope gate.** First decide whether tracked or untracked
+   source outside `openspec/changes/<change>/` differs from the archive parent
+   revision. Compare `git status --short --untracked-files=all` against
+   `git diff --name-only <archive-parent>` and the explicit
+   `IMPLEMENTATION_PATHS` list.
+
+   When source differs, two things follow:
+
+   - the archive scope SHALL include those exact implementation paths; and
+   - an archive-only scope — the change directory move plus synced
+     `openspec/specs/` files, with `implementation_paths` of zero — SHALL be
+     rejected before anything is synced, moved, or staged.
+
+   Reject it by returning blocked JSON with reason `ambiguous archive commit
+   scope` (or an equally specific reason) that names the missing implementation
+   scope and lists the pending source paths. An archive-only success is the
+   exact failure this gate exists to prevent: the change would be archived
+   while its implementation exists only in the working tree.
+
+   When no source differs from the archive parent — the change is
+   artifacts-only — an archive-only scope is correct and expected; record
+   `implementation_paths` as zero and proceed.
+
    The allowed staged set is:
    - changed files under `openspec/specs/` created or updated by delta sync
    - implementation files from controller-owned archive-scope evidence that
@@ -84,6 +115,10 @@ Required workflow:
     directory was untracked and no specs or implementation files changed),
     skip the commit — there is nothing to commit — and report `commit` as an
     empty string; the move still makes this a success.
+16. Report the implementation paths the commit actually carried as
+    `implementation_paths`. This count is the orchestrator's handoff input: a
+    zero count with accepted source outside `HEAD` is `handoff_ready: false`,
+    never completion.
 
 Post-move failure handling:
 - If a failure happens after step 11 but before the archive commit succeeds,
@@ -101,6 +136,9 @@ Guardrails:
   either created the required archive commit or confirmed nothing needed to
   be staged. Never reuse an existing archive directory, prior commit at `HEAD`,
   or state/history evidence as a success proxy.
+- Never report `status=archived` after refusing an archive-only scope; that
+  result is blocked, with the missing implementation scope and the pending
+  source paths named.
 - Untracked files outside the explicit archive set are not a blocker and must
   remain unstaged.
 - If you cannot finish safely, or you are at risk of exhausting your step
@@ -112,10 +150,16 @@ Final response requirements:
 - Use one of these shapes:
 
 Success:
-`{"status":"archived","change":"<change>","archive_path":"openspec/changes/archive/YYYY-MM-DD-<change>","spec_sync_status":"synced|sync-skipped|no-delta|already-synced|synced-anyway","commit":"<commit-sha created by this run, or empty when nothing was staged>","summary":"one short sentence"}`
+`{"status":"archived","change":"<change>","archive_path":"openspec/changes/archive/YYYY-MM-DD-<change>","spec_sync_status":"synced|sync-skipped|no-delta|already-synced|synced-anyway","commit":"<commit-sha created by this run, or empty when nothing was staged>","implementation_paths":["<path>"],"summary":"one short sentence"}`
 
 Blocked:
-`{"status":"blocked","change":"<change>","reason":"short reason","archive_path":"empty when restored or not moved","spec_sync_status":"not_started|synced|already-synced|no-delta","commit":"","summary":"one short sentence","triage":{"scope_basis":"short basis","in_scope_files":["path"],"ambiguous_files":["path"],"retry_guidance":"short next step","retry_outlook":"same_failure|may_succeed|unknown"}}`
+`{"status":"blocked","change":"<change>","reason":"short reason","archive_path":"empty when restored or not moved","spec_sync_status":"not_started|synced|already-synced|no-delta","commit":"","implementation_paths":[],"pending_implementation_paths":["<path>"],"summary":"one short sentence","triage":{"scope_basis":"short basis","in_scope_files":["path"],"ambiguous_files":["path"],"retry_guidance":"short next step","retry_outlook":"same_failure|may_succeed|unknown"}}`
+
+`implementation_paths` is the explicit list of implementation files the archive
+commit carried; an empty list is correct only for an artifacts-only change.
+`pending_implementation_paths` names the source that still differs from the
+archive parent when an archive-only scope was refused; use an empty list when it
+does not apply.
 
 Before finishing, validate:
 - the final assistant message is exactly one line

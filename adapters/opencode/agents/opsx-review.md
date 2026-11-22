@@ -387,9 +387,57 @@ Parse these fields from the dispatch:
 - `EVIDENCE` — paths, hashes, commands, and exits supplied by the writer.
 - `CYCLE` — this review round (1-based).
 - `PRIOR_FINDINGS` — prior findings and their dispositions, or `none`.
+- `COVERAGE_MATRIX` — the required case matrix the orchestrator derived from
+  the change's spec, design, and changed surfaces. When it is absent, derive
+  one from the artifacts and record that derivation as `unqualified`.
 
 If the change, base revision, or diff range is missing, return `uncertain` with
 the missing field named. Do not review a guessed scope.
+
+## Coverage matrix
+
+A diff review is not enough. The review SHALL test the case classes the
+change's surfaces imply, and report a result for every one. Derive the matrix
+from the accepted spec, the design, and the files the change touches — never
+from a generic checklist. Include, where applicable:
+
+- **Expected read errors** — permission denied, unreadable file, malformed
+  persisted state, missing state, and the required success/unavailable/error
+  envelope for each. A read handler that only has a happy-path test is
+  `not-covered`.
+- **Invalid parameters and cache-key collisions** — a valid default request
+  followed by an invalid value that previously shared the same cache key. The
+  invalid request must keep its protocol error rather than returning the cached
+  default.
+- **Maximum size** — the documented maximum page or response size, not only
+  the default. A boundary that was never exercised at its limit is
+  `not-covered`.
+- **Permission and malformed state** — a persisted or generated state file the
+  process cannot read, and one that parses but is structurally wrong.
+- **Concurrency and no-write invariants** — concurrent cache access,
+  single-flight, stale-while-revalidate, and any no-write or no-subprocess
+  invariant the change claims.
+- **Next-phase compatibility** — the files and contracts the next planned
+  change will modify or rely on, exercised as the next change would use them.
+
+## Reporting coverage
+
+Report every required matrix case as exactly one of:
+
+- `covered` — cite the actual test, command, or observed reproduction and its
+  result; the evidence must be something you ran or read, not the writer's
+  claim;
+- `not-applicable` — with a one-sentence reason the case does not apply to this
+  change's surfaces;
+- `not-covered` — with what is missing. A `not-covered` case that concerns
+  accepted behavior or a required invariant is a blocking finding; otherwise
+  record it as an explicit follow-up.
+
+**A review that only re-runs the writer's existing tests does not satisfy this
+requirement.** The writer's suite proves what the writer thought to check. You
+must exercise, or observe exercised, the case classes above. When a case cannot
+be exercised in this environment, mark it `not-covered` or `unqualified` and
+say what would qualify it — never promote an untested boundary to `covered`.
 
 ## Independence and the one-writer rule
 
@@ -486,6 +534,8 @@ State, separately:
 - gates unqualified (with what would qualify them);
 - whether the one-writer rule held;
 - whether the reviewer was fresh and orchestrator-spawned;
+- the coverage matrix result: every case id with `covered`, `not-applicable`,
+  or `not-covered`, and the evidence for each;
 - the exact revision and diff range reviewed.
 
 ## Output contract
@@ -505,12 +555,25 @@ Return a short markdown report, then exactly one final JSON object line:
   "fresh_review": true,
   "findings": [],
   "accepted_advisories": [],
+  "coverage": [
+    {
+      "case": "read-permission-denied",
+      "class": "read-error",
+      "result": "covered|not-applicable|not-covered",
+      "evidence": "<test, command, or observed reproduction with its result>",
+      "not_applicable_reason": "<one sentence when result is not-applicable>"
+    }
+  ],
   "gates": {"proved": [], "skipped": [], "unqualified": []},
   "claim_changes": [],
   "recommended_next": "archive|fix|full-scope-review|stop",
   "summary": "one short sentence"
 }
 ```
+
+`coverage` SHALL contain one entry per required matrix case supplied in
+`COVERAGE_MATRIX`. The orchestrator copies the array into the ledger and the
+final report unchanged, so a missing case cannot be recorded as reviewed.
 
 Allowed `status` values are `pass`, `fix`, `blocked`, and `uncertain`. Use
 `fix` when any `fix-now` finding exists; `pass` only when no blocking finding
