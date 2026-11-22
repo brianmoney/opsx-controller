@@ -63,7 +63,8 @@ You do not use `opsx-plan` as the execution engine and you do not use nested
 ## Input contract
 
 Resolve these fields from the invocation. Ask only when a missing field makes
-the run unsafe; otherwise apply the default and record it in the ledger.
+the run unsafe; otherwise apply the documented default, if any, and record it
+in the ledger.
 
 - **PLAN** (required): path to the markdown implementation plan. Accept a plan
   named in the invocation, or the single plan in `docs/plans/` when exactly one
@@ -78,8 +79,12 @@ the run unsafe; otherwise apply the default and record it in the ledger.
   absent, a scout records the current `HEAD` during preflight.
 - **MODE** (default `new`): `new` starts a run; `resume` continues the latest
   ledger for the plan without repeating completed stages.
-- **BUDGET** (optional): a wall-clock or per-phase dispatch budget. When absent,
-  use the defaults in *Stopping conditions*.
+- **BUDGET** (optional): a wall-clock limit for the run, for example `90m` or
+  `6h`. No default: when absent, no wall-clock budget is enforced. This mirrors
+  the controller's opt-in `opsx-plan --budget-minutes`; do not invent one.
+- **MAX_DISPATCHES** (optional): a maximum number of dispatched stages per
+  change, for example `12` or `12/change`. No default: when absent, no dispatch
+  cap is enforced.
 
 Do not infer the tier from the plan title, `status`, phase count, or wording.
 A plan that declares `acceptance: release` but is invoked with
@@ -123,7 +128,8 @@ creates it; you never write it yourself.
 - If the plan names a ledger or checkpoint, use that instead.
 - Record: plan, acceptance, base revision, phase, change, stage, dispatch,
   agent, gate result, evidence paths and hashes, open findings, deferred items,
-  spend if available, and the next action.
+  the supplied budget and dispatch cap with their source (or `none`), spend if
+  available, and the next action.
 - On `resume`, read the ledger before dispatching anything. Reconcile `HEAD`,
   the worktree, and any in-flight child. Never repeat a stage the ledger records
   as complete.
@@ -190,6 +196,8 @@ Every dispatch prompt must contain, in plain text:
   and whether it may run commands or tests.
 - **Evidence packet** — the exact data to return (see below).
 - **Stop conditions** — when to return `blocked` instead of guessing.
+- **Budget** — the per-child wall-clock and step limit, and what to return when
+  it is reached.
 - **Output contract** — the JSON shape the child must return.
 
 Keep prompts bounded. Do not paste whole files into a prompt when a path, a
@@ -270,6 +278,20 @@ with its impact and move on.
 - Never ask a question that blocks independent work; continue what does not
   depend on the answer.
 
+## Budget enforcement (opt-in)
+
+No wall-clock or dispatch budget is enforced unless the operator supplies
+`BUDGET` or `MAX_DISPATCHES`. Never invent a default. Record the supplied
+values and their source (`invocation`, plan metadata, or `none`) in the ledger.
+
+Check the budget before every dispatch and again when a child completes. Do not
+treat a running child as budget-free. Pass every child its own wall-clock and
+step limit, and require it to return `blocked` with partial evidence when the
+limit is reached. If a child overruns, use the harness cancel path when one
+exists; otherwise do not dispatch further work, record the overrun, and report
+when the child returns. An extension is an explicit operator decision recorded
+in the ledger; never reset or silently extend a budget.
+
 ## Stopping conditions
 
 Stop and report, rather than widening scope, when:
@@ -279,11 +301,7 @@ Stop and report, rather than widening scope, when:
 - a required gate is red and cannot be made green within the acceptance tier;
 - the worktree is dirty with user-owned changes that overlap the change;
 - the plan and the live artifacts contradict each other;
-- the dispatch or wall-clock budget is exhausted.
-
-The default per-change dispatch budget is 12 (author, implement, review, and
-corrections). The default plan budget is 6 hours of wall clock. Exceeding either
-requires an operator decision, not a silent extension.
+- an explicitly supplied wall-clock or dispatch budget is exhausted.
 
 ## Final report
 
@@ -296,6 +314,8 @@ End with:
   commit and PR if any;
 - gates proved, skipped, or unqualified;
 - accepted advisories and deferred items, with impact;
+- the supplied wall-clock budget and dispatch cap (or `none`) with their source,
+  any overrun, and any operator extension;
 - spend and dispatch counts per phase when available;
 - the exact next action, or the exact operator decision needed.
 

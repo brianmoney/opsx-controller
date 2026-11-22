@@ -37,6 +37,16 @@ class PlanOrchestratorContractTests(unittest.TestCase):
         self.assertIn("its source", text)
         self.assertIn("Do not infer the tier from the plan title", text)
 
+    def test_budget_is_opt_in_and_has_no_invented_default(self) -> None:
+        text = _ORCHESTRATOR.read_text(encoding="utf-8")
+        self.assertNotIn("The default plan budget", text)
+        self.assertNotIn("default per-change dispatch budget", text)
+        self.assertIn("No default", text)
+        self.assertIn("MAX_DISPATCHES", text)
+        self.assertIn("Check the budget before every dispatch", text)
+        self.assertIn("when a child completes", text)
+        self.assertIn("never reset or silently extend a budget", text)
+
     def test_plan_authoring_declares_acceptance(self) -> None:
         text = _PLAN_AUTHORING.read_text(encoding="utf-8")
         self.assertIn("acceptance: poc", text)
