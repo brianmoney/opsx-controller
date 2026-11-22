@@ -235,6 +235,32 @@ to `opsx-implementer`, fresh review to `opsx-review`, and archiving to
 the interactive counterpart to the deterministic `opsx-plan` / `opsx-run`
 entrypoints, not a replacement for them.
 
+### Phase Transition Gate
+
+Archiving a change does not make the repository ready for the next one. After
+each archive, `opsx-orchestrator` runs a mandatory handoff gate before it
+selects the next change:
+
+1. a fresh, read-only `opsx-integration-auditor` proves or disproves that the
+   next change can start reproducibly from `HEAD`;
+2. a blocked audit is handed to `opsx-repo-hygiene`, which commits exactly the
+   accepted implementation pathspecs the auditor named, ignores `.opsx-run/`,
+   and repairs handoff-blocking scripts or evidence;
+3. a fresh audit confirms the repair. The loop is capped at two repair/audit
+   rounds; a second failure stops the run.
+
+The auditor's `handoff_ready`, `checks[]`, and `blockers[]` are recorded in the
+run ledger and the final report unchanged. The orchestrator will not report "no
+open blockers" while `handoff_ready` is false or unknown, and it reserves three
+dispatches per change for the gate so review cycles cannot consume the budget.
+
+**An archive-only commit is a stop, not a handoff.** If the archive commit
+carries zero implementation paths while accepted source remains uncommitted,
+the change is archived but not delivered. An operator waiver to archive without
+committing source is recorded verbatim and does not authorize the next change;
+the run continues only after the operator grants authority to commit the
+implementation and a fresh audit returns `handoff_ready: true`.
+
 ## Documentation
 
 | Guide | What it covers |

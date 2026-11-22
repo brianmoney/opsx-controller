@@ -131,14 +131,28 @@ What it contains:
 - `adapters/opencode/agents/opsx-orchestrator.md`: plan-level conductor agent
   (`mode: all`, `edit: deny`, `bash: deny`, `task: allow`). It reads a markdown
   plan directly, drives changes in dependency order, and dispatches the change
-  writer, implementer, a fresh reviewer, and the archiver. It holds no durable
-  state of its own; the run ledger is maintained by delegated writers.
+  writer, implementer, a fresh reviewer, and the archiver. It then runs the
+  mandatory Phase Transition Gate before selecting the next change. It holds no
+  durable state of its own; the run ledger is maintained by delegated writers.
+- `adapters/opencode/agents/opsx-integration-auditor.md`: fresh read-only
+  handoff auditor (`mode: all`, `edit: deny`, `task: deny`, `question: deny`,
+  inspection-only shell). It proves or disproves `handoff_ready` from the
+  committed repository state and returns the machine-readable report
+  (`status`, `handoff_ready`, `change`, `head`, `checks[]`, `blockers[]`,
+  `next_action`). It never edits, stages, commits, pushes, or archives.
+- `adapters/opencode/agents/opsx-repo-hygiene.md`: scoped handoff writer
+  (`edit: allow`, `bash: allow`, `task: deny`, `question: deny`). It commits
+  exactly the accepted implementation pathspecs the auditor named, adds
+  `.opsx-run/` to `.gitignore`, and retargets handoff-blocking perf/evidence
+  scripts. It refuses to invent scope and never changes product behavior; a
+  code defect requires a reviewed change.
 - `adapters/opencode/agents/opsx-change-writer.md`: authors or amends exactly
   one change's OpenSpec artifacts and runs the strict validation gate. It does
   not implement source, archive, or commit.
 - `adapters/opencode/agents/opsx-review.md`: generic read-only reviewer with
-  acceptance tiers (`poc` / `phase` / `release`) and findings dispositions. It
-  is not tied to any one plan or repository.
+  acceptance tiers (`poc` / `phase` / `release`), findings dispositions, and a
+  required `coverage[]` matrix (`covered` / `not-applicable` / `not-covered`
+  with evidence). It is not tied to any one plan or repository.
 - `adapters/opencode/agents/opsx-implementer.md`: implementation agent. It
   supports the controller-round contract and a plan-orchestrator mode selected
   from its input fields.
@@ -151,6 +165,49 @@ What it contains:
   `<project>/.opencode/opsx-controller/plan-authoring.md` (project)
 - `adapters/opencode/templates/project/`: host-project setup snippets
 - `adapters/opencode/install.sh`: OpenCode installer
+
+### Phase Transition Gate
+
+`opsx-orchestrator` owns a mandatory handoff gate between changes. Archiving
+records a change as durable; it does not make the repository ready for the next
+change. The gate runs after archive and before any work for the next change:
+
+1. A **fresh** `opsx-integration-auditor` verifies a reproducible `HEAD`: a
+   clean tracked tree, the accepted source and plan at `HEAD`, the archive
+   lineage carrying the implementation paths, `.opsx-run/` ignored, evidence
+   manifests resolving at `HEAD`, perf/evidence scripts that do not recreate an
+   archived change directory, the next change's intake and dependencies, a
+   branch with an upstream or a recorded no-push waiver, and a fresh checkout
+   that can run the focused checks plus `openspec validate --all --strict`.
+2. When it returns `handoff_ready: false` with machine-actionable blockers,
+   `opsx-repo-hygiene` repairs exactly those blockers with explicit pathspecs.
+   It never stages user-owned files, unrelated source, secrets, or generated
+   state, and never edits product code to satisfy a check.
+3. A fresh audit confirms the repair. The loop is capped at two repair/audit
+   rounds; a second failure stops the run with the remaining blockers.
+
+The auditor's `handoff_ready`, `checks[]`, and `blockers[]` are copied into the
+run ledger and the final report unchanged, and `handoff_ready` is part of the
+orchestrator's definition of done. The orchestrator reserves three dispatches
+per change for the gate (`HANDOFF_RESERVE`, default `3`), excluded from any
+`MAX_DISPATCHES` cap, so review cycles cannot consume the handoff budget.
+
+An **archive-only** commit — the archive move plus synced specs with zero
+implementation paths, while accepted source remains outside `HEAD` — is
+`handoff_ready: false`, not completion. An operator waiver to archive without
+committing source is recorded verbatim and stops the run; the next change starts
+only after the operator grants authority to commit the implementation and a
+fresh audit passes.
+
+The archiver itself fails closed on this shape: `core/phase-agents/archiver.md`
+now requires an explicit `IMPLEMENTATION_PATHS` scope whenever tracked or
+untracked source differs from the archive parent, and returns blocked JSON with
+`ambiguous archive commit scope`, the pending source paths, and empty
+`implementation_paths` rather than reporting `status=archived`.
+
+These three surfaces (`opsx-integration-auditor`, `opsx-repo-hygiene`, and the
+gate section of `opsx-orchestrator`) are OpenCode-only today. Port them to
+`core/phase-agents` and the other adapters once their contracts stabilize.
 
 Requirements:
 

@@ -135,3 +135,70 @@ clear `latest_fix_prompt` only after recording the passing result.
 - **WHEN** a later review passes with zero findings after a prior failed review
 - **THEN** `latest_fix_prompt` is empty and subsequent controller state does not
   present the prior corrective handoff as active work
+
+### Requirement: Plan-level review prompts carry an adversarial coverage matrix
+
+Before dispatching a plan-level change review, the orchestrator SHALL derive and
+include a required coverage matrix for the change’s surfaces. The matrix SHALL
+include, where applicable:
+
+- expected read errors: permission denied, unreadable file, malformed persisted
+  state, missing state, and the required success/unavailable/error envelope;
+- invalid parameters and cache-key collisions, including a valid default request
+  followed by an invalid value that previously shared the same cache key;
+- maximum allowed response or page size, not only the default size;
+- concurrent cache, single-flight, stale-while-revalidate, and no-write or
+  no-subprocess invariants;
+- next-phase compatibility: files and contracts the next change will rely on or
+  modify.
+
+The matrix SHALL be derived from the accepted spec, design, and changed
+surfaces. It SHALL NOT be a generic checklist unrelated to the change.
+
+#### Scenario: Error-path cases are required
+- **WHEN** a change adds read handlers over generated or persisted state
+- **THEN** the review matrix includes permission-denied, unreadable, malformed,
+  and missing-state cases and the required response classification for each
+
+#### Scenario: Cache-collision case is required
+- **WHEN** a change caches handler results keyed by request parameters
+- **THEN** the matrix includes a valid-default-then-invalid-parameter case and
+  requires the invalid request to keep its protocol error
+
+#### Scenario: Maximum-size case is required
+- **WHEN** a change exposes a bounded page or response
+- **THEN** the matrix includes the documented maximum, not only the default
+
+#### Scenario: Next-phase compatibility is required
+- **WHEN** the next planned change will modify the same files or consume the new
+  contract
+- **THEN** the matrix includes the files and contract points the next change
+  depends on
+
+### Requirement: Reviewers report coverage for every required case
+
+The plan-level reviewer SHALL report each required matrix case as `covered`,
+`not-applicable`, or `not-covered` with evidence.
+
+A case marked `covered` SHALL cite the actual test, command, or observed
+behavior. A case marked `not-covered` SHALL be a blocking finding when it
+concerns accepted behavior or a required invariant; otherwise it SHALL be an
+explicit follow-up.
+
+A review that only re-runs the writer’s existing tests SHALL NOT satisfy this
+requirement.
+
+#### Scenario: Uncovered required case blocks acceptance
+- **WHEN** a required permission-denied case is not covered by a test or an
+  observed reproduction
+- **THEN** the reviewer returns a blocking finding with the case id, expected
+  behavior, and observed behavior
+
+#### Scenario: Not-applicable case is justified
+- **WHEN** a matrix case does not apply to the change
+- **THEN** the reviewer records `not-applicable` with a one-sentence reason
+
+#### Scenario: Coverage is machine-readable
+- **WHEN** the reviewer returns its verdict
+- **THEN** the final JSON includes a coverage array with case id, result, and
+  evidence for every required case

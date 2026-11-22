@@ -134,3 +134,70 @@ another leaves a dirty tree. The definitions covered are:
 
 - **WHEN** a plan run archives a change through the `claude-code`, `opencode`, or `codex-cli` adapter
 - **THEN** the resulting archive commit contains the change-directory deletion and the run can reach `status = done`
+
+### Requirement: Plan-level archive runs require an implementation scope
+
+When the plan-level orchestrator dispatches `opsx-archiver` for a change whose
+accepted implementation differs from the archive parent revision, it SHALL pass
+the explicit implementation file set in the archive scope.
+
+The implementation scope SHALL be the accepted source manifest for the change,
+not the whole worktree and not only the change artifact directory. It SHALL
+exclude user-owned files, run state, credentials, and unrelated changes.
+
+#### Scenario: Source differs from the archive parent
+- **WHEN** the accepted implementation has tracked or untracked source files
+  outside `openspec/changes/<change>/`
+- **THEN** the orchestrator supplies those exact paths to the archiver before
+  the archive move
+
+#### Scenario: No source differs from the archive parent
+- **WHEN** the change has no implementation files outside its own change
+  directory and the synced specs
+- **THEN** the archive scope may contain only the change directory and synced
+  specs
+
+### Requirement: The archiver fails closed on an archive-only scope with pending source
+
+When tracked or untracked source outside the change directory differs from the
+archive parent revision, `opsx-archiver` SHALL reject an archive scope that
+contains only the archive move and synced specs.
+
+It SHALL return blocked JSON with a reason that names the missing implementation
+scope and the pending source paths. It SHALL NOT create an archive-only commit
+and report `status=archived`.
+
+#### Scenario: Archive-only scope is rejected
+- **WHEN** 41 accepted implementation files differ from the archive parent but
+  the archiver receives no implementation scope
+- **THEN** the archiver returns blocked with `ambiguous archive commit scope`
+  (or an equally specific reason) and commits nothing
+
+#### Scenario: Explicit implementation scope is accepted
+- **WHEN** the archiver receives the exact accepted implementation paths and
+  they pass the staged-set inspection
+- **THEN** it creates the archive commit containing the archive move, synced
+  specs, and those implementation paths
+
+### Requirement: An archive-only commit is not completion
+
+The plan-level orchestrator SHALL treat an archive commit whose
+`implementation_paths` is zero, while accepted source remains outside `HEAD`, as
+`handoff_ready: false`.
+
+The orchestrator SHALL record the archive as durable but SHALL NOT report the
+change as delivered, SHALL NOT start the next change, and SHALL NOT report “no
+open blockers” unless the operator explicitly waives continuation and that
+waiver is recorded.
+
+#### Scenario: Archive-only commit blocks continuation
+- **WHEN** the archive commit contains zero implementation paths and the
+  accepted implementation remains uncommitted
+- **THEN** the orchestrator reports the change as archived but not
+  handoff-ready and stops before the next change
+
+#### Scenario: Complete archive commit permits continuation
+- **WHEN** the archive commit contains the accepted implementation paths and the
+  handoff audit passes
+- **THEN** the orchestrator may mark the change complete and select the next
+  change
