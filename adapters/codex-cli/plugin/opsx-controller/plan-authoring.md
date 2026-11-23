@@ -41,6 +41,8 @@ doc_type: implementation-plan
 status: proposed
 acceptance: poc
 updated: YYYY-MM-DD
+human_gates:            # optional; omit or leave empty when nothing is gated
+  - <planned-change-slug>
 ---
 ```
 
@@ -61,6 +63,32 @@ release plan at the default. The model-orchestrated `opsx-orchestrator` resolves
 the tier as: explicit invocation value, then this frontmatter field, then
 `poc`. The field is plan metadata; it does not replace the plan's success
 parameters or gates.
+
+`human_gates` is an optional list of exact change slugs declared in the same
+plan. A listed change is operator-gated for a model-level plan run: the
+`opsx-orchestrator` stops before it, does not author, implement, review, or
+archive it, and reports the resume instruction. A later change whose dependency
+is a gated change is not started either. Changes that are not listed are
+orchestrator-owned and are driven to completion without per-change questions.
+
+`human_gates` is distinct from `pause_before`, and neither substitutes for the
+other:
+
+| Field | Declared in | Read by | Gates |
+|-------|-------------|---------|-------|
+| `human_gates` | plan frontmatter | the model-level `opsx-orchestrator` run | a run-level stop before the change |
+| `pause_before` | compiled TOML manifest | the `opsx-plan` / `opsx-run` controller | an approval step in the compiled DAG |
+
+An absent or empty `human_gates` field means no human gates: every planned
+change is treated as orchestrator-owned. A value that names a slug with no
+`### Change:` heading in the plan is an authoring defect, not a silently
+ignored entry — the model-level run fails closed at preflight and reports the
+unknown slug.
+
+The field belongs to the plan document only: it adds no manifest key and needs
+no compile change. An explicit `HUMAN_GATES` value supplied to a model-level
+run replaces this list for that run; that is a runtime input, not an authoring
+edit, and the plan frontmatter is left unchanged.
 
 ### Sections (in order)
 
@@ -102,7 +130,8 @@ After the last phase:
 - **`## Suggested Manual Gates`** — changes where an operator should add
   `pause_before = true` to the compiled manifest. The compiler records but
   does not invent these gates; list them here so the operator knows where to
-  apply them.
+  apply them. This section feeds the compiled-manifest gate only; a
+  model-level run's stop list is the `human_gates` frontmatter field.
 
 ## Manual Tasks in tasks.md
 

@@ -153,3 +153,64 @@ than teaching a controller-owned per-change workflow.
 - **THEN** the documentation directs them to upstream OpenSpec commands and
   skills for propose, apply, archive, and verify, and reserves `opsx-plan` /
   `opsx-run` for plan-level orchestration and the supported single-change loop
+
+### Requirement: Plan frontmatter declares human gates
+
+The plan-authoring reference and every adapter-facing plan-authoring surface
+SHALL document an optional `human_gates` frontmatter field whose value is a list
+of exact change slugs declared in the same plan.
+
+The field SHALL mean: the listed changes are operator-gated for a model-level
+plan run and are not started by `opsx-orchestrator` without new operator
+authority. It SHALL be distinct from `pause_before`:
+
+- `pause_before` is a compiled-manifest gate consumed by the deterministic
+  `opsx-plan` runner and is placed through the `## Suggested Manual Gates`
+  section;
+- `human_gates` is frontmatter read directly by the model-level orchestrator and
+  does not add a TOML manifest key.
+
+An absent or empty `human_gates` field SHALL mean no human gates. A value that
+names a change not present in the plan SHALL be an authoring defect, not a
+silently ignored entry. An explicit `HUMAN_GATES` invocation value is a runtime
+override documented by the authoring surface but is not part of the plan
+document.
+
+The `/opsx-plan` authoring command SHALL instruct the author to declare
+`human_gates` when the plan contains operator-gated changes, and SHALL require
+the listed slugs to be verified against the plan’s `### Change:` headings.
+
+#### Scenario: A plan declares its operator-gated change
+- **WHEN** a plan contains changes one through four and change four requires an
+  operator decision before it may start
+- **THEN** its frontmatter declares `human_gates:` with the exact slug of change
+  four, and the authoring surface explains that the model orchestrator stops
+  before it
+
+#### Scenario: A plan omits the field
+- **WHEN** a plan has no operator-gated changes and omits `human_gates`
+- **THEN** the field resolves to the empty list and every planned change is
+  treated as orchestrator-owned
+
+#### Scenario: An unknown slug is an authoring defect
+- **WHEN** `human_gates` names a slug that does not match any `### Change:`
+  heading in the plan
+- **THEN** the authoring surface and the orchestrator treat it as a fail-closed
+  error rather than ignoring it
+
+#### Scenario: Human gates and pause_before are distinguished
+- **WHEN** an author reads the frontmatter and manual-gate guidance
+- **THEN** the reference explains that `human_gates` is a model-run stop list
+  while `pause_before` is a compiled-manifest approval gate, and that neither
+  substitutes for the other
+
+#### Scenario: The authoring command requires the field to be considered
+- **WHEN** a model authors a plan through `/opsx-plan`
+- **THEN** the command instructs it to declare `human_gates` when applicable,
+  verify every slug against the plan, and report the declared gates in its final
+  response
+
+#### Scenario: Explicit override is documented as runtime input
+- **WHEN** an operator needs to clear or replace a plan’s gates for one run
+- **THEN** the authoring surface documents the explicit `HUMAN_GATES` input as a
+  runtime override rather than instructing the author to edit the plan

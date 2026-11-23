@@ -134,18 +134,46 @@ What it contains:
   writer, implementer, a fresh reviewer, and the archiver. It then runs the
   mandatory Phase Transition Gate before selecting the next change. It holds no
   durable state of its own; the run ledger is maintained by delegated writers.
+  It drives every change outside the resolved human-gate set autonomously —
+  authoring, corrective rounds, evidence disposition, local commits, and intake
+  — records each decision with its basis, and does not ask for an internal
+  repository, evidence, commit, or intake decision. The run's stop list is the
+  optional `human_gates` plan-frontmatter list of exact change slugs, resolved
+  as explicit `HUMAN_GATES` input first, then frontmatter, then empty; an
+  explicit value replaces the frontmatter list, and an unknown slug fails
+  preflight. `human_gates` is a model-level plan field, distinct from the
+  compiled-manifest `pause_before` gate consumed by `opsx-plan` / `opsx-run`;
+  neither substitutes for the other.
 - `adapters/opencode/agents/opsx-integration-auditor.md`: fresh read-only
   handoff auditor (`mode: all`, `edit: deny`, `task: deny`, `question: deny`,
   inspection-only shell). It proves or disproves `handoff_ready` from the
   committed repository state and returns the machine-readable report
   (`status`, `handoff_ready`, `change`, `head`, `checks[]`, `blockers[]`,
   `next_action`). It never edits, stages, commits, pushes, or archives.
+  `local-only-delivery` replaces `branch-upstream` (an existing upstream is
+  informational); `next-change-readiness` fails only on a planned-slug collision
+  or an unmet dependency, never on an unauthored proposal. A collision with a
+  plan-reachable occupant is a `resolve-slug-collision` repair owned by the
+  orchestrator; an out-of-plan occupant is an `operator-decision` stop because
+  no worker may archive, rename, or rewrite it. Evidence manifests are read from
+  `HEAD`, every indexed entry needs a non-empty `path` and `sha256`, and a
+  worktree-only or malformed manifest is blocked rather than passed. An evidence
+  gap becomes a bounded `repair-evidence` repair or an `unqualified`
+  `carry_forward` record, with `stop` reserved for human-only boundaries.
 - `adapters/opencode/agents/opsx-repo-hygiene.md`: scoped handoff writer
-  (`edit: allow`, `bash: allow`, `task: deny`, `question: deny`). It commits
-  exactly the accepted implementation pathspecs the auditor named, adds
-  `.opsx-run/` to `.gitignore`, and retargets handoff-blocking perf/evidence
-  scripts. It refuses to invent scope and never changes product behavior; a
-  code defect requires a reviewed change.
+  (`edit: allow`, `bash: allow`, `task: deny`, `question: deny`). It repairs in
+  phases: Phase A commits the safe baseline (the exact accepted implementation
+  pathspecs the auditor named, the plan, the `.opsx-run/` ignore entry, and any
+  perf/evidence script retarget) even while an evidence blocker is still open;
+  Phase B repairs evidence within a bounded authority that preserves historical
+  originals byte-for-byte and never claims a missing artifact is verified. It
+  refuses to invent scope, never changes product behavior, and reports an
+  `amended_commit` only for its own commit while that commit is still `HEAD`. A
+  code defect requires a reviewed change. It performs repository repairs only:
+  a plan-reachable `resolve-slug-collision` is orchestrator-owned, so it never
+  renames, moves, archives, or deletes an active change directory to clear a
+  plan-reachable slug; an out-of-plan slug collision is an `operator-decision`
+  stop that it does not act on.
 - `adapters/opencode/agents/opsx-change-writer.md`: authors or amends exactly
   one change's OpenSpec artifacts and runs the strict validation gate. It does
   not implement source, archive, or commit.
@@ -170,21 +198,44 @@ What it contains:
 
 `opsx-orchestrator` owns a mandatory handoff gate between changes. Archiving
 records a change as durable; it does not make the repository ready for the next
-change. The gate runs after archive and before any work for the next change:
+change. The gate runs after archive and before any work for the next change.
+
+The run itself is autonomous: every change outside the resolved human-gate set
+is driven end-to-end without asking for an internal repository, evidence,
+commit, or intake decision. `MAX_DISPATCHES`, review corrective rounds, and
+repair/audit rounds are planning allowances rather than terminal stops, and a
+shortfall in the three-dispatch handoff reserve is recorded, not terminal.
 
 1. A **fresh** `opsx-integration-auditor` verifies a reproducible `HEAD`: a
    clean tracked tree, the accepted source and plan at `HEAD`, the archive
    lineage carrying the implementation paths, `.opsx-run/` ignored, evidence
-   manifests resolving at `HEAD`, perf/evidence scripts that do not recreate an
-   archived change directory, the next change's intake and dependencies, a
-   branch with an upstream or a recorded no-push waiver, and a fresh checkout
-   that can run the focused checks plus `openspec validate --all --strict`.
-2. When it returns `handoff_ready: false` with machine-actionable blockers,
-   `opsx-repo-hygiene` repairs exactly those blockers with explicit pathspecs.
-   It never stages user-owned files, unrelated source, secrets, or generated
-   state, and never edits product code to satisfy a check.
-3. A fresh audit confirms the repair. The loop is capped at two repair/audit
-   rounds; a second failure stops the run with the remaining blockers.
+   manifests read from `HEAD` (every indexed entry needs a non-empty `path` and
+   `sha256`; worktree-only or malformed manifests never pass), perf/evidence
+   scripts that do not recreate an archived change directory, no planned-slug
+   collision and archived dependencies for the next change (an unauthored next
+   proposal is expected, not a blocker), `local-only-delivery` instead of a
+   pushed branch, and a fresh checkout that can run the focused checks plus
+   `openspec validate --all --strict`.
+2. When it returns `handoff_ready: false` with machine-actionable blockers, the
+   list is split by `repair.owner`: `opsx-repo-hygiene` repairs exactly the
+   repository blockers with explicit pathspecs, while a plan-reachable
+   `resolve-slug-collision` blocker is resolved at plan level by the
+   orchestrator — it does not start or author the colliding change and records
+   which artifact is authoritative — with no repository mutation. An out-of-plan
+   slug occupant is an `operator-decision` stop, not a repair, because no worker
+   may archive, rename, or rewrite an external change. The hygiene
+   repairs run in two phases: Phase A commits the safe baseline (accepted
+   source, the plan, the `.opsx-run/` ignore entry, a script-path retarget)
+   even while an evidence question is still open, then Phase B adds or
+   supersedes evidence within a bounded authority that preserves historical
+   originals byte-for-byte. It never stages user-owned files, unrelated
+   source, secrets, or generated state, and never edits product code to
+   satisfy a check. `amended_commit` is reported only for its own commit
+   while that commit is still `HEAD`.
+3. A fresh audit confirms the repair. Two repair/audit rounds are a planning
+   allowance, not a terminal cap: a further round is permitted with a recorded
+   `cap_override`, and the run stops only when no scoped repair remains or the
+   blocker needs a human-only decision.
 
 The auditor's `handoff_ready`, `checks[]`, and `blockers[]` are copied into the
 run ledger and the final report unchanged, and `handoff_ready` is part of the
@@ -192,12 +243,28 @@ orchestrator's definition of done. The orchestrator reserves three dispatches
 per change for the gate (`HANDOFF_RESERVE`, default `3`), excluded from any
 `MAX_DISPATCHES` cap, so review cycles cannot consume the handoff budget.
 
+Delivery is local to the run: the archiver and the hygiene writer make local
+commits and local amendments, and no worker pushes, creates a remote branch,
+opens a pull request, merges, or requires a remote upstream. A configured
+upstream, when one exists, is reported as informational and changes no verdict.
+The run's stop list is the plan's optional `human_gates` list of exact change
+slugs (explicit `HUMAN_GATES` input first, then frontmatter, then empty); an
+unknown slug fails preflight, and a gated change is never started. `human_gates`
+is a model-level plan field, distinct from the compiled-manifest `pause_before`
+gate; neither substitutes for the other.
+
+A post-archive finding is a carry-forward item on the current change's ledger —
+with archived origin, locus, evidence, impact, `blocks-later-change`, and
+disposition — never a reopened archived change and never an unplanned change
+inserted mid-plan. Remaining carry-forwards are reported when the plan's
+changes finish.
+
 An **archive-only** commit — the archive move plus synced specs with zero
 implementation paths, while accepted source remains outside `HEAD` — is
-`handoff_ready: false`, not completion. An operator waiver to archive without
-committing source is recorded verbatim and stops the run; the next change starts
-only after the operator grants authority to commit the implementation and a
-fresh audit passes.
+`handoff_ready: false`, not completion, and the existing archive-only refusal
+remains in force. An operator waiver to archive without committing source is
+recorded verbatim and stops the run; the next change starts only after the
+operator grants authority to commit the implementation and a fresh audit passes.
 
 The archiver itself fails closed on this shape: `core/phase-agents/archiver.md`
 now requires an explicit `IMPLEMENTATION_PATHS` scope whenever tracked or

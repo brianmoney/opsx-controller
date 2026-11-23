@@ -235,6 +235,17 @@ to `opsx-implementer`, fresh review to `opsx-review`, and archiving to
 the interactive counterpart to the deterministic `opsx-plan` / `opsx-run`
 entrypoints, not a replacement for them.
 
+That run is autonomous by default: every planned change outside the resolved
+human-gate set is driven end-to-end — authoring, implementation, corrective
+rounds, evidence disposition, local commits, and intake — without asking for an
+internal repository, evidence, commit, or intake decision. The stop list is the
+plan's optional `human_gates` frontmatter list of exact change slugs, overridden
+by an explicit `HUMAN_GATES` input and empty when neither is supplied; an
+unknown slug is a fail-closed authoring defect. `human_gates` is a model-level
+plan field read by `opsx-orchestrator`, distinct from the compiled-manifest
+`pause_before` gate that `opsx-plan` / `opsx-run` consume: a plan may use both,
+neither substitutes for the other, and `human_gates` adds no manifest key.
+
 ### Phase Transition Gate
 
 Archiving a change does not make the repository ready for the next one. After
@@ -242,24 +253,58 @@ each archive, `opsx-orchestrator` runs a mandatory handoff gate before it
 selects the next change:
 
 1. a fresh, read-only `opsx-integration-auditor` proves or disproves that the
-   next change can start reproducibly from `HEAD`;
-2. a blocked audit is handed to `opsx-repo-hygiene`, which commits exactly the
-   accepted implementation pathspecs the auditor named, ignores `.opsx-run/`,
-   and repairs handoff-blocking scripts or evidence;
-3. a fresh audit confirms the repair. The loop is capped at two repair/audit
-   rounds; a second failure stops the run.
+   next change can start reproducibly from `HEAD` — a clean tracked tree, the
+   accepted source and plan at `HEAD`, the archive lineage carrying the
+   implementation paths, `.opsx-run/` ignored, evidence manifests read from
+   `HEAD` with every indexed entry declaring a non-empty `path` and `sha256`
+   (worktree-only or malformed manifests never pass), perf/evidence scripts that
+   do not recreate an archived change directory, no planned-slug collision with
+   an active change, archived dependencies, `local-only-delivery`, and a fresh
+   checkout that can run the focused checks plus
+   `openspec validate --all --strict`;
+2. a blocked audit is split by `repair.owner`: the repository repairs go to
+   `opsx-repo-hygiene`, which repairs in phases — a safe baseline commit of the
+   accepted implementation pathspecs the auditor named, the plan, and the
+   `.opsx-run/` ignore entry proceeds even while an evidence question is still
+   open, then a bounded evidence phase adds or supersedes evidence while
+   preserving historical originals byte-for-byte — while a plan-reachable
+   `resolve-slug-collision` blocker is resolved at plan level by the
+   orchestrator, which does not start or author the colliding change and records
+   which artifact is authoritative, with no repository mutation. An out-of-plan
+   change occupying the planned slug is not a repair: it is an
+   `operator-decision` stop, because no worker may archive, rename, move, or
+   rewrite an external change;
+3. a fresh audit confirms the repair. Two repair/audit rounds are a planning
+   allowance, not a terminal cap: a further round is permitted with a recorded
+   `cap_override`, and the run stops only when no scoped repair remains or the
+   blocker needs a human-only decision.
+
+An unauthored next change is not an intake blocker — its proposal is authored
+after handoff releases it — and `local-only-delivery` replaces the old
+`branch-upstream` check, so a committed local branch with no remote upstream is
+handoff-ready. Delivery never pushes, opens a remote branch or pull request, or
+merges; an existing upstream is informational only.
 
 The auditor's `handoff_ready`, `checks[]`, and `blockers[]` are recorded in the
-run ledger and the final report unchanged. The orchestrator will not report "no
-open blockers" while `handoff_ready` is false or unknown, and it reserves three
-dispatches per change for the gate so review cycles cannot consume the budget.
+run ledger and the final report unchanged. `handoff_ready` is part of the
+orchestrator's definition of done: it will not report "no open blockers" while
+it is false or unknown, and it reserves three dispatches per change for the gate
+so review cycles cannot consume the budget.
+
+`MAX_DISPATCHES`, review corrective rounds, and repair/audit rounds are planning
+allowances rather than terminal stops, and a finding discovered after archive is
+recorded as a carry-forward item — with its archived origin, locus, evidence,
+impact, and disposition — instead of reopening the archived change or inserting
+an unplanned change mid-plan. Remaining carry-forwards are reported when the
+plan's changes finish.
 
 **An archive-only commit is a stop, not a handoff.** If the archive commit
 carries zero implementation paths while accepted source remains uncommitted,
-the change is archived but not delivered. An operator waiver to archive without
-committing source is recorded verbatim and does not authorize the next change;
-the run continues only after the operator grants authority to commit the
-implementation and a fresh audit returns `handoff_ready: true`.
+the change is archived but not delivered: `handoff_ready` is false, not
+completion. An operator waiver to archive without committing source is recorded
+verbatim and does not authorize the next change; the run continues only after
+the operator grants authority to commit the implementation and a fresh audit
+returns `handoff_ready: true`.
 
 ## Documentation
 

@@ -202,3 +202,73 @@ requirement.
 - **WHEN** the reviewer returns its verdict
 - **THEN** the final JSON includes a coverage array with case id, result, and
   evidence for every required case
+
+### Requirement: Post-archive findings are carry-forward items, not reopened changes
+
+When a reviewer, implementer, or auditor finds a defect or missing verification
+in an already archived change while working on a later change, the finding SHALL
+be recorded as a carry-forward item rather than a finding against the active
+change. The record SHALL name the archived change, the active change, the locus
+(`path[:symbol]`), observed and required behavior, evidence, impact, and whether
+it affects a later planned change. Every surface that emits a carry-forward item
+— including `opsx-change-writer` and the plan mode of `opsx-implementer` — SHALL
+carry those fields; a contract that omits `observed` or `required` is
+incomplete.
+
+A carry-forward item SHALL NOT cause the archived change to be reopened, its
+archived delta to be edited, or an unplanned change to be inserted into the
+running plan. The reviewer SHALL NOT return a `fix` verdict or a non-empty
+corrective handoff whose scope is the archived change.
+
+If the archived defect is newly exposed or newly worsened by the active change’s
+diff, the finding SHALL be reported against the active change instead, with both
+the active locus and the archived origin named.
+
+`opsx-change-writer` and `opsx-implementer` SHALL NOT repair a prior archived
+change’s findings as part of a later change, including changes 2 and 3, unless
+that later change’s own accepted scope independently requires the behavior. They
+SHALL report the finding as out of scope for the active change and leave it to
+the carry-forward record.
+
+The reviewer SHALL keep the adversarial coverage matrix and the `coverage[]`
+output contract for the active change; carry-forward classification changes only
+which change owns a finding, not the required coverage.
+
+#### Scenario: Reviewing change two finds a defect in change one
+- **WHEN** the change-two review finds that an archived change-one handler
+  returns the wrong error for a missing file
+- **THEN** the reviewer records a carry-forward item naming change one and the
+  handler locus, returns no corrective handoff for the archived change, and
+  reports the change-two verdict on change two’s own scope
+
+#### Scenario: A newly exposed defect belongs to the active change
+- **WHEN** change two’s diff makes an archived change-one path reachable in a new
+  way and that path now fails
+- **THEN** the finding is reported against change two, with the archived origin
+  named, because the active diff introduced the observable failure
+
+#### Scenario: Change writer declines prior archived scope
+- **WHEN** `opsx-change-writer` is authoring change two and a prior archived
+  finding is present in the dispatch context
+- **THEN** it does not amend the archived change, records the finding as
+  out-of-scope carry-forward, and authors only change two
+
+#### Scenario: Implementer declines prior archived scope
+- **WHEN** `opsx-implementer` is implementing change three and the dispatch
+  names a defect in change one’s archived implementation
+- **THEN** it does not edit the archived change or adopt the archived finding as
+  change three’s scope; if change three’s own accepted scope requires the same
+  behavior, it implements that scope against change three and records the
+  archived origin in its report
+
+#### Scenario: Carry-forward does not block the next change by itself
+- **WHEN** a carry-forward item has no effect on the next change’s dependencies
+  or accepted behavior
+- **THEN** the orchestrator records it and proceeds with the next planned change
+  instead of stopping or reopening the archive
+
+#### Scenario: Carry-forward that affects a later change blocks that change
+- **WHEN** a carry-forward item invalidates a contract a later planned change
+  depends on
+- **THEN** the later change fails or blocks on its own acceptance criteria with
+  the carry-forward item named, and the archived change remains closed

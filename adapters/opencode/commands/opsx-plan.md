@@ -24,6 +24,17 @@ Entry rules:
   concept, `phase` when phase gates are the acceptance unit, and `release`
   when release qualification is in scope. Do not omit it for a release plan;
   the default is `poc`.
+- Declare `human_gates` in the frontmatter when the plan contains an
+  operator-gated change. The value is a list of exact change slugs, and every
+  listed slug must also appear as a `### Change:` heading in this document.
+  Omit the field, or declare an empty list, when no change is operator-gated.
+  A change listed in `human_gates` is a stop for the model-level
+  `opsx-orchestrator` run; it is not a compiled-manifest `pause_before` gate,
+  so do not omit it on the assumption that `## Suggested Manual Gates` covers
+  it.
+- Do not edit the plan to record a run-level gate decision. An explicit
+  `HUMAN_GATES` value passed to a model-level run replaces the frontmatter
+  list for that run and is a runtime input, not an authoring edit.
 
 Before writing, read:
 
@@ -63,16 +74,22 @@ Self-verification before the final response:
 2. Confirm the frontmatter declares `acceptance` and that it matches the
    plan's stated gates: `poc` for a bounded proof of concept, `phase` for
    phase-gated delivery, `release` for release qualification.
-3. Report whether the compile self-check ran and succeeded or why it was
+3. Verify every `human_gates` entry against the document: each slug must match
+   a `### Change:` heading exactly. A slug that matches no heading is an
+   authoring defect — fix the entry or drop the gate before reporting the plan
+   as complete, and never leave an unknown slug for the orchestrator to fail on
+   at preflight.
+4. Report whether the compile self-check ran and succeeded or why it was
    unavailable.
 
 Final response requirements:
 
 - Do not repeat the document body.
 - Report: the output path, the declared `acceptance` tier, phase and change
-  counts, proposed capabilities, the compile self-check result (or that it
-  was unavailable), and the suggested manual `pause_before` gates from the
-  document's `## Suggested Manual Gates` section.
+  counts, proposed capabilities, the declared `human_gates` (or that the plan
+  declares none), the compile self-check result (or that it was unavailable),
+  and the suggested manual `pause_before` gates from the document's
+  `## Suggested Manual Gates` section.
 - If compile self-checking was unavailable, explicitly say the markdown was
   authored but not compiled.
 - Remind the operator to review the compiled DAG with
