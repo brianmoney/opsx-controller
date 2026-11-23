@@ -525,6 +525,42 @@ A `fix-now` finding is blocking for the tier. Record accepted advisories as
 notes, for example "0 critical / 0 warning / 1 accepted advisory note", and
 describe them. Never claim a zero-finding gate.
 
+## Post-archive findings are carry-forward items
+
+Archive is a freeze. A finding whose target is an **already archived** change is
+not a finding against that archived change: record it as a **carry-forward
+item**. The record SHALL name:
+
+- `archived_origin` — the archived change the defect belongs to;
+- `current_change` — the change under review;
+- `locus` — `path[:symbol]` where the behavior lives;
+- the observed behavior and the required behavior;
+- `evidence` — the command, reproduction, or artifact you actually observed;
+- `impact` — what breaks or what claim becomes false;
+- `blocks_later_change` — true only when the item invalidates a contract a
+  later planned change depends on;
+- `disposition` — `follow-up`, `carry-forward`, or `blocks-later-change`.
+
+A carry-forward item is **not** a `fix-now` finding and **not** a corrective
+handoff against the archive. Return no corrective prompt, corrective scope, or
+`fix` verdict whose target is the archived change, and never edit, reopen, or
+re-review it. Report the active change's verdict on the active change's own
+scope, and report carry-forward items separately.
+
+If the archived defect is **newly exposed or newly worsened by the active
+change's diff**, report it against the **active** change instead, with both the
+active locus and the archived origin named. The active diff introduced the
+observable failure, so the active change owns it; naming the archived origin is
+still required.
+
+Carry-forward classification changes only which change owns a finding, not the
+coverage requirement: keep the full adversarial coverage matrix and one
+`coverage[]` entry per supplied matrix case for the active change. A
+carry-forward item never excuses a `not-covered` case, never blocks the active
+change by itself, and never reopens the archived change; a carry-forward marked
+`blocks-later-change` blocks that later change on the later change's own
+acceptance criteria, with the archive still closed.
+
 ## Gates to report
 
 State, separately:
@@ -536,6 +572,8 @@ State, separately:
 - whether the reviewer was fresh and orchestrator-spawned;
 - the coverage matrix result: every case id with `covered`, `not-applicable`,
   or `not-covered`, and the evidence for each;
+- carry-forward items reported separately from the active change's findings,
+  each with its archived origin;
 - the exact revision and diff range reviewed.
 
 ## Output contract
@@ -566,6 +604,19 @@ Return a short markdown report, then exactly one final JSON object line:
   ],
   "gates": {"proved": [], "skipped": [], "unqualified": []},
   "claim_changes": [],
+  "carry_forward": [
+    {
+      "archived_origin": "<archived-change-id>",
+      "current_change": "<change-id>",
+      "locus": "path[:symbol]",
+      "observed": "<observed behavior>",
+      "required": "<required behavior>",
+      "evidence": "<command, reproduction, or artifact observed with its result>",
+      "impact": "<what breaks or what claim becomes false>",
+      "blocks_later_change": false,
+      "disposition": "follow-up|carry-forward|blocks-later-change"
+    }
+  ],
   "recommended_next": "archive|fix|full-scope-review|stop",
   "summary": "one short sentence"
 }
@@ -574,6 +625,10 @@ Return a short markdown report, then exactly one final JSON object line:
 `coverage` SHALL contain one entry per required matrix case supplied in
 `COVERAGE_MATRIX`. The orchestrator copies the array into the ledger and the
 final report unchanged, so a missing case cannot be recorded as reviewed.
+
+`carry_forward` SHALL be `[]` when no prior-archived defect was encountered. An
+entry there is a record, never a corrective handoff: it does not change the
+active change's verdict and does not authorize work on the archived change.
 
 Allowed `status` values are `pass`, `fix`, `blocked`, and `uncertain`. Use
 `fix` when any `fix-now` finding exists; `pass` only when no blocking finding

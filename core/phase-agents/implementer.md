@@ -53,6 +53,25 @@ Workflow:
    markers. Do not spawn sub-agents.
 8. Return the plan-mode output contract below.
 
+Post-archive findings are carry-forward items:
+
+- A defect whose target is an already archived change is out of scope for
+  `CHANGE`. Do not reopen the archived change, edit its archived delta or
+  directory, or adopt the archived defect as this change's scope.
+- If this change's own accepted scope independently requires the same behavior,
+  implement that scope against `CHANGE` and name the archived origin in your
+  report; do not present it as repairing the archive. A defect newly exposed or
+  newly worsened by this change's diff belongs to `CHANGE`, with the archived
+  origin named.
+- Otherwise record a carry-forward item naming the archived origin, the current
+  change, the locus (`path[:symbol]`), the observed and required behavior,
+  evidence, impact, whether it blocks a later planned change, and a disposition
+  of `follow-up`, `carry-forward`, or `blocks-later-change`. Do not insert a
+  follow-up change or an unplanned fix into the plan.
+- Report the item in `carry_forward` below. It does not block `CHANGE` by
+  itself; a `blocks-later-change` item blocks the later change on that change's
+  own acceptance criteria, and the archived change stays closed.
+
 Plan-mode output contract: return a short markdown summary followed by exactly
 one final JSON object line containing:
 
@@ -70,14 +89,30 @@ one final JSON object line containing:
   "files_touched": ["path"],
   "checks": [{"command": "...", "exit": 0, "summary": "..."}],
   "evidence": {"paths": ["..."], "hashes": {"path": "sha256"}},
+  "carry_forward": [
+    {
+      "archived_origin": "<archived-change-id>",
+      "current_change": "<change-id>",
+      "locus": "path[:symbol]",
+      "observed": "<observed behavior>",
+      "required": "<required behavior>",
+      "evidence": "<command, artifact, or dispatch line observed>",
+      "impact": "<what breaks or what claim becomes false>",
+      "blocks_later_change": false,
+      "disposition": "follow-up|carry-forward|blocks-later-change"
+    }
+  ],
   "deferred": [],
   "summary": "one short sentence"
 }
 ```
 
-A blocked result must include `reason` and must not claim progress. Do not add
-fields outside this contract. The controller-round output contract later in
-this file does not apply in plan-orchestrator mode.
+A blocked result must include `reason` and must not claim progress.
+`carry_forward` SHALL be `[]` when no prior-archived defect was encountered, and
+it never authorizes work on an archived change. Do not add fields outside this
+contract.
+The controller-round output contract later in this file does not apply in
+plan-orchestrator mode.
 
 ## Controller-round workflow
 

@@ -70,6 +70,15 @@ return `blocked` without editing anything.
   use it to evade a task gate.
 - Record accepted deferrals explicitly: requirement or task id, reason, impact,
   and follow-up. Do not silently narrow the scope.
+- Do not amend or fix a prior **archived** change while authoring a later
+  change. This holds for every later change in the plan, including changes 2 and
+  3. When the dispatch or your reading surfaces a defect in an archived change,
+  do not touch the archived change's directory or delta: record the item as an
+  out-of-scope **carry-forward** item naming the archived change, the current
+  change, the locus (`path[:symbol]`), the observed behavior, the required
+  behavior, the evidence, the impact, and whether it blocks a later planned
+  change, then author only `CHANGE`. Do not turn the item into a task,
+  requirement, or accepted deferral of the change you are authoring.
 - Keep the design document proportional. A `poc` change does not need a
   release-grade threat model; a `release` change does.
 - Do not edit source code, tests, archived changes, or unrelated files. Do not
@@ -105,6 +114,19 @@ The JSON must be the last line and must contain:
   "validation": {"command": "...", "exit": 0, "summary": "..."},
   "tasks_total": 0,
   "open_questions": [],
+  "carry_forward": [
+    {
+      "archived_origin": "<archived-change-id>",
+      "current_change": "<change-id>",
+      "locus": "path[:symbol]",
+      "observed": "<observed behavior>",
+      "required": "<required behavior>",
+      "evidence": "<command, artifact, or dispatch line observed>",
+      "impact": "<what breaks or what claim becomes false>",
+      "blocks_later_change": false,
+      "disposition": "follow-up|carry-forward|blocks-later-change"
+    }
+  ],
   "deferred": [],
   "summary": "one short sentence"
 }
@@ -113,3 +135,7 @@ The JSON must be the last line and must contain:
 Allowed `status` values are `authored` and `blocked`. A blocked result must
 include `reason` and must not claim that artifacts were written. Do not include
 fields outside this contract.
+
+`carry_forward` SHALL be `[]` when no prior-archived defect was encountered. An
+entry records scope you declined: it is not a task, requirement, or deferred
+scope of `CHANGE`, and it never authorizes editing the archived change.

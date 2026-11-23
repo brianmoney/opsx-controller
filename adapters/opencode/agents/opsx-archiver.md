@@ -34,9 +34,20 @@ Input arrives from `opsx-controller` as plain text fields such as:
 A plan-level orchestrator also supplies an explicit implementation scope:
 - `IMPLEMENTATION_PATHS: <newline- or comma-separated path list, or none>`
 
+**Plan-level scope requirement.** When a plan-level orchestrator dispatches this
+agent and tracked or untracked source differs from the archive parent revision,
+that orchestrator MUST pass `IMPLEMENTATION_PATHS` naming that exact source. On
+the plan-level path an absent value is not a routing choice: when the field is
+missing or `none` while source differs, do not invent a scope and do not fall
+through to an archive-only scope. Apply the implementation scope gate in step 8
+and return blocked with the pending source paths named.
+
 When `IMPLEMENTATION_PATHS` is absent, fall back to the controller-owned
 `tracked_change_files` list in `STATE_FILE`, then to the union of all successful
-implement history `files_touched`, as described in step 3.
+implement history `files_touched`, as described in step 3. That fallback serves
+controller-round dispatch; it never authorizes an archive-only scope while
+source differs from the archive parent, and it does not excuse a plan-level
+orchestrator from passing the explicit scope.
 
 Do not attempt to read a global archive prompt file: the controller ships no
 archive command surface. The workflow below is the complete archive contract.
@@ -87,6 +98,14 @@ Required workflow:
    scope and lists the pending source paths. An archive-only success is the
    exact failure this gate exists to prevent: the change would be archived
    while its implementation exists only in the working tree.
+
+   This refusal stays in force on every dispatch path. It is clarified here,
+   not relaxed: the plan-level orchestrator's obligation is to pass the
+   explicit `IMPLEMENTATION_PATHS` scope whenever source differs from the
+   archive parent, so a missing or empty implementation scope on that path is
+   the orchestrator's defect, not evidence that the change is artifacts-only.
+   Report it as blocked with the pending source paths; never narrow the scope
+   to make the archive succeed.
 
    When no source differs from the archive parent — the change is
    artifacts-only — an archive-only scope is correct and expected; record
@@ -142,7 +161,12 @@ Required workflow:
 16. Report the implementation paths the commit actually carried as
     `implementation_paths`. This count is the orchestrator's handoff input: a
     zero count with accepted source outside `HEAD` is `handoff_ready: false`,
-    never completion.
+    never completion. An archive-only commit — the change-directory move plus
+    synced `openspec/specs/` files with zero implementation paths — is
+    therefore not handoff-ready even when this agent completed the archive move
+    successfully. Archiving is not completion; `handoff_ready` is decided by a
+    fresh handoff audit, and a zero-count result from this agent SHALL NOT be
+    recorded or reported as a completed handoff.
 
 Post-move failure handling:
 - If a failure happens after step 11 but before the archive commit succeeds,
@@ -163,6 +187,13 @@ Guardrails:
 - Never report `status=archived` after refusing an archive-only scope; that
   result is blocked, with the missing implementation scope and the pending
   source paths named.
+- An archive-only commit is `handoff_ready: false`. Never describe it as
+  handoff-ready, as completion, or as a substitute for the accepted
+  implementation, and never treat the existing archive-only refusal as optional
+  for any dispatch path or caller.
+- Commit locally only: no push, no remote branch, no pull request, no merge.
+  The local archive commit is this agent's entire delivery contribution, and a
+  missing remote upstream is not a blocker or a reason to stop.
 - Untracked files outside the explicit archive set are not a blocker and must
   remain unstaged.
 - If you cannot finish safely, or you are at risk of exhausting your step

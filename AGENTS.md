@@ -83,7 +83,11 @@ controller-round `opsx-implementer`/`opsx-reviewer`/`opsx-archiver` set:
 - `opsx-orchestrator` is the plan-level conductor. It holds no shell or edit
   capability and drives a markdown plan change-by-change, dispatching the change
   writer, the implementer, a fresh reviewer, the archiver, and then the
-  Phase Transition Gate.
+  Phase Transition Gate. It drives every change outside the resolved
+  human-gate set end-to-end — authoring, implementation, corrective rounds,
+  evidence disposition, local commits, and whether the next change's authoring
+  may start — and records each decision with its basis. It does not ask the
+  operator for an internal repository, evidence, commit, or intake decision.
 - `opsx-change-writer` authors or amends exactly one change's OpenSpec
   artifacts. It does not implement source, archive, or commit.
 - `opsx-review` is the generic read-only reviewer with acceptance tiers,
@@ -92,11 +96,24 @@ controller-round `opsx-implementer`/`opsx-reviewer`/`opsx-archiver` set:
 - `opsx-integration-auditor` is the fresh, read-only handoff auditor. It proves
   or disproves `handoff_ready` from the committed repository state and never
   edits, stages, commits, pushes, or archives. Its only product is the
-  machine-readable audit report.
+  machine-readable audit report. It checks `local-only-delivery` rather than a
+  pushed branch, treats an unauthored next change as expected (only a
+  planned-slug collision or an unmet dependency fails `next-change-readiness`),
+  and reports an evidence gap as a bounded `repair-evidence` repair or an
+  `unqualified` `carry_forward` record instead of an operator decision. A
+  planned-slug collision is a plan-level `resolve-slug-collision` repair when
+  the occupant is a plan change or declared dependency; an out-of-plan occupant
+  is an `operator-decision` stop because no worker may archive, rename, or
+  rewrite it.
 - `opsx-repo-hygiene` is the scoped handoff writer. It commits exactly the
   accepted implementation pathspecs the auditor named, ignores run-local state,
-  and repairs handoff-blocking scripts or evidence. It refuses to invent scope
-  and never changes product behavior.
+  and repairs handoff-blocking scripts or evidence. It repairs in phases: a safe
+  baseline commit (accepted source, the plan, the `.opsx-run/` ignore entry, a
+  script-path retarget) that proceeds even while an evidence question is still
+  open, then a bounded evidence phase that preserves historical originals
+  byte-for-byte. It refuses to invent scope, never changes product behavior, and
+  amends only a commit it created in the current round while that commit is
+  still `HEAD`.
 
 `opsx-implementer` carries both the original controller-round contract and a
 plan-orchestrator mode; the mode is selected from the input fields. Keep the
@@ -106,14 +123,68 @@ All five are OpenCode-only today. Port them to `core/phase-agents` and the
 other adapters once the shared contracts stabilize; do not hand-edit their
 installed copies under `~/.config/opencode/agents/`.
 
+Autonomy is scoped, not blanket. The orchestrator's stop list for a plan run is
+the optional `human_gates` plan-frontmatter list of exact change slugs, resolved
+as an explicit `HUMAN_GATES` input first, then the frontmatter list, then empty;
+an explicit value replaces the frontmatter list rather than merging with it, and
+an unknown slug is a fail-closed authoring defect. The orchestrator stops before
+a gated change, reports the resume instruction, and does not start a later
+change whose dependency is gated. `human_gates` is a **model-level plan field**
+read by `opsx-orchestrator`, distinct from the **compiled-manifest
+`pause_before` gate** consumed by the deterministic `opsx-plan` / `opsx-run`
+controller: a plan may use both, neither substitutes for the other, and
+`human_gates` adds no manifest key and needs no compile change.
+
+Delivery is local. Commits and amendments are made through `opsx-archiver` and
+`opsx-repo-hygiene` on the local branch: no push, no remote branch, no pull
+request, no merge, and no no-push waiver. A configured upstream, if one happens
+to exist, is informational and changes nothing.
+
+`MAX_DISPATCHES`, the review corrective rounds, and the repair/audit rounds are
+planning allowances, not terminal stops. Before exceeding one, the orchestrator
+records a `cap_override` ledger entry naming the cap and its source, the count
+already consumed, the concrete remaining work, why continuing is safer than
+stopping, and the checkpoint at which it re-evaluates; then it continues. The
+three-dispatch handoff reserve is likewise an allowance: a shortfall is
+recorded, not terminal.
+
+A finding discovered after archive is a carry-forward item, never a reopened
+change. Record the originating archived change, the current change, the locus
+(`path[:symbol]`), observed and required behavior, evidence, impact,
+`blocks-later-change`, and disposition. Do not reopen the archived change, edit
+its archived delta, or insert an unplanned follow-up change mid-plan; report the
+remaining follow-ups once the plan's orchestrator-owned changes finish.
+
 ### Phase Transition Gate
 
 A change is not complete when it is archived; it is complete when the next
 change can start reproducibly from `HEAD`. After archive and before selecting
 the next change, `opsx-orchestrator` dispatches a fresh
-`opsx-integration-auditor`. It advances only on `handoff_ready: true`. A blocked
-audit goes to `opsx-repo-hygiene` with the exact blocker list and then to a fresh
-audit, capped at two repair/audit rounds; a second failure stops the run.
+`opsx-integration-auditor`. It advances only on `handoff_ready: true`.
+A blocked audit goes to `opsx-repo-hygiene` only for the repository repairs it
+names, that is, the blockers whose `repair.owner` is `opsx-repo-hygiene`, and
+never for a plan-reachable `resolve-slug-collision` blocker, which the
+orchestrator resolves at plan level by not starting or authoring the colliding
+change and recording which artifact is authoritative, with no repository
+mutation. An out-of-plan slug occupant is not a repair: it is an
+`operator-decision` stop, because no worker may archive, rename, move, or rewrite
+an external change. A fresh audit follows either repair path. Two repair/audit rounds are a
+planning allowance, not a terminal cap: a further round is permitted with a
+recorded `cap_override`, and the run stops only when no scoped repair remains or
+the blocker needs a human-only decision.
+
+The audit proves reproducibility: clean tracked tree, accepted source and plan at
+`HEAD`, the archive lineage carrying the implementation paths, `.opsx-run/`
+ignored, evidence manifests read from `HEAD`, and perf/evidence scripts that
+do not recreate an archived change directory. It also requires
+`local-only-delivery` (a committed local `HEAD`; an existing upstream is
+informational) and a fresh checkout that can run the focused checks plus
+`openspec validate --all --strict`. Evidence manifests are read from `HEAD`,
+never from the worktree; every indexed entry needs a non-empty `path` and
+`sha256`, and a worktree-only or malformed manifest is blocked rather than
+passed. An unauthored next change is not an intake blocker — its proposal is
+authored after handoff releases it — and only a planned-slug collision or an
+unmet dependency fails `next-change-readiness`.
 
 `handoff_ready` is part of the orchestrator's run ledger, definition of done, and
 final report. The orchestrator SHALL NOT report "no open blockers" while it is
@@ -121,9 +192,10 @@ false or unknown.
 
 An archive-only commit — an archive move plus synced specs with zero
 implementation paths, while accepted source remains outside `HEAD` — is
-`handoff_ready: false`. An operator waiver to archive without committing source
-is recorded verbatim and is a **stop**, not a handoff: the next change starts
-only after the operator grants new authority to commit and a fresh audit passes.
+`handoff_ready: false`, not completion; the existing archive-only refusal
+remains in force. An operator waiver to archive without committing source is
+recorded verbatim and is a **stop**, not a handoff: the next change starts only
+after the operator grants new authority to commit and a fresh audit passes.
 
 ## Maintainer Notes: deploy after every change
 
