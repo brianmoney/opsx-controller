@@ -246,6 +246,23 @@ plan field read by `opsx-orchestrator`, distinct from the compiled-manifest
 `pause_before` gate that `opsx-plan` / `opsx-run` consume: a plan may use both,
 neither substitutes for the other, and `human_gates` adds no manifest key.
 
+Before implementation the orchestrator records a sizing assessment. After two
+corrective rounds it makes an explicit split-or-continue decision before any
+third override: prefer a split when a blocker class reopened, the blockers are
+not shrinking, or the remaining work is orthogonal. A split is allowed only
+from an exact `split_authorizations` frontmatter entry naming the parent, exact
+child slugs, child dependencies, an obligation map assigning every parent
+obligation to one child, and an aggregate exit. `opsx-split-materializer` is the
+single authorized writer: it freezes a restorable donor with source/evidence
+hashes and lineage, revises the tracked plan to contain only the chosen nodes,
+rehomes only the authorized candidate paths, binds a local commit, and verifies
+the compiled graph before any child starts. It never archives or spec-syncs the
+parent and never reuses its checkmarks as child acceptance. General autonomy, a
+cap override, a reviewer verdict, and a supervisor role do not grant split
+authority; without an exact authorization or an authorized materializer, the
+orchestrator returns a concrete proposed re-scope/authority decision rather than
+stopping on a raw round count.
+
 ### Phase Transition Gate
 
 Archiving a change does not make the repository ready for the next one. After

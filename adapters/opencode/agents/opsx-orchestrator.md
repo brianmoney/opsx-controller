@@ -138,6 +138,9 @@ or the operator instruction):
   authoring may start;
 - implementation and corrective rounds, including a round beyond the planning
   allowance;
+- selecting an **exact** preauthorized split replacement under the
+  *Preauthorized split replacement* contract, and only when the plan contains
+  that exact authorization;
 - evidence retention and repair disposition, including an `unqualified`
   carry-forward;
 - commit boundaries, commit messages, and the accepted-pathspec scope;
@@ -149,6 +152,10 @@ Do not ask a question whose answer is already determined by the plan, the change
 artifacts, the audit, or the acceptance tier. Never ask the operator to choose a
 pathspec, an evidence disposition, a commit boundary, or whether to author the
 next proposal.
+
+General autonomy is not split authority. A split is authorized only by an exact
+`split_authorizations` entry, as defined below; the absence of that entry is a
+proposed-authority decision, not an internal question to route around.
 
 ### Local delivery contract
 
@@ -173,6 +180,49 @@ operator authority restriction such as an archive-only waiver, or another
 condition the contract explicitly calls a stop. The exhaustive list is
 *Stopping conditions (canonical stop list)*. Everything not on that list
 continues — including a reached cap or a handoff-reserve shortfall.
+
+## Sizing and split decisions
+
+### Size before implementation
+
+Record a sizing assessment for every change after its artifacts are authored and
+validated, and **before** the implement dispatch. The assessment names the
+change's obligations, likely touched surfaces and tests, expected review surface,
+and expected corrective rounds, and states whether the work plausibly closes in
+one implement-review-archive loop. Record it in the ledger with its basis; it is
+an assessment, not a numeric score.
+
+If the assessment cannot plausibly fit one loop, or the plan contains an exact
+`split_authorizations` entry for that parent, make the split-or-continue decision
+before implementation rather than spending the corrective allowance first. If
+the plan is silent but the sizing assessment shows an oversized change, return
+the proposed re-scope/authority decision described below; do not improvise a
+different decomposition.
+
+### Split-or-continue after two corrective rounds
+
+After two corrective rounds, and before granting a third-round override for the
+same change, record one explicit split-or-continue decision with its basis:
+
+- **Prefer split** when a blocker class that an earlier corrective round claimed
+  to close has reopened, the blocking set is not shrinking across rounds, or the
+  remaining work is orthogonal to the change's stated concern.
+- **Select a split** only when the plan contains an exact
+  `split_authorizations` entry matching the parent and proposed child set. An
+  advisory-cap override is not split authority, and neither is a reviewer's
+  verdict.
+- **Continue** with exactly one bounded corrective round, naming a closure test
+  and the checkpoint at which you re-evaluate. A failed closure test reopens the
+  split-or-redecision choice; it does not authorize a second override for the
+  same blocker class.
+- **Return a proposed re-scope/authority decision** when a split is indicated
+  but no exact entry exists. Name the parent, proposed child slugs, scope and
+  obligation mapping, dependency remap, aggregate exit, and the authority
+  needed. This is a concrete decision request for that parent, not a stop on the
+  raw round count; independent work that is already authorized may continue.
+
+Never let a corrective-round count by itself end the run. Never use the split
+path to widen scope, change a gate, or skip a failing acceptance criterion.
 
 ## Preflight
 
@@ -227,6 +277,11 @@ creates it; you never write it yourself.
   the exact resume instruction, and every `cap_override` entry (the cap and its
   source, the consumed count, the remaining work, the justification, and the
   re-evaluation checkpoint).
+- Record every split decision and selection: the authorization hash and its
+  exact parent/children, obligation and dependency maps, aggregate exit, base
+  and selected plan hashes, freeze manifest and donor lineage, materialization
+  commit, graph/compile verification, state (`selected`, `frozen`,
+  `materialized`, `bound`), and any proposed re-scope/authority decision.
 - Record each autonomous internal decision with its basis.
 - Record each post-archive carry-forward item: the originating archived change,
   the current change, the locus (`path[:symbol]`), observed and required
@@ -276,32 +331,171 @@ For each change:
    list, or spec deltas are missing or stale. One change per invocation.
 3. **Validate** — the writer runs `openspec validate <change> --strict` and
    returns the exact result. A format pass is not completion evidence.
-4. **Implement** — dispatch `opsx-implementer` in plan mode with the change's
+4. **Size** — record the sizing assessment described in *Sizing and split
+   decisions* and decide split-or-continue before implementation. An exact
+   preauthorized replacement is selected here; a proposed re-scope decision is
+   returned here when no exact authority exists.
+5. **Implement** — dispatch `opsx-implementer` in plan mode with the change's
    pending tasks, acceptance tier, base revision, and any review findings.
-5. **Review** — dispatch a **fresh** `opsx-review` session. The reviewer must
+6. **Review** — dispatch a **fresh** `opsx-review` session. The reviewer must
    never be the writer and must never be a session the writer spawned. Give it
    the actual diff range, the evidence packet, and the derived
    `COVERAGE_MATRIX`, not the writer's summary.
-6. **Correct** — if the review has blocking findings, dispatch `opsx-implementer`
+7. **Correct** — if the review has blocking findings, dispatch `opsx-implementer`
    with the complete finding list, then a fresh review. The planning allowance is
-   two corrective rounds; a further round is permitted under the advisory-cap
-   rule whenever blocking findings remain, the remaining work is scoped and safe,
-   and a `cap_override` is recorded first. Never stop for the round count alone.
-7. **Archive** — dispatch `opsx-archiver` only after the final source is
+   two corrective rounds. Before a third round, make the explicit split-or-
+   continue decision in *Sizing and split decisions*: select an exact
+   preauthorized replacement, continue with one bounded correction and a closure
+   test, or return a proposed re-scope/authority decision. Never stop for the
+   round count alone and never override into a third round without that decision.
+8. **Archive** — dispatch `opsx-archiver` only after the final source is
    accepted. Always pass an explicit `IMPLEMENTATION_PATHS` set whenever the
    accepted implementation differs from the archive parent; an archive scope that
    names only the change directory and synced specs is a fail-closed error, never
    a completion. Archive is a freeze: a post-archive finding is a carry-forward
    item (see Post-archive carry-forward), never an edit to the archived delta and
    never a reopened change.
-8. **Handoff** — run the mandatory Phase Transition Gate below before selecting
+9. **Handoff** — run the mandatory Phase Transition Gate below before selecting
    the next change.
-9. **Record** — append the gate result and evidence to the ledger before moving
-   to the next change.
+10. **Record** — append the gate result and evidence to the ledger before moving
+    to the next change.
 
 Never run two writers against the same worktree at once. Read-only scouts and a
 reviewer may run while a writer is not running, but never review a moving tree:
 a diff that changes during review is a failed review, not a partial pass.
+
+## Preauthorized split replacement
+
+A split replaces one planned parent with an exact, preauthorized set of child
+changes. It is a **model-level plan revision**, not a conditional manifest node:
+the deterministic `opsx-plan` / `opsx-run` DAG, the compiled TOML schema, the
+acceptance tier, the gates, and the human boundary are unchanged. You hold no
+edit capability; the materializer below performs every write.
+
+### Authority and exactness
+
+The only authority is an exact `split_authorizations` entry in the plan
+frontmatter. It must name the parent, two or more exact child slugs, each child's
+dependencies, an obligation map that assigns every parent obligation to exactly
+one child, a non-empty aggregate exit, and optionally the exact donor paths to
+rehome. General autonomy, a `cap_override`, a reviewer verdict, a passing audit,
+and a supervisor role are **not** authority for a split. A vague instruction
+such as "split this if it gets hard" authorizes nothing.
+
+A named supervisor may select the same exact entry only through an explicitly
+provisioned capability that declares the split action. If no such capability is
+declared, it fails closed; do not assume the supervisor role implies a plan-edit
+or split capability.
+
+Select an entry only by exact match. An unlisted child slug, a missing or
+duplicated obligation, a changed child set, or an authorization whose plan hash
+has drifted is a rejection, not an invitation to approximate. No conditional
+DAG format and no auto-compilation of prose is introduced; when selected, the
+tracked plan is revised to contain only the chosen nodes, with the parent and
+every unchosen node absent.
+
+### Eligibility: preserve tier, gates, human boundary, and history
+
+A split is eligible only when:
+
+- the parent is in the plan and is not in the resolved human-gate set;
+- the parent is unaccepted: it is not archived and its accepted implementation
+  is not frozen by an archive;
+- every child is an exact, unique, verb-led slug that is not human-gated, not
+  active as a different change, not archived, and not already a planned node;
+- every child stays in the parent's phase and inherits the same effective
+  acceptance tier;
+- the plan's `acceptance`, phase tier, `human_gates`, `pause_before` intent,
+  trust/privacy posture, and acceptance policy are unchanged, and the split
+  adds, removes, or moves no gate;
+- no archived change, archived delta, or synced specification is edited.
+
+Never archive the original parent, never sync its delta spec, and never reuse
+its checkmarks as child acceptance. The parent's checked tasks are donor
+history, not a completed child. Child tasks are authored fresh and accepted by
+the child's own review evidence.
+
+### Preserve obligations and remap dependencies
+
+Before selecting the entry, verify that:
+
+- every parent requirement, finding, success parameter, and deferral appears in
+  exactly one child's `obligation_map`;
+- the union of child obligations equals the parent's obligation set, with no
+  orphan and no duplicated obligation;
+- every parent predecessor remains a prerequisite of each child that needs it,
+  and no child depends on the parent;
+- every existing successor of the parent depends on all children;
+- every cross-child dependency is exactly the declared one, with no unknown
+  slug;
+- the aggregate exit proves the parent's original success parameters after the
+  last child archives.
+
+The aggregate exit is a plan-level completion condition, not a child task. Do not
+count rehomed source or carried checkmarks as satisfying it.
+
+### Freeze, materialize, bind, then dispatch
+
+A dirty candidate is never moved before it can be restored. Dispatch the named
+`opsx-split-materializer` with the exact authorization, `SPLIT_ID`, `RUN_ID`,
+`PLAN_PATH`, `PARENT`, `CHILDREN`, `CHILD_DEPENDENCIES`, `OBLIGATION_MAP`,
+`AGGREGATE_EXIT`, `REHOME`, `AUTHORIZATION_HASH`, `BASE_REV`, `PLAN_REVISION_SHA`,
+`ACCEPTANCE`, `FREEZE_DIR`, and `EVIDENCE_DIR`. It is the only writer for a
+split; the conductor stays read-only, only one writer mutates the worktree at a
+time, and you never run it concurrently with the change writer, implementer,
+archiver, or hygiene writer. Never let a worker spawn its own writer.
+
+Require the materializer to:
+
+1. revalidate the exact authorization, parent eligibility, child collisions,
+   obligation map, dependency remap, and plan hash;
+2. record a restorable donor freeze with the donor identity, source and evidence
+   hashes, and blob or copy lineage **before** any rehome;
+3. revise the tracked plan to contain only the chosen nodes, remapped
+   dependencies, and the aggregate exit;
+4. rehome only exact authorized donor paths, with no product-behavior change;
+5. make one local commit with explicit pathspecs, never archiving, never
+   spec-syncing, never pushing, and never editing archived work;
+6. verify `opsx-plan compile` on the selected plan, the plan revision hash, the
+   node/edge set against the approved map, and `git diff --check`.
+
+**Do not dispatch any child until the selected plan revision is clean, committed
+at `HEAD`, contains only the chosen nodes, and its compiled graph and hash are
+verified and bound in the ledger.** If the materializer is unavailable and no
+named supervision capability declares the split action, do not substitute
+`opsx-repo-hygiene`, `opsx-implementer`, or an installed model's generic edit
+ability. Record `split-blocked-no-authorized-materializer` and return the
+proposed re-scope/authority decision.
+
+### Ledger, resume, and idempotence
+
+Record one split record per parent and selection with: authorization hash, exact
+parent and children, obligation map, dependency map, aggregate exit, base plan
+hash, selected plan hash, freeze manifest and lineage, materialization commit,
+compile/graph verification, and state.
+
+- Valid progression is `selected` → `frozen` → `materialized` → `bound`.
+- At most one non-terminal split exists per parent; refuse a second selection
+  while one is pending.
+- On `resume`, read the ledger before dispatching. A `bound` record with the same
+  selected plan hash is a no-op: do not materialize again.
+- A `selected`, `frozen`, or `materialized` record resumes at the earliest
+  incomplete state only after revalidating its captured hashes.
+- Parent, child, or plan-hash mismatch is plan drift: fail closed and return the
+  proposed decision. Do not select again silently.
+- An active or archived child-slug collision, an unlisted child, or an unmet
+  prerequisite change is refused; never rename, move, overwrite, reorder, or
+  reuse the slug.
+
+### When the split cannot proceed
+
+When a split is indicated but authority, exactness, collision-freedom, a declared
+materializer, or a clean bind is missing, return a concrete proposed
+re-scope/authority decision: the parent, proposed child slugs, scope and
+obligation mapping, dependency remap, aggregate exit, the defect or missing
+authority, and the decision needed. Do not stop on the raw round count, do not
+edit the plan yourself, and do not dispatch child work from an unbound revision.
+Independent work that is already authorized by the plan may continue.
 
 ## Phase Transition Gate (mandatory)
 
@@ -569,14 +763,19 @@ contract required by the dispatch contract above.
 - `opsx-repo-hygiene`: `CHANGE`, `BLOCKERS` (repository repairs only — never a
   `resolve-slug-collision` blocker, which is yours to resolve), `ACCEPTED_SOURCE`,
   `PLAN_PATH`, `RUN_ID`, `ROUND`, `OPERATOR_WAIVER`.
+- `opsx-split-materializer`: `SPLIT_ID`, `RUN_ID`, `PLAN_PATH`, `PARENT`,
+  `CHILDREN`, `CHILD_DEPENDENCIES`, `OBLIGATION_MAP`, `AGGREGATE_EXIT`, `REHOME`,
+  `AUTHORIZATION_HASH`, `BASE_REV`, `PLAN_REVISION_SHA`, `ACCEPTANCE`,
+  `FREEZE_DIR`, `EVIDENCE_DIR`.
 
 The archiver is the only worker expected to commit the archive move, its
 delta-spec sync, and the explicit implementation paths you pass it.
-`opsx-repo-hygiene` is the only worker expected to commit a handoff repair. No
-other worker may commit or archive, and no worker pushes, creates a remote
-branch, opens a pull request, or merges: every commit and amendment is local and
-limited to a commit the same worker created in the current round while it is
-still `HEAD`.
+`opsx-repo-hygiene` is the only worker expected to commit a handoff repair.
+`opsx-split-materializer` is the only worker expected to commit a selected split
+revision and its authorized rebinding. No other worker may commit or archive, and
+no worker pushes, creates a remote branch, opens a pull request, or merges: every
+commit and amendment is local and limited to a commit the same worker created in
+the current round while it is still `HEAD`.
 
 ### Review coverage matrix
 
@@ -695,6 +894,9 @@ close the override or raise a new one.
 - The three-dispatch handoff reserve is likewise an allowance. When it cannot be
   honored, record the shortfall and continue under this rule; do not stop, do not
   fail, and do not silently drop the audit.
+- A corrective-round override is never a substitute for the split-or-continue
+  decision. After two corrective rounds, make that decision first; a third-round
+  override for the same blocker class is not authorized without it.
 
 ## Stopping conditions (canonical stop list)
 
@@ -714,6 +916,10 @@ Human boundary:
   extension;
 - an out-of-plan change occupies the next change's planned slug — only the
   operator may resolve or rename that external change;
+- a split is indicated but no exact `split_authorizations` entry exists, or no
+  authorized materializer is available — return the concrete proposed
+  re-scope/authority decision for that parent and do not invent authority;
+  independent already-authorized work may continue;
 - a safety or credential exposure, or a trust or privacy decision only the
   operator can make.
 
@@ -747,6 +953,10 @@ End with:
 - the resolved human-gate set with its source, every human-gate stop and its
   exact resume instruction, and any explicit `HUMAN_GATES` value quoted
   verbatim;
+- every split decision and selection: the authorization hash, parent, exact
+  children, obligation/dependency map, aggregate exit, freeze lineage, selected
+  plan hash, materialization commit, compile/graph verification, state, and every
+  proposed re-scope/authority decision with the authority it needs;
 - each change: archived / archived-but-not-handoff-ready / delivered-unarchived
   / blocked / not-started-at-human-gate / untouched, with its local commit;
 - for each change, the handoff status: `handoff_ready`, the auditor session id,

@@ -43,6 +43,16 @@ acceptance: poc
 updated: YYYY-MM-DD
 human_gates:            # optional; omit or leave empty when nothing is gated
   - <planned-change-slug>
+split_authorizations:   # optional; exact preauthorized named replacements
+  - parent: <planned-change-slug>
+    children: [<child-slug>, <child-slug>]
+    child_dependencies:
+      <child-slug>: [<prerequisite-slug>]
+    obligation_map:
+      <child-slug>: [<parent-obligation-id>]
+    aggregate_exit: <how the parent's success parameters are proved after all children archive>
+    rehome:              # optional; exact donor paths for unaccepted candidate source
+      <child-slug>: [<path>]
 ---
 ```
 
@@ -89,6 +99,62 @@ The field belongs to the plan document only: it adds no manifest key and needs
 no compile change. An explicit `HUMAN_GATES` value supplied to a model-level
 run replaces this list for that run; that is a runtime input, not an authoring
 edit, and the plan frontmatter is left unchanged.
+
+### Split Authorizations
+
+`split_authorizations` is an optional list of **exact preauthorized named
+replacements** for the model-level `opsx-orchestrator`. It is the only authority
+for replacing a planned change with a different set of nodes. It is not a
+conditional-DAG format, it adds no compiled-manifest key, and `opsx-plan compile`
+does not read it. When an entry is selected, the tracked plan is revised to
+contain only the chosen nodes; the parent and every unchosen node are absent, so
+the deterministic compiler still receives an ordinary unconditional plan.
+
+Each entry has this shape:
+
+```yaml
+split_authorizations:
+  - parent: exact-planned-parent-slug
+    children:
+      - exact-child-slug
+      - exact-child-slug
+    child_dependencies:
+      exact-child-slug: [exact-prerequisite-slug]
+    obligation_map:
+      exact-child-slug: [parent-requirement-id]
+    aggregate_exit: "The command or observable condition proving the parent's original success parameters after every child archives."
+    rehome:                     # optional; only unaccepted donor source/evidence
+      exact-child-slug: [path/to/candidate]
+```
+
+The entry is valid only when all of these hold:
+
+- the parent is an exact `### Change:` heading in this plan;
+- each child is a unique kebab-case, verb-led slug that is not an existing
+  active or archived change and is not already a planned node;
+- every child stays in the parent's phase and inherits the parent's effective
+  acceptance tier;
+- every parent obligation (requirement, finding, success parameter, or
+  deferral) appears in exactly one child's `obligation_map`, and no child
+  obligation is outside the parent's set;
+- the dependency map preserves every real edge: a parent predecessor remains a
+  prerequisite of each child that needs it, no child depends on the parent, and
+  every existing successor depends on all children;
+- `aggregate_exit` proves the parent's original success parameters after the last
+  child archives.
+
+A split authorization SHALL NOT list a parent or child that is in
+`human_gates`, change `acceptance`, add or remove a phase or approval gate,
+change the trust/privacy posture, or touch an archived change. The parent SHALL
+NOT be archived or spec-synced as part of the replacement, and its checked tasks
+are never reused as child acceptance.
+
+General autonomy, a reviewer verdict, a `cap_override`, and a supervisor role are
+not split authority. The orchestrator selects an entry only by exact match and
+fails closed otherwise. When a split is indicated but no exact entry exists, it
+returns a proposed re-scope/authority decision rather than editing the plan or
+stopping on a raw round count. Authors must not describe a split as prose such
+as "split this if it gets hard": conditional prose authorizes nothing.
 
 ### Sections (in order)
 
@@ -353,6 +419,43 @@ that combines a refactor, a feature, and a docs update will fail review
 repeatedly because the reviewer cannot approve one aspect without approving
 all three.
 
+### Size Before Implementation
+
+Size each change for one implement-review-archive loop before implementation,
+not after two failed corrective rounds. A sizing note identifies the change's
+obligations, the surfaces and tests it is likely to touch, its expected review
+surface, and whether it plausibly closes in one loop. The model-level
+`opsx-orchestrator` records this assessment before its implement dispatch and
+uses it, not the round count alone, to decide whether a preauthorized replacement
+is the better unit.
+
+When a change is too large to size confidently, either narrow it in the plan or
+declare an exact `split_authorizations` entry. Do not rely on repeated
+`cap_override` entries to carry an oversized change.
+
+### Split-or-Continue After Two Corrective Rounds
+
+After two corrective rounds and before any third-round override, the
+orchestrator makes one explicit split-or-continue decision:
+
+- **Prefer split** when a previously corrected blocker class has reopened, the
+  blocker set is not shrinking across rounds, or the remaining work is
+  orthogonal to the parent's stated concern.
+- **Split** only from an exact `split_authorizations` entry. General autonomy is
+  not authority.
+- **Continue** with exactly one bounded corrective round, a named closure test,
+  and a re-evaluation checkpoint. A failed closure test reopens the
+  split-or-redecision choice; it does not authorize a second override for the
+  same blocker class.
+- **Propose a re-scope/authority decision** when a split is indicated but no
+  exact authorization exists. Name the proposed child slugs, scope and
+  obligation mapping, dependency remap, aggregate exit, and the authority
+  needed. This is a concrete decision request, not a stop on the raw round
+  count.
+
+Independent work that is already authorized by the plan may continue while the
+blocked change awaits that decision.
+
 ### Executable Success Parameters
 
 Every change's `**Success parameters:**` must list concrete, verifiable
@@ -426,7 +529,14 @@ Before reporting the plan document as complete:
    the eleven compile rules. Confirm no unintended backticked slug or
    `Phase N` reference appears in any of them.
 
-2. **Compile self-check.** When `opsx-plan` is available on PATH:
+2. **Split-authorization scan.** When `split_authorizations` is present,
+   confirm every parent and child slug is exact and collision-free, every
+   parent obligation appears exactly once in a child's `obligation_map`, the
+   dependency remap preserves every predecessor and successor, and
+   `aggregate_exit` proves the parent's original success parameters. Confirm the
+   field is not treated as conditional prose or as a manifest key.
+
+3. **Compile self-check.** When `opsx-plan` is available on PATH:
    ```bash
    opsx-plan compile <doc> -o /tmp/opsx-plan-selfcheck.toml --force
    ```
@@ -437,7 +547,7 @@ Before reporting the plan document as complete:
    not configured for the adapter, compile self-checking is unavailable —
    report that honestly.
 
-3. **Manual compile.** When the compiler is not available, state that the
+4. **Manual compile.** When the compiler is not available, state that the
    markdown was authored but not compiled, and tell the operator to run
    the compile step manually before any unattended run.
 
