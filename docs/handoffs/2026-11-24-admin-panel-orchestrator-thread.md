@@ -248,3 +248,13 @@ change.
 the run is intentionally stopped before H; the next decision is whether to
 implement the convergence controls before resuming H, and the immediate open
 conflict is `add-plan-convergence-controls` versus `add-adaptive-plan-splitting`.**
+
+## 10. Status update — 2026-11-24 (second session)
+
+- `add-adaptive-plan-splitting` is **merged** (PR #43: `2518832` + archive `a40ba54` + `8a66a47` authorization-hash tests). §1/§5 of this handoff are superseded.
+- `add-plan-convergence-controls` was amended on `feat/plan-convergence-controls` (`ece6e1c`) after four design decisions were settled with the operator. It now carries 19 deltas (15 added, 3 modified, 1 renamed) and 58 tasks; `openspec validate --all --strict` 30/30. Still unimplemented.
+- Settled decisions: (1) controller policy is a floor; an accepted plan may tighten but never loosen it; (2) `opsx-split-materializer` is the sole executor of every structural split — an unpreauthorized split is permitted only where the plan's own text permits it, with the change-writer authoring to the same exactness invariants; (3) split children inherit corrective-round consumption by blocker class (no budget reset); (4) H was pre-authorized for split (below).
+- §5's conflict is resolved in the amended change: the adaptive spec requirement is renamed to "split-or-re-scope" via delta; the bounded-continue option is removed; proposed re-scope/authority decisions are recorded, never terminal stops.
+- D's 5-dispatch handoff overrun was never labeled `cap_override`: `events.jsonl` seq 76 (reserve shortfall) and seq 78 (closed overrun of 2, not a waiver) carry the substance without the label. The run's 8 actual cap_override entries all named the corrective-round allowance (A, B, E×2, G×2, I×2) — the pattern convergence-controls removes.
+- Plan amendment (admin repo commit `8e8468bc`): `qualify-admin-panel-read-ui` now has an exact `split_authorizations` entry (children `qualify-admin-panel-harness-proofs`, `qualify-admin-panel-cold-evidence`). Plan sha256 is now `b1bf41d3677c8945a0afdd82fd313990ef93235a9202b2379ec5530268c809ac` (was `7b5c031c…`). The fresh orchestrator session must re-bind the plan revision hash at resume.
+- Next: implement `add-plan-convergence-controls` (58 tasks) → `bash install.sh --global --verify` → fresh orchestrator session resumes H under the new policy → phase 3 `add-admin-panel-actions` → stop at the phase-4 human gate.
