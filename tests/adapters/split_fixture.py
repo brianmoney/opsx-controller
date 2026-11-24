@@ -14,7 +14,8 @@ stdlib-only:
 * dependency remap and aggregate exit;
 * freeze-before-rehome, named materializer availability, and no child dispatch
   before a clean bound revision;
-* ledger selection/resume/idempotence and fail-closed plan drift;
+* ledger selection/resume/idempotence and fail-closed plan or authorization
+  drift;
 * the after-two-rounds split-or-continue decision.
 
 The tests that use this fixture prove the rules above. They do **not** prove
@@ -161,6 +162,7 @@ class SplitSpec:
     authority: str = "plan"
     plan_hash: str = "plan-h1"
     bound_plan_hash: str = "plan-h1"
+    authorization_hash: str = "auth-1"
     parent_accepted: bool = False
     parent_archived: bool = False
     parent_spec_synced: bool = False
@@ -399,6 +401,15 @@ def validate_split(spec: SplitSpec) -> SplitDecision:
     for record in spec.ledger:
         if record.state not in VALID_STATES:
             return _fail(spec, f"invalid-ledger-state: {record.state}")
+        if (
+            record.parent == spec.parent
+            and record.authorization_hash != spec.authorization_hash
+        ):
+            return _fail(
+                spec,
+                "authorization-hash-mismatch: ledger authorization differs from "
+                "the current selection",
+            )
         if record.parent == spec.parent and record.state != "bound" and record.plan_hash != spec.plan_hash:
             return _fail(spec, "plan-drift: ledger state hash differs")
     if bound:

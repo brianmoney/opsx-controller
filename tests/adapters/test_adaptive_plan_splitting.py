@@ -870,6 +870,45 @@ class SplitEligibilityTransitionTests(unittest.TestCase):
         self.assertTrue(decision.ok, decision.reasons)
         self.assertEqual(decision.resume_from, "materialized")
 
+    def test_authorization_hash_mismatch_is_refused(self) -> None:
+        for state in ("frozen", "materialized", "bound"):
+            with self.subTest(state=state):
+                self.assertFails(
+                    replace(
+                        fx.SplitSpec(),
+                        authorization_hash="auth-2",
+                        ledger=(
+                            fx.SplitRecord(
+                                parent=fx.PARENT,
+                                state=state,
+                                plan_hash="plan-h1",
+                                authorization_hash="auth-1",
+                            ),
+                        ),
+                        new_selection=False,
+                    ),
+                    "authorization-hash-mismatch",
+                )
+
+    def test_resume_accepts_a_matching_authorization_hash(self) -> None:
+        decision = fx.validate_split(
+            replace(
+                fx.SplitSpec(),
+                authorization_hash="auth-7",
+                ledger=(
+                    fx.SplitRecord(
+                        parent=fx.PARENT,
+                        state="frozen",
+                        plan_hash="plan-h1",
+                        authorization_hash="auth-7",
+                    ),
+                ),
+                new_selection=False,
+            )
+        )
+        self.assertTrue(decision.ok, decision.reasons)
+        self.assertEqual(decision.resume_from, "frozen")
+
     def test_invalid_ledger_state_is_refused(self) -> None:
         self.assertFails(
             replace(
