@@ -48,15 +48,45 @@
   endpoints, acceptance scenarios, task count, expected diff size, the mandatory
   API + CLI + page + freshness + error-taxonomy split, and the requirement that
   the command record and report the assessment.
-- [ ] 1.7 Reconcile the in-flight adaptive-splitting contract if it is present:
-  in `tests/adapters/test_adaptive_plan_splitting.py`, keep every split
-  authority, obligation, freeze, materialization, and idempotence assertion,
-  and replace the "continue permits one bounded corrective round" assertion with
-  "continue is replaced by autonomous split or re-scope; there is no
-  operator-authorization path". Do not duplicate,
-  rename, or re-implement `tests/adapters/split_fixture.py`, and do not edit
-  `openspec/changes/add-adaptive-plan-splitting/` in this change.
-- [ ] 1.8 Confirm the new test package is discovered: `tests/adapters/` already
+- [ ] 1.7 Reconcile the merged adaptive-splitting contract. Its normative text is
+  `openspec/specs/adaptive-plan-splitting/spec.md`; the archived
+  `add-adaptive-plan-splitting` change copy is historical and gitignored — do
+  not edit it, and do not recreate `openspec/changes/add-adaptive-plan-splitting/`.
+  In `tests/adapters/test_adaptive_plan_splitting.py` and
+  `tests/adapters/split_fixture.py`, keep every split authority, obligation,
+  freeze, materialization, resume, and idempotence assertion, and replace the
+  retired bounded-continue outcome and its assertions with the new decision
+  outcomes:
+  - `split_fixture.decide_convergence` returns `split`, `rescope`, or
+    `carry-forward` after two corrective rounds (and the pre-budget
+    `within-planning-allowance` result before that); it never returns
+    `bounded-continue`, never authorizes a third corrective round, and records a
+    proposal reason instead of returning a terminal decision kind.
+  - Extend `ConvergenceFacts` for the new facts it now reads: whether the plan
+    permits an unpreauthorized split, whether the plan reserves split approval to
+    the operator, and the inherited corrective-round consumption by blocker
+    class; leave the split-preference trigger facts unchanged.
+  - The reference phrase list (~L234) asserts the split-or-re-scope wording, the
+    refusal of a third corrective round, the plan-permission gate for an
+    unpreauthorized split, the recorded-not-returned proposal, and blocker-class
+    budget inheritance, and no longer asserts
+    "exactly one bounded corrective round, naming a closure test".
+  - `ConvergenceDecisionTests` (~L890-945) replaces
+    `test_continue_is_one_bounded_correction_with_a_closure_test` and
+    `test_no_closure_test_or_prior_override_returns_proposed` with assertions
+    that a third-round override is refused, a plan-permitted unpreauthorized
+    split is authored then materialized, a plan-reserved split approval is
+    honored instead of split autonomously, split children inherit consumed rounds
+    by blocker class, and a proposal is recorded while independent work
+    continues.
+  Edit `split_fixture.py` in place; do not create a parallel fixture, a second
+  convergence model, or a competing decision protocol.
+- [ ] 1.8 At archive time, refresh the merged
+  `openspec/specs/adaptive-plan-splitting/spec.md` Purpose sentence from
+  "split-or-continue decision" to "split-or-re-scope decision". A spec delta
+  cannot modify Purpose (OpenSpec ignores a delta Purpose for an existing spec),
+  so this is a direct prose edit of the merged spec, not a delta entry.
+- [ ] 1.9 Confirm the new test package is discovered: `tests/adapters/` already
   has `__init__.py`; run `python3 -m unittest
   tests.adapters.test_plan_convergence_controls` from the repository root and
   fix discovery or imports before proceeding.
@@ -65,11 +95,17 @@
 
 - [ ] 2.1 In `adapters/opencode/agents/opsx-orchestrator.md`, replace the
   post-two-round "continue with one bounded corrective round" text with the
-  two-round default: split from an exact `split_authorizations` entry or the
-  plan's scope-preserving split rules, re-scope/narrow and carry the remainder
+  two-round default: split from an exact `split_authorizations` entry or under
+  the plan's own split permission, re-scope/narrow and carry the remainder
   forward, then continue. State that a third-round `cap_override` is refused,
   that there is no operator-authorization path, and that no terminal decision
-  request is returned.
+  request is returned. The same edit SHALL also state: the precedence rule
+  (controller specs set the floor; a plan may tighten but never loosen them; the
+  tighter rule governs), that `opsx-split-materializer` is the sole executor of
+  every structural split, that split children inherit the parent's
+  corrective-round consumption by blocker class, and that a proposed
+  re-scope/authority decision is a recorded ledger artifact rather than a
+  terminal stop.
 - [ ] 2.2 Add a `## Review convergence and finding classification` section to
   `adapters/opencode/agents/opsx-orchestrator.md` defining
   `introduced_by_diff`, `adjacent_scope`, and `pre_existing`, the precedence
@@ -80,11 +116,15 @@
   the three-or-more-uncorrelated-loci trigger, the three-or-more unprovable
   acceptance scenarios trigger, and the rule that the split-or-re-scope
   decision happens before any corrective dispatch. Link it to the exact
-  `split_authorizations` entry and the plan's scope-preserving split rules. If
-  the baseline does not provide `split_authorizations` or
-  `opsx-split-materializer`, use the plan rules with the standard change-writer;
-  if no split rule covers the remainder, narrow and carry forward. Do not ask
-  the operator and do not invent a materializer or a plan edit.
+  `split_authorizations` entry and the plan's own split permission.
+  `opsx-split-materializer` always executes a structural split; where no exact
+  authorization exists, the standard change-writer may author the child set only
+  where the plan's own split rules or text permit an unpreauthorized split, held
+  to the same exactness invariants (obligation map, dependency remap, aggregate
+  exit). Where the plan reserves split approval to the operator, honor the
+  plan's declared checkpoint; otherwise narrow and carry forward. Never ask the
+  operator for a convergence decision, and never invent a materializer or a plan
+  edit.
 - [ ] 2.4 Add a `## Operator attestation` section to
   `adapters/opencode/agents/opsx-orchestrator.md` with the record fields
   `subject`, `statement`, `scope`, `source`, and `recorded_at`; state that a
@@ -128,9 +168,11 @@
 - [ ] 2.11 Update `## Stopping conditions (canonical stop list)` in
   `adapters/opencode/agents/opsx-orchestrator.md`: remove the generic
   corrective-round cap from the "never stop" list, add "a corrective budget
-  exhausted with no split authorization uses the plan split rules or narrows and
-  carries forward, then continues; it is not a raw-count stop and does not ask
-  the operator", and keep dispatch and repair caps on the never-stop list.
+  exhausted with no split authorization uses the plan's own split permission
+  through `opsx-split-materializer`, or narrows and carries forward, then
+  continues; it is not a raw-count stop, records rather than returns a proposed
+  decision, and does not ask the operator", and keep dispatch and repair caps on
+  the never-stop list.
 - [ ] 2.12 Update `## Final report` in
   `adapters/opencode/agents/opsx-orchestrator.md` to include the convergence
   decision and basis, finding classification counts, operator attestations
@@ -250,9 +292,11 @@
   error taxonomy and for three or more named surfaces.
 - [ ] 7.2 In `core/plan-authoring.md`, make the split checkpoint the default
   response to an oversized change, not another review override; require an
-  exact `split_authorizations` entry when one exists, otherwise an autonomous
-  split under the plan rules or narrowing/carry-forward, and forbid leaving the
-  oversized change for corrective rounds.
+  exact `split_authorizations` entry when one exists, otherwise a split only
+  where the plan's own rules or text permit it, executed by
+  `opsx-split-materializer` with children authored to authorization-equivalent
+  exactness, or narrowing/carry-forward, and forbid leaving the oversized change
+  for corrective rounds.
 - [ ] 7.3 In `core/plan-authoring.md`, require the surface assessment in the
   change section or authoring response and require the error taxonomy,
   scope/registry cases, cache invariants, parity checks, and guards to be
@@ -272,7 +316,9 @@
   two-round corrective budget, finding classification, broad-first-review split
   checkpoint, operator attestation, bounded bookkeeping, cost/burn reporting,
   stale-idle handling, and maximum surface heuristic. Keep the existing split
-  authority and human-gate rules intact.
+  authority, `human_gates`, and Phase Transition Gate rules intact, and add the
+  precedence rule that controller specs set the floor while a plan may tighten
+  but never loosen them.
 - [ ] 8.2 Update `README.md` with the convergence policy and the statement that
   a third corrective round is not an advisory-cap override. Keep the Phase
   Transition Gate and archive-only stop language.
@@ -291,7 +337,10 @@
 
 - [ ] 9.1 Run `python3 -m unittest discover -t . -s tests` and `node
   tests/opencode/test-opsx-usage-emitter.js` from the repository root; both
-  pass.
+  pass. After the 1.7 reconciliation, also run the focused file
+  `python3 -m unittest tests.adapters.test_adaptive_plan_splitting` and confirm
+  every retained split authority, obligation, freeze, materialization, resume,
+  and idempotence test still passes.
 - [ ] 9.2 Run `python3 scripts/generate-phase-agents.py --check`; no drift.
 - [ ] 9.3 Run `bash install.sh --global --only opencode --verify` into a
   temporary `HOME` under `/tmp/opencode`; confirm the updated orchestrator,
@@ -300,7 +349,15 @@
 - [ ] 9.4 Confirm the temporary-`HOME` install reports verification success and
   does not modify this repository's worktree.
 - [ ] 9.5 Run `openspec validate add-plan-convergence-controls --strict` and
-  confirm it passes with no warnings.
-- [ ] 9.6 After merge, the maintainer re-runs `bash install.sh --global
+  confirm it passes with no warnings, including the new
+  `specs/adaptive-plan-splitting/spec.md` delta. Confirm that delta parses as a
+  `RENAMED` + `MODIFIED` pair (new header *Two corrective rounds trigger an
+  explicit split-or-re-scope decision*) and not as a fallback, and that
+  `openspec change show add-plan-convergence-controls --json --deltas-only`
+  reports 15 added, 3 modified, and 1 renamed delta.
+- [ ] 9.6 Run `openspec validate --all --strict` and confirm every capability
+  and change validates, so the added `adaptive-plan-splitting` delta does not
+  disturb the merged spec.
+- [ ] 9.7 After merge, the maintainer re-runs `bash install.sh --global
   --verify` on the real machine to deploy the updated agents and reference
   (manual).

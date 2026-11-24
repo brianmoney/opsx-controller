@@ -41,7 +41,7 @@ round, and a `cap_override` that names a corrective round SHALL be refused.
 - **WHEN** the two-round corrective budget is exhausted and `MAX_DISPATCHES`
   still has headroom
 - **THEN** the orchestrator does not create a `cap_override` for a third
-  corrective round, and selects the split-or-authorize path instead
+  corrective round, and selects the split-or-re-scope decision instead
 
 ## ADDED Requirements
 
@@ -60,10 +60,17 @@ SHALL NOT grant a third corrective round by default and SHALL NOT stop or ask th
 operator for convergence authorization. It SHALL choose exactly one autonomous
 action:
 
-1. **Split** — select an exact `split_authorizations` entry for the parent and
-   materialize it through the authorized split path when available; otherwise
-   use the plan's scope-preserving split rules and split checkpoints to create
-   replacement slices.
+1. **Split** — `opsx-split-materializer` SHALL execute every structural split.
+   When the plan contains an exact `split_authorizations` entry for the parent,
+   the orchestrator SHALL select that exact entry and materialize it through
+   `opsx-split-materializer`. When it does not, the orchestrator SHALL split only
+   where the plan's own split rules or plan text permit an unpreauthorized
+   split; the standard change-writer then authors the child set to
+   authorization-equivalent exactness — a complete obligation map, a dependency
+   remap, and an aggregate exit — and the materializer executes it. Where the
+   plan reserves split approval to the operator, the orchestrator SHALL NOT
+   split autonomously; it SHALL honor the plan's declared operator checkpoint,
+   re-scope, or carry forward.
 2. **Re-scope** — narrow the current change to its accepted surface, carry the
    remainder forward as a new slice with an explicit obligation mapping, and
    continue.
@@ -72,9 +79,19 @@ action:
    continue with independent authorized work.
 
 The orchestrator SHALL record the split/re-scope/carry-forward decision in the
-ledger before dispatching the next stage. It SHALL NOT widen scope, change a
-gate, skip a failing acceptance criterion, or create an unplanned requirement to
-avoid the decision.
+ledger before dispatching the next stage. A proposed re-scope/authority decision
+SHALL be recorded there too, naming the parent, the proposed child set, the
+obligation and dependency mapping, the aggregate exit, and the missing authority
+or plan permission; it SHALL NOT be returned as a terminal stop. The orchestrator
+SHALL NOT widen scope, change a gate, skip a failing acceptance criterion, or
+create an unplanned requirement to avoid the decision, and SHALL NOT invent a
+materializer or a plan edit.
+
+A child of a split SHALL inherit the parent's corrective-round consumption by
+blocker class: a blocker class that consumed a corrective round in the parent
+SHALL NOT receive a fresh two-round budget in a child, while a blocker class
+introduced by a child's own diff accrues under that child's budget. The ledger
+SHALL record the inherited classes and their consumed counts per child.
 
 A split, re-scope, or carry-forward that would change requirements, human gates,
 or acceptance tiers is outside this authority. In that case the orchestrator
@@ -94,12 +111,33 @@ remain advisory and do not authorize a third corrective round.
   and continues, without asking the operator and without granting a third
   corrective round
 
-#### Scenario: No exact split authorization uses the plan rules
+#### Scenario: No exact split authorization uses the plan's own split permission
 - **WHEN** two corrective rounds are exhausted and the plan has no exact
-  `split_authorizations` entry but has scope-preserving split rules and
-  checkpoints
-- **THEN** the orchestrator performs the split or re-scope under those rules,
-  records the obligation mapping, and continues
+  `split_authorizations` entry but its own split rules or text permit an
+  unpreauthorized split
+- **THEN** the standard change-writer authors the child set with a complete
+  obligation map, a dependency remap, and an aggregate exit,
+  `opsx-split-materializer` executes it, and the orchestrator continues
+
+#### Scenario: A plan-reserved split approval is honored
+- **WHEN** two corrective rounds are exhausted, a split is indicated, and the
+  plan reserves split approval to the operator
+- **THEN** the orchestrator does not split autonomously; it honors the plan's
+  declared checkpoint, or narrows to the accepted surface and carries the
+  remainder forward, and it does not invent a materializer or a plan edit
+
+#### Scenario: A split child inherits the parent's consumed rounds
+- **WHEN** a corrective round was spent on a blocker class in the parent and a
+  child owns that blocker class's obligation
+- **THEN** the child's ledger record inherits the consumed count for that class
+  and the child does not receive a fresh two-round budget for it
+
+#### Scenario: A proposed decision is recorded, not returned as a stop
+- **WHEN** a split is indicated and neither an exact authorization nor a plan
+  split permission exists
+- **THEN** the orchestrator records the proposed re-scope/authority decision in
+  the ledger, narrows or carries forward as the plan permits, and continues
+  instead of returning a terminal stop
 
 #### Scenario: Split is not permitted, carry forward and continue
 - **WHEN** two corrective rounds are exhausted and neither a split nor a
@@ -221,19 +259,24 @@ exceeds the maximum surface heuristic before the first review runs. The
 checkpoint is evaluated at the earliest evidence, not only after two failed
 rounds.
 
-When an exact `split_authorizations` entry exists and an authorized
-materialization path is available, the orchestrator SHALL select and materialize
-it before any further correction.
+When an exact `split_authorizations` entry exists, the orchestrator SHALL select
+that entry and `opsx-split-materializer` SHALL execute the split before any
+further correction.
 
-When no exact authorization exists, or no authorized materializer is available,
-the orchestrator SHALL perform the split or re-scope under the plan's
-scope-preserving split rules and split checkpoints using the standard
-change-writer, then continue. It SHALL NOT return a terminal proposed decision
-and SHALL NOT ask the operator to authorize the split.
+When no exact authorization exists, the orchestrator SHALL split only where the
+plan's own split rules or text permit an unpreauthorized split. In that case the
+standard change-writer SHALL author the child set to the same exactness
+invariants — a complete obligation map, a dependency remap, and an aggregate
+exit — and `opsx-split-materializer` SHALL execute the split. Where the plan
+reserves split approval to the operator, the orchestrator SHALL honor the plan's
+declared checkpoint instead of splitting autonomously.
 
-When the plan has no split rule that covers the remainder, the orchestrator SHALL
-narrow the current change to its accepted surface, carry the remainder forward as
-a new slice or follow-up, and continue with independent work.
+When no materializer is available, or the plan permits neither an exact
+authorization nor an unpreauthorized split, the orchestrator SHALL re-scope:
+narrow the current change to its accepted surface, carry the remainder forward
+as a new slice or follow-up, and continue with independent work. It SHALL NOT
+return a terminal proposed decision, SHALL NOT ask the operator to authorize the
+split, and SHALL NOT improvise a materializer or a plan edit.
 
 A reviewer verdict, a `cap_override`, or general autonomy SHALL NOT substitute
 for the plan's split rules or for a change to requirements, acceptance tiers, or
@@ -257,17 +300,19 @@ human gates.
 - **THEN** the orchestrator selects and materializes the replacement before any
   further correction
 
-#### Scenario: No exact authorization uses the plan split rules
-- **WHEN** the first review is broad and no exact split authorization exists
-- **THEN** the orchestrator performs the split or re-scope under the plan's
-  scope-preserving split rules and continues, without asking the operator
+#### Scenario: No exact authorization uses the plan's split permission
+- **WHEN** the first review is broad and no exact split authorization exists, but
+  the plan's own split rules or text permit an unpreauthorized split
+- **THEN** the change-writer authors the child set with a complete obligation
+  map, a dependency remap, and an aggregate exit, the materializer executes it,
+  and the orchestrator continues without asking the operator
 
-#### Scenario: No materializer uses the standard change-writer
-- **WHEN** an exact split authorization exists but no authorized materialization
-  path is available
-- **THEN** the orchestrator creates the split under the plan rules with the
-  standard change-writer and continues, without improvising a new requirement or
-  gate
+#### Scenario: No materializer re-scopes and carries forward
+- **WHEN** a split is indicated but `opsx-split-materializer` is unavailable, or
+  the plan permits neither an exact authorization nor an unpreauthorized split
+- **THEN** the orchestrator narrows the change to its accepted surface, carries
+  the remainder forward, and continues, without improvising a materializer, a
+  new requirement, or a gate
 
 #### Scenario: One shared root cause avoids an unnecessary split
 - **WHEN** the first review finds three blocking loci that all follow from one
@@ -559,3 +604,39 @@ An attestation SHALL NOT waive a hard content check the auditor can read from
 #### Scenario: Duplicate transcripts are not required
 - **WHEN** an audit can prove a check from one retained command log and its hash
 - **THEN** it does not require a second copy of the same output
+
+### Requirement: Controller specs set the floor and a plan may only tighten them
+
+A controller capability spec SHALL set the floor for a plan-level run. Where an
+accepted plan's own text and a controller spec prescribe different behavior for
+the same situation, the tighter rule SHALL govern. A plan SHALL NOT loosen a
+controller policy, corrective-round budget, cap, gate, acceptance tier, scope
+limit, or stop condition.
+
+An accepted plan MAY tighten the controller floor. Tightening includes reserving
+a split or another structural decision for the plan's declared operator
+checkpoint, shortening a budget, narrowing a change or surface limit, adding a
+gate, and raising an evidence bar. The orchestrator SHALL apply a tightening
+provision in place of the looser controller default.
+
+Plan silence SHALL leave the controller rule unchanged; silence is not
+permission. A plan provision that would loosen controller policy SHALL be void
+for that run, and the orchestrator SHALL record it as plan drift rather than
+follow it.
+
+#### Scenario: A plan's bounded third corrective round is void
+- **WHEN** plan prose permits one extra corrective round after the two-round
+  budget is exhausted
+- **THEN** the provision is void, the orchestrator records it as plan drift, and
+  the split-or-re-scope decision governs instead of a third round
+
+#### Scenario: A plan reserving split approval stands
+- **WHEN** the plan reserves split approval to its own declared operator
+  checkpoint
+- **THEN** the orchestrator does not split autonomously even where the controller
+  policy would permit a plan-permitted unpreauthorized split, and it honors the
+  declared checkpoint or re-scopes and carries forward
+
+#### Scenario: Plan silence does not relax the controller rule
+- **WHEN** a plan says nothing about the corrective-round budget
+- **THEN** the two-round default and every other controller rule apply unchanged

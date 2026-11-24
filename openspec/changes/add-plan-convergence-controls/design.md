@@ -19,6 +19,10 @@ that constrain them:
   `opsx-repo-hygiene.md` own handoff verification and repair.
 - `core/plan-authoring.md` and `adapters/opencode/commands/opsx-plan.md` own
   how a plan is sized before it is written.
+- `openspec/specs/adaptive-plan-splitting/spec.md` is the merged capability
+  spec that owns sizing, exact split authorizations, eligibility,
+  freeze/materialization, and the after-two-rounds decision this change
+  constrains.
 
 The current contracts were built to prevent premature stopping. The
 `add-autonomous-plan-continuation` change made `MAX_DISPATCHES`, review
@@ -46,6 +50,8 @@ six cannot converge a change whose accepted surface was never bounded.
 
 - Make two corrective rounds the default ceiling and make split/re-scope the
   default response after it.
+- Set a one-directional precedence so a plan can tighten but never loosen
+  controller policy, and so a split cannot reset the corrective-round budget.
 - Classify every finding so only a defect introduced by the reviewed diff earns
   another corrective round.
 - Make the first review full-scope, and make later reviews full-scope too, so
@@ -73,8 +79,10 @@ six cannot converge a change whose accepted surface was never bounded.
   honest reporting of what the orchestrator observed.
 - Proving live model behavior in tests. The tests prove the shipped prompt
   contract and a pure decision protocol.
-- Making split authority implicit in a round count, a cap override, a reviewer
-  verdict, or a supervisor role.
+- Making split permission implicit in a round count, a cap override, a reviewer
+  verdict, or a supervisor role. Only an exact `split_authorizations` entry or
+  the plan's own explicit split permission counts, and the materializer executes
+  either one.
 
 ## Decisions
 
@@ -89,9 +97,15 @@ internal decision, as today. After the second corrective round's review still
 fails, the orchestrator SHALL NOT create a third-round `cap_override`. It SHALL
 choose and execute one autonomous action:
 
-1. **Split** — select an exact `split_authorizations` entry for the parent and
-   materialize it; if none exists, use the plan's scope-preserving split rules
-   and checkpoints with the standard change-writer.
+1. **Split** — `opsx-split-materializer` is the sole executor of every
+   structural split. Select the plan's exact `split_authorizations` entry when
+   one exists. When no exact entry exists, a split is permitted only where the
+   plan's own split rules or plan text permit an unpreauthorized split; the
+   standard change-writer then authors the child set to the same exactness
+   invariants (complete obligation map, dependency remap, aggregate exit) and
+   the materializer executes it. Where the plan reserves split approval to the
+   operator, the orchestrator does not split autonomously: it honors the plan's
+   declared operator checkpoint or does not split.
 2. **Re-scope** — narrow the current change to its accepted surface, carry the
    remainder forward as a new slice with an explicit obligation mapping, and
    continue.
@@ -100,7 +114,8 @@ choose and execute one autonomous action:
    work.
 
 There is no operator-authorization path for internal convergence. The phrase
-"continue with one bounded corrective round" is not an option.
+"continue with one bounded corrective round" is not an option. A proposed
+re-scope/authority decision is a ledger record, not a terminal stop.
 
 Rationale: the observed 4–5-cycle slices did not fail because the fifth round
 was unsafe. They failed because the contract let the orchestrator treat "more
@@ -173,10 +188,13 @@ run yet. The checkpoint is evaluated at the earliest evidence, not only after
 two failed rounds.
 
 If an exact `split_authorizations` entry exists, it is selected and
-materialized. If not, the orchestrator performs the split or re-scope under the
-plan's scope-preserving rules with the standard change-writer, or narrows and
-carries the remainder forward, then continues. It does not ask the operator and
-does not leave a terminal decision pending.
+materialized. If not, the orchestrator splits only where the plan's own split
+rules or text permit an unpreauthorized split — the change-writer authors the
+child set to authorization-equivalent exactness and `opsx-split-materializer`
+executes it — or it narrows and carries the remainder forward, then continues.
+Where the plan reserves split approval to the operator, the plan's declared
+checkpoint governs. The orchestrator does not ask the operator for a
+convergence decision and does not leave a terminal decision pending.
 
 ### D4. The first review, and every re-review, is full-scope
 
@@ -235,8 +253,10 @@ and spec deltas it SHALL enumerate:
 The enumeration is the acceptance surface. If it exceeds the maximum heuristic
 in D8, the writer SHALL split or narrow before writing rather than authoring an
 oversized change and letting review discover it. The orchestrator may create the
-child changes under the plan's scope-preserving split rules; it does not ask the
-operator to approve the split.
+child changes only where the plan preauthorizes an exact entry or its own split
+rules permit an unpreauthorized split; either way `opsx-split-materializer`
+executes the structural split and the orchestrator does not ask the operator to
+approve a convergence decision.
 
 The writer's tasks and acceptance scenarios stay proportional to that surface.
 It does not add release-grade hardening to a `poc` change, and it does not
@@ -417,49 +437,116 @@ The auditor may not waive `source-manifest-at-head`, `plan-at-head`, or
 content facts it can read. It may accept attestation for quiescence, authority,
 and a gate the operator owns.
 
-### D14. Precedence and relationship to adaptive splitting
+### D14. Precedence and relationship to the merged adaptive-plan-splitting capability
 
-The in-flight `add-adaptive-plan-splitting` change adds the exact
-`split_authorizations` schema, sizing, materializer, and a split-or-continue
-decision after two corrective rounds. This change reuses all of that. The only
-conflict is its "continue" option, which permits one bounded third round without
-a split or re-scope.
+`add-adaptive-plan-splitting` is merged (PR #43); its normative text is
+`openspec/specs/adaptive-plan-splitting/spec.md`. Its exact
+`split_authorizations` schema, pre-implementation sizing checkpoint,
+eligibility rules, obligation and dependency preservation, freeze,
+materialization, binding, and ledger-idempotence rules are unchanged, and they
+remain the only path by which a planned change is structurally replaced.
 
-Precedence when both are present:
+What changes is its after-two-rounds decision requirement, and this change
+carries that change as a delta on the merged spec: *Two corrective rounds
+trigger an explicit split-or-continue decision* is renamed and modified to *Two
+corrective rounds trigger an explicit split-or-re-scope decision*. The decision
+set loses "continue with one bounded corrective round" and becomes split |
+re-scope | carry-forward. Its "proposed re-scope/authority decision" becomes a
+ledger record rather than a terminal stop.
+
+Precedence, when the merged capability and this change are both in force:
 
 1. This change's D1 budget governs how many corrective rounds are allowed.
-2. Adaptive splitting's authority, eligibility, obligation mapping, freeze,
-   materialization, binding, and ledger-idempotence rules are unchanged.
-3. Adaptive splitting's "continue" is replaced by autonomous split or
-   re-scope; there is no operator-authorization path for internal convergence.
-4. Constructor-level rules in this change's spec delta
-   (`Review convergence has a default two-round corrective budget` and
-   `Broad first reviews trigger a slice split checkpoint`) are the normative
-   source for the budget.
+2. Adaptive splitting's authority, eligibility, obligation mapping, dependency
+   remap, freeze, materialization, binding, and ledger-idempotence rules are
+   unchanged, and `opsx-split-materializer` remains the only structural-split
+   executor, per D1.
+3. Adaptive splitting's "continue" is replaced by split, re-scope, or
+   carry-forward; there is no operator-authorization path for internal
+   convergence.
+4. The controller-level requirements in this change's spec deltas
+   (`plan-handoff-gate`: *Review convergence has a default two-round corrective
+   budget* and *Controller specs set the floor and a plan may only tighten
+   them*; `adaptive-plan-splitting`: *Two corrective rounds trigger an explicit
+   split-or-re-scope decision*) are the normative source for the budget and the
+   decision set.
 
-If adaptive splitting is merged first, its continue sentence must be reconciled
-during implementation. This is a genuine cross-change ambiguity, not a reason to
-duplicate the split machinery. If it is not merged, this change still works:
-the plan has no `split_authorizations`, so the default after two rounds is an
-autonomous split or re-scope under the plan's scope-preserving rules, or a
-narrow/carry-forward decision that continues independent work.
+No duplicate split machinery is added. Implementation reconciles the merged
+capability's test and fixture assertions and the agent/documentation wording, per
+the proposal's relationship section. A plan with no `split_authorizations` still
+works: the default after two rounds is a plan-permitted split, a re-scope, or a
+narrow/carry-forward decision that continues independent authorized work.
+
+The merged spec's other requirements are unchanged. Where they say a refusal
+"returns the proposed decision" — a vague split instruction, an undeclared
+supervisor capability, an unavailable materializer, plan drift — the refusal
+still fails closed for that split, and the resulting proposal is a ledger record
+reported in the run, not an operator question and not a raw-count stop.
+
+### D15. Controller specs set the floor; a plan may tighten but never loosen them
+
+An accepted plan is active authority for its own run, but it cannot lower the
+controller contract. Where a plan's text and a controller capability spec
+prescribe different behavior for the same situation, the tighter rule SHALL
+govern.
+
+- A plan MAY tighten: reserve a split for its declared operator checkpoint,
+  shorten a corrective budget, narrow the change or surface limits, add a gate,
+  or raise an evidence bar.
+- A plan SHALL NOT loosen: permit a bounded third corrective round, widen a
+  surface or scope, remove a gate, lower an acceptance tier, or weaken a stop
+  condition or a hard handoff check.
+- Plan silence leaves the controller rule unchanged; silence is not permission.
+- A plan provision that would loosen controller policy is void for that run. The
+  orchestrator records it as plan drift and does not follow it.
+
+Rationale: the observed overrun came from lifting a controller ceiling, and the
+cheapest way to reintroduce it is plan prose written under the softer rule. A
+one-directional precedence keeps plan-specific autonomy — including a plan that
+reserves split approval to itself — while the controller floor stays fixed.
+
+### D16. Split children inherit corrective-round consumption by blocker class
+
+A child of a split does not start with a fresh two-round budget for work that
+already consumed rounds in its parent. Consumption is tracked by blocker class,
+not by change slug.
+
+- A blocker class that consumed a corrective round in the parent is inherited as
+  consumed by the child that owns that obligation. After two consumed rounds the
+  inherited allowance for that class is zero.
+- A blocker class first introduced by a child's own diff accrues under that
+  child's budget.
+- The ledger records, per child, the inherited blocker classes and their
+  consumed counts, so a resumed run reads the same allowance instead of
+  recomputing a fresh one.
+- The rule creates no stop: a child that exhausts its inherited allowance enters
+  the same split-or-re-scope decision as any other change.
+
+Rationale: without inheritance a split is a budget reset, and the same failure
+returns as several children each earning two rounds — the observed 4–5-cycle
+pattern multiplied by the child count.
 
 ## Risks / Trade-offs
 
 - **Splitting adds plan and handoff overhead.** Mitigation: the split checkpoint
   is only mandatory for the cross-surface case or a broad first review; a
   narrow change still gets two corrective rounds. Splitting is bounded by the
-  exact authorization and existing materializer.
+  plan's own split permission — an exact `split_authorizations` entry or the
+  plan's explicit rules — and by the existing materializer.
 - **Autonomous splitting over-splits.** Mitigation: splits must follow the
   plan's scope-preserving rules and preserve obligation mapping; a split that
   would change requirements, acceptance tiers, or human gates is refused and the
   orchestrator narrows/carries forward instead. No operator question is created.
+- **Splitting becomes a corrective-budget reset.** Mitigation: D16 inherits the
+  parent's corrective-round consumption by blocker class, so a child receives no
+  fresh budget for work that already consumed rounds, and a child cannot be used
+  to launder a non-converging change into several short budgets.
 - **Classification disputes stall a round.** Mitigation: the orchestrator
   adjudicates with the evidence packet; `unknown` is resolved before a round,
   not deferred to another reviewer.
 - **Adjacent scope becomes a dumping ground.** Mitigation: every adjacent item
   must name its proposed slice and is not silently dropped; it becomes real only
-  through an authorized split/re-scope or a reported follow-up.
+  through a plan-permitted split, a re-scope, or a reported follow-up.
 - **Cost fields add reporting ceremony.** Mitigation: only the three token
   categories and a cost status are required; `not-reported` is an honest,
   cheap value. The report never invents a number.
@@ -477,24 +564,39 @@ No data migration. New ledger fields are additive and optional on resume:
   corrective round;
 - a missing token field is `not-reported`, not zero;
 - a missing attestation record means no attestation exists;
-- a run already past two corrective rounds resumes at the split-or-authorize
+- a run already past two corrective rounds resumes at the split-or-re-scope
   decision, not with a third override.
 
-Existing plans without `split_authorizations` keep working: they return the
-proposed re-scope/authority decision instead of a split. The deterministic
-controller, compiled TOML schema, acceptance tiers, human gates, and archived
-changes are untouched. The shipped agents are OpenCode-only today; the
-implementer change is authored in `core/phase-agents/implementer.md` and
+Existing plans without `split_authorizations` keep working: they do not return a
+proposed re-scope/authority decision to the operator. They make the same
+split-or-re-scope decision under the plan's own permission — a plan-permitted
+unpreauthorized split executed by `opsx-split-materializer`, or narrowing to the
+accepted surface with the remainder carried forward — record the decision and
+any proposal in the ledger, and continue independent authorized work. The
+deterministic controller, compiled TOML schema, acceptance tiers, human gates,
+and archived changes are untouched. The shipped agents are OpenCode-only today;
+the implementer change is authored in `core/phase-agents/implementer.md` and
 regenerated, never hand-edited in an adapter.
 
 ## Open Questions
 
-**One genuine ambiguity:** the in-flight `add-adaptive-plan-splitting` change
-already permits one bounded "continue" corrective round after the two-round
-decision. This change intentionally narrows that to explicit operator
-authorization. The two changes cannot both be normative as written. The
-resolution is D14: this change's budget wins, adaptive splitting's split
-mechanics survive. If the maintainer prefers to keep the one-round continue, the
-two-round budget becomes three rounds in practice and the observed 4–5-cycle
-pattern is not corrected. That is a product decision, not an implementation
-detail.
+**None blocking.** The cross-change ambiguity that earlier drafts recorded is
+resolved: `add-adaptive-plan-splitting` merged (PR #43), and its bounded-continue
+option is replaced by the split-or-re-scope decision through the requirement
+delta in `specs/adaptive-plan-splitting/spec.md`. Precedence is settled by D15 —
+controller specs set the floor, an accepted plan may tighten but never loosen
+them, and the tighter rule governs a conflict. There is no operator
+authorization path for internal convergence and no operator question to leave
+open; a plan that reserves split approval to itself is a tightening the
+orchestrator honors, not an ambiguity.
+
+Two bounded implementation notes remain — implementer decisions, not operator
+questions:
+
+- The merged capability's `decide_convergence` fixture branch and its
+  `ConvergenceDecisionTests` encode `bounded-continue`; they are replaced with
+  the split | re-scope | carry-forward outcomes in the same file, keeping every
+  split authority, obligation, freeze, materialization, and idempotence
+  assertion intact.
+- The archived `add-adaptive-plan-splitting` change copy is historical and
+  read-only; only the synced capability spec and the tests carry the new rule.
