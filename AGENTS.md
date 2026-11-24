@@ -77,8 +77,9 @@ are stale.
 ## Plan-level agent set (OpenCode)
 
 The hand-authored OpenCode agents `opsx-orchestrator`, `opsx-change-writer`,
-`opsx-review`, `opsx-integration-auditor`, and `opsx-repo-hygiene` complement the
-controller-round `opsx-implementer`/`opsx-reviewer`/`opsx-archiver` set:
+`opsx-review`, `opsx-integration-auditor`, `opsx-repo-hygiene`, and
+`opsx-split-materializer` complement the controller-round
+`opsx-implementer`/`opsx-reviewer`/`opsx-archiver` set:
 
 - `opsx-orchestrator` is the plan-level conductor. It holds no shell or edit
   capability and drives a markdown plan change-by-change, dispatching the change
@@ -114,12 +115,22 @@ controller-round `opsx-implementer`/`opsx-reviewer`/`opsx-archiver` set:
   byte-for-byte. It refuses to invent scope, never changes product behavior, and
   amends only a commit it created in the current round while that commit is
   still `HEAD`.
+- `opsx-split-materializer` is the single authorized writer for an exact
+  plan-preauthorized split. It freezes a restorable donor (identity, source and
+  evidence hashes, lineage), revises the tracked plan to contain only the chosen
+  child nodes, rehomes only the authorized unaccepted candidate paths, binds a
+  local commit, and verifies the compiled node/edge set. It does not archive or
+  spec-sync the parent, change the acceptance or phase tier, gates, human
+  boundary, trust posture, or archived work, reuse parent checkmarks as child
+  acceptance, or push. It is not a generic writer: a plan split with no exact
+  authorization or no available materializer returns a proposed
+  re-scope/authority decision.
 
 `opsx-implementer` carries both the original controller-round contract and a
 plan-orchestrator mode; the mode is selected from the input fields. Keep the
 controller-round contract intact when editing that canonical body.
 
-All five are OpenCode-only today. Port them to `core/phase-agents` and the
+All six are OpenCode-only today. Port them to `core/phase-agents` and the
 other adapters once the shared contracts stabilize; do not hand-edit their
 installed copies under `~/.config/opencode/agents/`.
 
@@ -134,6 +145,23 @@ read by `opsx-orchestrator`, distinct from the **compiled-manifest
 `pause_before` gate** consumed by the deterministic `opsx-plan` / `opsx-run`
 controller: a plan may use both, neither substitutes for the other, and
 `human_gates` adds no manifest key and needs no compile change.
+
+Plan sizing and split authority are also explicit. Before implementation the
+orchestrator records a sizing assessment, and after two corrective rounds it
+makes a split-or-continue decision before any third-round override. Split
+authority is not implicit in general autonomy, a cap override, a reviewer
+verdict, or a supervisor role. A split is permitted only from an exact
+`split_authorizations` frontmatter entry naming the parent, exact child slugs,
+child dependencies, an obligation map that gives every parent obligation to
+exactly one child, and an aggregate exit. `split_authorizations` is model-level
+plan data read by `opsx-orchestrator`, not a compiled-manifest key or
+conditional DAG; selecting it revises the tracked plan so it contains only the
+chosen nodes. Without an exact authorization or an authorized materializer, the
+orchestrator returns a concrete proposed re-scope/authority decision instead of
+stopping on a raw round count.
+With no split, one bounded corrective round is permitted with a named closure
+test and re-evaluation checkpoint. Independent, already-authorized work may
+continue.
 
 Delivery is local. Commits and amendments are made through `opsx-archiver` and
 `opsx-repo-hygiene` on the local branch: no push, no remote branch, no pull

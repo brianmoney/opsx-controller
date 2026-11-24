@@ -174,6 +174,19 @@ What it contains:
   renames, moves, archives, or deletes an active change directory to clear a
   plan-reachable slug; an out-of-plan slug collision is an `operator-decision`
   stop that it does not act on.
+- `adapters/opencode/agents/opsx-split-materializer.md`: the single authorized
+  writer for one exact plan-preauthorized split. It revalidates the exact
+  `split_authorizations` entry, freezes a restorable donor with source/evidence
+  hashes and lineage, revises the tracked plan to contain only the chosen child
+  nodes, rehomes only the authorized unaccepted candidate paths, binds a local
+  commit with explicit pathspecs, and verifies the compiled node/edge set. It
+  never archives or spec-syncs the parent, changes the acceptance/phase tier,
+  gates, human boundary, trust posture, or archived work, reuses parent
+  checkmarks as child acceptance, pushes, or spawns sub-agents. The orchestrator
+  dispatches no child until the selected plan revision is clean, committed at
+  `HEAD`, and the graph is verified and bound. A split with no exact
+  authorization or no available materializer returns a proposed
+  re-scope/authority decision, never an improvised generic-writer fallback.
 - `adapters/opencode/agents/opsx-change-writer.md`: authors or amends exactly
   one change's OpenSpec artifacts and runs the strict validation gate. It does
   not implement source, archive, or commit.

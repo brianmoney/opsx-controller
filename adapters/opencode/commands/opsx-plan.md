@@ -35,6 +35,22 @@ Entry rules:
 - Do not edit the plan to record a run-level gate decision. An explicit
   `HUMAN_GATES` value passed to a model-level run replaces the frontmatter
   list for that run and is a runtime input, not an authoring edit.
+- Size each change for one implement-review-archive loop before implementation,
+  and record the sizing basis in the change's scope/success parameters. Do not
+  leave an oversized change for corrective rounds to discover.
+- Declare `split_authorizations` only when the plan preauthorizes an exact named
+  replacement for an oversized change. Every entry must name one exact parent,
+  two or more exact child slugs, each child's dependencies, an obligation map
+  assigning every parent obligation to exactly one child, and an aggregate exit
+  proving the parent's original success parameters after all children archive.
+  Child slugs must not collide with active or archived changes, and the split
+  must leave the phase, acceptance tier, gates, and human boundary unchanged.
+  Omit the field when no exact replacement is authorized.
+- `split_authorizations` is model-level plan data read by
+  `opsx-orchestrator`. It adds no compiled-manifest key, `opsx-plan compile`
+  does not read it, and it must not be expressed as conditional prose or a
+  conditional DAG. When an entry is selected, the tracked plan contains only
+  the chosen nodes.
 
 Before writing, read:
 
@@ -79,7 +95,14 @@ Self-verification before the final response:
    authoring defect — fix the entry or drop the gate before reporting the plan
    as complete, and never leave an unknown slug for the orchestrator to fail on
    at preflight.
-4. Report whether the compile self-check ran and succeeded or why it was
+4. Verify every `split_authorizations` entry: each parent and child slug must
+   match an exact `### Change:` heading or a declared dependency, no child collides
+   with an active or archived change, every parent obligation appears exactly
+   once in a child's `obligation_map`, the dependency remap preserves every
+   predecessor and successor, and `aggregate_exit` proves the parent's original
+   success parameters. A defective entry is an authoring defect; fix it or drop
+   the authorization.
+5. Report whether the compile self-check ran and succeeded or why it was
    unavailable.
 
 Final response requirements:
@@ -87,6 +110,7 @@ Final response requirements:
 - Do not repeat the document body.
 - Report: the output path, the declared `acceptance` tier, phase and change
   counts, proposed capabilities, the declared `human_gates` (or that the plan
+  declares none), the declared `split_authorizations` (or that the plan
   declares none), the compile self-check result (or that it was unavailable),
   and the suggested manual `pause_before` gates from the document's
   `## Suggested Manual Gates` section.
