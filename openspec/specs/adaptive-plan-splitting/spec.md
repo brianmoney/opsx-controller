@@ -1,6 +1,17 @@
 # adaptive-plan-splitting Specification
 
-## ADDED Requirements
+## Purpose
+
+Define how a plan-level `opsx-orchestrator` run decides that a planned change is
+the wrong unit of work and replaces it with a preauthorized, exact set of child
+changes. The capability covers sizing a change before implementation, an
+explicit split-or-continue decision after two corrective rounds, the exact
+`split_authorizations` model-level plan frontmatter contract, eligibility and
+obligation/dependency preservation, and the single authorized writer
+(`opsx-split-materializer`) that freezes a restorable donor and binds a clean
+plan revision before any child is dispatched.
+
+## Requirements
 
 ### Requirement: Changes are sized before implementation
 
