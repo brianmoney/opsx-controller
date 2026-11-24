@@ -103,12 +103,15 @@ edit, and the plan frontmatter is left unchanged.
 ### Split Authorizations
 
 `split_authorizations` is an optional list of **exact preauthorized named
-replacements** for the model-level `opsx-orchestrator`. It is the only authority
-for replacing a planned change with a different set of nodes. It is not a
-conditional-DAG format, it adds no compiled-manifest key, and `opsx-plan compile`
-does not read it. When an entry is selected, the tracked plan is revised to
-contain only the chosen nodes; the parent and every unchosen node are absent, so
-the deterministic compiler still receives an ordinary unconditional plan.
+replacements** for the model-level `opsx-orchestrator`. It is the only
+preauthorized authority for replacing a planned change with a different set of
+nodes; where it holds no entry for the parent, a split is permitted only where
+the plan's own split rules or text permit one, under the same materializer. It
+is not a conditional-DAG format, it adds no compiled-manifest key, and
+`opsx-plan compile` does not read it. When an entry is selected, the tracked plan
+is revised to contain only the chosen nodes; the parent and every unchosen node
+are absent, so the deterministic compiler still receives an ordinary
+unconditional plan.
 
 Each entry has this shape:
 
@@ -419,6 +422,36 @@ that combines a refactor, a feature, and a docs update will fail review
 repeatedly because the reviewer cannot approve one aspect without approving
 all three.
 
+### Maximum Change Surface
+
+Size each change against all five dimensions before it is written:
+
+| Dimension | Maximum before split or narrowing |
+|---|---|
+| Named surfaces | 3 (one primary plus at most two supporting) |
+| Pages / endpoints / routes | 3 total |
+| Acceptance scenarios | 5 |
+| Tasks | 12 |
+| Expected production diff | 400 changed lines (additions + deletions), excluding tests, fixtures, and docs |
+
+A **named surface** is a distinct externally observable contract: an API
+endpoint group, a CLI command group, a page/UI route, a freshness or persistence
+contract, an error taxonomy, or a cache layer. A page that adds an API endpoint
+counts as both.
+
+The mandatory split rule is independent of the numeric limits: a change that
+spans **API + CLI + page + freshness + error taxonomy**, or three or more named
+surfaces, SHALL be split before it is written. There is no review override for
+this rule.
+
+Exceeding a numeric threshold requires the author to split or narrow the change.
+There is no operator-authorization exception inside the run, and no exception
+waives the mandatory cross-surface split. The split checkpoint is the default
+response to an oversized change, not another review override: never leave an
+oversized change for corrective rounds to discover. The `/opsx-plan` authoring
+command records the five-dimension assessment for every change and reports any
+change that was split, narrowed, or proposed for re-scope.
+
 ### Size Before Implementation
 
 Size each change for one implement-review-archive loop before implementation,
@@ -433,28 +466,74 @@ When a change is too large to size confidently, either narrow it in the plan or
 declare an exact `split_authorizations` entry. Do not rely on repeated
 `cap_override` entries to carry an oversized change.
 
-### Split-or-Continue After Two Corrective Rounds
+### Acceptance-Surface Enumeration
 
-After two corrective rounds and before any third-round override, the
-orchestrator makes one explicit split-or-continue decision:
+Before writing a change's proposal, design, tasks, and spec deltas, enumerate the
+acceptance surface its behavior implies:
 
-- **Prefer split** when a previously corrected blocker class has reopened, the
-  blocker set is not shrinking across rounds, or the remaining work is
-  orthogonal to the parent's stated concern.
-- **Split** only from an exact `split_authorizations` entry. General autonomy is
-  not authority.
-- **Continue** with exactly one bounded corrective round, a named closure test,
-  and a re-evaluation checkpoint. A failed closure test reopens the
-  split-or-redecision choice; it does not authorize a second override for the
-  same blocker class.
-- **Propose a re-scope/authority decision** when a split is indicated but no
-  exact authorization exists. Name the proposed child slugs, scope and
-  obligation mapping, dependency remap, aggregate exit, and the authority
-  needed. This is a concrete decision request, not a stop on the raw round
-  count.
+- the error taxonomy: every error class, envelope, and terminal state the change
+  can produce;
+- scope and registry cases: the missing, invalid, valid, disabled, aliased,
+  duplicate, and unauthorized cases that apply;
+- cache invariants: key composition, collision behavior, invalidation,
+  single-flight, stale-while-revalidate, and no-write or no-subprocess rules;
+- parity checks: each pair of surfaces that must agree, such as API/CLI/page;
+- guards: authentication, authorization, tenant, and limit checks.
 
-Independent work that is already authorized by the plan may continue while the
-blocked change awaits that decision.
+The enumeration is the change's accepted surface: its acceptance scenarios and
+tasks cover only what it names. A behavior outside it is a new slice or an
+explicit accepted plan change, never a silent review correction. Keep the
+surface proportional to the change: no release-grade hardening on a `poc` change
+and no speculative case the plan has not accepted.
+
+The surface assessment is the five dimensions in **Maximum Change Surface**.
+Record named surfaces, pages/endpoints/routes, acceptance scenarios, task count,
+and expected production diff in the change's scope and success parameters, or in
+the authoring response when the change body carries no sizing note. When the
+enumeration exceeds the maximum, propose the split before writing.
+
+### Split-or-Re-scope After Two Corrective Rounds
+
+Two corrective rounds are the default budget for one change. After the second
+corrective round's review still fails, and before any further corrective
+dispatch, the decision set is exactly:
+
+- **Split** — select the plan's exact `split_authorizations` entry when one
+  exists. When no exact entry exists, a split is permitted only where the plan's
+  own split rules or plan text permit an unpreauthorized split; the children are
+  authored to authorization-equivalent exactness — a complete obligation map, a
+  dependency remap, and an aggregate exit — and `opsx-split-materializer`
+  executes the structural split.
+- **Re-scope** — narrow the current change to its accepted surface and carry the
+  remainder forward as a new slice with an explicit obligation mapping.
+- **Carry-forward** — when neither split nor re-scope is permitted by the plan,
+  record the remainder as a carry-forward item.
+
+Prefer split when a previously corrected blocker class has reopened, the blocker
+set is not shrinking across rounds, or the remaining work is orthogonal to the
+parent's stated concern; otherwise re-scope or carry forward.
+
+There is no third corrective round, no bounded-continue option, no operator
+convergence question, and no terminal stop on the round count. A proposed
+re-scope/authority decision — a split the plan does not permit — is a recorded
+ledger artifact reported in the run, not a decision request that ends it.
+Independent work that is already authorized by the plan may continue.
+
+A split child does not receive a fresh two-round budget for work that already
+consumed rounds in its parent. Consumption is inherited by blocker class: a
+blocker class that consumed a corrective round in the parent is recorded as
+consumed for the child that owns that obligation, and a class first introduced by
+the child's own diff accrues under that child's budget. A child that exhausts its
+inherited allowance enters the same split-or-re-scope decision as any other
+change.
+
+Controller specs set the floor and a plan may tighten but never loosen them.
+Where plan text and a controller capability spec prescribe different behavior
+for the same situation, the tighter rule governs: a plan may reserve a split for
+its own checkpoint, shorten a corrective budget, narrow the surface limits, add a
+gate, or raise an evidence bar, but it may not permit a bounded third corrective
+round, widen a surface, remove a gate, or weaken a stop condition or a hard
+handoff check. Plan silence leaves the controller rule unchanged.
 
 ### Executable Success Parameters
 

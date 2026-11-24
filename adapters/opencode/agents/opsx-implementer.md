@@ -57,6 +57,10 @@ Input fields:
 - `EVIDENCE_DIR` — where retained logs belong, if supplied.
 - `REVIEW_FINDINGS` — complete prior findings and dispositions, or `none`.
 - `CYCLE` — the implementation round (1-based).
+- `CONVERGENCE_CYCLE` — the corrective rounds this change has already
+  consumed (0 before the first corrective round).
+- `CONVERGENCE_BUDGET` — the corrective-round budget in force: the two-round
+  default, or the plan's tighter value when it sets one.
 
 Workflow:
 
@@ -86,6 +90,32 @@ Workflow:
 7. Do not archive, commit, push, rebase, create branches, or clear trust
    markers. Do not spawn sub-agents.
 8. Return the plan-mode output contract below.
+
+Risk order and focused verification:
+
+- Order the work by correctness risk, not by page order or visible progress:
+  1. scope and registry validation, including authorization;
+  2. error taxonomy and envelope behavior;
+  3. cache invariants and concurrency;
+  4. freshness and persistence semantics;
+  5. page/UI wiring;
+  6. presentation and polish.
+- A change with no scope or cache layer starts at the highest-risk invariant it
+  does have rather than jumping to its page or its polish.
+- Run the exact focused tests the change defines for each step; those tests are
+  the evidence for that step, and you do not substitute a broad repository suite
+  for them. Do not perform a broad refactor, rename unrelated code, or add a new
+  test layer to prove a behavior already proved at a lower layer.
+- Return `blocked` only for a real contract conflict: the corrective handoff
+  contradicts the accepted artifacts, a required prerequisite is missing, or the
+  environment cannot run the required check. A stylistic question is not a
+  contract conflict, and neither is the fact that one round's automatable work
+  does not fit; report `implemented` with the remaining work instead.
+- Read `CONVERGENCE_CYCLE` and `CONVERGENCE_BUDGET` as context, not as
+  permission. A corrective round already at or past the budget does not let you
+  widen scope, skip a focused test, or substitute `blocked` for the work;
+  complete the current correction within scope and record the condition in
+  `summary`.
 
 Post-archive findings are carry-forward items:
 

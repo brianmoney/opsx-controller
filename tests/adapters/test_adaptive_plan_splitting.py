@@ -145,18 +145,27 @@ class AuthoringGuidanceContractTests(unittest.TestCase):
         )
 
     def test_reference_documents_the_convergence_decision(self) -> None:
-        self.assertIn("### Split-or-Continue After Two Corrective Rounds", self.reference)
+        self.assertIn("### Split-or-Re-scope After Two Corrective Rounds", self.reference)
         section = _section(
-            self.reference, "Split-or-Continue After Two Corrective Rounds", level=3
+            self.reference, "Split-or-Re-scope After Two Corrective Rounds", level=3
         )
         for phrase in (
+            "Two corrective rounds are the default budget for one change",
+            "select the plan's exact split_authorizations entry when one exists",
+            "a split is permitted only where the plan's own split rules or plan "
+            "text permit an unpreauthorized split",
+            "opsx-split-materializer executes the structural split",
             "Prefer split when a previously corrected blocker class has reopened",
             "the blocker set is not shrinking across rounds",
             "orthogonal to the parent's stated concern",
-            "exactly one bounded corrective round, a named closure test",
-            "A failed closure test reopens the split-or-redecision choice",
-            "Propose a re-scope/authority decision",
-            "not a stop on the raw round count",
+            "There is no third corrective round, no bounded-continue option, no "
+            "operator convergence question, and no terminal stop on the round count",
+            "A proposed re-scope/authority decision — a split the plan does not "
+            "permit — is a recorded ledger artifact reported in the run, not a "
+            "decision request that ends it",
+            "Consumption is inherited by blocker class",
+            "Controller specs set the floor and a plan may tighten but never "
+            "loosen them",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, section)
@@ -229,13 +238,24 @@ class OrchestratorSplitContractTests(unittest.TestCase):
         )
         selection = _section(self.text, "Stage selection")
         self.assertIn("4. Size —", selection)
-        self.assertIn("decide split-or-continue before implementation", selection)
+        self.assertIn(
+            "make the split-or-re-scope decision before implementation",
+            selection,
+        )
+        self.assertIn(
+            "An exact preauthorized replacement is selected here; a "
+            "plan-permitted unpreauthorized split is authored and materialized "
+            "here; otherwise narrow to the accepted surface and carry the "
+            "remainder forward.",
+            selection,
+        )
 
     def test_two_round_convergence_is_explicit(self) -> None:
         section = _section(self.text, "Sizing and split decisions")
         self.assertIn(
-            "After two corrective rounds, and before granting a third-round "
-            "override for the same change",
+            "After the second corrective round ends with a failing review, "
+            "record one explicit split-or-re-scope decision with its basis, and "
+            "do not grant a third corrective round:",
             section,
         )
         for phrase in (
@@ -243,10 +263,19 @@ class OrchestratorSplitContractTests(unittest.TestCase):
             "has reopened",
             "the blocking set is not shrinking across rounds",
             "orthogonal to the change's stated concern",
-            "exactly one bounded corrective round, naming a closure test",
-            "does not authorize a second override for the same blocker class",
-            "concrete decision request for that parent, not a stop on the raw "
-            "round count",
+            "opsx-split-materializer is the sole executor of every structural split",
+            "split only where the plan's own split rules or plan text permit an "
+            "unpreauthorized split",
+            "Where the plan reserves split approval to the operator, do not split "
+            "autonomously: honor the plan's declared checkpoint, or re-scope and "
+            "carry forward.",
+            "A child of a split SHALL inherit the parent's corrective-round "
+            "consumption by blocker class",
+            "There is no operator-authorization path for internal convergence",
+            "A third-round cap_override is refused even when MAX_DISPATCHES has "
+            "headroom, and a dispatch, repair, or audit override never authorizes "
+            "a corrective round.",
+            "A proposed re-scope/authority decision is a recorded ledger artifact",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, section)
@@ -379,16 +408,17 @@ class OrchestratorSplitContractTests(unittest.TestCase):
     def test_proposed_decision_replaces_a_raw_count_stop(self) -> None:
         section = _section(self.text, "Preauthorized split replacement")
         self.assertIn(
-            "return a concrete proposed re-scope/authority decision",
+            "record a concrete proposed re-scope/authority decision in the ledger",
             section,
         )
         self.assertIn(
             "Do not stop on the raw round count, do not edit the plan yourself, "
-            "and do not dispatch child work from an unbound revision",
+            "and do not dispatch child work from an unbound revision.",
             section,
         )
         self.assertIn(
-            "Independent work that is already authorized by the plan may continue",
+            "Narrow or carry forward as the plan permits, and let independent "
+            "work that is already authorized by the plan continue.",
             section,
         )
 
@@ -433,6 +463,28 @@ class MaterializerContractTests(unittest.TestCase):
         ):
             with self.subTest(field=field_name):
                 self.assertIn(field_name, self.text)
+
+    def test_input_contract_names_both_authority_paths(self) -> None:
+        for phrase in (
+            "SPLIT_AUTHORITY — exact or plan-permitted (required)",
+            "AUTHORITY_CITATION — the verbatim plan rule or plan text that "
+            "permits an unpreauthorized split, required when SPLIT_AUTHORITY is "
+            "plan-permitted and none otherwise",
+            "Two authority paths exist, and you execute either one under the same "
+            "discipline",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, self.flat)
+        orchestrator = _flat(_text(_ORCHESTRATOR))
+        for phrase in (
+            "with the selected replacement's authority and fields: SPLIT_ID, "
+            "RUN_ID, SPLIT_AUTHORITY, AUTHORITY_CITATION",
+            "opsx-split-materializer: SPLIT_ID, RUN_ID, SPLIT_AUTHORITY, "
+            "AUTHORITY_CITATION",
+            "AUTHORITY_CITATION is the verbatim plan rule or text that permits it",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, orchestrator)
 
     def test_freeze_precedes_rehome_and_requires_hashes_and_lineage(self) -> None:
         self.assertIn(
@@ -927,11 +979,12 @@ class SplitEligibilityTransitionTests(unittest.TestCase):
 
 
 class ConvergenceDecisionTests(unittest.TestCase):
-    """The split-or-continue rule never becomes a raw-count stop."""
+    """Split-or-re-scope never becomes a third round or a raw-count stop."""
 
     def test_before_two_rounds_continues(self) -> None:
         decision = fx.decide_convergence(fx.ConvergenceFacts(corrective_rounds=1))
         self.assertEqual(decision.kind, "continue")
+        self.assertIn("within-planning-allowance", decision.reasons)
 
     def test_reopened_non_shrinking_and_orthogonal_prefer_split(self) -> None:
         cases = (
@@ -955,47 +1008,151 @@ class ConvergenceDecisionTests(unittest.TestCase):
             with self.subTest(facts=facts):
                 self.assertEqual(fx.decide_convergence(facts).kind, "split")
 
-    def test_unauthorized_split_returns_a_proposed_decision(self) -> None:
+    def test_a_third_corrective_round_is_refused(self) -> None:
+        # No fact — including remaining MAX_DISPATCHES headroom or a shrinking
+        # blocker set — produces a third round or a bounded continuation.
+        cases = (
+            fx.ConvergenceFacts(corrective_rounds=2, blocker_counts=(3, 1)),
+            fx.ConvergenceFacts(
+                corrective_rounds=2,
+                reopened_blocker_class=True,
+                authorization_available=True,
+            ),
+            fx.ConvergenceFacts(
+                corrective_rounds=3,
+                blocker_counts=(1, 1),
+                orthogonal_work=True,
+            ),
+        )
+        for facts in cases:
+            with self.subTest(facts=facts):
+                decision = fx.decide_convergence(facts)
+                self.assertIn(decision.kind, ("split", "rescope", "carry-forward"))
+                self.assertNotIn(
+                    decision.kind, ("continue",) + fx.RETIRED_CONVERGENCE_KINDS
+                )
+                self.assertTrue(decision.independent_work_may_continue)
+        self.assertEqual(
+            set(fx.CONVERGENCE_DECISION_KINDS),
+            {"continue", "split", "rescope", "carry-forward"},
+        )
+        for retired in fx.RETIRED_CONVERGENCE_KINDS:
+            with self.subTest(retired=retired):
+                self.assertNotIn(retired, fx.CONVERGENCE_DECISION_KINDS)
+
+    def test_a_plan_permitted_unpreauthorized_split_is_authored_then_materialized(
+        self,
+    ) -> None:
         decision = fx.decide_convergence(
             fx.ConvergenceFacts(
                 corrective_rounds=2,
                 reopened_blocker_class=True,
-                authorization_available=False,
+                plan_permits_unpreauthorized_split=True,
             )
         )
-        self.assertEqual(decision.kind, "proposed-redecision")
-        self.assertIn("no-exact-authorization", decision.reasons)
-        self.assertTrue(decision.independent_work_may_continue)
+        self.assertEqual(decision.kind, "split")
+        self.assertIn("plan-permitted-split", decision.reasons)
+        self.assertIn("change-writer-authors-child-set", decision.reasons)
+        self.assertIn("materializer-executes-split", decision.reasons)
 
-    def test_continue_is_one_bounded_correction_with_a_closure_test(self) -> None:
+    def test_a_plan_reserved_split_approval_is_honored(self) -> None:
         decision = fx.decide_convergence(
             fx.ConvergenceFacts(
                 corrective_rounds=2,
-                blocker_counts=(3, 1),
-                closure_test="pytest tests/cache/test_policy.py",
+                reopened_blocker_class=True,
+                plan_permits_unpreauthorized_split=True,
+                plan_reserves_split_approval=True,
             )
         )
-        self.assertEqual(decision.kind, "bounded-continue")
+        self.assertEqual(decision.kind, "rescope")
+        self.assertIn("plan-reserves-split-approval", decision.reasons)
+        self.assertIn("honor-plan-checkpoint", decision.reasons)
+
+    def test_a_split_child_inherits_consumed_rounds_by_blocker_class(self) -> None:
+        inherited = fx.ConvergenceFacts(
+            corrective_rounds=0,
+            reopened_blocker_class=True,
+            authorization_available=True,
+            inherited_rounds_by_blocker_class=(("error-envelope", 2),),
+        )
+        # The inherited class has no allowance; a class new to the child keeps
+        # its full own budget.
+        self.assertEqual(fx.remaining_allowance(inherited, "error-envelope"), 0)
         self.assertEqual(
-            decision.closure_test,
-            "pytest tests/cache/test_policy.py",
+            fx.remaining_allowance(inherited, "cache-invariant"),
+            fx.CORRECTIVE_ROUND_BUDGET,
+        )
+        # Inheritance is per blocker class, not per child: an exhausted class
+        # no current finding names does not move the child to the decision.
+        self.assertEqual(
+            fx.decide_convergence(
+                replace(
+                    inherited,
+                    blocker_counts=(1, 1),
+                    blocking_blocker_classes=("cache-invariant",),
+                )
+            ).kind,
+            "continue",
+        )
+        # A finding of the exhausted inherited class does reach the decision.
+        exhausted = fx.decide_convergence(
+            replace(inherited, blocking_blocker_classes=("error-envelope",))
+        )
+        self.assertIn(exhausted.kind, ("split", "rescope", "carry-forward"))
+        self.assertIn("blocker-class-allowance-exhausted", exhausted.reasons)
+        self.assertTrue(exhausted.independent_work_may_continue)
+
+        # Half-consumed inheritance still has one round, and a child corrective
+        # round on that class consumes it.
+        partial = replace(
+            inherited,
+            inherited_rounds_by_blocker_class=(("error-envelope", 1),),
+        )
+        self.assertEqual(fx.remaining_allowance(partial, "error-envelope"), 1)
+        self.assertEqual(
+            fx.decide_convergence(
+                replace(partial, blocking_blocker_classes=("error-envelope",))
+            ).kind,
+            "continue",
+        )
+        spent = replace(
+            partial,
+            corrective_rounds=1,
+            consumed_rounds_by_blocker_class=(("error-envelope", 1),),
+            blocking_blocker_classes=("error-envelope",),
+        )
+        self.assertEqual(fx.remaining_allowance(spent, "error-envelope"), 0)
+        # The spent round did not touch the budget of a class new to the child.
+        self.assertEqual(
+            fx.remaining_allowance(spent, "cache-invariant"),
+            fx.CORRECTIVE_ROUND_BUDGET,
+        )
+        self.assertIn(
+            fx.decide_convergence(spent).kind,
+            ("split", "rescope", "carry-forward"),
+        )
+        # A finding of the new class still earns its round in the same child.
+        self.assertEqual(
+            fx.decide_convergence(
+                replace(spent, blocking_blocker_classes=("cache-invariant",))
+            ).kind,
+            "continue",
         )
 
-    def test_no_closure_test_or_prior_override_returns_proposed(self) -> None:
-        for facts in (
-            fx.ConvergenceFacts(corrective_rounds=2, blocker_counts=(3, 1)),
+    def test_a_proposal_is_recorded_while_independent_work_continues(self) -> None:
+        decision = fx.decide_convergence(
             fx.ConvergenceFacts(
                 corrective_rounds=2,
-                blocker_counts=(3, 1),
-                closure_test="pytest tests/cache/test_policy.py",
-                override_already_used=True,
-            ),
-        ):
-            with self.subTest(facts=facts):
-                self.assertEqual(
-                    fx.decide_convergence(facts).kind,
-                    "proposed-redecision",
-                )
+                reopened_blocker_class=True,
+            )
+        )
+        self.assertEqual(decision.kind, "carry-forward")
+        self.assertIn("proposed-decision-recorded", decision.reasons)
+        self.assertIsNotNone(decision.proposal_reason)
+        self.assertIn(
+            "exact split_authorizations entry", decision.proposal_reason or ""
+        )
+        self.assertTrue(decision.independent_work_may_continue)
 
 
 if __name__ == "__main__":

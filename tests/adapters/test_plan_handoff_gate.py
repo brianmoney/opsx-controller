@@ -140,6 +140,62 @@ class OrchestratorGateContractTests(unittest.TestCase):
         self.assertIn("advisory", self.flat.lower())
         self.assertIn("repair/audit rounds", self.flat.lower())
 
+    def test_a_third_corrective_round_is_refused_without_a_successor_decision(
+        self,
+    ) -> None:
+        self.assertIn("## Split-or-re-scope after two corrective rounds", self.text)
+        section = " ".join(
+            self.text.split(
+                "## Split-or-re-scope after two corrective rounds", 1
+            )[1]
+            .split("\n## ", 1)[0]
+            .split()
+        )
+        for kind in ("**Split**", "**Re-scope**", "**Carry-forward**"):
+            with self.subTest(kind=kind):
+                self.assertIn(kind, section)
+        self.assertIn(
+            "A third-round `cap_override` is refused even when `MAX_DISPATCHES` "
+            "has headroom, and a dispatch, repair, or audit override never "
+            "authorizes a corrective round.",
+            section,
+        )
+        self.assertIn(
+            "There is no operator-authorization path for internal convergence",
+            section,
+        )
+        # The bare round count never becomes a generic cap stop either:
+        # the exhausted budget has its own split-or-re-scope handling.
+        stops = " ".join(
+            self.text.split("## Stopping conditions (canonical stop list)", 1)[1].split()
+        )
+        self.assertIn("Never stop for: a dispatch or repair/audit cap;", stops)
+        self.assertNotIn(
+            "Never stop for: a dispatch, corrective-round, or repair-round cap;",
+            stops,
+        )
+
+    def test_operator_attestation_is_recorded_and_not_re_derived(self) -> None:
+        self.assertIn("## Operator attestation", self.text)
+        section = " ".join(
+            self.text.split("## Operator attestation", 1)[1].split("\n## ", 1)[0].split()
+        )
+        for field in ("`subject`", "`statement`", "`scope`", "`source`", "`recorded_at`"):
+            with self.subTest(field=field):
+                self.assertIn(field, section)
+        self.assertIn("It is authoritative for its named subject", section)
+        self.assertIn(
+            "do not re-derive, re-check, or ask again about a state the operator "
+            "has confirmed",
+            section,
+        )
+        self.assertIn("Attestation cannot make a false repository claim true", section)
+        self.assertIn(
+            "When an attestation conflicts with a hard repository fact, record "
+            "the conflict and stop for a human-only decision",
+            section,
+        )
+
     def test_archive_only_waiver_is_a_stop_not_completion(self) -> None:
         self.assertIn("archive-only", self.flat.lower())
         self.assertIn("waiver", self.flat.lower())
@@ -385,6 +441,18 @@ class AuditorContractTests(unittest.TestCase):
             self.flat,
         )
 
+    def test_recorded_ledger_evidence_is_reused_by_hash(self) -> None:
+        self.assertIn("## Proportional evidence", self.text)
+        self.assertIn("Reuse recorded ledger evidence.", self.flat)
+        self.assertIn(
+            "read that path at `HEAD` and compare it with the recorded hash "
+            "instead of re-collecting a duplicate",
+            self.flat,
+        )
+        self.assertIn("Record each reuse in `evidence_reused[]`.", self.flat)
+        self.assertIn('"evidence_reused"', self.text)
+        self.assertIn("A missing hash is collected, not assumed.", self.flat)
+
 
 class HygieneContractTests(unittest.TestCase):
     """`opsx-repo-hygiene` writes, but only inside an explicit blocker scope."""
@@ -438,6 +506,19 @@ class HygieneContractTests(unittest.TestCase):
     def test_repairs_are_limited_to_the_named_blockers(self) -> None:
         self.assertIn("blocker", self.flat.lower())
         self.assertIn("only", self.flat.lower())
+
+    def test_recorded_ledger_evidence_is_reused_by_hash(self) -> None:
+        self.assertIn("Reuse recorded ledger evidence.", self.flat)
+        self.assertIn(
+            "reference the recorded hash instead of re-collecting a duplicate "
+            "transcript",
+            self.flat,
+        )
+        self.assertIn(
+            "read the artifact before any hash you write, and never carry one "
+            "over from a summary",
+            self.flat,
+        )
 
 
 class ArchiverScopeContractTests(unittest.TestCase):

@@ -87,13 +87,23 @@ The hand-authored OpenCode agents `opsx-orchestrator`, `opsx-change-writer`,
   Phase Transition Gate. It drives every change outside the resolved
   human-gate set end-to-end — authoring, implementation, corrective rounds,
   evidence disposition, local commits, and whether the next change's authoring
-  may start — and records each decision with its basis. It does not ask the
-  operator for an internal repository, evidence, commit, or intake decision.
+  may start — and records each decision with its basis. It holds the two-round
+  corrective budget, the finding classification, and the split-or-re-scope
+  decision described in *Convergence, review, and cost controls*. It does not ask
+  the operator for an internal repository, evidence, commit, or intake decision.
 - `opsx-change-writer` authors or amends exactly one change's OpenSpec
-  artifacts. It does not implement source, archive, or commit.
+  artifacts. It sizes the change against the maximum-surface heuristic first,
+  enumerates the acceptance surface (error taxonomy, scope/registry cases, cache
+  invariants, parity checks, guards) before writing, and proposes a split instead
+  of authoring an oversized change. It does not implement source, archive, or
+  commit.
 - `opsx-review` is the generic read-only reviewer with acceptance tiers,
-  findings dispositions, and a required coverage matrix. It carries no
-  plan-specific paths or requirements.
+  findings dispositions, and a required coverage matrix. The first review and
+  every re-review are full-scope; it reports a coverage `scope`
+  (`current-slice` or `adjacent`), classifies every finding
+  `introduced_by_diff` / `adjacent_scope` / `pre_existing`, and judges only the
+  change's accepted success parameters. It carries no plan-specific paths or
+  requirements.
 - `opsx-integration-auditor` is the fresh, read-only handoff auditor. It proves
   or disproves `handoff_ready` from the committed repository state and never
   edits, stages, commits, pushes, or archives. Its only product is the
@@ -101,34 +111,45 @@ The hand-authored OpenCode agents `opsx-orchestrator`, `opsx-change-writer`,
   pushed branch, treats an unauthored next change as expected (only a
   planned-slug collision or an unmet dependency fails `next-change-readiness`),
   and reports an evidence gap as a bounded `repair-evidence` repair or an
-  `unqualified` `carry_forward` record instead of an operator decision. A
-  planned-slug collision is a plan-level `resolve-slug-collision` repair when
-  the occupant is a plan change or declared dependency; an out-of-plan occupant
-  is an `operator-decision` stop because no worker may archive, rename, or
-  rewrite it.
+  `unqualified` `carry_forward` record instead of an operator decision. It
+  accepts a recorded operator attestation for the state or authority question it
+  names, reuses hash-bound ledger evidence instead of re-collecting it, and never
+  waives a hard content check it can read from `HEAD`. A planned-slug collision
+  is a plan-level `resolve-slug-collision` repair when the occupant is a plan
+  change or declared dependency; an out-of-plan occupant is an
+  `operator-decision` stop because no worker may archive, rename, or rewrite it.
 - `opsx-repo-hygiene` is the scoped handoff writer. It commits exactly the
   accepted implementation pathspecs the auditor named, ignores run-local state,
-  and repairs handoff-blocking scripts or evidence. It repairs in phases: a safe
+  and repairs handoff-blocking scripts or evidence. It accepts recorded operator
+  authority for the commit it names and reuses hash-bound ledger evidence, while
+  still refusing a wider pathspec. It repairs in phases: a safe
   baseline commit (accepted source, the plan, the `.opsx-run/` ignore entry, a
   script-path retarget) that proceeds even while an evidence question is still
   open, then a bounded evidence phase that preserves historical originals
   byte-for-byte. It refuses to invent scope, never changes product behavior, and
   amends only a commit it created in the current round while that commit is
   still `HEAD`.
-- `opsx-split-materializer` is the single authorized writer for an exact
-  plan-preauthorized split. It freezes a restorable donor (identity, source and
-  evidence hashes, lineage), revises the tracked plan to contain only the chosen
-  child nodes, rehomes only the authorized unaccepted candidate paths, binds a
-  local commit, and verifies the compiled node/edge set. It does not archive or
-  spec-sync the parent, change the acceptance or phase tier, gates, human
-  boundary, trust posture, or archived work, reuse parent checkmarks as child
-  acceptance, or push. It is not a generic writer: a plan split with no exact
-  authorization or no available materializer returns a proposed
-  re-scope/authority decision.
+- `opsx-split-materializer` is the single authorized writer for a plan split,
+  whether it comes from an exact `split_authorizations` entry or from a
+  plan-permitted unpreauthorized split the standard change-writer authored to
+  authorization-equivalent exactness. It freezes a restorable donor (identity,
+  source and evidence hashes, lineage), revises the tracked plan to contain only
+  the chosen child nodes, rehomes only the authorized unaccepted candidate paths,
+  binds a local commit, and verifies the compiled node/edge set. It does not
+  archive or spec-sync the parent, change the acceptance or phase tier, gates,
+  human boundary, trust posture, or archived work, reuse parent checkmarks as
+  child acceptance, or push. It is not a generic writer: a plan split with
+  neither an exact authorization nor a cited plan permission, or with no
+  available materializer, fails closed for that split, and the orchestrator
+  records the proposed re-scope/authority decision and narrows or carries the
+  remainder forward.
 
 `opsx-implementer` carries both the original controller-round contract and a
 plan-orchestrator mode; the mode is selected from the input fields. Keep the
-controller-round contract intact when editing that canonical body.
+controller-round contract intact when editing that canonical body. In plan mode
+it implements in risk order — scope/registry validation, error taxonomy, cache
+invariants, freshness, then page/UI and polish — and verifies each step with the
+change's exact focused tests.
 
 All six are OpenCode-only today. Port them to `core/phase-agents` and the
 other adapters once the shared contracts stabilize; do not hand-edit their
@@ -147,34 +168,85 @@ controller: a plan may use both, neither substitutes for the other, and
 `human_gates` adds no manifest key and needs no compile change.
 
 Plan sizing and split authority are also explicit. Before implementation the
-orchestrator records a sizing assessment, and after two corrective rounds it
-makes a split-or-continue decision before any third-round override. Split
-authority is not implicit in general autonomy, a cap override, a reviewer
+orchestrator records a sizing assessment against the maximum-surface heuristic in
+`core/plan-authoring.md` — three named surfaces, three pages/endpoints/routes,
+five acceptance scenarios, twelve tasks, and a 400-line expected production diff
+— and a change spanning API + CLI + page + freshness + error taxonomy, or three
+or more named surfaces, is split before it is written. After two corrective
+rounds it makes a split-or-re-scope decision; there is no third-round override.
+Split authority is not implicit in general autonomy, a cap override, a reviewer
 verdict, or a supervisor role. A split is permitted only from an exact
 `split_authorizations` frontmatter entry naming the parent, exact child slugs,
 child dependencies, an obligation map that gives every parent obligation to
-exactly one child, and an aggregate exit. `split_authorizations` is model-level
+exactly one child, and an aggregate exit, or from the plan's own split rules
+under the `opsx-split-materializer` writer. `split_authorizations` is model-level
 plan data read by `opsx-orchestrator`, not a compiled-manifest key or
 conditional DAG; selecting it revises the tracked plan so it contains only the
-chosen nodes. Without an exact authorization or an authorized materializer, the
-orchestrator returns a concrete proposed re-scope/authority decision instead of
-stopping on a raw round count.
-With no split, one bounded corrective round is permitted with a named closure
-test and re-evaluation checkpoint. Independent, already-authorized work may
-continue.
+chosen nodes. With neither an exact authorization nor a cited plan permission,
+or without an authorized materializer, the orchestrator records a concrete
+proposed re-scope/authority decision in the ledger and narrows or carries the
+remainder forward instead of stopping on a raw round count. Independent,
+already-authorized work may continue.
+
+### Convergence, review, and cost controls
+
+Corrective rounds default to **two per change**. A corrective round is one
+corrective implementation dispatch followed by the review that verifies it; the
+initial review is not one. The first two are an internal orchestrator decision
+when the prior review's findings are eligible. After the second failing review
+the orchestrator records one split-or-re-scope-or-carry-forward decision and
+continues: it SHALL NOT grant a third corrective round, treat one as a
+`cap_override`, or ask the operator for convergence authorization. A child of a
+split inherits its parent's corrective-round consumption by blocker class, so a
+split cannot reset the budget.
+
+Every finding is classified before another round: `introduced_by_diff` is the
+only class that earns one, `adjacent_scope` becomes a proposed new slice or a
+follow-up, and `pre_existing` is a carry-forward item. `unknown` is adjudicated
+from evidence first and never earns a round on its own. The first review is
+full-scope and doubles as a sizing checkpoint: a broad blocking set, or a change
+spanning three or more named surfaces, triggers the split-or-re-scope decision
+before any corrective implementation. Every re-review is full-scope too, and a
+current-slice finding that round 1 could have established from the same evidence
+is a reviewer process defect, not a reason for another round.
+
+Bookkeeping is bounded: at most one ledger-writer dispatch per stage, batching
+all record-only events, and a record-only update never justifies its own `coder`
+session. Operator attestation about quiescence, authority, or a gate is
+authoritative for the subject it names and is not re-derived — but it cannot make
+a false repository claim true, waive a hard content check, or widen accepted
+scope. A stale idle marker does not interrupt a live, in-flight child: record
+`stale_idle_marker` with the evidence and keep waiting.
+
+Each stage records `tokens_in`, `tokens_out`, `cache_read_tokens`, and a
+`cost_status` of `estimated`, `unresolved`/`unpriced`, `unavailable`, or
+`not-reported`. The run report carries per-stage tokens and cost status, the
+three run token totals, a `priced_subtotal`, and an `unpriced_stage_count`; a
+bare `$0` is forbidden while any stage is unpriced or `not-reported`.
+
+**Precedence.** Controller capability specs set the floor for a plan run. An
+accepted plan MAY tighten that floor — reserving a split for its own declared
+checkpoint, shortening a budget, narrowing a surface limit, adding a gate, or
+raising an evidence bar — but SHALL NOT loosen it: no third corrective round, no
+widened surface or scope, no removed gate, no lowered acceptance tier, no
+weakened stop condition or hard handoff check. Plan silence leaves the controller
+rule in force; a loosening provision is void for that run and recorded as plan
+drift.
 
 Delivery is local. Commits and amendments are made through `opsx-archiver` and
 `opsx-repo-hygiene` on the local branch: no push, no remote branch, no pull
 request, no merge, and no no-push waiver. A configured upstream, if one happens
 to exist, is informational and changes nothing.
 
-`MAX_DISPATCHES`, the review corrective rounds, and the repair/audit rounds are
-planning allowances, not terminal stops. Before exceeding one, the orchestrator
-records a `cap_override` ledger entry naming the cap and its source, the count
-already consumed, the concrete remaining work, why continuing is safer than
-stopping, and the checkpoint at which it re-evaluates; then it continues. The
-three-dispatch handoff reserve is likewise an allowance: a shortfall is
-recorded, not terminal.
+`MAX_DISPATCHES` and the repair/audit rounds are planning allowances, not
+terminal stops. Before exceeding one, the orchestrator records a `cap_override`
+ledger entry naming the cap and its source, the count already consumed, the
+concrete remaining work, why continuing is safer than stopping, and the
+checkpoint at which it re-evaluates; then it continues. The three-dispatch
+handoff reserve is likewise an allowance: a shortfall is recorded, not terminal.
+The review corrective-round budget is not an advisory cap: a third corrective
+round is refused even when `MAX_DISPATCHES` has headroom, and no dispatch,
+repair, or audit override authorizes one.
 
 A finding discovered after archive is a carry-forward item, never a reopened
 change. Record the originating archived change, the current change, the locus

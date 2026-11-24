@@ -387,12 +387,27 @@ Parse these fields from the dispatch:
 - `EVIDENCE` — paths, hashes, commands, and exits supplied by the writer.
 - `CYCLE` — this review round (1-based).
 - `PRIOR_FINDINGS` — prior findings and their dispositions, or `none`.
+- `PRIOR_CLASSIFICATIONS` — the orchestrator's recorded classification
+  (`introduced_by_diff`, `adjacent_scope`, or `pre_existing`) for each prior
+  finding, or `none`.
+- `SUCCESS_PARAMETERS` — the change's accepted success parameters, as recorded
+  in the change's acceptance surface.
+- `SLICE_SURFACES` — the named surfaces the orchestrator scoped to this slice.
 - `COVERAGE_MATRIX` — the required case matrix the orchestrator derived from
   the change's spec, design, and changed surfaces. When it is absent, derive
   one from the artifacts and record that derivation as `unqualified`.
 
 If the change, base revision, or diff range is missing, return `uncertain` with
 the missing field named. Do not review a guessed scope.
+
+Judge only the change's accepted success parameters (`SUCCESS_PARAMETERS`) and
+the coverage matrix derived from them. Do not expand the review into the next
+slice's concerns, hardening the plan did not accept, or a preferred future
+design. A real behavior on a surface outside the accepted success parameters is
+`adjacent_scope`, proposed as a new slice; it does not block the active change,
+and `SLICE_SURFACES` tells you which surfaces this slice owns. A defect the
+diff introduces in behavior the change already claims to preserve is
+`introduced_by_diff`.
 
 ## Coverage matrix
 
@@ -419,6 +434,8 @@ from a generic checklist. Include, where applicable:
   invariant the change claims.
 - **Next-phase compatibility** — the files and contracts the next planned
   change will modify or rely on, exercised as the next change would use them.
+  Such a case is `adjacent` unless the current change's accepted success
+  parameters require that behavior now.
 
 ## Reporting coverage
 
@@ -429,9 +446,21 @@ Report every required matrix case as exactly one of:
   claim;
 - `not-applicable` — with a one-sentence reason the case does not apply to this
   change's surfaces;
-- `not-covered` — with what is missing. A `not-covered` case that concerns
-  accepted behavior or a required invariant is a blocking finding; otherwise
-  record it as an explicit follow-up.
+- `not-covered` — with what is missing.
+
+Every case also carries a `scope`:
+
+- `current-slice` — the case exercises behavior the change's accepted success
+  parameters require now. A `not-covered` current-slice case that concerns
+  accepted behavior or a required invariant is a blocking finding.
+- `adjacent` — the case concerns a next slice or hardening this change did not
+  accept, including a next-phase compatibility case unless the current success
+  parameters require the next slice's behavior now. A `not-covered` adjacent
+  case is recorded and does not block the active change; record it as an
+  explicit follow-up.
+
+A coverage entry without `scope` is incomplete, and a `not-covered` case is
+never promoted to `covered` because a later slice will exercise it.
 
 **A review that only re-runs the writer's existing tests does not satisfy this
 requirement.** The writer's suite proves what the writer thought to check. You
@@ -496,16 +525,34 @@ Do not manufacture a stricter gate because the code could be better. Do not
 downgrade an unqualified operator gate to a pass. Do not demand live services
 for unit or documentation tasks that do not require them.
 
-## Cycle discipline
+## Full-scope review discipline
 
-- **Cycle 1–2**: review the stated diff and the class of defect it represents.
-- **Cycle 3+**: perform a full-scope review of the artifact and its threat
-  model, not only the last correction. A narrow re-review after round 2 is a
-  process defect; report it.
-- Reconcile severity: the same defect class may not be blocking in one round
-  and advisory in the next without an explicit reason. Carry `PRIOR_FINDINGS`
-  forward and say whether each is closed, still open, or superseded.
-- Do not reopen an accepted advisory unless the current diff changes it.
+The first review and every re-review are full-scope. Read the change's accepted
+success parameters, proposal, design, tasks, and spec deltas, the actual diff,
+the evidence packet, and — on a re-review — the prior findings. Do not review
+only the last correction: a narrow re-review discovers the surface one concern
+at a time, and one full-scope pass is worth more than five narrow ones.
+
+Every round SHALL:
+
+- enumerate every current-slice blocking finding you can establish from that
+  scope, including findings outside the stated diff that the accepted scope
+  requires;
+- report each prior finding in `PRIOR_FINDINGS` as `closed`, `still open`, or
+  `superseded`, and say which;
+- keep `severity` stable for the same defect class across rounds. A class may
+  change severity only with an explicit adjudication note that names the new
+  evidence.
+
+A current-slice blocking finding that could have been established in round 1
+from the same evidence — the same diff, artifacts, and prior findings — SHALL
+NOT be introduced in a later round when the diff has not changed in a way that
+exposes it. Record it as a reviewer process defect and do not present it as a
+reason for another corrective round; the orchestrator adjudicates it. New
+evidence, a changed diff, or a prior finding that was not actually closed may
+justify a later current-slice finding.
+
+Do not reopen an accepted advisory unless the current diff changes it.
 
 ## Findings
 
@@ -519,11 +566,77 @@ Every finding must include:
 - `disposition` — `fix-now`, `follow-up`, `accept`, or `uncertain`;
 - `blocking` — true only when the finding meets the tier's blocking rule;
 - `introduced_by_diff` — `yes`, `no`, or `unknown`;
+- `adjacent_scope` — `true` or `false`;
 - `changes_claim` — whether it changes the qualification statement.
+
+In the machine-readable `findings` array the same location is expressed as
+`locus`: an array of repository-root-relative paths, each optionally suffixed
+with `:<symbol>` naming the function, class, or constant. A locus entry is never
+an absolute path, a bare symbol without its file, or a path relative to a
+subdirectory of the repository.
+
+Classify every finding with this precedence, and report the class you derived:
+
+1. `adjacent_scope: true` → `adjacent_scope`;
+2. else `introduced_by_diff: yes` → `introduced_by_diff`;
+3. else `pre_existing`.
+
+Only `introduced_by_diff` findings enter the prose `FINDINGS` section, the
+`fix_prompt`, or the machine-readable `findings` array. `adjacent_scope` and
+`pre_existing` findings are returned in `out_of_scope[]` and never block the
+active change. A finding that omits `introduced_by_diff` or `adjacent_scope` is
+incomplete, and the orchestrator does not use it to authorize a corrective
+round. `introduced_by_diff: unknown` is not a fourth class and does not earn a
+round: return it, and the orchestrator resolves it from the diff and evidence
+before another round.
 
 A `fix-now` finding is blocking for the tier. Record accepted advisories as
 notes, for example "0 critical / 0 warning / 1 accepted advisory note", and
 describe them. Never claim a zero-finding gate.
+
+## Out-of-scope records
+
+Return every `adjacent_scope` and `pre_existing` finding in the machine-readable
+`out_of_scope[]` array, never in `findings` and never in the prose corrective
+handoff. Each entry SHALL carry:
+
+- `classification` — `adjacent_scope` or `pre_existing`;
+- `locus` — `path[:symbol]`, repository-root-relative;
+- `observed` — the observed behavior;
+- `required` — the required behavior;
+- `evidence` — the command, reproduction, or artifact you actually observed,
+  with its result;
+- `impact` — what breaks or what claim becomes false;
+- `proposed_slice` — the slice or follow-up that would own the behavior, for an
+  `adjacent_scope` item, or `none` for a `pre_existing` item;
+- `disposition` — `proposed-slice`, `follow-up`, or `carry-forward`;
+- `introduced_by_diff` — `yes`, `no`, or `unknown`;
+- `adjacent_scope` — `true` or `false`.
+
+An `adjacent_scope` item is recorded and proposed as a new slice; it is not
+fixed in the current change and does not block it. A `pre_existing` item is a
+carry-forward record for a later change, not corrective scope.
+
+A `pass` MAY carry `out_of_scope[]` entries: they are records and do not change
+the verdict. `out_of_scope[]` SHALL be `[]` when every finding is current-slice
+scope, that is, when no `adjacent_scope` or `pre_existing` behavior was
+encountered.
+
+`out_of_scope[]` is not a substitute for a carry-forward item whose target is
+an **already archived** change. Record that item in `carry_forward[]` under
+*Post-archive findings are carry-forward items*, not here.
+
+## Evidence format is not a blocking finding
+
+Judge the behavior, not the ceremony. A log shape, transcript style, preferred
+artifact type, evidence field order, or preferred command spelling is not a
+blocking finding when the behavior is otherwise proved by a test, command, or
+observed reproduction. A missing preferred artifact does not block when an
+equivalent proof is named with its result: accept the equivalent proof and
+record the substitution as a note, not a finding.
+
+This lowers ceremony, not truthfulness. A false claim remains blocking, and a
+defect in accepted behavior remains blocking.
 
 ## Post-archive findings are carry-forward items
 
@@ -570,8 +683,9 @@ State, separately:
 - gates unqualified (with what would qualify them);
 - whether the one-writer rule held;
 - whether the reviewer was fresh and orchestrator-spawned;
-- the coverage matrix result: every case id with `covered`, `not-applicable`,
-  or `not-covered`, and the evidence for each;
+- the coverage matrix result: every case id with its `scope`, `covered`,
+  `not-applicable`, or `not-covered`, and the evidence for each;
+- `out_of_scope[]` items reported separately from the active change's findings;
 - carry-forward items reported separately from the active change's findings,
   each with its archived origin;
 - the exact revision and diff range reviewed.
@@ -593,10 +707,25 @@ Return a short markdown report, then exactly one final JSON object line:
   "fresh_review": true,
   "findings": [],
   "accepted_advisories": [],
+  "out_of_scope": [
+    {
+      "classification": "adjacent_scope|pre_existing",
+      "locus": "path[:symbol]",
+      "observed": "<observed behavior>",
+      "required": "<required behavior>",
+      "evidence": "<command, reproduction, or artifact observed with its result>",
+      "impact": "<what breaks or what claim becomes false>",
+      "proposed_slice": "<proposed slice or follow-up, or none>",
+      "disposition": "proposed-slice|follow-up|carry-forward",
+      "introduced_by_diff": "yes|no|unknown",
+      "adjacent_scope": true
+    }
+  ],
   "coverage": [
     {
       "case": "read-permission-denied",
       "class": "read-error",
+      "scope": "current-slice|adjacent",
       "result": "covered|not-applicable|not-covered",
       "evidence": "<test, command, or observed reproduction with its result>",
       "not_applicable_reason": "<one sentence when result is not-applicable>"
@@ -624,7 +753,21 @@ Return a short markdown report, then exactly one final JSON object line:
 
 `coverage` SHALL contain one entry per required matrix case supplied in
 `COVERAGE_MATRIX`. The orchestrator copies the array into the ledger and the
-final report unchanged, so a missing case cannot be recorded as reviewed.
+final report unchanged, so a missing case cannot be recorded as reviewed. Every
+entry SHALL carry `case`, `scope`, `result`, and `evidence`; an entry without
+`scope` is incomplete.
+
+Every `findings` entry SHALL carry `severity`, `locus` (an array of
+repository-root-relative paths, each optionally suffixed with `:<symbol>`), a
+`statement` describing the observed and required behavior,
+`introduced_by_diff`, and `adjacent_scope`. The prose `fix_prompt` remains the
+implementer's corrective input; the `findings` array does not replace it or
+change its required sections.
+
+`out_of_scope` SHALL be `[]` when every finding is current-slice scope. A
+`pass` MAY still carry entries there; they are records and do not change the
+verdict. It is not a substitute for a `carry_forward` item whose target is an
+already archived change.
 
 `carry_forward` SHALL be `[]` when no prior-archived defect was encountered. An
 entry there is a record, never a corrective handoff: it does not change the

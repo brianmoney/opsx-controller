@@ -55,6 +55,10 @@ Parse these fields from the dispatch:
 - `ROUND` — this repair round (1-based). The repair/audit round limit is
   advisory; a later round is legitimate when the orchestrator says so.
 - `OPERATOR_WAIVER` — a verbatim operator restriction, or `none`.
+- `OPERATOR_ATTESTATIONS` — the recorded attestation records, each with
+  `subject`, `statement`, `scope`, `source`, and `recorded_at`, or `none`.
+- `EXISTING_EVIDENCE` — evidence already recorded in the ledger, each with a
+  path and its `sha256`, or `none`.
 
 If `BLOCKERS` is missing or empty, return `blocked`. Never reconstruct it from
 the transcript. A blocker whose `repair.action` is `resolve-slug-collision`, and
@@ -62,6 +66,38 @@ whose `repair.owner` is `orchestrator`, is not a repair this writer performs;
 see *`resolve-slug-collision` is not a hygiene action*. An out-of-plan slug
 collision arrives as `repair.action: operator-decision`; that is a human-only
 stop, so you return `blocked` and touch nothing.
+
+## Operator authority and recorded evidence
+
+An operator attestation is an explicit statement in the invocation, a dispatch
+reply, or a recorded message. It is authoritative for its named subject, and you
+SHALL NOT re-derive, re-check, or ask again about a state the operator has
+confirmed.
+
+- An `authority` attestation authorizes exactly the commit or action it names.
+  When it authorizes the accepted-source commit and covers the pathspecs the
+  blocker names, record it verbatim and stage those pathspecs in Phase A without
+  asking for the authorization again.
+- A `gate` or `quiescence` attestation answers that question for the named
+  change; record it verbatim. It is not a repair and adds no pathspec.
+- An `evidence` or `scope` attestation is authoritative for the question it
+  names and is not re-derived either.
+
+An attestation authorizes only the named commit or action, never a wider
+pathspec. It SHALL NOT add a path no blocker named, SHALL NOT widen a
+`pathspecs` list, SHALL NOT override the `OPERATOR_WAIVER` bound, and SHALL NOT
+stand in for reading an artifact before you hash it. An attestation that
+conflicts with a hard repository fact is recorded as a conflict and returned
+`blocked`, not silently resolved in either direction.
+
+Reuse recorded ledger evidence. When `EXISTING_EVIDENCE` records a path and its
+`sha256` and the artifact still resolves at `HEAD`, reference the recorded hash
+instead of re-collecting a duplicate transcript; read the artifact before any
+hash you write, and never carry one over from a summary. Preservation of
+historical originals is unchanged, and a reused entry never authorizes a write.
+Keep the report minimal: name the paths, the commits, the accepted
+attestations, and what remains, not a transcript of commands whose output proves
+nothing further.
 
 ## Repair in phases
 
@@ -286,6 +322,14 @@ then exactly one final JSON object line:
   ],
   "phase_commits": {"A": "<sha or empty>", "B": "<sha or empty>"},
   "amended_commit": {"sha": "<new sha>", "replaced": "<old sha>"},
+  "attestations": [
+    {
+      "subject": "quiescence|authority|gate|evidence|scope",
+      "statement": "<the operator's words, verbatim>",
+      "scope": "<the exact change, commit, or action it covers>",
+      "source": "invocation|message|ledger"
+    }
+  ],
   "evidence_actions": [
     {
       "action": "add-evidence|supersede-manifest|supersede-versioned-file|update-checksum|record-unqualified",
@@ -323,6 +367,10 @@ then exactly one final JSON object line:
 Set `amended_commit` to `null` when no commit was amended. `evidence_actions`
 is `[]` when Phase B took no action. `unqualified` lists every item still
 unverified after both phases; an empty list means none remain.
+`attestations` is `[]` when the dispatch carried none; it lists only an operator
+attestation you actually used. An attestation authorizes only the commit or
+action it names, never a wider pathspec, so a stage outside that scope stays
+out of scope.
 
 `actions` and `blockers_repaired` list only repairs you actually performed, so an
 orchestrator-owned `resolve-slug-collision` never appears in either.

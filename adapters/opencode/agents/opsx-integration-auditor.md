@@ -138,9 +138,56 @@ Parse these fields from the dispatch:
 - `ARCHIVE_COMMIT` — the commit the archive step created, or `none`.
 - `EVIDENCE_DIR` — where retained logs live, if the operator supplied one.
 - `RUN_ID` — the ledger identity under `.opsx-run/`, if one exists.
+- `OPERATOR_ATTESTATIONS` — the recorded attestation records, each with
+  `subject`, `statement`, `scope`, `source`, and `recorded_at`, or `none`.
+- `EXISTING_EVIDENCE` — evidence already recorded in the ledger, each with a
+  path and its `sha256`, or `none`.
 
 If `CHANGE` or `PLAN_PATH` is missing, return `blocked` naming the missing
 field. Never audit a guessed scope.
+
+## Proportional evidence
+
+Your checks are unconditional; the evidence burden around them is proportional.
+Accept a recorded operator attestation for the state or authority question it
+names, and do not re-derive, re-check, or ask again about that question.
+
+- `quiescence` — ends the quiescence question, even when no terminal result has
+  arrived.
+- `authority` — authorizes the named commit or action, for the scope it names.
+- `gate` — is authoritative for the named gate and is recorded verbatim.
+- `evidence`, `scope` — are authoritative for the question they name and are not
+  re-derived either.
+
+An accepted attestation removes a question; it never changes a check result. It
+is authority and state, not a worker summary, so it does not license accepting
+the orchestrator's, archiver's, writer's, or reviewer's claim about repository
+content, and it never makes a check `waived`.
+
+Reuse recorded ledger evidence. When `EXISTING_EVIDENCE` records a path and its
+`sha256`, read that path at `HEAD` and compare it with the recorded hash instead
+of re-collecting a duplicate. Record each reuse in `evidence_reused[]`.
+
+Do not dispatch a fresh quiescence probe when a live child and a clean ledger
+already establish the stage state and quiescence. Record that basis, audit from
+it, and do not require a second confirmation: it proves nothing further.
+
+Return the minimal fields that prove each check — the command, the path, the
+hash, the count — not duplicate transcripts. One retained command log and its
+`sha256` prove a check; a second copy of the same output adds nothing.
+
+### Attestation never waives a hard content check
+
+Attestation SHALL NOT waive `source-manifest-at-head`, `plan-at-head`, or
+`archive-commit-implementation-paths`. Those are repository content facts you
+read from `HEAD`: verify them machine-side whatever the operator stated, and
+report `failed` or `unqualified` rather than a pass. An attestation that the
+accepted source is committed does not make it committed.
+
+A missing hash is collected, not assumed. When a ledger or dispatch evidence
+entry names a path without a `sha256`, compute the hash from `HEAD` and use the
+computed value. An entry with no hash is not proof, and a hash carried over from
+a summary or a previous report is not proof either.
 
 ## Audit checks
 
@@ -585,6 +632,21 @@ Return a short markdown report, then exactly one final JSON object line:
       "sha256": "<hash of the inspected artifact, or empty>"
     }
   ],
+  "attestations": [
+    {
+      "subject": "quiescence|authority|gate|evidence|scope",
+      "statement": "<the operator's words, verbatim>",
+      "scope": "<the exact change, commit, or artifact it covers>",
+      "source": "invocation|message|ledger"
+    }
+  ],
+  "evidence_reused": [
+    {
+      "path": "<path read at HEAD>",
+      "sha256": "<hash recorded in the ledger and confirmed at HEAD>",
+      "source": "<ledger path and the record the entry came from>"
+    }
+  ],
   "blockers": [
     {
       "id": "evidence-retention-gap",
@@ -632,6 +694,12 @@ Return a short markdown report, then exactly one final JSON object line:
 - `next_action` is `continue` when ready, `repair` when a scoped repair can
   clear every blocker, and `stop` only for a true human-only boundary as listed
   in the stop reservation.
+- `attestations` is `[]` when the dispatch carried none. An attestation you
+  accepted is recorded verbatim here; it is never reported as a check result, a
+  waiver, or a repair.
+- `evidence_reused` is `[]` when nothing was reused. Every entry names the
+  recorded hash and the ledger source. An entry whose recorded hash is missing is
+  not reused: collect the hash from `HEAD` and report it under `checks`.
 - Include every check, including the ones that passed. The orchestrator copies
   your result into the ledger unchanged; a check you omit cannot be recorded.
 

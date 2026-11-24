@@ -406,8 +406,8 @@ no entries). In reports:
 - **JSON mode**: `cost_status` is `"unresolved"`, `estimated_cost` is `null`.
 - **Dashboard**: amber `(unresolved)` label.
 
-Unresolved costs do **not** contribute to total or average cost calculations.
-The change is still counted in `unresolved_cost_changes`.
+Unresolved costs do **not** contribute to the priced subtotal or average cost
+calculations. The change is still counted in `unresolved_cost_changes`.
 
 ---
 
@@ -415,18 +415,43 @@ The change is still counted in `unresolved_cost_changes`.
 
 ### Cost statuses
 
-Every telemetry record carries a `cost.status` field (requirement: *Cost
-estimation placeholders reserve billing mode slots* in the
-`plan-run-observability` spec):
+A cost status says how much is known about a stage's cost, and it always
+distinguishes a genuine zero from an unknown:
 
 | Status | Meaning | Rendering |
 |---|---|---|
 | `estimated` | A cost was computed from usage and pricing data. | `$X.XX` (table), `estimated_cost` field (JSON) |
 | `unresolved` | Estimation attempted but required inputs were missing (unknown model, no usage data, missing subscription denominator). | `unresolved` (table), `null` (JSON) |
 | `unavailable` | Cost estimation has never been attempted (records before Phase 2, or records from runs where estimation was disabled). | `—` (table), `null` (JSON) |
+| `not-reported` | The harness or child reported no token usage at all, so there is nothing to estimate. The burn is unknown, not zero. | `not-reported` (report), `null` (JSON) |
+
+The deterministic telemetry record's `cost.status` field uses `estimated`,
+`unresolved`, and `unavailable` (requirement: *Cost estimation placeholders
+reserve billing mode slots* in the `plan-run-observability` spec). A plan-level
+stage record adds `not-reported` for a stage with no reported usage at all.
+
+A stage with observed usage and an `unresolved` or `unavailable` price is
+presented as **unpriced**: the usage is real, the price is not. Only
+`not-reported` means the usage itself is missing.
 
 **Zero estimated cost** (`$0.00`) is distinct from unresolved: a stage that
 used zero tokens with a known model produces a legitimate zero‑cost estimate.
+
+### A run total with unpriced stages is not `$0`
+
+Only `estimated` stages contribute to the priced subtotal. A run that has any
+`unresolved`, `unavailable`, or `not-reported` stage has a **priced subtotal**,
+not a total, and it must be reported with its `unpriced_stage_count` (and its
+`not_reported_stage_count`, where tracked).
+
+- Never present that subtotal as the run total, and never present it as `$0`.
+- A bare `$0.00` total is valid only when every stage is `estimated` and each
+  estimate is zero, or the run truly used zero tokens.
+- A stage with observed usage and an unresolved price is `unpriced`; it is
+  never folded into zero.
+- A stage with no reported usage is `not-reported`; say the burn is unknown
+  instead of inventing a number.
+- The three token totals still expose the burn when no cost can be priced.
 
 ### Per‑token (list‑price‑equivalent) cost
 
@@ -458,19 +483,43 @@ period). Without a configured denominator, the cost is unresolved.
 
 `opsx-plan report <plan>` (table mode) shows:
 
-- **Plan summary**: `total_estimated_cost` (sum), plus breakdown counts
+- **Plan summary**: `total_estimated_cost` (a **priced subtotal**, labelled
+  `partial` when any stage is unresolved or unknown), plus breakdown counts
   (`estimated_cost_changes`, `unresolved_cost_changes`, `unknown_cost_changes`).
 - **Per‑change table**: cost column renders `$X.XX` / `unresolved` /
-  `unavailable` / `—` per change.
+  `unavailable` / `—` per change, with token columns carrying the change's
+  observed usage.
 - **Leaderboard**: `average_cost` computed from only the changes with at least
   one estimated‑cost stage.
+
+In JSON mode, each telemetry record carries the burn fields directly under
+`usage` and `cost`: `input_tokens`, `output_tokens`, `cached_input_tokens`,
+`usage_source`, `cost_status`, and `estimated_cost`. `usage_source` records how
+the usage was obtained (`worker_json`, `log_metadata`, `provider_api`, or
+`opencode_plugin`). A field that was not reported is `null`, never zero.
+
+A plan-level run report (the orchestrator's ledger and final report) uses the
+same vocabulary, with `tokens_in`, `tokens_out`, `cache_read_tokens`, a
+`usage_source` naming telemetry, the child's report, or the operator, and these
+aggregate fields:
+
+| Field | Meaning |
+|---|---|
+| `priced_subtotal` | Sum of `estimated` stage costs only. |
+| `unpriced_stage_count` | Stages with observed usage and no resolved price. |
+| `not_reported_stage_count` | Stages with no reported usage, where tracked. |
+
+A report whose `unpriced_stage_count` or `not_reported_stage_count` is non-zero
+has no honest run total: report the priced subtotal and the unpriced count
+instead of a bare `$0`.
 
 ### Reading cost in dashboards
 
 `opsx-plan dashboard <plan>` includes a **Cost Breakdown** section with a CSS
 bar chart showing the proportion of estimated, unresolved, and unknown costs.
 The **Per‑Change Table** uses color coding: normal text for `$X.XX`, amber for
-`(unresolved)`, gray for `—` / no data.
+`(unresolved)`, gray for `—` / no data. The unknown band is missing or
+`not-reported` data, not a zero cost.
 
 ---
 

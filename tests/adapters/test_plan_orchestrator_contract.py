@@ -22,6 +22,15 @@ def _flat(text: str) -> str:
     return " ".join(text.split())
 
 
+def _table_row(text: str, dimension: str) -> str:
+    """Return one markdown table row as ``dimension | value``."""
+    for line in text.splitlines():
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if cells and cells[0] == dimension:
+            return " | ".join(cells)
+    raise AssertionError(f"missing table row for {dimension!r}")
+
+
 class PlanOrchestratorContractTests(unittest.TestCase):
     def test_orchestrator_is_delegation_only(self) -> None:
         text = _ORCHESTRATOR.read_text(encoding="utf-8")
@@ -144,6 +153,121 @@ class PlanOrchestratorContractTests(unittest.TestCase):
             flat,
         )
         self.assertIn("runtime input, not an authoring edit", flat)
+
+
+class MaximumSurfaceHeuristicTests(unittest.TestCase):
+    """Plan authoring sizes a change against all five surfaces before writing."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.reference = _PLAN_AUTHORING.read_text(encoding="utf-8")
+        cls.flat_reference = _flat(cls.reference)
+        cls.command = _PLAN_COMMAND.read_text(encoding="utf-8")
+        cls.flat_command = _flat(cls.command)
+
+    def test_reference_publishes_every_dimension_and_its_maximum(self) -> None:
+        self.assertIn("### Maximum Change Surface", self.reference)
+        expected = {
+            "Named surfaces": "3 (one primary plus at most two supporting)",
+            "Pages / endpoints / routes": "3 total",
+            "Acceptance scenarios": "5",
+            "Tasks": "12",
+            "Expected production diff": (
+                "400 changed lines (additions + deletions), excluding tests, "
+                "fixtures, and docs"
+            ),
+        }
+        for dimension, maximum in expected.items():
+            with self.subTest(dimension=dimension):
+                self.assertEqual(
+                    _table_row(self.reference, dimension),
+                    f"{dimension} | {maximum}",
+                )
+
+    def test_reference_defines_a_named_surface(self) -> None:
+        self.assertIn(
+            "is a distinct externally observable contract:",
+            self.flat_reference,
+        )
+        self.assertIn(
+            "an API endpoint group, a CLI command group, a page/UI route, a "
+            "freshness or persistence contract, an error taxonomy, or a cache layer.",
+            self.flat_reference,
+        )
+        self.assertIn(
+            "A page that adds an API endpoint counts as both.",
+            self.flat_reference,
+        )
+
+    def test_reference_mandates_the_cross_surface_split(self) -> None:
+        self.assertIn(
+            "The mandatory split rule is independent of the numeric limits: a "
+            "change that spans",
+            self.flat_reference,
+        )
+        self.assertIn(
+            "API + CLI + page + freshness + error taxonomy",
+            self.flat_reference,
+        )
+        self.assertIn(
+            "or three or more named surfaces, SHALL be split before it is "
+            "written. There is no review override for this rule.",
+            self.flat_reference,
+        )
+        self.assertIn(
+            "Exceeding a numeric threshold requires the author to split or "
+            "narrow the change.",
+            self.flat_reference,
+        )
+
+    def test_command_records_the_five_dimension_assessment(self) -> None:
+        self.assertIn(
+            "Apply the maximum-surface heuristic to every change before writing "
+            "it: at most 3 named surfaces (one primary plus at most two "
+            "supporting), 3 pages/endpoints/routes, 5 acceptance scenarios, 12 "
+            "tasks, and 400 expected production changed lines (additions + "
+            "deletions), excluding tests, fixtures, and docs.",
+            self.flat_command,
+        )
+        self.assertIn(
+            "A named surface is a distinct externally observable contract",
+            self.flat_command,
+        )
+        self.assertIn(
+            "Record the five-dimension surface assessment for every change in "
+            "its scope and success parameters",
+            self.flat_command,
+        )
+
+    def test_command_mandates_the_cross_surface_split(self) -> None:
+        self.assertIn(
+            "Split a change before writing it when it spans API + CLI + page + "
+            "freshness + error taxonomy, or three or more named surfaces.",
+            self.flat_command,
+        )
+        self.assertIn(
+            "That rule is independent of the numeric limits and has no review "
+            "override; a recorded numeric exception does not waive it either.",
+            self.flat_command,
+        )
+
+    def test_command_self_verifies_and_reports_the_assessment(self) -> None:
+        self.assertIn(
+            "Verify every change against the maximum-surface heuristic: named "
+            "surfaces, pages/endpoints/routes, acceptance scenarios, tasks, and "
+            "expected production diff.",
+            self.flat_command,
+        )
+        self.assertIn(
+            "Report the recorded five-dimension surface assessment for each "
+            "change, and every change that was split, narrowed, or proposed for "
+            "re-scope with the surface that prompted it.",
+            self.flat_command,
+        )
+        self.assertIn(
+            "never omit the assessment or the decision",
+            self.flat_command,
+        )
 
 
 if __name__ == "__main__":
