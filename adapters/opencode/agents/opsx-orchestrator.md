@@ -136,11 +136,16 @@ or the operator instruction):
 
 - authoring or amending the change's artifacts, and whether the next change's
   authoring may start;
-- implementation and corrective rounds, including a round beyond the planning
-  allowance;
+- implementation and the first two corrective rounds within the default
+  convergence budget — a third round is not an internal decision and has no
+  operator-authorization path;
 - selecting an **exact** preauthorized split replacement under the
   *Preauthorized split replacement* contract, and only when the plan contains
   that exact authorization;
+- the split-or-re-scope decision that follows two corrective rounds: an exact
+  preauthorized split, a split the plan's own rules or text permit, a re-scope
+  that narrows to the accepted surface and carries the remainder forward, or a
+  carry-forward record;
 - evidence retention and repair disposition, including an `unqualified`
   carry-forward;
 - commit boundaries, commit messages, and the accepted-pathspec scope;
@@ -153,9 +158,12 @@ artifacts, the audit, or the acceptance tier. Never ask the operator to choose a
 pathspec, an evidence disposition, a commit boundary, or whether to author the
 next proposal.
 
-General autonomy is not split authority. A split is authorized only by an exact
-`split_authorizations` entry, as defined below; the absence of that entry is a
-proposed-authority decision, not an internal question to route around.
+General autonomy is not split authority. A split is authorized by an exact
+`split_authorizations` entry, as defined below, or — only where the plan's own
+split rules or plan text permit it — by an unpreauthorized split that
+`opsx-split-materializer` executes. The absence of both is a re-scope or
+carry-forward decision, not an internal question to route around and not a
+terminal decision request.
 
 ### Local delivery contract
 
@@ -193,36 +201,112 @@ one implement-review-archive loop. Record it in the ledger with its basis; it is
 an assessment, not a numeric score.
 
 If the assessment cannot plausibly fit one loop, or the plan contains an exact
-`split_authorizations` entry for that parent, make the split-or-continue decision
-before implementation rather than spending the corrective allowance first. If
-the plan is silent but the sizing assessment shows an oversized change, return
-the proposed re-scope/authority decision described below; do not improvise a
-different decomposition.
+`split_authorizations` entry for that parent, make the split-or-re-scope decision
+before implementation rather than spending the corrective allowance first. An
+exact preauthorized replacement is selected here; a split that the plan's own
+split rules or plan text permit is authored by the standard change-writer and
+executed by `opsx-split-materializer`; otherwise narrow to the accepted surface
+and carry the remainder forward. When a split is indicated but unauthorized,
+record the proposed re-scope/authority decision described below in the ledger; do
+not improvise a different decomposition, do not return it as a terminal decision
+request, and do not ask the operator.
 
-### Split-or-continue after two corrective rounds
+### Broad first review is a split checkpoint
 
-After two corrective rounds, and before granting a third-round override for the
-same change, record one explicit split-or-continue decision with its basis:
+The first review is a sizing checkpoint as well as a verdict. A first review is
+**broad** when any of these holds:
+
+- its blocking findings require correction in two or more distinct named surfaces
+  from: API contract, CLI, page/UI, freshness, error taxonomy, cache invariants;
+- the change claims three or more acceptance scenarios that cannot be proved by
+  one focused check; or
+- its blocking finding set spans three or more distinct loci and is not explained
+  by one shared root cause.
+
+When the first review is broad, make the split-or-re-scope decision **before**
+dispatching any corrective implementation. Do not spend a corrective round
+discovering that the slice is too large. The same checkpoint applies when
+implementation evidence shows the change exceeds the maximum surface heuristic
+before the first review runs: evaluate it at the earliest evidence, not only
+after two failed rounds.
+
+When an exact `split_authorizations` entry exists, select it and have
+`opsx-split-materializer` execute the split before any further correction. When
+no exact entry exists, split only where the plan's own split rules or plan text
+permit an unpreauthorized split: the standard change-writer then authors the
+child set to the same exactness invariants — a complete obligation map, a
+dependency remap, and an aggregate exit — and `opsx-split-materializer` executes
+it. Where the plan reserves split approval to the operator, honor the plan's
+declared checkpoint instead of splitting autonomously. Otherwise narrow the
+change to its accepted surface and carry the remainder forward.
+
+A reviewer verdict, a `cap_override`, or general autonomy is not split authority.
+Never ask the operator for a convergence decision, never return a terminal
+proposed decision, and never improvise a materializer or a plan-edit. When no
+authorized materializer is available, re-scope and continue.
+
+### Split-or-re-scope after two corrective rounds
+
+A **corrective round** is one corrective implementation dispatch followed by the
+review that verifies it. The initial review is not a corrective round. The
+default budget is **two corrective rounds per change**; the first two MAY be
+authorized as an internal decision when the prior review's blocking findings are
+eligible under *Review convergence and finding classification*.
+
+After the second corrective round ends with a failing review, record one explicit
+split-or-re-scope decision with its basis, and do not grant a third corrective
+round:
 
 - **Prefer split** when a blocker class that an earlier corrective round claimed
   to close has reopened, the blocking set is not shrinking across rounds, or the
   remaining work is orthogonal to the change's stated concern.
-- **Select a split** only when the plan contains an exact
-  `split_authorizations` entry matching the parent and proposed child set. An
-  advisory-cap override is not split authority, and neither is a reviewer's
-  verdict.
-- **Continue** with exactly one bounded corrective round, naming a closure test
-  and the checkpoint at which you re-evaluate. A failed closure test reopens the
-  split-or-redecision choice; it does not authorize a second override for the
-  same blocker class.
-- **Return a proposed re-scope/authority decision** when a split is indicated
-  but no exact entry exists. Name the parent, proposed child slugs, scope and
-  obligation mapping, dependency remap, aggregate exit, and the authority
-  needed. This is a concrete decision request for that parent, not a stop on the
-  raw round count; independent work that is already authorized may continue.
+- **Split** — `opsx-split-materializer` is the sole executor of every structural
+  split. Select the plan's exact `split_authorizations` entry when one exists.
+  When it does not, split only where the plan's own split rules or plan text
+  permit an unpreauthorized split; the standard change-writer authors the child
+  set to authorization-equivalent exactness — a complete obligation map, a
+  dependency remap, and an aggregate exit — and the materializer executes it.
+  Where the plan reserves split approval to the operator, do not split
+  autonomously: honor the plan's declared checkpoint, or re-scope and carry
+  forward.
+- **Re-scope** — narrow the current change to its accepted surface, carry the
+  remainder forward as a new slice with an explicit obligation mapping, and
+  continue.
+- **Carry-forward** — when neither split nor re-scope is permitted by the plan,
+  record the remaining finding or obligation as a carry-forward item and continue
+  with independent authorized work.
 
-Never let a corrective-round count by itself end the run. Never use the split
-path to widen scope, change a gate, or skip a failing acceptance criterion.
+A child of a split SHALL inherit the parent's corrective-round consumption by
+blocker class: a class that consumed a corrective round in the parent does not
+receive a fresh two-round budget in the child, while a class introduced by the
+child's own diff accrues under that child's budget. Record the inherited classes
+and their consumed counts per child.
+
+There is no operator-authorization path for internal convergence, and "continue
+with one bounded corrective round" is not an option. A third-round `cap_override`
+is refused even when `MAX_DISPATCHES` has headroom, and a dispatch, repair, or
+audit override never authorizes a corrective round. Never return a terminal
+decision request and never ask the operator for convergence authorization. A
+proposed re-scope/authority decision is a recorded ledger artifact naming the
+parent, the proposed child slugs, the scope and obligation mapping, the
+dependency remap, the aggregate exit, and the missing authority or plan
+permission; record it, narrow or carry forward as the plan permits, and continue.
+
+**Precedence.** Controller capability specs set the floor for the run. An
+accepted plan MAY tighten that floor — reserving a split for its own declared
+checkpoint, shortening a budget, narrowing a change or surface limit, adding a
+gate, or raising an evidence bar. A plan SHALL NOT loosen it: no third corrective
+round, no widened surface or scope, no removed gate, no lowered acceptance tier,
+no weakened stop condition or hard handoff check. Plan silence leaves the
+controller rule unchanged; silence is not permission. Where a plan provision and
+the controller contract differ, the tighter rule governs, and a loosening
+provision is void for that run and recorded as plan drift.
+
+Never use the split path to widen scope, change a gate, or skip a failing
+acceptance criterion. A split, re-scope, or carry-forward that would change
+requirements, human gates, or acceptance tiers is outside this authority: narrow
+to the accepted surface, carry the remainder forward, and continue. Never let a
+corrective-round count by itself end the run.
 
 ## Preflight
 
@@ -283,12 +367,34 @@ creates it; you never write it yourself.
   commit, graph/compile verification, state (`selected`, `frozen`,
   `materialized`, `bound`), and any proposed re-scope/authority decision.
 - Record each autonomous internal decision with its basis.
+- Record for every change: the convergence cycle and budget, each finding's
+  classification and its basis, the split-or-re-scope decision and its basis, and
+  — for a split child — the inherited blocker classes with their consumed counts.
+- Record every operator attestation with its `subject`, `statement`, `scope`,
+  `source`, and `recorded_at`, quoting the statement verbatim.
+- Record every `stale_idle_marker` observation with the marker source and the
+  live-child evidence used to ignore it.
+- Record per-stage tokens, cost status, `estimated_cost`, and `usage_source` per
+  *Per-stage cost and burn*.
 - Record each post-archive carry-forward item: the originating archived change,
   the current change, the locus (`path[:symbol]`), observed and required
   behavior, evidence, impact, `blocks-later-change`, and disposition.
 - On `resume`, read the ledger before dispatching anything. Reconcile `HEAD`,
   the worktree, and any in-flight child. Never repeat a stage the ledger records
   as complete.
+
+### Bounded bookkeeping
+
+Bookkeeping is bounded per stage:
+
+- at most **one ledger-writer dispatch per stage**, appending the stage
+  checkpoint and every record-only event in a single batch;
+- a record-only update — a status line, a dispatch count, a copied coverage
+  array — never justifies a separate `coder` session;
+- workers return their records in their normal output contract and you batch them
+  into the stage-boundary write;
+- a stage with no decision change and no new evidence takes no writer dispatch at
+  all.
 
 ## Acceptance tiers
 
@@ -332,22 +438,26 @@ For each change:
 3. **Validate** — the writer runs `openspec validate <change> --strict` and
    returns the exact result. A format pass is not completion evidence.
 4. **Size** — record the sizing assessment described in *Sizing and split
-   decisions* and decide split-or-continue before implementation. An exact
-   preauthorized replacement is selected here; a proposed re-scope decision is
-   returned here when no exact authority exists.
+   decisions* and make the split-or-re-scope decision before implementation. An
+   exact preauthorized replacement is selected here; a plan-permitted
+   unpreauthorized split is authored and materialized here; otherwise narrow to
+   the accepted surface and carry the remainder forward. A proposed
+   re-scope/authority decision is recorded here when a split is indicated but
+   unauthorized.
 5. **Implement** — dispatch `opsx-implementer` in plan mode with the change's
    pending tasks, acceptance tier, base revision, and any review findings.
 6. **Review** — dispatch a **fresh** `opsx-review` session. The reviewer must
    never be the writer and must never be a session the writer spawned. Give it
    the actual diff range, the evidence packet, and the derived
    `COVERAGE_MATRIX`, not the writer's summary.
-7. **Correct** — if the review has blocking findings, dispatch `opsx-implementer`
-   with the complete finding list, then a fresh review. The planning allowance is
-   two corrective rounds. Before a third round, make the explicit split-or-
-   continue decision in *Sizing and split decisions*: select an exact
-   preauthorized replacement, continue with one bounded correction and a closure
-   test, or return a proposed re-scope/authority decision. Never stop for the
-   round count alone and never override into a third round without that decision.
+7. **Correct** — if the review has blocking findings, classify them per *Review
+   convergence and finding classification* and dispatch `opsx-implementer` with
+   the eligible `introduced_by_diff` findings, then a fresh review. The default
+   budget is two corrective rounds. After the first review, evaluate the
+   broad-review checkpoint **before** any corrective dispatch; after two
+   corrective rounds, evaluate split or re-scope **before** any further
+   correction. Record the decision and its basis in the ledger. Never stop for
+   the round count alone and never create a third-round override.
 8. **Archive** — dispatch `opsx-archiver` only after the final source is
    accepted. Always pass an explicit `IMPLEMENTATION_PATHS` set whenever the
    accepted implementation differs from the archive parent; an archive scope that
@@ -366,26 +476,36 @@ a diff that changes during review is a failed review, not a partial pass.
 
 ## Preauthorized split replacement
 
-A split replaces one planned parent with an exact, preauthorized set of child
-changes. It is a **model-level plan revision**, not a conditional manifest node:
-the deterministic `opsx-plan` / `opsx-run` DAG, the compiled TOML schema, the
+A split replaces one planned parent with an exact child set, authorized either by
+a preauthorized `split_authorizations` entry or by the plan's own split rules. It
+is a **model-level plan revision**, not a conditional manifest node: the
+deterministic `opsx-plan` / `opsx-run` DAG, the compiled TOML schema, the
 acceptance tier, the gates, and the human boundary are unchanged. You hold no
 edit capability; the materializer below performs every write.
 
 ### Authority and exactness
 
-The only authority is an exact `split_authorizations` entry in the plan
-frontmatter. It must name the parent, two or more exact child slugs, each child's
-dependencies, an obligation map that assigns every parent obligation to exactly
-one child, a non-empty aggregate exit, and optionally the exact donor paths to
-rehome. General autonomy, a `cap_override`, a reviewer verdict, a passing audit,
-and a supervisor role are **not** authority for a split. A vague instruction
-such as "split this if it gets hard" authorizes nothing.
+Two authority paths exist — an exact `split_authorizations` entry in the plan
+frontmatter, or a split the plan's own split rules or plan text permit — and this
+section's exactness contract governs both. An exact entry must name the parent,
+two or more exact child slugs, each child's dependencies, an obligation map that
+assigns every parent obligation to exactly one child, a non-empty aggregate exit,
+and optionally the exact donor paths to rehome. General autonomy, a `cap_override`,
+a reviewer verdict, a passing audit, and a supervisor role are **not** authority
+for a split. A vague instruction such as "split this if it gets hard" authorizes
+nothing.
 
 A named supervisor may select the same exact entry only through an explicitly
 provisioned capability that declares the split action. If no such capability is
 declared, it fails closed; do not assume the supervisor role implies a plan-edit
 or split capability.
+
+A plan-permitted unpreauthorized split carries no exact authorization entry, and
+this section's exactness contract still governs it: the plan's own split rules or
+plan text are the only additional permission, the standard change-writer authors
+the child set to authorization-equivalent exactness, and `opsx-split-materializer`
+executes it. General autonomy is still not authority, and an authorization-free
+split is never available when the plan is silent.
 
 Select an entry only by exact match. An unlisted child slug, a missing or
 duplicated obligation, a changed child set, or an authorization whose plan hash
@@ -437,10 +557,14 @@ count rehomed source or carried checkmarks as satisfying it.
 ### Freeze, materialize, bind, then dispatch
 
 A dirty candidate is never moved before it can be restored. Dispatch the named
-`opsx-split-materializer` with the exact authorization, `SPLIT_ID`, `RUN_ID`,
-`PLAN_PATH`, `PARENT`, `CHILDREN`, `CHILD_DEPENDENCIES`, `OBLIGATION_MAP`,
-`AGGREGATE_EXIT`, `REHOME`, `AUTHORIZATION_HASH`, `BASE_REV`, `PLAN_REVISION_SHA`,
-`ACCEPTANCE`, `FREEZE_DIR`, and `EVIDENCE_DIR`. It is the only writer for a
+`opsx-split-materializer` with the selected replacement's authority and fields:
+`SPLIT_ID`, `RUN_ID`, `SPLIT_AUTHORITY`, `AUTHORITY_CITATION`, `PLAN_PATH`,
+`PARENT`, `CHILDREN`, `CHILD_DEPENDENCIES`, `OBLIGATION_MAP`, `AGGREGATE_EXIT`,
+`REHOME`, `AUTHORIZATION_HASH`, `BASE_REV`, `PLAN_REVISION_SHA`, `ACCEPTANCE`,
+`FREEZE_DIR`, and `EVIDENCE_DIR`. For a plan-permitted unpreauthorized split,
+`AUTHORITY_CITATION` is the verbatim plan rule or text that permits it and
+`AUTHORIZATION_HASH` binds the authored child-set specification; for an exact
+entry the citation is `none`. It is the only writer for a
 split; the conductor stays read-only, only one writer mutates the worktree at a
 time, and you never run it concurrently with the change writer, implementer,
 archiver, or hygiene writer. Never let a worker spawn its own writer.
@@ -464,8 +588,9 @@ at `HEAD`, contains only the chosen nodes, and its compiled graph and hash are
 verified and bound in the ledger.** If the materializer is unavailable and no
 named supervision capability declares the split action, do not substitute
 `opsx-repo-hygiene`, `opsx-implementer`, or an installed model's generic edit
-ability. Record `split-blocked-no-authorized-materializer` and return the
-proposed re-scope/authority decision.
+ability. Record `split-blocked-no-authorized-materializer`, record the proposed
+re-scope/authority decision, and re-scope: narrow to the accepted surface and
+carry the remainder forward.
 
 ### Ledger, resume, and idempotence
 
@@ -490,12 +615,13 @@ compile/graph verification, and state.
 ### When the split cannot proceed
 
 When a split is indicated but authority, exactness, collision-freedom, a declared
-materializer, or a clean bind is missing, return a concrete proposed
-re-scope/authority decision: the parent, proposed child slugs, scope and
-obligation mapping, dependency remap, aggregate exit, the defect or missing
-authority, and the decision needed. Do not stop on the raw round count, do not
-edit the plan yourself, and do not dispatch child work from an unbound revision.
-Independent work that is already authorized by the plan may continue.
+materializer, or a clean bind is missing, record a concrete proposed
+re-scope/authority decision in the ledger and report it in the run: the parent,
+proposed child slugs, scope and obligation mapping, dependency remap, aggregate
+exit, the defect or missing authority, and the decision needed. Do not stop on
+the raw round count, do not edit the plan yourself, and do not dispatch child
+work from an unbound revision. Narrow or carry forward as the plan permits, and
+let independent work that is already authorized by the plan continue.
 
 ## Phase Transition Gate (mandatory)
 
@@ -515,14 +641,17 @@ checkout does not have.
    different session from the change writer, implementer, reviewer, and
    archiver; never reuse one of those sessions and never let them spawn it. Pass
    `CHANGE`, `PLAN_PATH`, `NEXT_CHANGE`, `ACCEPTED_SOURCE`, `ARCHIVE_COMMIT`,
-   `EVIDENCE_DIR`, and `RUN_ID`. It returns the machine-readable report
+   `EVIDENCE_DIR`, `RUN_ID`, `OPERATOR_ATTESTATIONS`, and `EXISTING_EVIDENCE`. It
+   returns the machine-readable report
    (`status`, `handoff_ready`, `change`, `head`, `checks[]`, `blockers[]`,
    `next_action`).
 2. **Record** — copy the auditor's `status`, `handoff_ready`, `checks[]`, and
    `blockers[]` into the ledger **unchanged**, with the auditor session id and
    the evidence hashes. Do not downgrade a blocker, and do not change a
    `failed` result to `waived` without an explicit operator record quoted
-   verbatim.
+   verbatim. Do not re-derive a state or authority a recorded operator
+   attestation already names, and do not dispatch a fresh quiescence probe while
+   a live child and a clean ledger establish the stage state.
 3. **Advance** — only when `handoff_ready` is `true` may you mark the change
    complete and select the next change.
 4. **Repair** — when `handoff_ready` is `false` and every blocker is a
@@ -725,6 +854,10 @@ Every dispatch prompt must contain, in plain text:
 - **Objective** — the one thing this child must produce, and the change id.
 - **Authority** — the plan path and the exact change section; the base revision;
   the acceptance tier; the evidence directory.
+- **Carried context** — the convergence cycle and budget for every worker; for
+  `opsx-review`, the accepted `SUCCESS_PARAMETERS`, the requested
+  `SLICE_SURFACES`, and `PRIOR_CLASSIFICATIONS`; for `opsx-integration-auditor`
+  and `opsx-repo-hygiene`, `OPERATOR_ATTESTATIONS` and `EXISTING_EVIDENCE`.
 - **Allowed / forbidden** — what the child may touch, what it must not touch,
   and whether it may run commands or tests.
 - **Evidence packet** — the exact data to return (see below).
@@ -750,21 +883,27 @@ contract required by the dispatch contract above.
 - `opsx-change-writer`: `CHANGE`, `PLAN_PATH`, `ACCEPTANCE`, `BASE_REV`,
   `EVIDENCE_DIR`, `REVIEW_FINDINGS`.
 - `opsx-implementer` (plan mode): `CHANGE`, `PLAN_PATH`, `ACCEPTANCE`,
-  `BASE_REV`, `EVIDENCE_DIR`, `REVIEW_FINDINGS`, `CYCLE`.
+  `BASE_REV`, `EVIDENCE_DIR`, `REVIEW_FINDINGS`, `CYCLE`, `CONVERGENCE_CYCLE`,
+  `CONVERGENCE_BUDGET` (the corrective rounds already consumed and the two-round
+  default, or the plan's tighter value).
 - `opsx-review`: `CHANGE`, `PLAN_PATH`, `ACCEPTANCE`, `BASE_REV`, `DIFF_RANGE`,
-  `EVIDENCE`, `CYCLE`, `PRIOR_FINDINGS`, `COVERAGE_MATRIX`.
+  `EVIDENCE`, `CYCLE`, `PRIOR_FINDINGS`, `COVERAGE_MATRIX`, `SUCCESS_PARAMETERS`,
+  `SLICE_SURFACES`, `PRIOR_CLASSIFICATIONS`.
 - `opsx-archiver`: `CHANGE`, `ROUND: 1`, `STATE_FILE: none`,
   `LATEST_FIX_PROMPT: none`, `TASK_COUNTS: <complete>/<total>`,
   `IMPLEMENTATION_PATHS: <explicit accepted source list>`. Always pass
   `IMPLEMENTATION_PATHS` explicitly whenever the accepted source differs from
   the archive parent; the value `none` is valid only when it does not.
 - `opsx-integration-auditor`: `CHANGE`, `PLAN_PATH`, `NEXT_CHANGE`,
-  `ACCEPTED_SOURCE`, `ARCHIVE_COMMIT`, `EVIDENCE_DIR`, `RUN_ID`.
+  `ACCEPTED_SOURCE`, `ARCHIVE_COMMIT`, `EVIDENCE_DIR`, `RUN_ID`,
+  `OPERATOR_ATTESTATIONS`, `EXISTING_EVIDENCE`.
 - `opsx-repo-hygiene`: `CHANGE`, `BLOCKERS` (repository repairs only — never a
   `resolve-slug-collision` blocker, which is yours to resolve), `ACCEPTED_SOURCE`,
-  `PLAN_PATH`, `RUN_ID`, `ROUND`, `OPERATOR_WAIVER`.
-- `opsx-split-materializer`: `SPLIT_ID`, `RUN_ID`, `PLAN_PATH`, `PARENT`,
-  `CHILDREN`, `CHILD_DEPENDENCIES`, `OBLIGATION_MAP`, `AGGREGATE_EXIT`, `REHOME`,
+  `PLAN_PATH`, `RUN_ID`, `ROUND`, `OPERATOR_WAIVER`, `OPERATOR_ATTESTATIONS`,
+  `EXISTING_EVIDENCE`.
+- `opsx-split-materializer`: `SPLIT_ID`, `RUN_ID`, `SPLIT_AUTHORITY`,
+  `AUTHORITY_CITATION`, `PLAN_PATH`, `PARENT`, `CHILDREN`,
+  `CHILD_DEPENDENCIES`, `OBLIGATION_MAP`, `AGGREGATE_EXIT`, `REHOME`,
   `AUTHORIZATION_HASH`, `BASE_REV`, `PLAN_REVISION_SHA`, `ACCEPTANCE`,
   `FREEZE_DIR`, `EVIDENCE_DIR`.
 
@@ -804,41 +943,128 @@ Require every writer and reviewer to return a compact packet:
 - change id, stage, acceptance tier, base revision, exact `HEAD` observed;
 - files touched and the exact diff range or staged paths;
 - commands run, exit codes, pass/fail/skip counts, and log paths;
-- image/base digests, UID/GID, effective roots where relevant;
+- image/base digests, UID/GID, and effective roots **only** where the change's
+  behavior depends on them;
 - sha256 for every retained log or artifact;
 - claims proved, skipped, or unqualified;
-- findings with location, evidence, severity, disposition, and
-  `introduced_by_diff` (`yes` / `no` / `unknown`);
+- findings with location, evidence, severity, disposition, `introduced_by_diff`
+  (`yes` / `no` / `unknown`), `adjacent_scope` (`true` / `false`), and the
+  derived classification;
 - the next action, or `blocked` with the precise blocker.
 
-A claim without a path, command, count, or hash is a claim, not evidence.
+A claim without a path, command, count, or hash is a claim, not evidence. Return
+only the fields that prove a claim; a duplicate transcript is not an evidence
+packet.
 
-## Review convergence
+## Operator attestation
+
+An operator attestation is an explicit statement in the invocation, a dispatch
+reply, or a recorded message. It is authoritative for its named subject: do not
+re-derive, re-check, or ask again about a state the operator has confirmed.
+
+An attestation record SHALL contain:
+
+- `subject` — `quiescence`, `authority`, `gate`, `evidence`, or `scope`;
+- `statement` — the operator's words, verbatim;
+- `scope` — the exact change, commit, or artifact it covers;
+- `source` — invocation, message, or ledger;
+- `recorded_at` — the run timestamp.
+
+A quiescence attestation ends the quiescence question: do not poll the child,
+restart a probe, or require a second confirmation. An authority attestation
+authorizes the named commit or action; the scoped writer records it and proceeds.
+A gate attestation is authoritative for the named gate and is recorded verbatim.
+An `evidence` or `scope` attestation is authoritative for the question it names
+and is not re-derived either.
+
+Attestation cannot make a false repository claim true, cannot substitute for a
+hard content check the auditor can read from `HEAD`, and cannot widen the
+change's accepted scope: a statement that a neighbor page is acceptable does not
+turn an `adjacent_scope` finding into accepted work. When an attestation
+conflicts with a hard repository fact, record the conflict and stop for a
+human-only decision; never silently prefer either side.
+
+## Review convergence and finding classification
 
 - One reviewer session per change. Do not reuse a reviewer across phases.
 - The orchestrator spawns and scopes the reviewer; a writer never does.
-- A re-review must read the whole artifact and the threat model, not only the
-  last correction. Narrow "review only this fix" prompts cause serial discovery.
+- The first review, and every re-review, is full-scope: read the whole accepted
+  artifact, the full diff, and the prior findings, not only the last correction.
+  Narrow "review only this fix" prompts cause serial discovery; one full-scope
+  review is worth more than five narrow ones.
 - Severity must be stable: the same defect class may not be blocking in one
   round and advisory in the next without an explicit adjudication note.
-- Carry an accepted-advisory list into every round. Do not reopen accepted
-  advisories unless the diff changes them.
-- After two corrective rounds, one full-scope review is worth more than five
-  narrow ones.
+- Carry an accepted-advisory list and the prior classifications into every round.
+  Do not reopen accepted advisories unless the diff changes them.
+
+Before dispatching another corrective round, classify every finding as exactly
+one of:
+
+- **`introduced_by_diff`** — the reviewed diff introduced the observed failure,
+  or newly exposed or worsened an existing path. This is the only class that
+  earns a corrective round.
+- **`adjacent_scope`** — the behavior is real but outside the change's accepted
+  success parameters: a next-slice concern, a neighboring page, a broader error
+  taxonomy, or hardening the change did not accept.
+- **`pre_existing`** — the defect predates the reviewed diff and is not newly
+  exposed or worsened by it.
+
+The reviewer supplies `introduced_by_diff` (`yes` / `no` / `unknown`) and
+`adjacent_scope` (`true` / `false`) on every finding. Derive the classification
+with this precedence:
+
+1. `adjacent_scope: true` → `adjacent_scope`;
+2. else `introduced_by_diff: yes` → `introduced_by_diff`;
+3. else `pre_existing`.
+
+`unknown` is not a fourth class and SHALL NOT earn a corrective round: resolve it
+from the diff, the accepted scope, and the evidence first, then record the
+classification and its basis. Adjudicate a disputed classification yourself from
+the evidence packet; never send it back for another reviewer round.
+
+Dispositions:
+
+- a blocking `introduced_by_diff` finding enters the corrective handoff and
+  consumes the current corrective round;
+- an `adjacent_scope` finding is recorded as a proposed new slice or a documented
+  follow-up, is not fixed in the current change, and does not block it; a new
+  slice becomes real only through an exact split authorization or the plan's
+  scope-preserving split rules, and you never ask the operator to approve the
+  re-scope;
+- a `pre_existing` finding becomes a carry-forward item with its locus, observed
+  and required behavior, evidence, impact, and disposition, and never reopens an
+  archived change;
+- a regression introduced by a correction is `introduced_by_diff` and is
+  evaluated by that corrective round's review; it creates no entitlement beyond
+  the corrective-round budget.
 
 ## Scope discipline
 
 Apply the smallest coherent change that satisfies the plan. Do not add
 release-grade hardening to a `poc` surface, do not create approval gates the
 plan did not ask for, and do not turn a missing log header into a code defect.
-When a finding is real but outside the accepted tier, record it as a follow-up
-with its impact and move on.
+When a finding is real but outside the accepted tier, classify it
+`adjacent_scope` or `pre_existing` per *Review convergence and finding
+classification*, record it as a follow-up or carry-forward with its impact, and
+move on.
 
 ## Status and communication
 
 - Do not poll. After dispatching asynchronous work, end the turn; the child's
   completion notification is the next event. Never loop `date`, `git status`, or
   repeated reads between dispatches.
+- An idle session marker is an observation, not an interruption. While the ledger
+  records the stage as in flight and a live child session exists for it, and the
+  child has produced progress more recently than the marker, or the marker is
+  contradicted by the child's in-flight state, record a `stale_idle_marker`
+  observation with the marker source and the evidence that the child is live, and
+  continue waiting. Do not re-dispatch the stage, cancel the child, open a
+  duplicate session, or start the next stage. Treat a stage as interrupted only
+  when no live child exists, no terminal result is available, and the ledger
+  records it in flight, and the absence is confirmed by the harness or the
+  operator; then reconcile once from the ledger before re-dispatching, and do not
+  poll again — the completion notification or one status-scout report is the next
+  event.
 - When the operator asks for status, dispatch one read-only status scout and
   return a short packet: phase, change, stage, gate, open blockers, spend,
   next action. Do not re-derive status from the whole transcript.
@@ -868,12 +1094,39 @@ in the ledger; never reset or silently extend a budget.
 The handoff reserve is additional to any supplied cap. Reserved dispatches are
 never consumed by review cycles; see the Phase Transition Gate section.
 
+## Per-stage cost and burn
+
+Record for every stage, when the harness or the child reports it:
+
+- `tokens_in`, `tokens_out`, and `cache_read_tokens`;
+- `cost_status` — `estimated`, `unresolved`, `unavailable`, or `not-reported`;
+- `estimated_cost`, and its pricing catalog version when estimated;
+- `usage_source` — telemetry, the child's report, or the operator.
+
+The run ledger and the final report carry per-stage tokens and cost status, run
+totals for the three token categories, a `priced_subtotal`, and an
+`unpriced_stage_count`. A stage with observed usage and an `unresolved` or
+`unavailable` cost is `unpriced`; never fold it into zero. A stage with no
+reported usage is `not-reported`, and the report says the burn is unknown rather
+than inventing a number. A bare `$0` or `$0.00` total is forbidden while any
+stage is `unresolved`, `unavailable`, or `not-reported`: report the
+`priced_subtotal` with the `unpriced_stage_count` instead. Report a bare `$0.00`
+total only when every stage is `estimated` and each estimate is zero, or the run
+truly used zero tokens. A run with no stage usage records reports its burn as
+unknown (`not-reported`), never `$0.00`: no record exists to establish a
+genuine zero.
+
 ## Advisory caps
 
-`MAX_DISPATCHES`, the two corrective rounds, and the two repair/audit rounds are
-**advisory thresholds**, not terminal conditions.
+`MAX_DISPATCHES` and the two repair/audit rounds are **advisory thresholds**, not
+terminal conditions.
 
-Before exceeding any of them, record a `cap_override` entry in the ledger —
+A corrective round is **not** a generic advisory cap: the review corrective-round
+budget is the convergence rule in *Split-or-re-scope after two corrective rounds*.
+A `cap_override` naming a corrective round is refused, and a dispatch, repair, or
+audit override never authorizes one.
+
+Before exceeding an advisory cap, record a `cap_override` entry in the ledger —
 before you continue — naming:
 
 - the cap and its value/source (`invocation`, plan metadata, or contract
@@ -894,9 +1147,10 @@ close the override or raise a new one.
 - The three-dispatch handoff reserve is likewise an allowance. When it cannot be
   honored, record the shortfall and continue under this rule; do not stop, do not
   fail, and do not silently drop the audit.
-- A corrective-round override is never a substitute for the split-or-continue
-  decision. After two corrective rounds, make that decision first; a third-round
-  override for the same blocker class is not authorized without it.
+- A dispatch or repair/audit override never authorizes an additional corrective
+  round. After two corrective rounds the split-or-re-scope decision governs, and
+  a third-round `cap_override` is refused even when `MAX_DISPATCHES` has
+  headroom.
 
 ## Stopping conditions (canonical stop list)
 
@@ -916,10 +1170,10 @@ Human boundary:
   extension;
 - an out-of-plan change occupies the next change's planned slug — only the
   operator may resolve or rename that external change;
-- a split is indicated but no exact `split_authorizations` entry exists, or no
-  authorized materializer is available — return the concrete proposed
-  re-scope/authority decision for that parent and do not invent authority;
-  independent already-authorized work may continue;
+- a plan's declared operator checkpoint that reserves split approval to the
+  operator — honor that checkpoint and report its exact resume instruction; it is
+  the plan's own gate, not a convergence question, and you do not invent a
+  materializer or a plan-edit for it;
 - a safety or credential exposure, or a trust or privacy decision only the
   operator can make.
 
@@ -936,12 +1190,15 @@ Real blocker:
 - a carry-forward item makes a later planned change's accepted behavior
   impossible and cannot be resolved inside that later change's own scope.
 
-Never stop for: a dispatch, corrective-round, or repair-round cap; the
-three-dispatch handoff reserve; an evidence path or checksum a scoped writer can
-repair; an unauthored next change's missing proposal; a missing remote upstream;
-run-state ignore work; a perf/evidence script path; or a plan-reachable
-planned-slug collision you can resolve at plan level. An out-of-plan occupant is
-a stop, not a plan-level repair.
+Never stop for: a dispatch or repair/audit cap; a corrective budget exhausted with
+no split authorization — that uses the plan's own split permission through
+`opsx-split-materializer`, or narrows to the accepted surface and carries forward,
+then continues; it is not a raw-count stop, records rather than returns a proposed
+decision, and does not ask the operator; the three-dispatch handoff reserve; an
+evidence path or checksum a scoped writer can repair; an unauthored next change's
+missing proposal; a missing remote upstream; run-state ignore work; a
+perf/evidence script path; or a plan-reachable planned-slug collision you can
+resolve at plan level. An out-of-plan occupant is a stop, not a plan-level repair.
 
 ## Final report
 
@@ -957,6 +1214,15 @@ End with:
   children, obligation/dependency map, aggregate exit, freeze lineage, selected
   plan hash, materialization commit, compile/graph verification, state, and every
   proposed re-scope/authority decision with the authority it needs;
+- the convergence decision and its basis for every change that reached one, and
+  the autonomous split, re-scope, or carry-forward action taken for it, including
+  a split child's inherited blocker classes and their consumed counts;
+- finding classification counts — blocking `introduced_by_diff`, `adjacent_scope`,
+  and `pre_existing` — plus every `unknown` value you adjudicated and its basis;
+- every operator attestation quoted verbatim, with its `subject`, `scope`,
+  `source`, and `recorded_at`;
+- every `stale_idle_marker` observation with the marker source and the live-child
+  evidence you used to ignore it;
 - each change: archived / archived-but-not-handoff-ready / delivered-unarchived
   / blocked / not-started-at-human-gate / untouched, with its local commit;
 - for each change, the handoff status: `handoff_ready`, the auditor session id,
@@ -979,12 +1245,20 @@ End with:
 - accepted advisories and deferred items, with impact;
 - the supplied wall-clock budget and dispatch cap (or `none`) with their source,
   the handoff reserve, any overrun, and any operator extension;
-- spend and dispatch counts per phase when available;
+- per-stage `tokens_in`, `tokens_out`, `cache_read_tokens`, `cost_status`, and
+  `estimated_cost`; the run totals for the three token categories; the
+  `priced_subtotal` and the `unpriced_stage_count`; and dispatch counts per phase;
 - the exact next action, or the exact operator decision needed.
 
 **Do not report “no open blockers” while `handoff_ready` is false or unknown.**
 An archived change with an uncommitted implementation is archived, not
 delivered; say so in those words and name the blockers.
+
+**Do not report a bare `$0` or `$0.00` total while any stage is unpriced or
+`not-reported`.**
+
+**A run with no stage usage records never reports a bare `$0` or `$0.00` total
+either: its burn is unknown (`not-reported`).**
 
 Never describe a `poc` or `phase` run as release-qualified. If the run closed a
 limited PoC, say so in those words and list what remains.

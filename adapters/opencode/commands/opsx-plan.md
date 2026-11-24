@@ -38,6 +38,24 @@ Entry rules:
 - Size each change for one implement-review-archive loop before implementation,
   and record the sizing basis in the change's scope/success parameters. Do not
   leave an oversized change for corrective rounds to discover.
+- Apply the maximum-surface heuristic to every change before writing it: at most
+  3 named surfaces (one primary plus at most two supporting), 3
+  pages/endpoints/routes, 5 acceptance scenarios, 12 tasks, and 400 expected
+  production changed lines (additions + deletions), excluding tests, fixtures,
+  and docs. A named surface is a distinct externally observable contract — an
+  API endpoint group, a CLI command group, a page/UI route, a freshness or
+  persistence contract, an error taxonomy, or a cache layer — and a page that
+  adds an API endpoint counts as both. Split a change before writing it when it
+  spans API + CLI + page + freshness + error taxonomy, or three or more named
+  surfaces. That rule is independent of the numeric limits and has no review
+  override; a recorded numeric exception does not waive it either. The split
+  checkpoint is the default response to an oversized change, never another
+  review override.
+- Record the five-dimension surface assessment for every change in its scope and
+  success parameters, and enumerate its error taxonomy, scope and registry
+  cases, cache invariants, parity checks, and guards before writing the
+  proposal, design, tasks, and spec deltas. The enumeration is the change's
+  accepted surface: its acceptance scenarios and tasks cover only what it names.
 - Declare `split_authorizations` only when the plan preauthorizes an exact named
   replacement for an oversized change. Every entry must name one exact parent,
   two or more exact child slugs, each child's dependencies, an obligation map
@@ -87,27 +105,40 @@ Self-verification before the final response:
 1. Re-scan every `**Depends on:**` paragraph against the compile convention
    in the plan-authoring reference. Confirm no unintended backticked slug
    or `Phase N` reference appears in any of them.
-2. Confirm the frontmatter declares `acceptance` and that it matches the
+2. Verify every change against the maximum-surface heuristic: named surfaces,
+   pages/endpoints/routes, acceptance scenarios, tasks, and expected production
+   diff. Confirm the five-dimension assessment is recorded for each change,
+   that no change spans API + CLI + page + freshness + error taxonomy or three
+   or more named surfaces without a split, and that each change's acceptance
+   scenarios and tasks cover only its enumerated error taxonomy, scope and
+   registry cases, cache invariants, parity checks, and guards. Split or narrow
+   an oversized change before reporting the plan as complete.
+3. Confirm the frontmatter declares `acceptance` and that it matches the
    plan's stated gates: `poc` for a bounded proof of concept, `phase` for
    phase-gated delivery, `release` for release qualification.
-3. Verify every `human_gates` entry against the document: each slug must match
+4. Verify every `human_gates` entry against the document: each slug must match
    a `### Change:` heading exactly. A slug that matches no heading is an
    authoring defect — fix the entry or drop the gate before reporting the plan
    as complete, and never leave an unknown slug for the orchestrator to fail on
    at preflight.
-4. Verify every `split_authorizations` entry: each parent and child slug must
+5. Verify every `split_authorizations` entry: each parent and child slug must
    match an exact `### Change:` heading or a declared dependency, no child collides
    with an active or archived change, every parent obligation appears exactly
    once in a child's `obligation_map`, the dependency remap preserves every
    predecessor and successor, and `aggregate_exit` proves the parent's original
    success parameters. A defective entry is an authoring defect; fix it or drop
    the authorization.
-5. Report whether the compile self-check ran and succeeded or why it was
+6. Report whether the compile self-check ran and succeeded or why it was
    unavailable.
 
 Final response requirements:
 
 - Do not repeat the document body.
+- Report the recorded five-dimension surface assessment for each change, and
+  every change that was split, narrowed, or proposed for re-scope with the
+  surface that prompted it. Report that no change needed a split, narrowing, or
+  re-scope proposal when that is the case; never omit the assessment or the
+  decision.
 - Report: the output path, the declared `acceptance` tier, phase and change
   counts, proposed capabilities, the declared `human_gates` (or that the plan
   declares none), the declared `split_authorizations` (or that the plan

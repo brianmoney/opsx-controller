@@ -16,7 +16,8 @@ stdlib-only:
   before a clean bound revision;
 * ledger selection/resume/idempotence and fail-closed plan or authorization
   drift;
-* the after-two-rounds split-or-continue decision.
+* the after-two-rounds split-or-re-scope decision: exactly split, re-scope, or
+  carry-forward, with a recorded rather than returned proposed decision.
 
 The tests that use this fixture prove the rules above. They do **not** prove
 live model behaviour; that remains a contract regression until a real
@@ -200,7 +201,10 @@ def _proposed(defect: str, spec: SplitSpec) -> ProposedDecision:
         scope="split the parent's obligations across the proposed children",
         aggregate_exit=spec.aggregate_exit
         or (spec.plan.authorizations[0].aggregate_exit if spec.plan.authorizations else ""),
-        authority_needed="an exact split_authorizations entry plus an authorized materializer",
+        authority_needed=(
+            "an exact split_authorizations entry, a cited plan permission, or an "
+            "authorized materializer"
+        ),
         defect=defect,
     )
 
@@ -443,33 +447,168 @@ def validate_split(spec: SplitSpec) -> SplitDecision:
 # ---------------------------------------------------------------------------
 
 
+#: Corrective rounds one change may consume before the split-or-re-scope
+#: decision. The initial review is not a corrective round.
+CORRECTIVE_ROUND_BUDGET = 2
+
+#: The pre-budget result plus the three post-budget decision outcomes.
+CONVERGENCE_DECISION_KINDS = ("continue", "split", "rescope", "carry-forward")
+
+#: Kinds the contract refuses: no bounded continuation, no operator question, no
+#: third corrective round, and no terminal proposed-decision kind.
+RETIRED_CONVERGENCE_KINDS = (
+    "bounded-continue",
+    "operator-question",
+    "third-round",
+    "proposed-redecision",
+)
+
+
 @dataclass(frozen=True)
 class ConvergenceFacts:
+    """The facts the after-two-rounds decision reads.
+
+    ``corrective_rounds`` is the change's own total consumption.
+    ``consumed_rounds_by_blocker_class`` records how much of it each blocker
+    class consumed. ``blocking_blocker_classes`` names the blocker classes of the
+    current blocking findings, which is what the exhaustion check reads. The
+    split-preference triggers are unchanged: a reopened blocker class, a
+    non-shrinking blocker set, or orthogonal remaining work prefers a split. The
+    split-permission facts mirror the plan's own gate: an exact
+    ``split_authorizations`` entry (``authorization_available``), plan rules or
+    text that permit an unpreauthorized split
+    (``plan_permits_unpreauthorized_split``), or a plan that reserves split
+    approval to its operator checkpoint (``plan_reserves_split_approval``).
+    ``inherited_rounds_by_blocker_class`` carries the consumption a split child
+    inherits from its parent, keyed by blocker class.
+    """
+
     corrective_rounds: int
     reopened_blocker_class: bool = False
     blocker_counts: tuple[int, ...] = (0, 0)
     orthogonal_work: bool = False
     authorization_available: bool = False
-    closure_test: str | None = None
-    override_already_used: bool = False
+    plan_permits_unpreauthorized_split: bool = False
+    plan_reserves_split_approval: bool = False
+    inherited_rounds_by_blocker_class: tuple[tuple[str, int], ...] = ()
+    consumed_rounds_by_blocker_class: tuple[tuple[str, int], ...] = ()
+    blocking_blocker_classes: tuple[str, ...] = ()
+
+    def inherited_rounds(self) -> dict[str, int]:
+        """Return the parent consumption this change inherits, by class."""
+
+        return dict(self.inherited_rounds_by_blocker_class)
+
+    def own_rounds(self) -> dict[str, int]:
+        """Return this change's own corrective rounds, by blocker class."""
+
+        return dict(self.consumed_rounds_by_blocker_class)
+
+    def consumed_rounds(self) -> int:
+        """Return the change's own total corrective-round consumption.
+
+        Inherited consumption is not added here: D16 tracks the budget by
+        blocker class, so :func:`remaining_allowance` and
+        :func:`exhausted_blocker_classes` decide whether a class still has a
+        round. A change with an exhausted inherited class is not itself at the
+        decision while its current blocking findings belong to classes that
+        still have allowance.
+        """
+
+        return self.corrective_rounds
 
 
 @dataclass(frozen=True)
 class ConvergenceDecision:
+    """One recorded decision.
+
+    ``proposal_reason`` is a ledger record, never a terminal stop: a decision
+    that cannot split records why, then narrows or carries forward and lets
+    independent authorized work continue.
+    """
+
     kind: str
     reasons: tuple[str, ...]
-    closure_test: str | None = None
+    proposal_reason: str | None = None
     independent_work_may_continue: bool = True
 
 
-def decide_convergence(facts: ConvergenceFacts) -> ConvergenceDecision:
-    """Model the explicit after-two-rounds split-or-continue decision.
+def remaining_allowance(facts: ConvergenceFacts, blocker_class: str) -> int:
+    """Return the corrective rounds left for one blocker class.
 
-    A raw round count never produces a stop. An indicated split without exact
-    authorization produces a concrete proposed-redecision decision.
+    Consumption is tracked per class (D16): the allowance is
+    ``CORRECTIVE_ROUND_BUDGET - inherited - own``, floored at zero. A class
+    inherited from the parent starts from the parent's recorded consumption; a
+    class new to the child inherits nothing and accrues under the child's own
+    budget, so it keeps its full allowance until the child spends a round on it.
+    A class inherited at two has no allowance.
+
+    When the facts record no per-class own consumption, a class with no inherited
+    record falls back to the change's total consumption, so a caller that only
+    knows the total cannot accidentally grant a fresh class budget.
     """
 
-    if facts.corrective_rounds < 2:
+    inherited_map = facts.inherited_rounds()
+    own_map = facts.own_rounds()
+    inherited = inherited_map.get(blocker_class, 0)
+    own = own_map.get(blocker_class)
+    if own is None:
+        # A per-class record is authoritative; an absent entry means nothing was
+        # spent on that class. Only a caller that reports no per-class detail at
+        # all falls back to the change's total, which cannot grant a fresh budget
+        # to a class it may already have spent.
+        own = (
+            0
+            if (own_map or blocker_class in inherited_map)
+            else facts.corrective_rounds
+        )
+    return max(0, CORRECTIVE_ROUND_BUDGET - inherited - own)
+
+
+def exhausted_blocker_classes(facts: ConvergenceFacts) -> tuple[str, ...]:
+    """Return the current blocking classes that have no remaining allowance.
+
+    Only classes that a current blocking finding belongs to are considered: an
+    exhausted inherited class that no current finding names is not a stop.
+    """
+
+    return tuple(
+        blocker_class
+        for blocker_class in facts.blocking_blocker_classes
+        if remaining_allowance(facts, blocker_class) == 0
+    )
+
+
+def decide_convergence(facts: ConvergenceFacts) -> ConvergenceDecision:
+    """Model the explicit after-two-rounds split-or-re-scope decision.
+
+    Before the budget is consumed the result is ``continue`` with the
+    ``within-planning-allowance`` reason. After it, the result is exactly one of
+    ``split``, ``rescope``, or ``carry-forward``: never a bounded continuation,
+    never a third corrective round, and never a terminal proposed-decision kind.
+
+    Exhaustion is evaluated per blocker class (D16). When the facts name the
+    current blocking findings' classes, a corrective round is available only
+    while every one of those classes still has allowance, so an exhausted
+    inherited class reaches the decision only through a finding of that class and
+    a class new to the child keeps its own budget. Without named classes, the
+    change's own total consumption is the gate.
+
+    An exact ``split_authorizations`` entry splits, and a plan that permits an
+    unpreauthorized split splits after the change-writer authors the child set
+    for the materializer to execute. A plan that reserves split approval to its
+    operator checkpoint is honored instead of split autonomously. An indicated
+    split the plan does not permit records its ``proposal_reason`` and carries
+    the remainder forward; with no structural reason to split, the decision
+    re-scopes to the accepted surface.
+    """
+
+    exhausted = exhausted_blocker_classes(facts)
+    if facts.blocking_blocker_classes:
+        can_correct = not exhausted
+    else:
+        can_correct = facts.consumed_rounds() < CORRECTIVE_ROUND_BUDGET
+    if can_correct:
         return ConvergenceDecision("continue", ("within-planning-allowance",))
 
     not_shrinking = (
@@ -480,6 +619,8 @@ def decide_convergence(facts: ConvergenceFacts) -> ConvergenceDecision:
         facts.reopened_blocker_class or not_shrinking or facts.orthogonal_work
     )
     reasons: list[str] = []
+    if exhausted:
+        reasons.append("blocker-class-allowance-exhausted")
     if facts.reopened_blocker_class:
         reasons.append("blocker-class-reopened")
     if not_shrinking:
@@ -487,23 +628,49 @@ def decide_convergence(facts: ConvergenceFacts) -> ConvergenceDecision:
     if facts.orthogonal_work:
         reasons.append("orthogonal-work")
 
-    if split_indicated:
-        if facts.authorization_available:
-            return ConvergenceDecision("split", tuple(reasons))
+    if not split_indicated:
+        # Nothing structural says the unit is wrong: narrow to the accepted
+        # surface and carry the remainder forward as the next slice.
         return ConvergenceDecision(
-            "proposed-redecision",
-            tuple(reasons) + ("no-exact-authorization",),
+            "rescope",
+            tuple(reasons) + ("rescope-accepted-surface",),
         )
 
-    if facts.closure_test and not facts.override_already_used:
+    if facts.authorization_available:
         return ConvergenceDecision(
-            "bounded-continue",
-            ("one-bounded-correction",),
-            closure_test=facts.closure_test,
+            "split",
+            tuple(reasons) + ("exact-authorization-selected",),
         )
+
+    if facts.plan_reserves_split_approval:
+        # The plan's declared checkpoint is a tightening the orchestrator honors;
+        # it is not a convergence question to route around, so it governs even
+        # where controller policy would permit an unpreauthorized split.
+        return ConvergenceDecision(
+            "rescope",
+            tuple(reasons)
+            + ("plan-reserves-split-approval", "honor-plan-checkpoint"),
+        )
+
+    if facts.plan_permits_unpreauthorized_split:
+        return ConvergenceDecision(
+            "split",
+            tuple(reasons)
+            + (
+                "plan-permitted-split",
+                "change-writer-authors-child-set",
+                "materializer-executes-split",
+            ),
+        )
+
     return ConvergenceDecision(
-        "proposed-redecision",
-        ("no-closure-test-or-override-already-used",),
+        "carry-forward",
+        tuple(reasons) + ("proposed-decision-recorded", "no-exact-authorization"),
+        proposal_reason=(
+            "a split is indicated but the plan provides neither an exact "
+            "split_authorizations entry nor permission for an unpreauthorized "
+            "split"
+        ),
     )
 
 

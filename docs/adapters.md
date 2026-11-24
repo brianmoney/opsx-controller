@@ -137,7 +137,20 @@ What it contains:
   It drives every change outside the resolved human-gate set autonomously —
   authoring, corrective rounds, evidence disposition, local commits, and intake
   — records each decision with its basis, and does not ask for an internal
-  repository, evidence, commit, or intake decision. The run's stop list is the
+  repository, evidence, commit, or intake decision. Convergence is bounded:
+  corrective rounds default to two per change, every finding is classified
+  `introduced_by_diff` / `adjacent_scope` / `pre_existing` before another round,
+  and after the second failing review the orchestrator records a
+  split-or-re-scope-or-carry-forward decision instead of granting a third round
+  or a `cap_override`. Each change is sized before implementation, and the first
+  review is full-scope and doubles as a split checkpoint when its blocking set
+  is broad or spans multiple named surfaces. Each stage records tokens and an
+  honest `cost_status`; a stale idle marker with a live in-flight child is
+  recorded and not treated as an interruption; bookkeeping is one batched
+  ledger-writer dispatch per stage; and an operator attestation of quiescence,
+  authority, or a gate is authoritative for the subject it names. Controller
+  specs set the floor: a plan may tighten a budget, surface limit, gate, or
+  evidence bar, but never loosen one. The run's stop list is the
   optional `human_gates` plan-frontmatter list of exact change slugs, resolved
   as explicit `HUMAN_GATES` input first, then frontmatter, then empty; an
   explicit value replaces the frontmatter list, and an unknown slug fails
@@ -159,7 +172,12 @@ What it contains:
   `HEAD`, every indexed entry needs a non-empty `path` and `sha256`, and a
   worktree-only or malformed manifest is blocked rather than passed. An evidence
   gap becomes a bounded `repair-evidence` repair or an `unqualified`
-  `carry_forward` record, with `stop` reserved for human-only boundaries.
+  `carry_forward` record, with `stop` reserved for human-only boundaries. The
+  evidence burden is proportional: it accepts a recorded operator attestation for
+  the state or authority question it names, reuses a ledger path and `sha256`
+  instead of re-collecting a duplicate, and returns the minimal fields that prove
+  each check — but it never waives `source-manifest-at-head`, `plan-at-head`, or
+  `archive-commit-implementation-paths`, which stay machine-verified at `HEAD`.
 - `adapters/opencode/agents/opsx-repo-hygiene.md`: scoped handoff writer
   (`edit: allow`, `bash: allow`, `task: deny`, `question: deny`). It repairs in
   phases: Phase A commits the safe baseline (the exact accepted implementation
@@ -168,35 +186,55 @@ What it contains:
   Phase B repairs evidence within a bounded authority that preserves historical
   originals byte-for-byte and never claims a missing artifact is verified. It
   refuses to invent scope, never changes product behavior, and reports an
-  `amended_commit` only for its own commit while that commit is still `HEAD`. A
+  `amended_commit` only for its own commit while that commit is still `HEAD`. An
+  operator authority attestation authorizes exactly the commit or action it
+  names, and hash-bound ledger evidence is reused rather than re-collected, but
+  neither widens a `pathspecs` list or overrides an `OPERATOR_WAIVER`. A
   code defect requires a reviewed change. It performs repository repairs only:
   a plan-reachable `resolve-slug-collision` is orchestrator-owned, so it never
   renames, moves, archives, or deletes an active change directory to clear a
   plan-reachable slug; an out-of-plan slug collision is an `operator-decision`
   stop that it does not act on.
 - `adapters/opencode/agents/opsx-split-materializer.md`: the single authorized
-  writer for one exact plan-preauthorized split. It revalidates the exact
-  `split_authorizations` entry, freezes a restorable donor with source/evidence
-  hashes and lineage, revises the tracked plan to contain only the chosen child
-  nodes, rehomes only the authorized unaccepted candidate paths, binds a local
-  commit with explicit pathspecs, and verifies the compiled node/edge set. It
-  never archives or spec-syncs the parent, changes the acceptance/phase tier,
-  gates, human boundary, trust posture, or archived work, reuses parent
-  checkmarks as child acceptance, pushes, or spawns sub-agents. The orchestrator
-  dispatches no child until the selected plan revision is clean, committed at
-  `HEAD`, and the graph is verified and bound. A split with no exact
-  authorization or no available materializer returns a proposed
-  re-scope/authority decision, never an improvised generic-writer fallback.
+  writer for one plan split — an exact `split_authorizations` entry, or a
+  plan-permitted unpreauthorized split whose child set the standard
+  change-writer authored to authorization-equivalent exactness. It revalidates
+  that authority (the exact entry, or the cited plan permission together with the
+  authored child set), freezes a restorable donor with source/evidence hashes and
+  lineage, revises the tracked plan to contain only the chosen child nodes,
+  rehomes only the authorized unaccepted candidate paths, binds a local commit
+  with explicit pathspecs, and verifies the compiled node/edge set. It never
+  archives or spec-syncs the parent, changes the acceptance/phase tier, gates,
+  human boundary, trust posture, or archived work, reuses parent checkmarks as
+  child acceptance, pushes, or spawns sub-agents. The orchestrator dispatches no
+  child until the selected plan revision is clean, committed at `HEAD`, and the
+  graph is verified and bound. A split with neither an exact authorization nor a
+  cited plan permission, or with no available materializer, fails closed for that
+  split; the orchestrator records the proposed re-scope/authority decision,
+  narrows or carries the remainder forward, and never improvises a generic-writer
+  fallback.
 - `adapters/opencode/agents/opsx-change-writer.md`: authors or amends exactly
-  one change's OpenSpec artifacts and runs the strict validation gate. It does
-  not implement source, archive, or commit.
+  one change's OpenSpec artifacts and runs the strict validation gate. It records
+  a pre-writing surface assessment against the maximum-surface heuristic
+  (named surfaces, pages or endpoints, acceptance scenarios, tasks, expected
+  diff), enumerates the acceptance surface — error taxonomy, scope/registry
+  cases, cache invariants, parity checks, guards — before writing, and returns a
+  `split_proposal` instead of authoring an oversized change. It does not create
+  child changes, implement source, archive, or commit.
 - `adapters/opencode/agents/opsx-review.md`: generic read-only reviewer with
   acceptance tiers (`poc` / `phase` / `release`), findings dispositions, and a
   required `coverage[]` matrix (`covered` / `not-applicable` / `not-covered`
-  with evidence). It is not tied to any one plan or repository.
+  with evidence and a `current-slice` or `adjacent` scope). The first review and
+  every re-review are full-scope; each finding carries `introduced_by_diff` and
+  `adjacent_scope`, and only `introduced_by_diff` findings block and enter the
+  corrective handoff. It is not tied to any one plan or repository.
 - `adapters/opencode/agents/opsx-implementer.md`: implementation agent. It
   supports the controller-round contract and a plan-orchestrator mode selected
-  from its input fields.
+  from its input fields. In plan mode it implements in correctness-risk order —
+  scope/registry validation, error taxonomy, cache invariants, freshness,
+  page/UI, then polish — and verifies each step with the change's exact focused
+  tests, reading `CONVERGENCE_CYCLE` and `CONVERGENCE_BUDGET` as context rather
+  than permission to widen scope.
 - `adapters/opencode/agents/opsx-reviewer.md`: strict controller-round reviewer
   agent (distinct from the plan-level `opsx-review`)
 - `adapters/opencode/agents/opsx-archiver.md`: non-interactive archiver agent
@@ -215,9 +253,11 @@ change. The gate runs after archive and before any work for the next change.
 
 The run itself is autonomous: every change outside the resolved human-gate set
 is driven end-to-end without asking for an internal repository, evidence,
-commit, or intake decision. `MAX_DISPATCHES`, review corrective rounds, and
-repair/audit rounds are planning allowances rather than terminal stops, and a
-shortfall in the three-dispatch handoff reserve is recorded, not terminal.
+commit, or intake decision. `MAX_DISPATCHES` and the repair/audit rounds are
+planning allowances rather than terminal stops; the review corrective-round
+budget is a convergence rule, not an advisory cap, and a third corrective round
+is never granted by an override. A shortfall in the three-dispatch handoff
+reserve is recorded, not terminal.
 
 1. A **fresh** `opsx-integration-auditor` verifies a reproducible `HEAD`: a
    clean tracked tree, the accepted source and plan at `HEAD`, the archive
@@ -228,7 +268,10 @@ shortfall in the three-dispatch handoff reserve is recorded, not terminal.
    collision and archived dependencies for the next change (an unauthored next
    proposal is expected, not a blocker), `local-only-delivery` instead of a
    pushed branch, and a fresh checkout that can run the focused checks plus
-   `openspec validate --all --strict`.
+   `openspec validate --all --strict`. It accepts a recorded operator attestation
+   for the state or authority question it names and reuses hash-bound ledger
+   evidence, while `source-manifest-at-head`, `plan-at-head`, and
+   `archive-commit-implementation-paths` stay machine-verified at `HEAD`.
 2. When it returns `handoff_ready: false` with machine-actionable blockers, the
    list is split by `repair.owner`: `opsx-repo-hygiene` repairs exactly the
    repository blockers with explicit pathspecs, while a plan-reachable

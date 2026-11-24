@@ -125,7 +125,9 @@ Workflow](core/model-efficiency-workflow.md) for that benchmarking loop.
 > The `—` and `unresolved` entries above are honest output, not placeholders:
 > that run's workers reported no token usage (`unresolved_reason: "usage
 > unavailable"`), so cost could not be estimated. Token capture is what the
-> later telemetry work added; runs with usage data populate these columns.
+> later telemetry work added; runs with usage data populate these columns. A run
+> total with unpriced stages is never `$0`: report the priced subtotal and the
+> unpriced-stage count instead.
 
 ## Quick start
 
@@ -246,22 +248,41 @@ plan field read by `opsx-orchestrator`, distinct from the compiled-manifest
 `pause_before` gate that `opsx-plan` / `opsx-run` consume: a plan may use both,
 neither substitutes for the other, and `human_gates` adds no manifest key.
 
-Before implementation the orchestrator records a sizing assessment. After two
-corrective rounds it makes an explicit split-or-continue decision before any
-third override: prefer a split when a blocker class reopened, the blockers are
-not shrinking, or the remaining work is orthogonal. A split is allowed only
-from an exact `split_authorizations` frontmatter entry naming the parent, exact
-child slugs, child dependencies, an obligation map assigning every parent
-obligation to one child, and an aggregate exit. `opsx-split-materializer` is the
-single authorized writer: it freezes a restorable donor with source/evidence
-hashes and lineage, revises the tracked plan to contain only the chosen nodes,
-rehomes only the authorized candidate paths, binds a local commit, and verifies
-the compiled graph before any child starts. It never archives or spec-syncs the
-parent and never reuses its checkmarks as child acceptance. General autonomy, a
-cap override, a reviewer verdict, and a supervisor role do not grant split
-authority; without an exact authorization or an authorized materializer, the
-orchestrator returns a concrete proposed re-scope/authority decision rather than
-stopping on a raw round count.
+Before implementation the orchestrator records a sizing assessment against the
+maximum change surface in
+[`core/plan-authoring.md`](core/plan-authoring.md) — three named surfaces, three
+pages or endpoints, five acceptance scenarios, twelve tasks, and a 400-line
+production diff — and a change spanning API + CLI + page + freshness + error
+taxonomy, or three or more named surfaces, is split before it is written.
+
+Corrective rounds default to **two per change**, and every finding is classified
+first: only `introduced_by_diff` earns another round, `adjacent_scope` becomes a
+proposed new slice or follow-up, and `pre_existing` is a carry-forward item. The
+first review is full-scope and doubles as a split checkpoint. After two failing
+corrective rounds it makes an explicit split-or-re-scope decision: prefer a split
+when a blocker class reopened, the blockers are not shrinking, or the remaining
+work is orthogonal. A split is allowed only from an exact
+`split_authorizations` frontmatter entry naming the parent, exact child slugs,
+child dependencies, an obligation map assigning every parent obligation to one
+child, and an aggregate exit, or from the plan's own split rules through the
+materializer. `opsx-split-materializer` is the single authorized writer: it
+freezes a restorable donor with source/evidence hashes and lineage, revises the
+tracked plan to contain only the chosen nodes, rehomes only the authorized
+candidate paths, binds a local commit, and verifies the compiled graph before
+any child starts. It never archives or spec-syncs the parent and never reuses
+its checkmarks as child acceptance. General autonomy, a cap override, a reviewer
+verdict, and a supervisor role do not grant split authority; with neither an
+exact authorization nor a cited plan permission, or without an authorized
+materializer, the orchestrator records a concrete proposed re-scope/authority
+decision and narrows or carries the remainder forward rather than stopping on a
+raw round count. Independent authorized work continues.
+
+**A third corrective round is not an advisory-cap override.** `MAX_DISPATCHES`
+and the repair/audit rounds remain advisory and can be exceeded with a recorded
+`cap_override`; a corrective round cannot, and no dispatch, repair, or audit
+override authorizes one. Controller specs set the floor for a run: a plan may
+tighten a budget, surface limit, gate, or evidence bar, but never loosen one,
+and a loosening provision is void and recorded as plan drift.
 
 ### Phase Transition Gate
 
@@ -308,12 +329,13 @@ orchestrator's definition of done: it will not report "no open blockers" while
 it is false or unknown, and it reserves three dispatches per change for the gate
 so review cycles cannot consume the budget.
 
-`MAX_DISPATCHES`, review corrective rounds, and repair/audit rounds are planning
-allowances rather than terminal stops, and a finding discovered after archive is
-recorded as a carry-forward item — with its archived origin, locus, evidence,
-impact, and disposition — instead of reopening the archived change or inserting
-an unplanned change mid-plan. Remaining carry-forwards are reported when the
-plan's changes finish.
+`MAX_DISPATCHES` and the repair/audit rounds are planning allowances rather than
+terminal stops; the review corrective-round budget is a convergence rule, not an
+advisory cap, and a third round is never granted by an override. A finding
+discovered after archive is recorded as a carry-forward item — with its archived
+origin, locus, evidence, impact, and disposition — instead of reopening the
+archived change or inserting an unplanned change mid-plan. Remaining
+carry-forwards are reported when the plan's changes finish.
 
 **An archive-only commit is a stop, not a handoff.** If the archive commit
 carries zero implementation paths while accepted source remains uncommitted,

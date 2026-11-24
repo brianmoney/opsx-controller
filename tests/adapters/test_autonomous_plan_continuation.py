@@ -316,10 +316,22 @@ class OrchestratorAutonomyContractTests(unittest.TestCase):
     ) -> None:
         self.assertIn("## Advisory caps", self.text)
         section = _section(self.text, "Advisory caps")
+        # MAX_DISPATCHES and repair/audit rounds stay advisory; the review
+        # corrective rounds are a convergence budget, not a generic cap.
         self.assertIn(
-            "MAX_DISPATCHES, the two corrective rounds, and the two "
-            "repair/audit rounds are advisory thresholds, not terminal "
-            "conditions.",
+            "MAX_DISPATCHES and the two repair/audit rounds are advisory "
+            "thresholds, not terminal conditions.",
+            section,
+        )
+        self.assertIn(
+            "A corrective round is not a generic advisory cap: the review "
+            "corrective-round budget is the convergence rule in",
+            section,
+        )
+        self.assertIn("Split-or-re-scope after two corrective rounds", section)
+        self.assertIn(
+            "A cap_override naming a corrective round is refused, and a "
+            "dispatch, repair, or audit override never authorizes one.",
             section,
         )
         for field in (
@@ -371,8 +383,21 @@ class OrchestratorAutonomyContractTests(unittest.TestCase):
             section,
         )
         self.assertIn(
+            "Never stop for: a dispatch or repair/audit cap;",
+            section,
+        )
+        self.assertNotIn(
             "Never stop for: a dispatch, corrective-round, or repair-round "
-            "cap; the three-dispatch handoff reserve;",
+            "cap;",
+            section,
+            "a corrective-round cap must not be listed as a generic cap stop",
+        )
+        self.assertIn(
+            "a corrective budget exhausted with no split authorization — that "
+            "uses the plan's own split permission through opsx-split-materializer, "
+            "or narrows to the accepted surface and carries forward, then "
+            "continues; it is not a raw-count stop, records rather than returns a "
+            "proposed decision, and does not ask the operator;",
             section,
         )
         self.assertIn(
