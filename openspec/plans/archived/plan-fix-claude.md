@@ -1,5 +1,16 @@
 # Plan: Complete Claude Code Plan Authoring Support
 
+> **COMPLETED — do not resume.** This is a prose fix note, not a compiled plan
+> document: it carries no frontmatter and no `### Change:` headings, so it was
+> never a runnable manifest. Its single change,
+> `add-claude-code-plan-authoring` (declared in the sibling `.toml`), was
+> implemented and archived (archive `562962b`). The delivered artefacts are the
+> `claude-code-plan-authoring` capability spec, the Claude Code `opsx-plan`
+> skill in both the adapter and the standalone plugin, and `opsx-plan-author.md`
+> in both agent directories.
+>
+> Kept as a historical record of the fix, not as pending work.
+
 ## Goal
 
 Let Claude Code users author phased OpenSpec implementation-plan Markdown with

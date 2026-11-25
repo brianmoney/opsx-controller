@@ -1,9 +1,19 @@
 ---
 title: Model Efficiency Telemetry And Dashboard Plan
 doc_type: implementation-plan
-status: proposed
-updated: 2026-07-05
+status: completed
+updated: 2026-11-25
 ---
+
+> **COMPLETED — do not resume.** All 9 changes in this plan were implemented and
+> archived: see the archive commits in `HEAD` and the
+> `model-efficiency-telemetry` capability spec. This frontmatter read `proposed`
+> long after the work landed, which made a finished plan look like pending
+> obligations.
+>
+> Concrete artefacts: the telemetry schema, direct-stage records, worker usage
+> capture, the pricing catalog, stage cost estimation, efficiency metrics, the
+> `report` command, the `dashboard` export and the workflow doc.
 
 # Model Efficiency Telemetry And Dashboard Plan
 

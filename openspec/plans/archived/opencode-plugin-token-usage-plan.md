@@ -1,9 +1,18 @@
 ---
 title: OpenCode Plugin Token Usage Plan
 doc_type: implementation-plan
-status: proposed
-updated: 2026-07-09
+status: completed
+updated: 2026-11-25
 ---
+
+> **COMPLETED — do not resume.** All 3 changes in this plan were implemented and
+> archived: see the archive commits in `HEAD` and the
+> `opencode-plugin-token-usage` capability spec. This frontmatter read
+> `proposed` long after the work landed, which made a finished plan look like
+> pending obligations.
+>
+> Concrete artefacts: the usage contract, the `opsx-usage-emitter` plugin and
+> the orchestrator's sidecar consumption.
 
 # OpenCode Plugin Token Usage Plan
 

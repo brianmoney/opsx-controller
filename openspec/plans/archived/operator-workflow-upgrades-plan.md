@@ -1,9 +1,19 @@
 ---
 title: Operator Workflow Upgrades Plan
 doc_type: implementation-plan
-status: proposed
-updated: 2026-07-08
+status: completed
+updated: 2026-11-25
 ---
+
+> **COMPLETED — do not resume.** All 10 changes in this plan were implemented and
+> archived: see the archive commits in `HEAD` and the
+> `operator-workflow-upgrades` capability spec. This frontmatter read `proposed`
+> long after the work landed, which made a finished plan look like pending
+> obligations.
+>
+> Concrete artefacts: active-plan resolution, `doctor`, the git-delivery
+> contract and PR delivery, `--budget-usd`, batch approve/accept/reset, `logs`,
+> run-event notifications and the operator workflow doc.
 
 # Operator Workflow Upgrades Plan
 

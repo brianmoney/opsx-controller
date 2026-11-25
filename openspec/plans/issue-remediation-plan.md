@@ -1,11 +1,21 @@
 ---
 title: Open-Issue Remediation (Autopilot Pause + Phase-Agent Generation)
 doc_type: implementation-plan
-status: proposed
-updated: 2026-10-06
+status: completed
+updated: 2026-11-25
 ---
 
 # Open-Issue Remediation
+
+> **COMPLETED — do not resume.** Both changes in this plan were implemented and
+> archived on 2026-10-06: `fix-autopilot-deterministic-pause`
+> (`openspec/changes/archive/2026-10-06-fix-autopilot-deterministic-pause`) and
+> `add-phase-agent-generation`
+> (`openspec/changes/archive/2026-10-06-add-phase-agent-generation`). The live
+> artefacts are the deterministic pause classification in
+> `lib/orchestrator/cmd_autopilot.py` and `scripts/generate-phase-agents.py`
+> with the per-adapter `agent-templates/`. This frontmatter read `proposed`
+> long after the work landed.
 
 ## Purpose
 
