@@ -1,3 +1,7 @@
+> **SUPERSEDED 2026-11-25.** This document is retained as run history only. The
+> admin panel run is **closed at `complete-through-phase-3`**; its §7 next
+> actions are void. See `2026-11-25-admin-panel-run-closed-phase3.md`.
+
 # Handoff — KF Admin Panel orchestrator thread
 
 **Date:** 2026-11-24  
