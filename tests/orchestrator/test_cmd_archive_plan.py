@@ -187,6 +187,88 @@ class ArchivePlanCommandTests(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("must be under openspec/plans/", stderr.getvalue())
 
+    def test_archive_stamps_completed_status(self):
+        """Archiving promotes `status: proposed` so the plan stops reading as pending.
+
+        A finished plan that keeps `proposed` is indistinguishable from an unmet
+        obligation and invites re-running changes that already shipped.
+        """
+        content = textwrap.dedent(
+            """\
+            ---
+            title: Test Plan
+            doc_type: implementation-plan
+            status: proposed
+            updated: 2026-01-01
+            ---
+
+            # Test Plan
+
+            ### Change: `a-change`
+            """
+        )
+        toml_path, md_path = self._write_plan_pair("my-plan", content=content)
+        git(self.repo, "add", str(toml_path.relative_to(self.repo)))
+        git(self.repo, "add", str(md_path.relative_to(self.repo)))
+
+        args = argparse.Namespace(
+            repo=str(self.repo), plan=str(toml_path.relative_to(self.repo))
+        )
+        rc = self.opsx_plan.cmd_archive_plan.cmd_archive_plan(args)
+        self.assertEqual(rc, 0)
+
+        archived_md = self.repo / "openspec" / "plans" / "archived" / "my-plan.md"
+        archived = archived_md.read_text(encoding="utf-8")
+        self.assertIn("status: completed", archived)
+        self.assertNotIn("status: proposed", archived)
+        # The rest of the frontmatter and the body survive untouched.
+        self.assertIn("title: Test Plan", archived)
+        self.assertIn("updated: 2026-01-01", archived)
+        self.assertIn("### Change: `a-change`", archived)
+
+    def test_archive_preserves_an_explicit_superseded_status(self):
+        """Only a bare `proposed` is promoted; a deliberate verdict is kept."""
+        content = textwrap.dedent(
+            """\
+            ---
+            title: Test Plan
+            status: superseded
+            ---
+
+            # Test Plan
+            """
+        )
+        toml_path, md_path = self._write_plan_pair("my-plan", content=content)
+        git(self.repo, "add", str(md_path.relative_to(self.repo)))
+
+        args = argparse.Namespace(
+            repo=str(self.repo), plan=str(toml_path.relative_to(self.repo))
+        )
+        rc = self.opsx_plan.cmd_archive_plan.cmd_archive_plan(args)
+        self.assertEqual(rc, 0)
+
+        archived = (
+            self.repo / "openspec" / "plans" / "archived" / "my-plan.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("status: superseded", archived)
+        self.assertNotIn("status: completed", archived)
+
+    def test_archive_leaves_a_plan_without_frontmatter_alone(self):
+        """A prose note with no frontmatter must not gain a status it never had."""
+        toml_path, md_path = self._write_plan_pair("my-plan", content="# Just a note\n")
+        git(self.repo, "add", str(md_path.relative_to(self.repo)))
+
+        args = argparse.Namespace(
+            repo=str(self.repo), plan=str(toml_path.relative_to(self.repo))
+        )
+        rc = self.opsx_plan.cmd_archive_plan.cmd_archive_plan(args)
+        self.assertEqual(rc, 0)
+
+        archived = (
+            self.repo / "openspec" / "plans" / "archived" / "my-plan.md"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(archived, "# Just a note\n")
+
     def test_archive_refuses_missing_target(self):
         """7.7 — archive-plan refuses a path that does not exist."""
         args = argparse.Namespace(

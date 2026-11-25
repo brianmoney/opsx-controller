@@ -8,11 +8,42 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 from lib.orchestrator import planref
+
+# A plan's own status field is a claim about its state; archiving is the
+# transition that makes `proposed` a lie. Matching is deliberately narrow so a
+# deliberate `superseded`/`abandoned` value survives the move untouched.
+_ARCHIVABLE_STATUS = re.compile(r"^status:[ \t]*proposed[ \t]*$", re.M)
+
+
+def _stamp_completed_status(md_path: Path) -> bool:
+    """Promote a ``status: proposed`` frontmatter value to ``completed``.
+
+    Returns True when the file was rewritten. A plan archived with its changes
+    all shipped must not keep reading as pending work: a stale ``proposed``
+    status is indistinguishable from an unmet obligation and invites re-running
+    finished changes. Only a bare ``proposed`` value is promoted, so an
+    explicit ``superseded``/``abandoned``/``completed`` value is preserved.
+    """
+    try:
+        text = md_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if not text.startswith("---\n"):
+        return False
+    head, sep, rest = text.partition("\n---\n")
+    if not sep:
+        return False
+    new_head, count = _ARCHIVABLE_STATUS.subn("status: completed", head, count=1)
+    if not count:
+        return False
+    md_path.write_text(new_head + sep + rest, encoding="utf-8")
+    return True
 
 
 def cmd_archive_plan(args: argparse.Namespace) -> int:
@@ -60,6 +91,10 @@ def cmd_archive_plan(args: argparse.Namespace) -> int:
         md_dst = archived_dir / md_path.name
         moved.append(str(md_path.relative_to(repo)))
         _git_mv_or_rename(repo, md_path, md_dst)
+        # Stamp the archived markdown so it never reads as pending work again.
+        restamped = _stamp_completed_status(md_dst)
+    else:
+        restamped = False
 
     # Clear the active-plan pointer when it referenced the archived plan
     active = planref.read_active_plan(repo)
@@ -71,6 +106,8 @@ def cmd_archive_plan(args: argparse.Namespace) -> int:
     print(f"Archived:")
     for path in moved:
         print(f"  {path} -> openspec/plans/archived/{Path(path).name}")
+    if restamped:
+        print(f"  Set status: completed in openspec/plans/archived/{md_path.name}")
     if active == plan_rel:
         print(f"  Cleared active-plan pointer (was: {plan_rel})")
     print(f"  Move still needs committing; archive-plan does not create a commit.")
