@@ -357,7 +357,10 @@ class OrchestratorAutonomyContractTests(unittest.TestCase):
     def test_three_dispatch_reserve_is_a_planning_allowance_not_terminal(self) -> None:
         self.assertIn("### Handoff reserve", self.text)
         section = _section(self.text, "Handoff reserve", level=3)
-        self.assertIn("Reserve at least three dispatches per change", section)
+        # The three-dispatch reserve is the `release`-tier reserve; lighter
+        # tiers book fewer dispatches because their gate is self-satisfied.
+        self.assertIn("three dispatches per change", section)
+        self.assertIn("release", section)
         self.assertIn(
             "The reserve is a planning allowance, not a gate on arithmetic.",
             section,
@@ -367,10 +370,10 @@ class OrchestratorAutonomyContractTests(unittest.TestCase):
             section,
         )
         self.assertIn(
-            "The reserve is excluded from MAX_DISPATCHES and from the "
-            "review/implementation cap",
+            "The reserve is excluded from",
             section,
         )
+        self.assertIn("MAX_DISPATCHES", section)
 
     def test_canonical_stop_list_forbids_stopping_for_caps_or_the_reserve(
         self,

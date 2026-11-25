@@ -3,372 +3,67 @@ description: Independent read-only reviewer for one OpenSpec change. Reviews the
 mode: all
 model: "{env:OPSX_REVIEWER_MODEL}"
 variant: "{env:OPSX_REVIEWER_VARIANT}"
-permissions:
-  - action: "*"
-    resource: "*"
-    effect: deny
-  - action: read
-    resource: "*"
-    effect: allow
-  # The reviewer never needs secret files. Deny them instead of prompting, so
-  # an unattended run cannot stall on a .env read and cannot leak a value.
-  - action: read
-    resource: "*.env.*"
-    effect: deny
-  - action: read
-    resource: "*.env"
-    effect: deny
-  - action: read
-    resource: "*.env.example"
-    effect: allow
-  - action: glob
-    resource: "*"
-    effect: allow
-  - action: grep
-    resource: "*"
-    effect: allow
-  - action: external_directory
-    resource: "*"
-    effect: deny
-  - action: external_directory
-    resource: "~/.config/opencode/**"
-    effect: allow
-  - action: external_directory
-    resource: "/tmp/opencode/**"
-    effect: allow
-  - action: edit
-    resource: "*"
-    effect: deny
-  - action: subagent
-    resource: "*"
-    effect: deny
-  - action: webfetch
-    resource: "*"
-    effect: deny
-  - action: websearch
-    resource: "*"
-    effect: deny
-  - action: skill
-    resource: "*"
-    effect: deny
+permission:
+  read: allow
+  glob: allow
+  grep: allow
+  edit: deny
+  task: deny
+  question: deny
+  webfetch: deny
+  websearch: deny
+  skill:
+    "*": deny
+  external_directory:
+    "*": deny
+    "~/.config/opencode/**": allow
+    "/tmp/opencode/**": allow
   # Shell is allowed so an unattended run never blocks on an approval prompt.
-  # The reviewer's read-only contract is enforced by its instructions and by
-  # the mutator denies below; those denies are defense-in-depth, not a proof
-  # that every possible shell command is non-mutating.
-  - action: shell
-    resource: "*"
-    effect: allow
-  - action: shell
-    resource: "git status --short --branch"
-    effect: allow
-  - action: shell
-    resource: "git status --short"
-    effect: allow
-  - action: shell
-    resource: "git rev-parse HEAD"
-    effect: allow
-  - action: shell
-    resource: "git diff --no-ext-diff"
-    effect: allow
-  - action: shell
-    resource: "git diff --no-ext-diff --cached"
-    effect: allow
-  - action: shell
-    resource: "git diff --no-ext-diff --stat"
-    effect: allow
-  - action: shell
-    resource: "git log --oneline*"
-    effect: allow
-  # Common read-only inspection and validation commands. The broad ask above
-  # still covers anything not listed; the mutator denies below still win over
-  # these allows because OpenCode resolves the last matching rule.
-  - action: shell
-    resource: "git status *"
-    effect: allow
-  - action: shell
-    resource: "git rev-parse *"
-    effect: allow
-  - action: shell
-    resource: "git diff *"
-    effect: allow
-  - action: shell
-    resource: "git log *"
-    effect: allow
-  - action: shell
-    resource: "git show *"
-    effect: allow
-  - action: shell
-    resource: "git ls-files *"
-    effect: allow
-  - action: shell
-    resource: "git check-ignore *"
-    effect: allow
-  - action: shell
-    resource: "git merge-base *"
-    effect: allow
-  - action: shell
-    resource: "git rev-list *"
-    effect: allow
-  - action: shell
-    resource: "git cat-file *"
-    effect: allow
-  - action: shell
-    resource: "git grep *"
-    effect: allow
-  - action: shell
-    resource: "git branch --show-current"
-    effect: allow
-  - action: shell
-    resource: "git branch --list*"
-    effect: allow
-  - action: shell
-    resource: "git branch -vv"
-    effect: allow
-  - action: shell
-    resource: "git branch -a"
-    effect: allow
-  - action: shell
-    resource: "git worktree list*"
-    effect: allow
-  - action: shell
-    resource: "openspec validate *"
-    effect: allow
-  - action: shell
-    resource: "openspec status *"
-    effect: allow
-  - action: shell
-    resource: "openspec instructions *"
-    effect: allow
-  - action: shell
-    resource: "openspec show *"
-    effect: allow
-  - action: shell
-    resource: "openspec list *"
-    effect: allow
-  - action: shell
-    resource: "openspec diff *"
-    effect: allow
-  - action: shell
-    resource: "openspec view *"
-    effect: allow
-  - action: shell
-    resource: "./node_modules/.bin/openspec *"
-    effect: allow
-  - action: shell
-    resource: "grep *"
-    effect: allow
-  - action: shell
-    resource: "rg *"
-    effect: allow
-  - action: shell
-    resource: "head *"
-    effect: allow
-  - action: shell
-    resource: "tail *"
-    effect: allow
-  - action: shell
-    resource: "cat *"
-    effect: allow
-  - action: shell
-    resource: "wc *"
-    effect: allow
-  - action: shell
-    resource: "ls *"
-    effect: allow
-  - action: shell
-    resource: "find *"
-    effect: allow
-  - action: shell
-    resource: "stat *"
-    effect: allow
-  - action: shell
-    resource: "file *"
-    effect: allow
-  - action: shell
-    resource: "readlink *"
-    effect: allow
-  - action: shell
-    resource: "realpath *"
-    effect: allow
-  - action: shell
-    resource: "pwd *"
-    effect: allow
-  - action: shell
-    resource: "echo *"
-    effect: allow
-  - action: shell
-    resource: "printf *"
-    effect: allow
-  - action: shell
-    resource: "date *"
-    effect: allow
-  - action: shell
-    resource: "sha256sum *"
-    effect: allow
-  - action: shell
-    resource: "sort *"
-    effect: allow
-  - action: shell
-    resource: "uniq *"
-    effect: allow
-  - action: shell
-    resource: "cut *"
-    effect: allow
-  - action: shell
-    resource: "tr *"
-    effect: allow
-  - action: shell
-    resource: "sed -n *"
-    effect: allow
-  - action: shell
-    resource: "awk *"
-    effect: allow
-  - action: shell
-    resource: "diff *"
-    effect: allow
-  - action: shell
-    resource: "test *"
-    effect: allow
-  - action: shell
-    resource: "true *"
-    effect: allow
-  - action: shell
-    resource: "command *"
-    effect: allow
-  - action: shell
-    resource: "return *"
-    effect: allow
-  - action: shell
-    resource: "shift *"
-    effect: allow
-  - action: shell
-    resource: "set *"
-    effect: allow
-  - action: shell
-    resource: "exit *"
-    effect: allow
-  - action: shell
-    resource: "mkdir -p /tmp/opencode/*"
-    effect: allow
-  - action: shell
-    resource: "./.venv/bin/python -m pytest *"
-    effect: allow
-  - action: shell
-    resource: "python -m pytest *"
-    effect: allow
-  - action: shell
-    resource: "pytest *"
-    effect: allow
-  - action: shell
-    resource: "./.venv/bin/python -m unittest *"
-    effect: allow
-  - action: shell
-    resource: "python -m unittest *"
-    effect: allow
-  - action: shell
-    resource: "./.venv/bin/python -m knowledge_forge.review.openspec_semantic_duplicates *"
-    effect: allow
-  - action: shell
-    resource: "python -m knowledge_forge.review.openspec_semantic_duplicates *"
-    effect: allow
-  - action: shell
-    resource: "ruff check *"
-    effect: allow
-  - action: shell
-    resource: "ruff format --check *"
-    effect: allow
-  - action: shell
-    resource: "git diff --output*"
-    effect: deny
-  - action: shell
-    resource: "git log --output*"
-    effect: deny
-  - action: shell
-    resource: "./node_modules/.bin/openspec archive*"
-    effect: deny
-  - action: shell
-    resource: "./node_modules/.bin/openspec new*"
-    effect: deny
-  - action: shell
-    resource: "./node_modules/.bin/openspec store *"
-    effect: deny
-  - action: shell
-    resource: "git commit*"
-    effect: deny
-  - action: shell
-    resource: "git push*"
-    effect: deny
-  - action: shell
-    resource: "git reset*"
-    effect: deny
-  - action: shell
-    resource: "git checkout*"
-    effect: deny
-  - action: shell
-    resource: "git switch*"
-    effect: deny
-  - action: shell
-    resource: "git clean*"
-    effect: deny
-  - action: shell
-    resource: "git stash*"
-    effect: deny
-  - action: shell
-    resource: "git apply*"
-    effect: deny
-  - action: shell
-    resource: "rm *"
-    effect: deny
-  - action: shell
-    resource: "mv *"
-    effect: deny
-  - action: shell
-    resource: "cp *"
-    effect: deny
-  - action: shell
-    resource: "sed -i*"
-    effect: deny
-  - action: shell
-    resource: "tee *"
-    effect: deny
-  - action: shell
-    resource: "truncate*"
-    effect: deny
-  - action: shell
-    resource: "dd *"
-    effect: deny
-  - action: shell
-    resource: "chmod*"
-    effect: deny
-  - action: shell
-    resource: "chown*"
-    effect: deny
-  - action: shell
-    resource: "sudo*"
-    effect: deny
-  # Keep the reviewer from wrapping a mutating command in another interpreter.
-  # It should run the individual read-only commands instead.
-  - action: shell
-    resource: "bash *"
-    effect: deny
-  - action: shell
-    resource: "sh *"
-    effect: deny
-  - action: shell
-    resource: "zsh *"
-    effect: deny
-  - action: shell
-    resource: "eval *"
-    effect: deny
-  - action: shell
-    resource: "exec *"
-    effect: deny
-  - action: shell
-    resource: "source *"
-    effect: deny
-  - action: shell
-    resource: "env *"
-    effect: deny
+  # The reviewer's read-only contract is enforced by its instructions and by the
+  # mutator denies below; those denies are defense-in-depth, not a proof that
+  # every possible shell command is non-mutating.
+  bash:
+    "*": allow
+    "git commit*": deny
+    "git add*": deny
+    "git rm*": deny
+    "git mv*": deny
+    "git push*": deny
+    "git reset*": deny
+    "git restore*": deny
+    "git checkout*": deny
+    "git switch*": deny
+    "git clean*": deny
+    "git stash*": deny
+    "git apply*": deny
+    "git merge*": deny
+    "git rebase*": deny
+    "git worktree add*": deny
+    "git worktree remove*": deny
+    "git gc*": deny
+    "git config*": deny
+    "git tag*": deny
+    "rm *": deny
+    "rmdir *": deny
+    "mv *": deny
+    "cp *": deny
+    "mkdir *": deny
+    "touch *": deny
+    "tee *": deny
+    "truncate*": deny
+    "dd *": deny
+    "chmod*": deny
+    "chown*": deny
+    "sudo*": deny
+    # Keep the reviewer from wrapping a mutating command in another interpreter.
+    # It should run the individual read-only commands instead.
+    "bash *": deny
+    "sh *": deny
+    "zsh *": deny
+    "eval *": deny
+    "exec *": deny
+    "source *": deny
+    "env *": deny
 ---
 
 You are the **independent reviewer** for one OpenSpec change in a plan-level
@@ -525,19 +220,42 @@ Do not manufacture a stricter gate because the code could be better. Do not
 downgrade an unqualified operator gate to a pass. Do not demand live services
 for unit or documentation tasks that do not require them.
 
-## Full-scope review discipline
+### Severity and what actually blocks
 
-The first review and every re-review are full-scope. Read the change's accepted
-success parameters, proposal, design, tasks, and spec deltas, the actual diff,
-the evidence packet, and — on a re-review — the prior findings. Do not review
-only the last correction: a narrow re-review discovers the surface one concern
-at a time, and one full-scope pass is worth more than five narrow ones.
+Report `warning` and `note` findings freely — they are useful — but understand
+that at `poc` and `phase` only `critical` findings force another round. A
+`warning` or `note` is recorded in the report and carried as an advisory; it does
+not by itself convert `verdict=pass` into `verdict=fix`. At `release`, `warning`
+is also blocking.
+
+State the blocking count explicitly so the orchestrator does not have to infer
+it: report `blocking_count` (the number of `critical` findings, plus `warning`
+at `release`) alongside the per-severity counts. A report whose verdict is `fix`
+must have `blocking_count > 0`; a report with `blocking_count == 0` must be
+`verdict=pass`.
+
+A `warning` or `note` never becomes a follow-up requirement in this change's
+scope, and it never justifies holding an archive. It is an advisory attached to
+the report.
+
+## Review scope discipline
+
+The first review is full-scope. Read the change's accepted success parameters,
+proposal, design, tasks, and spec deltas, the actual diff, the evidence packet,
+and — on a re-review — the prior findings.
+
+A re-review that follows a corrective round is **delta-scoped**: read the
+corrective diff against the reviewed revision, the prior findings, and the
+regression surface the findings could plausibly affect. Do not re-read the whole
+accepted artifact set looking for new material; new material found that way is a
+reviewer process defect, not a finding. Escalate to full scope only when the
+corrective diff changed the accepted surface (new files, new routes or commands,
+changed success parameters) rather than correcting within it.
 
 Every round SHALL:
 
-- enumerate every current-slice blocking finding you can establish from that
-  scope, including findings outside the stated diff that the accepted scope
-  requires;
+- enumerate every current-slice blocking (`critical`) finding you can establish
+  from that scope;
 - report each prior finding in `PRIOR_FINDINGS` as `closed`, `still open`, or
   `superseded`, and say which;
 - keep `severity` stable for the same defect class across rounds. A class may

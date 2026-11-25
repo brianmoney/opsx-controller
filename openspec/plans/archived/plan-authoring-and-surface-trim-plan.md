@@ -1,9 +1,18 @@
 ---
 title: Plan-Authoring Guidance and Controller Surface Trim
 doc_type: implementation-plan
-status: proposed
-updated: 2026-08-01
+status: superseded
+updated: 2026-11-25
 ---
+
+> **SUPERSEDED — do not run.** Every change in this plan was implemented and
+> archived on 2026-09-19/20 (`remove-legacy-command-surfaces`,
+> `remove-legacy-drive-mode`, `add-plan-authoring-reference`,
+> `rewrite-plan-guidance-surfaces`, `update-docs-for-trimmed-controller`). Its
+> frontmatter was never advanced past `proposed`, which made a completed plan
+> look like pending work. Its TOML twin also fails closed at load: it carries no
+> `implement_invoke`/`review_invoke`/`archive_invoke`, which `planref.py`
+> requires since the direct-dispatch model landed. Kept as a historical record.
 
 # Plan-Authoring Guidance and Controller Surface Trim
 

@@ -174,6 +174,12 @@ five acceptance scenarios, twelve tasks, and a 400-line expected production diff
 — and a change spanning API + CLI + page + freshness + error taxonomy, or three
 or more named surfaces, is split before it is written. After two corrective
 rounds it makes a split-or-re-scope decision; there is no third-round override.
+
+Sizing is a `phase` and `release` obligation. At `poc` the sizing assessment and
+the mandatory-split rule do not apply: an oversized `poc` change narrows to its
+accepted surface and carries the remainder forward, and it is never split. Do
+not create a split node to satisfy a heuristic at the tier whose point is to
+ship.
 Split authority is not implicit in general autonomy, a cap override, a reviewer
 verdict, or a supervisor role. A split is permitted only from an exact
 `split_authorizations` frontmatter entry naming the parent, exact child slugs,

@@ -771,14 +771,40 @@ class ReviewerConvergenceContractTests(unittest.TestCase):
         cls.text = _text(_REVIEW)
         cls.flat = _flat(cls.text)
 
-    def test_every_review_is_full_scope(self) -> None:
-        self.assertIn("## Full-scope review discipline", self.text)
-        section = _section(self.text, "Full-scope review discipline")
-        self.assertIn("The first review and every re-review are full-scope.", section)
+    def test_frontmatter_uses_the_current_permission_schema(self) -> None:
+        """The reviewer's read-only guard must actually bind.
+
+        OpenCode's schema is the singular `permission:` key speaking an object.
+        The retired model was a plural `permissions:` list of
+        `action`/`resource`/`effect` triples, which parses as an unknown key and
+        silently leaves the agent at default (unrestricted) permissions. This
+        file was the last one still using it, so the deny-all guard never
+        applied. Guard the shape rather than the wording.
+        """
+        frontmatter = self.text.split("---\n", 2)[1]
+        self.assertIn("\npermission:\n", frontmatter)
+        self.assertNotIn("\npermissions:", frontmatter)
+        self.assertNotIn("- action:", frontmatter)
+        self.assertNotIn("resource:", frontmatter)
+        self.assertNotIn("effect:", frontmatter)
+
+        # The capability floor the retired block was trying to express.
+        for line in ("  read: allow", "  edit: deny", "  task: deny", "  bash:"):
+            self.assertIn(line, frontmatter)
+        # Mutating shell verbs stay denied even though bash is otherwise open.
+        for deny in ('"git commit*": deny', '"git push*": deny', '"rm *": deny'):
+            self.assertIn(deny, frontmatter)
+
+    def test_first_review_is_full_scope_and_rereviews_are_delta_scoped(self) -> None:
+        self.assertIn("## Review scope discipline", self.text)
+        section = _section(self.text, "Review scope discipline")
+        self.assertIn("The first review is full-scope.", section)
+        # A re-review after a correction is delta-scoped to the corrective diff
+        # plus its regression surface; that is what keeps a second round cheap.
+        self.assertIn("is delta-scoped", section)
         self.assertIn(
-            "enumerate every current-slice blocking finding you can establish "
-            "from that scope, including findings outside the stated diff that the "
-            "accepted scope requires;",
+            "enumerate every current-slice blocking (critical) finding you can "
+            "establish",
             section,
         )
         self.assertIn(

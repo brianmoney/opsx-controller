@@ -542,6 +542,37 @@ criteria — commands that can be run, files that must exist, tests that must
 pass. A success parameter of "code is clean" is unverifiable; a success
 parameter of `pytest tests/` produces a pass/fail.
 
+**A success parameter asserts behavior, a gate result, or a delivered artifact
+of the change itself. It SHALL NOT assert the existence, integrity, or
+provenance of evidence produced to prove another parameter.** These are the
+shapes to reject, whatever their wording:
+
+- "N screenshots exist", "the screenshot set is complete" — a delivered
+  screenshot is fine; a *proof set* of them is not a requirement.
+- "all inputs are frozen before measurement", "the runtime binding is
+  reconciled", "no evidence is retagged".
+- "the manifest/pin/index/`sha256` resolves" — manifests are a distribution
+  concern, not an acceptance criterion.
+- "the traceability ledger has one row per task and scenario".
+- "p95 ≤ X ms measured over N requests" — record a performance *target* in the
+  design; do not make the measurement campaign an obligation.
+- "the final evidence packet binds exact HEAD".
+
+The reason is structural, not stylistic. An evidence obligation is
+**self-justifying**: proving the claim requires a harness, the harness requires
+a binding, the binding requires a manifest, and the manifest requires an
+auditor. Nothing in that chain is bounded by the product's value, so a single
+evidence parameter can consume more than the entire feature it was meant to
+validate. It is also **unfalsifiable at authoring time** — a plan cannot know
+whether a cold-cache observation is even obtainable, so the obligation may be
+impossible to discharge and the run discovers that only after paying for it.
+
+Keep the proof where it belongs: in the change's own `tasks.md` and the
+reviewer's evidence packet, cross-referenced. Never promote it into an
+acceptance criterion. When a claim genuinely needs evidence to be believed,
+that is a signal the requirement is wrong — state what the system *does*, not
+what you will hash to prove it did it.
+
 ### Create-Stage Scope Discipline
 
 When the plan uses `create_invoke` to author changes automatically, the

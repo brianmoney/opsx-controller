@@ -410,8 +410,15 @@ State the tier in every dispatch and every review prompt.
   dependencies, classified suite, or detached-process containment.
 
 Never apply release-grade requirements in `poc` tier. Never promote fixture
-evidence to phase or release evidence. The operator's MVP instruction is a
-scope ceiling, not a suggestion.
+evidence to phase or release evidence.
+
+The tier also selects how much process the change pays: see *Stage selection* and
+*Handoff reserve*. Choose the tier deliberately at intake and record why. A
+throwaway internal tool is `poc`; a phase of a product plan is `phase`; only
+shipping release qualification is `release`. When a change's blast radius is
+small and reversible, do not buy `release` ceremony for it — the operator's
+instruction to move fast is authorization to use the lighter tier, and the
+lightest correct tier is the right default.
 
 ## Stage selection
 
@@ -428,7 +435,21 @@ that dependency is unmet until the gate is cleared and the gated change is
 complete. A later change whose dependency is gated is reported as not started,
 not dispatched.
 
-For each change:
+For each change, run the stage set the acceptance tier requires. The tier
+selects the pipeline, not only what may block.
+
+**`release`** — all ten stages below.
+**`phase`** — all ten stages, with stage 9 satisfied by the archiver's own
+handoff record plus the orchestrator's verification; a fresh `opsx-integration-auditor`
+is required only when a repair was performed in this change.
+**`poc`** — stages 1, 2 (only when artifacts are missing), 5, 6, 8, 10. Stage 3
+format validation and stage 10's handoff record are mandatory; the sizing
+decision (4), the corrective-round checkpoint (7), stage 9's fresh auditor, the
+evidence packet, and the coverage matrix are not required. A `poc` change is
+complete when its success parameters are met, it is reviewed once, and it is
+archived and committed.
+
+The full stage list, for reference:
 
 1. **Resolve** — dispatch a read-only scout to establish the change's current
    artifacts, tasks, branch state, and whether it is already archived. Do not
@@ -443,13 +464,13 @@ For each change:
    unpreauthorized split is authored and materialized here; otherwise narrow to
    the accepted surface and carry the remainder forward. A proposed
    re-scope/authority decision is recorded here when a split is indicated but
-   unauthorized.
+   unauthorized. **Required at `phase` and `release`; optional at `poc`.**
 5. **Implement** — dispatch `opsx-implementer` in plan mode with the change's
    pending tasks, acceptance tier, base revision, and any review findings.
 6. **Review** — dispatch a **fresh** `opsx-review` session. The reviewer must
    never be the writer and must never be a session the writer spawned. Give it
-   the actual diff range, the evidence packet, and the derived
-   `COVERAGE_MATRIX`, not the writer's summary.
+   the actual diff range, the evidence packet, and — at `phase` and `release` —
+   the derived `COVERAGE_MATRIX`, not the writer's summary.
 7. **Correct** — if the review has blocking findings, classify them per *Review
    convergence and finding classification* and dispatch `opsx-implementer` with
    the eligible `introduced_by_diff` findings, then a fresh review. The default
@@ -465,8 +486,12 @@ For each change:
    a completion. Archive is a freeze: a post-archive finding is a carry-forward
    item (see Post-archive carry-forward), never an edit to the archived delta and
    never a reopened change.
-9. **Handoff** — run the mandatory Phase Transition Gate below before selecting
-   the next change.
+9. **Handoff** — run the Phase Transition Gate below before selecting the next
+   change. At `poc` and `phase` the gate is satisfied by the archiver's own
+   clean-HEAD record and the orchestrator's verification that the archive commit
+   carries the accepted implementation paths, the tracked tree is clean, and
+   `.opsx-run/` is ignored. A fresh `opsx-integration-auditor` is required at
+   `release`, and at `phase` only when a repair was performed in this change.
 10. **Record** — append the gate result and evidence to the ledger before moving
     to the next change.
 
@@ -781,19 +806,21 @@ the next change, and never push the archive commit to make it look delivered.
 
 ### Handoff reserve
 
-The gate costs dispatches. Reserve at least **three dispatches per change** —
-audit, repair, re-audit, where the repair is either a hygiene repair or a
-plan-reachable slug-collision resolution — via `HANDOFF_RESERVE` (default
-`3`). The
-reserve is **excluded** from `MAX_DISPATCHES` and from the review/implementation
-cap: review cycles must never consume the dispatches the handoff needs.
+The gate costs dispatches, and how many depends on the tier. At `release`,
+reserve at least **three dispatches per change** — audit, repair, re-audit —
+via `HANDOFF_RESERVE` (default `3`). At `phase`, reserve **one** (the audit is
+required only when a repair was performed). At `poc`, reserve **zero**: the
+archiver's own clean-HEAD record is the gate.
 
 The reserve is a planning allowance, not a gate on arithmetic. Before starting a
 change, check that the remaining allowance can still honor it. When the remaining
 allowance is below the reserve, record the shortfall in the ledger and continue
 under the advisory-cap rule: do not stop solely because the reserve cannot be
 honored. Reserved dispatches are charged to the reserve, not to the next change's
-implementation budget.
+implementation budget. The reserve is excluded from `MAX_DISPATCHES` and from the
+review/implementation cap — review cycles must never consume the dispatches the
+handoff needs. Do not book a reserve a tier does not need; that dispatch is the
+tier's main fixed cost.
 
 ## Post-archive carry-forward
 
@@ -988,10 +1015,17 @@ human-only decision; never silently prefer either side.
 
 - One reviewer session per change. Do not reuse a reviewer across phases.
 - The orchestrator spawns and scopes the reviewer; a writer never does.
-- The first review, and every re-review, is full-scope: read the whole accepted
-  artifact, the full diff, and the prior findings, not only the last correction.
-  Narrow "review only this fix" prompts cause serial discovery; one full-scope
-  review is worth more than five narrow ones.
+- The first review is full-scope: read the whole accepted artifact, the full
+  diff, and the prior findings. Every re-review that follows a corrective round
+  is delta-scoped to the corrective diff plus the surface the findings could
+  affect, per the reviewer's *Review scope discipline*; escalate to full scope
+  only when the corrective diff changed the accepted surface rather than
+  correcting within it. Narrow "review only this fix" prompts still cause serial
+  discovery — the delta scope is the corrective diff plus its regression
+  surface, not the corrected lines alone.
+- Only `critical` findings are blocking at `poc` and `phase`; `warning` and
+  `note` are advisories recorded in the report. At `release`, `warning` is also
+  blocking. Never treat an advisory as a reason to withhold archive.
 - Severity must be stable: the same defect class may not be blocking in one
   round and advisory in the next without an explicit adjudication note.
 - Carry an accepted-advisory list and the prior classifications into every round.
@@ -1077,11 +1111,13 @@ move on.
 - Never ask a question that blocks independent work; continue what does not
   depend on the answer.
 
-## Budget enforcement (opt-in)
+## Budget enforcement
 
-No wall-clock or dispatch budget is enforced unless the operator supplies
-`BUDGET` or `MAX_DISPATCHES`. Never invent a default. Record the supplied
-values and their source (`invocation`, plan metadata, or `none`) in the ledger.
+A per-change dispatch budget is always in force. The operator may override it
+with `MAX_DISPATCHES`; otherwise the tier default applies: **`poc` 12**,
+**`phase` 30**, **`release` 60** dispatches per change. Record the effective
+value and its source (`invocation`, `plan metadata`, or `tier default`) in the
+ledger.
 
 Check the budget before every dispatch and again when a child completes. Do not
 treat a running child as budget-free. Pass every child its own wall-clock and

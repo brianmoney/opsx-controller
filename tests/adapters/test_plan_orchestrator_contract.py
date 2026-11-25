@@ -51,15 +51,36 @@ class PlanOrchestratorContractTests(unittest.TestCase):
         self.assertIn("its source", text)
         self.assertIn("Do not infer the tier from the plan title", text)
 
-    def test_budget_is_opt_in_and_has_no_invented_default(self) -> None:
+    def test_budget_is_always_in_force_with_a_tier_default(self) -> None:
         text = _ORCHESTRATOR.read_text(encoding="utf-8")
-        self.assertNotIn("The default plan budget", text)
-        self.assertNotIn("default per-change dispatch budget", text)
-        self.assertIn("No default", text)
+        self.assertIn("A per-change dispatch budget is always in force", text)
+        self.assertIn("tier default", text)
         self.assertIn("MAX_DISPATCHES", text)
         self.assertIn("Check the budget before every dispatch", text)
         self.assertIn("when a child completes", text)
         self.assertIn("never reset or silently extend a budget", text)
+        # Each tier must name a concrete default so a run is never unbounded.
+        for tier_cap in ("`poc` 12", "`phase` 30", "`release` 60"):
+            self.assertIn(tier_cap, text)
+
+    def test_the_tier_selects_the_pipeline_not_just_the_threshold(self) -> None:
+        text = _ORCHESTRATOR.read_text(encoding="utf-8")
+        self.assertIn("The tier\nselects the pipeline, not only what may block.", text)
+        self.assertIn("**`poc`** — stages 1, 2", text)
+        # The cheap tier must not pay for a split, a coverage matrix, or a
+        # fresh independent auditor.
+        self.assertIn("the\nevidence packet, and the coverage matrix are not required", text)
+        self.assertIn(
+            "a fresh `opsx-integration-auditor`\nis required only when a repair "
+            "was performed",
+            text,
+        )
+
+    def test_release_keeps_the_full_ceremony(self) -> None:
+        text = _ORCHESTRATOR.read_text(encoding="utf-8")
+        self.assertIn("**`release`** — all ten stages below.", text)
+        # Loosening a tier must never loosen the floor for release.
+        self.assertIn("Never apply release-grade requirements in `poc` tier.", text)
 
     def test_plan_authoring_declares_acceptance(self) -> None:
         text = _PLAN_AUTHORING.read_text(encoding="utf-8")

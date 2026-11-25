@@ -88,8 +88,8 @@ try:
         base, compiler, cmd_archive_plan, cmd_autopilot,
         cmd_autopilot_install, cmd_doctor, cmd_gates,
         cmd_logs, cmd_models, cmd_run_one, cmd_status, cmd_supervise, cmd_use,
-        dashboard, delivery, doctor, groundtruth, logs, planref, report,
-        supervision_service, telemetry,
+        dashboard, delivery, doctor, evidence_creep, groundtruth, logs, planref,
+        report, supervision_service, telemetry,
     )
     from lib.orchestrator import cost as cost_mod
     from lib.orchestrator import state as state_mod
@@ -4990,6 +4990,7 @@ def run_doctor_checks(repo: Path, plan_src: str | None,
     checks.append(doctor._check_plan_loads(repo, plan_src))
     checks.append(doctor._check_pr_delivery(repo, plan_src))
     checks.append(doctor._check_direct_worker_agents(cfg, repo))
+    checks.append(evidence_creep.check_evidence_creep(repo, plan_src))
 
     failures = 0
     for passed, label, remediation in checks:
