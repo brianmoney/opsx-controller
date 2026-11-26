@@ -1,3 +1,10 @@
+> **SUPERSEDED 2026-11-25 — do not follow this document's resume steps.**
+> The admin panel run has since been **closed at `complete-through-phase-3`**.
+> Phase 2 was re-planned (the harness/cold evidence children were withdrawn by
+> commit `feaae21e`) and phase 3 `add-admin-panel-actions` landed at `7ac1a583`.
+> See `2026-11-25-admin-panel-plan-delivered.md` for current state and the
+> phase-4 launch conditions.
+
 # Handoff — Resume KF Admin Panel run (fresh orchestrator session)
 
 **Date:** 2026-11-24
